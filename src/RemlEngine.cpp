@@ -454,7 +454,7 @@ void calcu_tr_PA_woodbury(const RemlCtx& ctx, RemlVec& tr_PA, RemlVec* tr_PA_cor
     // (R, built in ai_reml from APy) uncorrected causes AI-REML to diverge once 
     // a component hits its clamp (score and curvature stop describing the same 
     // objective). This output is for a post-hoc, non-iterated correction only.
-    // See ai_reml's delta_corrected_out.
+    // See compute_woodbury_posthoc_delta, which reuses this output.
     if (tr_PA_corrected) {
         tr_PA_corrected->resize(ncomp);
         double tr_Vinv_c   = tr_Vinv;
@@ -674,8 +674,7 @@ double newton_decrement_null_quantile(const RemlMat& Hi, const RemlVec& var_U, d
 // — see call site.
 void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
              RemlVec& prev_varcmp, RemlVec& varcmp, double dlogL,
-             double& lambda_sq, RemlVec& var_U,
-             RemlVec* delta_corrected_out = nullptr) {
+             double& lambda_sq, RemlVec& var_U) {
     const bool use_approx     = ctx.reml_trace_hutchpp;
     const bool woodbury_basis_active = ctx.Vi_use_woodbury_basis;
 
@@ -711,22 +710,10 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     }
     Hi = 0.5 * Hi;
 
-    // Saved before R is overwritten into the score U below. R_raw is the
-    // quadratic-form term (y'PA_iPy); it has no closed-form tail-heterogeneity
-    // correction (unlike tr_PA's log-linear terms), so it's reused as-is for
-    // the post-hoc corrected estimate -- see delta_corrected_out below.
-    const RemlVec R_raw = R;
-
     RemlVec tr_PA;
-    RemlVec tr_PA_corrected;
     RemlVec tr_PA_var = RemlVec::Zero(m);   // deterministic (exact/Woodbury) => 0
     if (woodbury_basis_active) {
-        if (delta_corrected_out) {
-            tr_PA_corrected.resize(m);
-            calcu_tr_PA_woodbury(ctx, tr_PA, &tr_PA_corrected);
-        } else {
-            calcu_tr_PA_woodbury(ctx, tr_PA);
-        }
+        calcu_tr_PA_woodbury(ctx, tr_PA);
     } else if (use_approx) {
         const int eff_nprobes = (std::fabs(dlogL) < 1.0)
             ? ctx.reml_trace_hutchpp_nprobes
@@ -751,14 +738,6 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     RemlVec delta = Hi * R;
     lambda_sq = R.dot(delta);
 
-    // Post-hoc, diagnostic-only tail correction: one Newton step using the
-    // *same* curvature (Hi) as the live step above, but a tail-heterogeneity-
-    // corrected score. Deliberately NOT fed back into varcmp/prev_varcmp --
-    // only tr_PA's log-linear terms have a validated closed-form correction;
-    // R_raw (the quadratic term) does not, so this is a partial correction
-    // and must never be iterated (confirmed: iterating it diverges once a
-    // component hits its clamp).
-    //
     // Step-size damping. Legacy behaviour (default): GCTA's original fixed
     // 0.316 (~1/sqrt(10)) shrink whenever the *previous* iteration's logL
     // change exceeded 1.0 -- an undocumented magic constant, and a backward-
@@ -784,21 +763,67 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
         step_scale = std::min(1.0, std::sqrt(target_decrement / std::max(lambda_sq, 1e-12)));
     }
 
-    if (delta_corrected_out) {
-        if (woodbury_basis_active) {
-            const RemlVec U_corrected = -0.5 * (tr_PA_corrected - R_raw);
-            *delta_corrected_out = step_scale * (Hi * U_corrected);
-        } else {
-            delta_corrected_out->setZero(m);
-        }
-    }
-
     // Var(U_i) = 0.25 * Var(tr_PA_i) since only tr_PA is stochastic (Hutch++).
     // 0 for exact/Woodbury since tr_PA_var == 0. Left as a vector (not reduced
     // to trace(AI^{-1}*Var(U)) here) so the caller can build the full
     // null-distribution weight matrix, not just its trace.
     var_U = 0.25 * tr_PA_var;
     varcmp = prev_varcmp + step_scale * delta;
+}
+
+// Post-hoc, Woodbury-only tail correction. Called exactly once, only at
+// convergence, only when ctx.woodbury_basis_posthoc_correction is set --
+// NEVER from inside the AI-REML iteration loop, so it has zero effect
+// (zero extra compute, zero behavioural change) on every iteration leading
+// up to convergence, and zero cost at all when the flag is off.
+//
+// Reuses (Hi, Py) exactly as left behind by the final ai_reml call rather
+// than re-deriving them, so this adds no additional REML iteration.
+//
+// tr_PA's tail contribution gets the validated closed-form delta-method
+// correction (calcu_tr_PA_woodbury's tr_PA_corrected output). R's tail
+// contribution has no such closed form (see calcu_tr_PA_woodbury's own
+// comment) -- instead, when the flag is set, R is computed exactly via one
+// direct matvec against the true GRM (ctx.A), which is the one O(n^2) cost
+// this feature pays, paid exactly once. Falls back to the flat-tail
+// approximation with a warning if ctx.A has already been freed.
+RemlVec compute_woodbury_posthoc_delta(RemlCtx& ctx, const RemlMat& Hi, const RemlVec& Py) {
+    const int m = static_cast<int>(ctx.r_indx.size());
+
+    RemlVec tr_PA(m), tr_PA_corrected(m);
+    calcu_tr_PA_woodbury(ctx, tr_PA, &tr_PA_corrected);
+
+    // Flat-tail-approximate R, computed the same way ai_reml computes it --
+    // O(n*k), not O(n^2) -- so this matches exactly what the live iteration
+    // used, before any exact-R substitution below.
+    RemlVec R_raw(m);
+    for (int i = 0; i < m; i++) {
+        if (i == 0)
+            R_raw(i) = Py.dot(woodbury_basis_Kv(ctx, Py));
+        else if (ctx.A[ctx.r_indx[i]].size() == 0)
+            R_raw(i) = Py.dot(Py);
+        else
+            R_raw(i) = Py.dot(RemlVec(ctx.A[ctx.r_indx[i]] * Py));
+    }
+
+    RemlVec R_for_correction = R_raw;
+    if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
+        const RemlVec APy_exact = ctx.A[ctx.r_indx[0]] * Py;   // the one O(n^2) pass
+        R_for_correction(0) = Py.dot(APy_exact);
+    } else {
+        LOGGER.w(0, "ctx.woodbury_basis_posthoc_correction is set but the exact GRM "
+                    "(ctx.A) is not resident -- falling back to the flat-tail "
+                    "approximation for R. Keep ctx.A resident through convergence "
+                    "(skip the free in compute_woodbury_basis) to use this correction.");
+    }
+
+    const RemlVec U_corrected = -0.5 * (tr_PA_corrected - R_for_correction);
+    // Applied "as is" (no damping) for now, per design: this is a one-time
+    // post-hoc correction, not an iterated step, so the in-loop trust-region
+    // damping isn't obviously the right mechanism to reuse here -- add a
+    // dedicated damping step later if testing shows it's needed, rather than
+    // borrowing that one's free parameter by default.
+    return Hi * U_corrected;
 }
 
 void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
@@ -852,7 +877,6 @@ double reml_iteration(RemlCtx& ctx,
     double prev_lgL = -1e20, lgL = -1e20, dlogL = 1000.0;
     double lambda_sq = 1e300;   // only meaningful when reml_mtd == 0
     RemlVec var_U;              // ditto -- Var(U) per component, from Hutch++ probe noise (0 for exact/Woodbury)
-    RemlVec delta_corrected = RemlVec::Zero(m);   // post-hoc tail-corrected step; diagnostic only, read once at convergence
     RemlVec prev_prev_varcmp(varcmp), prev_varcmp(varcmp), varcomp_init(varcmp);
 
     // ctx.reml_ai_robust_risk is the one number you set: the (Bonferroni,
@@ -875,7 +899,7 @@ double reml_iteration(RemlCtx& ctx,
                << ctx.reml_trace_hutchpp_nprobes << (ctx.reml_hutchpp_fixed_probes ? "fixed" : "fresh")  << " probes." << std::endl;
     }
     if (ctx.reml_mtd == 0 && ctx.reml_ai_robust) {
-        LOGGER << "Using Newton-decrement convergence criterion (--reml-ai-robust-stop, "
+        LOGGER << "Using Newton-decrement convergence criterion (--reml-ai-robust, "
                << "logL tol=" << ctx.reml_ai_robust_tol
                << ", run-level false-stop risk=" << ctx.reml_ai_robust_risk
                << " => alpha/iter=" << ai_robust_alpha_per_iter << ")." << std::endl;
@@ -883,7 +907,7 @@ double reml_iteration(RemlCtx& ctx,
 
     bool converged_flag = false;
     // small_delta_streak/M are only used by the legacy dlogL gate (mtd==1,
-    // mtd==2, and mtd==0 when --reml-ai-robust-stop is off): a single small
+    // mtd==2, and mtd==0 when --reml-ai-robust is off): a single small
     // dlogL is a weak, uncalibrated signal there (no known false-stop rate),
     // so repetition is the only cheap way to build confidence. The AI-robust
     // path below doesn't need this -- the calibrated null-quantile test
@@ -938,13 +962,8 @@ double reml_iteration(RemlCtx& ctx,
         }
         logdet_Xt_Vi_X = logdet_Xt_Vi_X2;
 
-        if (ctx.reml_mtd == 0) {
-            ai_reml(ctx, ctx.P, Hi, Py, prev_varcmp, varcmp, dlogL, lambda_sq, var_U, &delta_corrected);
-            if (ctx.Vi_use_woodbury_basis) {   // TEMP: unconditional, remove after diagnostic run
-                LOGGER << "  [diag] iter " << iter << " post-hoc: "
-                       << (prev_varcmp + delta_corrected).transpose() << std::endl;
-            }
-        }
+        if (ctx.reml_mtd == 0)
+            ai_reml(ctx, ctx.P, Hi, Py, prev_varcmp, varcmp, dlogL, lambda_sq, var_U);
         else if (ctx.reml_mtd == 1)
             reml_equation(ctx, ctx.P, Hi, Py, varcmp);
         else if (ctx.reml_mtd == 2)
@@ -1013,7 +1032,7 @@ double reml_iteration(RemlCtx& ctx,
         // Fisher-scoring (mtd==1) and EM-REML (mtd==2) don't materialise AI^{-1}
         // as part of their update (that's the point of EM), so no equally cheap
         // curvature estimate is available there; they keep the legacy logL-delta
-        // gate, as does mtd==0 when --reml-ai-robust-stop isn't set (this also
+        // gate, as does mtd==0 when --reml-ai-robust isn't set (this also
         // covers the iter==0 EM burn-in step used to pick priors).
         bool like_small;
         const bool ai_robust_active = (ctx.reml_mtd == 0 && ctx.reml_ai_robust);
@@ -1052,11 +1071,71 @@ double reml_iteration(RemlCtx& ctx,
 
         if (converged_flag) {
             //varcmp = best_varcmp;   // report best-seen, not last-iterate //Deactivated on purpose without testing, as this would no longer be a "convergence" method.
-            if (ctx.Vi_use_woodbury_basis && ctx.reml_mtd == 0) {
+            if (ctx.Vi_use_woodbury_basis && ctx.reml_mtd == 0 && ctx.woodbury_basis_posthoc_correction) {
+                // Hi/Py here are exactly what the final ai_reml call above left
+                // behind -- still consistent with prev_varcmp, the converged
+                // (flat-tail) fixed point. Nothing above this point in the loop
+                // pays any extra cost for this feature; this is the only place
+                // it runs, and it runs at most once.
+                const RemlVec delta_corrected = compute_woodbury_posthoc_delta(ctx, Hi, Py);
                 const RemlVec varcmp_post = prev_varcmp + delta_corrected;
-                // Disabled for now
-                //LOGGER << "Post-hoc tail-corrected estimate (diagnostic only, not applied): "
-                //       << varcmp_post.transpose() << std::endl;
+                const double lgL_pre = lgL;
+                varcmp = varcmp_post;
+
+                // Refresh everything downstream to be self-consistent with the
+                // corrected varcmp. Vi_X_out/Xt_Vi_X_i_out/Hi/lgL (-> ctx.logL)
+                // are otherwise only captured once, below/by the caller, from
+                // whatever state the last (pre-correction) iteration left
+                // behind -- reassigning varcmp alone does not update any of
+                // them, which is exactly what produced the earlier MLMA
+                // regression from a hand-patched factorize_only attempt.
+                //
+                // Woodbury mode cannot materialize a dense P/Vi ("Woodbury REML
+                // is incompatible with explicit V^{-1} materialisation") --
+                // skip_P must stay true, and Py/Hi are rebuilt the same
+                // implicit way ai_reml computes them every iteration
+                // (applyP_vec/applyP_mat via the low-rank+tail basis), not via
+                // calcu_Hi's dense-P path (that path is only ever exercised by
+                // the reml_mtd==2 branch below, which is not reachable here).
+                double logdet_post = 0.0;
+                if (!calcu_Vi(ctx, varcmp, logdet_post, iter, /*skip_P=*/true)) {
+                    LOGGER.w(0, "REML: post-hoc corrected variance components are not "
+                                 "positive-definite; keeping the pre-correction estimate.");
+                    varcmp = prev_varcmp;
+                    calcu_Vi(ctx, varcmp, logdet_post, iter, true);
+                }
+                const double logdet_Xt_Vi_X_post = calcu_P_impl(ctx, nullptr);
+                Py = applyP_vec(ctx, ctx.y);
+
+                const int m_post = static_cast<int>(ctx.r_indx.size());
+                RemlMat APy_post(ctx.n, m_post);
+                for (int i = 0; i < m_post; i++) {
+                    if (i == 0)
+                        APy_post.col(i) = woodbury_basis_Kv(ctx, Py);
+                    else if (ctx.A[ctx.r_indx[i]].size() == 0)
+                        APy_post.col(i) = Py;
+                    else
+                        APy_post.col(i).noalias() = ctx.A[ctx.r_indx[i]] * Py;
+                }
+                const RemlMat PAPy_post = applyP_mat(ctx, APy_post);
+                Hi.noalias() = APy_post.transpose() * PAPy_post;
+                Hi = 0.5 * Hi;
+                if (!inverse_H(ctx, Hi)) {
+                    LOGGER.w(0, "REML: AI matrix at the post-hoc corrected point is not "
+                                 "invertible; SE reporting at the corrected point may be "
+                                 "unreliable.");
+                }
+                lgL = -0.5 * (logdet_Xt_Vi_X_post + logdet_post + ctx.y.dot(Py));
+
+                LOGGER << "REML: Woodbury post-hoc tail correction applied.\n"
+                       << "\tConverged (flat-tail) estimate: " << prev_varcmp.transpose()
+                       << "  (logL=" << lgL_pre << ")\n"
+                       << "\tCorrected estimate:              " << varcmp.transpose()
+                       << "  (logL=" << lgL << ")\n"
+                       << "\tNote: reported SE(s) are the flat-tail model's curvature (AI^-1) "
+                       << "evaluated at the corrected point, not a rigorously re-derived SE "
+                       << "for the corrected estimator itself -- treat as approximate."
+                       << std::endl;
             }
             if (ctx.reml_mtd == 2) {
                 RemlMat P_tmp;
@@ -1536,7 +1615,8 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     ctx.Uk            = evec;
     ctx.woodbury_basis_rank_ = k;
 
-    ctx.A[ctx.r_indx[0]].resize(0, 0);
+    if (!ctx.woodbury_basis_posthoc_correction)
+        ctx.A[ctx.r_indx[0]].resize(0, 0);
     ctx.Vi_use_woodbury_basis = true;
 
     LOGGER << "Woodbury basis: k=" << k

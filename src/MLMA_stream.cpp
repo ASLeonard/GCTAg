@@ -625,6 +625,10 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
             options_d["woodbury_basis_range_max"] = std::stod(vals[1]);
             options_in.erase("--reml-woodbury-basis-range");
         }
+        if (options_in.find("--reml-woodbury-basis-posthoc-correction") != options_in.end()) {
+            options["woodbury_basis_posthoc_correction"] = "1";
+            options_in.erase("--reml-woodbury-basis-posthoc-correction");
+        }
         if (options_in.find("--reml-trace-hutchpp") != options_in.end()) {
             options["trace_hutchpp"] = "1";
             const auto& v = options_in["--reml-trace-hutchpp"];
@@ -684,6 +688,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
                 LOGGER.e(0, "--mlma-stream accepts at most one value: the memory budget in GB for tile-based streaming.");
         }
     }
+    options_in.erase("--mlma-stream");
     if (options_in.find("--log-pval") != options_in.end()) {
         options["log_pval"] = "1";
         options_in.erase("--log-pval");
@@ -1034,6 +1039,7 @@ void MLMA::processMain()
                 ? static_cast<int>(options_d.at("woodbury_basis_range_init")) : 2000;
             ctx.woodbury_basis_k_max  = options_d.count("woodbury_basis_range_max")
                 ? static_cast<int>(options_d.at("woodbury_basis_range_max")) : 25000;
+            ctx.woodbury_basis_posthoc_correction = options.count("woodbury_basis_posthoc_correction") > 0;
             ctx.svd_mem_budget_gb   = woodbury_basis_mem_budget_gb;
             ctx.svd_nystrom         = svd_nystrom;
             ctx.svd_chunked_budget         = svd_chunked ? svd_chunked_budget : 0.0;

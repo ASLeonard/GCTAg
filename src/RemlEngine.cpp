@@ -777,53 +777,114 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
 // (zero extra compute, zero behavioural change) on every iteration leading
 // up to convergence, and zero cost at all when the flag is off.
 //
-// Reuses (Hi, Py) exactly as left behind by the final ai_reml call rather
-// than re-deriving them, so this adds no additional REML iteration.
-//
 // tr_PA's tail contribution gets the validated closed-form delta-method
 // correction (calcu_tr_PA_woodbury's tr_PA_corrected output). R's tail
 // contribution has no such closed form (see calcu_tr_PA_woodbury's own
-// comment) -- instead, when the flag is set, R is computed exactly via one
-// direct matvec against the true GRM (ctx.A), which is the one O(n^2) cost
-// this feature pays, paid exactly once. Falls back to the flat-tail
+// comment) -- instead R is computed exactly via one direct matvec against
+// the true GRM (ctx.A) per score evaluation. Falls back to the flat-tail
 // approximation with a warning if ctx.A has already been freed.
-RemlVec compute_woodbury_posthoc_delta(RemlCtx& ctx, const RemlMat& Hi, const RemlVec& Py) {
+//
+// Step size: NOT the raw Newton step Hi*U_corrected taken at full strength.
+// Hi is the flat-tail model's curvature, evaluated at the flat-tail fixed
+// point -- there is no reason to trust its *magnitude* once the score being
+// solved is no longer the one it was derived from (confirmed empirically:
+// the raw full step overshoots badly and by an increasing amount as the
+// starting point approaches the true optimum). Instead of an arbitrary fixed
+// damping factor, this evaluates the corrected score a second time, at the
+// full-step trial endpoint, and takes a secant (regula falsi) step along the
+// same direction Hi proposed -- i.e. it still trusts Hi's *direction*, but
+// replaces its *magnitude* with one grounded in an actual second measurement
+// of the corrected score, not an assumed constant. Costs one additional
+// exact O(n^2) matvec (the trial-point score evaluation) on top of the one
+// already paid for the current-point score -- still only paid once per
+// converged run, still nothing paid unless the flag is on.
+RemlVec compute_woodbury_posthoc_delta(RemlCtx& ctx, const RemlMat& Hi, const RemlVec& Py,
+                                        const RemlVec& prev_varcmp, int iter) {
     const int m = static_cast<int>(ctx.r_indx.size());
 
-    RemlVec tr_PA(m), tr_PA_corrected(m);
-    calcu_tr_PA_woodbury(ctx, tr_PA, &tr_PA_corrected);
+    // Corrected score U(varcmp), evaluated at whatever point ctx is currently
+    // set up for (Py must be V^{-1}-projected at that same point -- true both
+    // for the current-point call below and the trial-point call further down).
+    auto corrected_score = [&](const RemlVec& Py_at) -> RemlVec {
+        RemlVec tr_PA_l(m), tr_PA_corrected_l(m);
+        calcu_tr_PA_woodbury(ctx, tr_PA_l, &tr_PA_corrected_l);
 
-    // Flat-tail-approximate R, computed the same way ai_reml computes it --
-    // O(n*k), not O(n^2) -- so this matches exactly what the live iteration
-    // used, before any exact-R substitution below.
-    RemlVec R_raw(m);
-    for (int i = 0; i < m; i++) {
-        if (i == 0)
-            R_raw(i) = Py.dot(woodbury_basis_Kv(ctx, Py));
-        else if (ctx.A[ctx.r_indx[i]].size() == 0)
-            R_raw(i) = Py.dot(Py);
-        else
-            R_raw(i) = Py.dot(RemlVec(ctx.A[ctx.r_indx[i]] * Py));
-    }
+        RemlVec R_raw_l(m);
+        for (int i = 0; i < m; i++) {
+            if (i == 0)
+                R_raw_l(i) = Py_at.dot(woodbury_basis_Kv(ctx, Py_at));
+            else if (ctx.A[ctx.r_indx[i]].size() == 0)
+                R_raw_l(i) = Py_at.dot(Py_at);
+            else
+                R_raw_l(i) = Py_at.dot(RemlVec(ctx.A[ctx.r_indx[i]] * Py_at));
+        }
 
-    RemlVec R_for_correction = R_raw;
-    if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
-        const RemlVec APy_exact = ctx.A[ctx.r_indx[0]] * Py;   // the one O(n^2) pass
-        R_for_correction(0) = Py.dot(APy_exact);
+        RemlVec R_for_correction_l = R_raw_l;
+        if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
+            const RemlVec APy_exact_l = ctx.A[ctx.r_indx[0]] * Py_at;   // the O(n^2) pass
+            R_for_correction_l(0) = Py_at.dot(APy_exact_l);
+        } else {
+            LOGGER.w(0, "ctx.woodbury_basis_posthoc_correction is set but the exact GRM "
+                        "(ctx.A) is not resident -- falling back to the flat-tail "
+                        "approximation for R. Keep ctx.A resident through convergence "
+                        "(skip the free in compute_woodbury_basis) to use this correction.");
+        }
+        return -0.5 * (tr_PA_corrected_l - R_for_correction_l);
+    };
+
+    // g(0): corrected score at the current (converged, flat-tail) point.
+    // ctx is already correctly set up for prev_varcmp/Py on entry -- no
+    // calcu_Vi call needed here, unlike the trial point below.
+    const RemlVec U0 = corrected_score(Py);
+    const RemlVec d  = U0; //Hi * U0;          // raw Newton direction (and, at t=1, the old full step)
+    const double  g0 = d.dot(U0);
+
+    // g(1): corrected score at the trial full-step endpoint. Requires moving
+    // ctx to that point first (same skip_P=true, dense-P-free path the main
+    // convergence refresh uses -- Woodbury cannot materialise dense P/Vi).
+    RemlVec varcmp_trial = prev_varcmp + d;
+
+    double logdet_trial = 0.0;
+    double t_star = 0.0;
+    if (calcu_Vi(ctx, varcmp_trial, logdet_trial, iter, /*skip_P=*/true)) {
+        calcu_P_impl(ctx, nullptr);
+        const RemlVec Py_trial = applyP_vec(ctx, ctx.y);
+        const RemlVec U1 = corrected_score(Py_trial);
+        const double  g1 = d.dot(U1);
+
+        constexpr double denom_eps = 1e-12;   // numerical-safety threshold, not a tuning knob
+        if (std::fabs(g0 - g1) > denom_eps) {
+            // Secant root of g(t) = g0 + t*(g1-g0) along the Hi-proposed
+            // direction. Clamped to [0, 1] -- interpolate between "no
+            // correction" (t=0, known-safe) and "full raw step" (t=1, known
+            // to overshoot), never extrapolate beyond either.
+            t_star = std::clamp(g0 / (g0 - g1), 0.0, 1.0);
+        } else {
+            LOGGER.w(0, "REML: post-hoc secant step denominator is degenerate "
+                        "(corrected score barely changed over the trial step); "
+                        "keeping the pre-correction estimate.");
+        }
+        LOGGER << "REML: post-hoc secant line search: g(0)=" << g0 << ", g(1)=" << g1
+               << ", t*=" << t_star << std::endl;
     } else {
-        LOGGER.w(0, "ctx.woodbury_basis_posthoc_correction is set but the exact GRM "
-                    "(ctx.A) is not resident -- falling back to the flat-tail "
-                    "approximation for R. Keep ctx.A resident through convergence "
-                    "(skip the free in compute_woodbury_basis) to use this correction.");
+        LOGGER.w(0, "REML: post-hoc secant trial point is not positive-definite; "
+                    "keeping the pre-correction estimate.");
     }
 
-    const RemlVec U_corrected = -0.5 * (tr_PA_corrected - R_for_correction);
-    // Applied "as is" (no damping) for now, per design: this is a one-time
-    // post-hoc correction, not an iterated step, so the in-loop trust-region
-    // damping isn't obviously the right mechanism to reuse here -- add a
-    // dedicated damping step later if testing shows it's needed, rather than
-    // borrowing that one's free parameter by default.
-    return Hi * U_corrected;
+    // Restore ctx to the state it was in on entry (consistent with prev_varcmp
+    // and the caller's Py) before returning, so this function has no side
+    // effects the caller needs to know about or compensate for -- do not rely
+    // on the caller happening to re-sync state right after this returns.
+    // Local mutable copy: calcu_Vi requires non-const RemlVec& (it may
+    // constrain/clamp values in place), and prev_varcmp is a const-ref
+    // parameter here -- the mutated copy itself is discarded, only the side
+    // effect on ctx state is wanted.
+    RemlVec prev_varcmp_restore = prev_varcmp;
+    double logdet_restore = 0.0;
+    calcu_Vi(ctx, prev_varcmp_restore, logdet_restore, iter, /*skip_P=*/true);
+    calcu_P_impl(ctx, nullptr);
+
+    return t_star * d;
 }
 
 void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
@@ -1077,7 +1138,7 @@ double reml_iteration(RemlCtx& ctx,
                 // (flat-tail) fixed point. Nothing above this point in the loop
                 // pays any extra cost for this feature; this is the only place
                 // it runs, and it runs at most once.
-                const RemlVec delta_corrected = compute_woodbury_posthoc_delta(ctx, Hi, Py);
+                const RemlVec delta_corrected = compute_woodbury_posthoc_delta(ctx, Hi, Py, prev_varcmp, iter);
                 const RemlVec varcmp_post = prev_varcmp + delta_corrected;
                 const double lgL_pre = lgL;
                 varcmp = varcmp_post;

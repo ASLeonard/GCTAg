@@ -100,7 +100,7 @@ int main(int argc, char *argv[]){
         "--bfile", "--bim", "--fam", "--bed", "--keep", "--remove", 
         "--chr", "--autosome-num", "--autosome", "--autosome-sex", "--chr-homogametic", "--extract", "--exclude", "--maf", "--max-maf", 
         "--sex-chr-file", "--homogametic-chr", "--heterogametic-chr",
-        "--freq", "--out", "--make-grm", "--make-grm-part", "--thread-num", "--threads", "--grm", "--nMarkers",
+        "--freq", "--out", "--make-grm", "--make-grm-part", "--thread-num", "--threads", "--grm",
         "--grm-cutoff", "--grm-singleton", "--cutoff-detail", "--make-bK-sparse", "--make-bK", "--pheno",
         "--mpheno", "--ge", "--fastGWA", "--fastGWA-mlm", "--fastGWA-mlm-exact", "--fastGWA-lr", "--save-fastGWA-mlm-residual", "--grm-sparse", "--qcovar", "--covar", "--rcovar", "--covar-maxlevel", "--make-grm-d", "--make-grm-d-part",
         "--cg", "--ldlt", "--llt", "--pardiso", "--tcg", "--lscg", "--save-inv", "--load-inv",
@@ -112,12 +112,17 @@ int main(int argc, char *argv[]){
         "--pfile", "--bpfile", "--mpfile", "--mbpfile", "--model-only", "--load-model", "--seed", "--fastGWA-mlm-binary", "--num-vec", "--trace-exact", "--cv-threshold", "--tao-start",
         "--acat", "--gene-list", "--snp-list", "--min-mac", "--max-maf", "--wind",
         "--envir", "--optimal-rho", "--noSandwich", "--grid-size",
-        "--GRM-tile-budget",
-        "--mlma-stream", "--save-reml", "--load-reml", "--mlma-no-preadj-covar", "--log-pval", "--model",
-        "--reml-trace-hutchpp", "--reml-trace-hutchpp-fixed-probes", "--reml-maxit", "--reml-woodbury-basis", "--svd-method", "--reml-woodbury-basis-eigen-mass", "--reml-woodbury-basis-var-thresh", "--svd-chunked-budget", "--reml-alg",
-        "--reml-no-constrain", "--reml-no-HE-start", "--reml-priors", "--reml-priors-var", "--reml-diagV-adj", "--reml-ai-robust", "--reml-ai-robust-tol", "--reml-ai-robust-risk",
-        "--mlma-loco-stream", "--loco-manifest",
+        "--GRM-tile-budget", "--nMarkers",
         "--pca", "--pca-v1", "--pca-stream", "--pca-approx",
+        "--svd-method", "--svd-chunked-budget",
+        "--reml-trace-hutchpp", "--reml-trace-hutchpp-fixed-probes", "--reml-no-HE-start", "--reml-force-dense-V",
+        "--reml-woodbury-basis", "--reml-woodbury-basis-MP-margin", "--reml-woodbury-basis-MP-confirm", "--reml-woodbury-basis-EIG-mass", "--reml-woodbury-basis-EIG-k-buffer", "--reml-woodbury-basis-VAR-tail", "--reml-woodbury-basis-range", "--reml-woodbury-basis-posthoc-correction",
+        "--reml-no-constrain", "--reml-priors", "--reml-priors-var", "--reml-diagV-adj", "--reml-maxit",  "--reml-alg",
+        "--reml-ai-robust", "--reml-ai-robust-tol", "--reml-ai-robust-risk",
+        "--mlma-loco-stream", "--loco-manifest",
+        "--mlma-no-preadj-covar",
+        "--mlma-stream", "--mlma-tile-budget-gb", "--save-reml", "--load-reml", "--log-pval", "--model",
+
     };
     map<string, vector<string>> options;
     vector<string> keys;
@@ -279,14 +284,14 @@ int main(int argc, char *argv[]){
     // Please take care of the order, C++ has few reflation feature, I did in a ugly way.
         // Note: "mlma", "mlma_loco", and "pca_stream" must appear before "GRM" so
         // that --grm is captured by those modules before GRM::registerOption erases it.
-        vector<string> module_names = {"phenotype", "marker", "genotype", "covar", "mlma", "mlma_loco", "pca_stream", "GRM", "fastFAM", "LD"};
+        vector<string> module_names = {"phenotype", "marker", "genotype", "covar", "mlma", /*"mlma_loco",*/ "pca_stream", "GRM", "fastFAM", "LD"};
     vector<int (*)(map<string, vector<string>>&)> registers = {
             Pheno::registerOption,
             Marker::registerOption,
             Geno::registerOption,
             Covar::registerOption,
             MLMA::registerOption,
-            MLMALoco::registerOption,
+            //MLMALoco::registerOption,
             PCAStream::registerOption,
             GRM::registerOption,
             FastFAM::registerOption,
@@ -298,7 +303,7 @@ int main(int argc, char *argv[]){
             Geno::processMain,
             Covar::processMain,
             MLMA::processMain,
-            MLMALoco::processMain,
+            //MLMALoco::processMain,
             PCAStream::processMain,
             GRM::processMain,
             FastFAM::processMain,

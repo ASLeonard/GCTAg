@@ -53,6 +53,32 @@ inline Eigen::MatrixXd compact_sample_rows(const Eigen::MatrixXd& values,
     return compacted;
 }
 
+// Resolve the streaming block width (SNPs per tile) from a memory budget.
+// Two buffers dominate, both O(n * block):
+//   - GenoBufItem::geno : n doubles/SNP (8 bytes) — the raw genotype call
+//                         buffer Geno::getGenoDouble hands back per SNP,
+//                         resident for every SNP currently in flight.
+//   - X_block           : n floats/SNP  (4 bytes) — the centered, weighted
+//                         float design block actually consumed by BLAS.
+// Per-SNP scalars (Xt_Vi_y, xvx_diag, af_v, valid_v) are O(1) per column
+// and negligible next to the O(n) terms above.
+// budget_gb <= 0 preserves the previous fixed BLOCK=10000 behavior exactly
+inline int resolve_mlma_block_size(int n, double budget_gb)
+{
+    if (budget_gb <= 0.0 || n <= 0)
+        return 10000; // Somewhat arbitrary, but balance of peak RSS and throughout. Increasing may help STRSM efficiency but increases memory.
+
+    constexpr double bytes_per_snp_per_sample = 8.0 /* GenoBufItem::geno */
+                                               + 4.0 /* X_block */;
+    constexpr int    min_block = 256;    // floor: keep BLAS3 tiles meaningful
+    constexpr int    max_block = 65536;  // ceiling: cap per-column scalar creep
+
+    const double budget_bytes  = budget_gb * 1e9;
+    const double per_snp_bytes = static_cast<double>(n) * bytes_per_snp_per_sample;
+    const int    block         = static_cast<int>(budget_bytes / per_snp_bytes);
+    return std::clamp(block, min_block, max_block);
+}
+
 template <typename XVXDiagFn>
 inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
                                              XVXDiagFn&& compute_xvx_diag,
@@ -60,13 +86,14 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
                                              Geno* geno,
                                              Marker* marker,
                                              int n,
+                                             int block_size,
                                              bool log_pval,
                                              std::ofstream& ofile)
 {
     const uint32_t total_m = marker->count_extract();
     LOGGER << "\nStreaming association tests for " << total_m << " SNPs..." << std::endl;
 
-    constexpr int BLOCK = 10000;
+    const int BLOCK = block_size;
     Eigen::MatrixXf X_block(n, BLOCK);
     Eigen::VectorXf Xt_Vi_y(BLOCK);
     Eigen::VectorXf xvx_diag(BLOCK);
@@ -170,30 +197,37 @@ inline void run_mlma_stream_association(RemlState& state,
                                         Marker* marker,
                                         int n,
                                         bool log_pval,
-                                        std::ofstream& ofile)
+                                        std::ofstream& ofile,
+                                        double block_mem_budget_gb = 0.0)
 {
     Eigen::VectorXf Vi_y(n);
-    Eigen::LLT<Eigen::MatrixXf> Vi_llt;
 
     const bool use_wb  = state.is_woodbury;
-    const bool use_llt = state.is_llt;
+    const bool use_llt = state.is_llt;  // selects TRSM (factor = L(V)) vs TRMM (factor = Li(Vi))
 
     if (use_wb) {
+        LOGGER << "MLMA streaming: applying V^{-1} via Woodbury low-rank update "
+            "(V^{-1} = D^{-1} - D^{-1} U_k C U_k^T D^{-1})." << std::endl;
         Vi_y = woodbury_apply_Vi_f(state.wb, y_adj);
     } else if (use_llt) {
-        // V^{-1} y = L^{-T}(L^{-1} y) via two float triangular solves.
-        // Avoids dpotri + a second Cholesky decomposition (saves 2×O(n³/3)).
+        // V^{-1} y = L^{-T}(L^{-1} y) via two float triangular solves
+        // against L, the Cholesky factor of V.
+        LOGGER << "MLMA streaming: applying V^{-1} via triangular solve against L, "
+            "where V = L L^T (STRSM/STRSV — forward/back substitution)." << std::endl;
         Vi_y = y_adj;
         cblas_strsv(CblasColMajor, CblasLower, CblasNoTrans, CblasNonUnit,
                     n, state.Vi_L_f.data(), n, Vi_y.data(), 1);
         cblas_strsv(CblasColMajor, CblasLower, CblasTrans, CblasNonUnit,
                     n, state.Vi_L_f.data(), n, Vi_y.data(), 1);
     } else {
-        Vi_y.noalias() = state.Vi * y_adj;
-        Vi_llt = Eigen::LLT<Eigen::MatrixXf>(state.Vi);
-        if (Vi_llt.info() != Eigen::Success)
-            LOGGER.e(0, "REML state Vi matrix is not positive definite.");
-        state.Vi.resize(0, 0);  // free RAM immediately
+        // V^{-1} y = Li (Li^T y) via two float triangular products against
+        // Li, the Cholesky factor of V^{-1} itself. Li was already computed
+        // once at REML-exit/save time (see writeRemlStateFromCtx /
+        // build_reml_state) — no factorization happens here, ever.
+        LOGGER << "MLMA streaming: applying V^{-1} via triangular product against L_i, "
+            "where V^{-1} = L_i L_i^T (STRMM — no linear solve)." << std::endl;
+        Vi_y.noalias() = state.Vi_L_f.triangularView<Eigen::Lower>().transpose() * y_adj;
+        Vi_y = state.Vi_L_f.triangularView<Eigen::Lower>() * Vi_y;
     }
 
     Vi_y.array() *= w_sqrt.array();
@@ -211,14 +245,16 @@ inline void run_mlma_stream_association(RemlState& state,
         } else {
             cblas_strmm(CblasColMajor, CblasLeft, CblasLower, CblasTrans, CblasNonUnit,
                         n, bs, 1.0f,
-                        Vi_llt.matrixLLT().data(), n,
+                        state.Vi_L_f.data(), n,
                         X_block.data(), n);
             xvx_diag.head(bs) = X_block.leftCols(bs).colwise().squaredNorm();
         }
     };
 
     run_mlma_stream_association_impl(Vi_y, compute_xvx_diag, w_sqrt,
-                                     geno, marker, n, log_pval, ofile);
+                                     geno, marker, n,
+                                     resolve_mlma_block_size(n, block_mem_budget_gb),
+                                     log_pval, ofile);
 }
 
 inline void run_mlma_stream_association(RemlCtx& ctx,
@@ -228,7 +264,8 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
                                         Marker* marker,
                                         int n,
                                         bool log_pval,
-                                        std::ofstream& ofile)
+                                        std::ofstream& ofile,
+                                        double block_mem_budget_gb = 0.0)
 {
     Eigen::VectorXf Vi_y(n);
 
@@ -273,5 +310,7 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
     };
 
     run_mlma_stream_association_impl(Vi_y, compute_xvx_diag, w_sqrt,
-                                     geno, marker, n, log_pval, ofile);
+                                     geno, marker, n,
+                                     resolve_mlma_block_size(n, block_mem_budget_gb),
+                                     log_pval, ofile);
 }

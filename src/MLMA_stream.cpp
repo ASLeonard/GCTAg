@@ -164,18 +164,25 @@ RemlState readRemlState(const string& filename, bool no_adj_covar)
     if (magic != "GOBY")
         LOGGER.e(0, "[" + filename + "] is not a valid REML state file (bad magic bytes).");
 
-    const size_t tri = static_cast<size_t>(hdr.n) * (hdr.n + 1) / 2;
-    vector<float> buf(tri);
-    must_read(buf.data(), static_cast<std::streamsize>(tri * sizeof(float)));
+    int32_t factor_kind = 0;  // 0 = L(V), apply via TRSM; 1 = Li(Vi), apply via TRMM
+    must_read(&factor_kind, sizeof(int32_t));
+    st.is_llt = (factor_kind == 0);
 
-    // Unpack lower-triangle into full symmetric matrix
-    st.Vi.resize(hdr.n, hdr.n);
-    size_t idx = 0;
-    for (int32_t j = 0; j < hdr.n; ++j)
-        for (int32_t i = j; i < hdr.n; ++i, ++idx) {
-            st.Vi(i, j) = buf[idx];
-            st.Vi(j, i) = buf[idx];
-        }
+    // Unpack the lower triangle directly into a contiguous n×n factor
+    // buffer. This is a Cholesky factor, not a symmetric matrix — only the
+    // lower triangle is meaningful (every consumer applies it via
+    // triangularView<Lower>()), so there is no mirroring step and no
+    // temptation to ever materialise the dense V^{-1} this factor represents.
+    st.Vi_L_f.resize(hdr.n, hdr.n);
+    {
+        const size_t tri = static_cast<size_t>(hdr.n) * (hdr.n + 1) / 2;
+        vector<float> buf(tri);
+        must_read(buf.data(), static_cast<std::streamsize>(tri * sizeof(float)));
+        size_t idx = 0;
+        for (int32_t j = 0; j < hdr.n; ++j)
+            for (int32_t i = j; i < hdr.n; ++i, ++idx)
+                st.Vi_L_f(i, j) = buf[idx];
+    }  // buf (~n²/2 floats) freed here, ahead of the b/varcmp reads below
 
     if (!no_adj_covar) {
         st.b.resize(hdr.x_c);
@@ -187,95 +194,6 @@ RemlState readRemlState(const string& filename, bool no_adj_covar)
     must_read(st.varcmp.data(),
               static_cast<std::streamsize>(hdr.num_varcmp * sizeof(float)));
     return st;
-}
-
-void writeRemlState(const string& filename, const RemlState& st, bool no_adj_covar)
-{
-    std::ofstream out(filename, std::ios::binary);
-    if (!out.is_open())
-        LOGGER.e(0, "cannot open [" + filename + "] for writing.");
-
-    if (st.is_woodbury) {
-        struct Header {
-            char    magic[4] = {'T', 'U', 'N', 'A'};
-            int32_t n = 0, x_c = 0, num_varcmp = 0, num_r_indx = 0;
-        } hdr;
-        hdr.n = st.n;
-        hdr.x_c = st.x_c;
-        hdr.num_varcmp = static_cast<int32_t>(st.varcmp.size());
-        hdr.num_r_indx = static_cast<int32_t>(st.varcmp.size());
-        out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-
-        const int32_t k = static_cast<int32_t>(st.wb.ck_f.size());
-        out.write(reinterpret_cast<const char*>(&k), sizeof(int32_t));
-
-        const double lambda_tail = static_cast<double>(st.lambda_tail_f);
-        out.write(reinterpret_cast<const char*>(&lambda_tail), sizeof(double));
-
-        if (st.wb.Uk_f.rows() != k || st.wb.Uk_f.cols() != st.n)
-            LOGGER.e(0, "invalid Woodbury REML state dimensions before save.");
-        if (st.dk_f.size() != k)
-            LOGGER.e(0, "invalid Woodbury eigenvalue vector before save.");
-
-        out.write(reinterpret_cast<const char*>(st.wb.Uk_f.data()),
-                  static_cast<std::streamsize>(static_cast<size_t>(st.n) * k * sizeof(float)));
-        out.write(reinterpret_cast<const char*>(st.dk_f.data()),
-                  static_cast<std::streamsize>(k * sizeof(float)));
-
-        if (!no_adj_covar) {
-            if (st.b.size() != st.x_c)
-                LOGGER.e(0, "invalid fixed-effect vector length before save.");
-            out.write(reinterpret_cast<const char*>(st.b.data()),
-                      static_cast<std::streamsize>(st.x_c * sizeof(float)));
-        }
-
-        out.write(reinterpret_cast<const char*>(st.varcmp.data()),
-                  static_cast<std::streamsize>(hdr.num_varcmp * sizeof(float)));
-    } else {
-        struct Header {
-            char    magic[4] = {'G', 'O', 'B', 'Y'};
-            int32_t n = 0, x_c = 0, num_varcmp = 0, num_r_indx = 0;
-        } hdr;
-        hdr.n = st.n;
-        hdr.x_c = st.x_c;
-        hdr.num_varcmp = static_cast<int32_t>(st.varcmp.size());
-        hdr.num_r_indx = static_cast<int32_t>(st.varcmp.size());
-        out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-
-        Eigen::MatrixXf Vi_f;
-        if (st.is_llt) {
-            if (st.Vi_L_f.rows() != st.n || st.Vi_L_f.cols() != st.n)
-                LOGGER.e(0, "invalid LLT REML state dimensions before save.");
-            Vi_f = Eigen::MatrixXf::Identity(st.n, st.n);
-            st.Vi_L_f.triangularView<Eigen::Lower>().solveInPlace(Vi_f);
-            st.Vi_L_f.triangularView<Eigen::Lower>().transpose().solveInPlace(Vi_f);
-        } else {
-            Vi_f = st.Vi;
-        }
-
-        const size_t tri = static_cast<size_t>(st.n) * (st.n + 1) / 2;
-        vector<float> packed(tri);
-        size_t idx = 0;
-        for (int32_t j = 0; j < st.n; ++j)
-            for (int32_t i = j; i < st.n; ++i)
-                packed[idx++] = Vi_f(i, j);
-        out.write(reinterpret_cast<const char*>(packed.data()),
-                  static_cast<std::streamsize>(tri * sizeof(float)));
-
-        if (!no_adj_covar) {
-            if (st.b.size() != st.x_c)
-                LOGGER.e(0, "invalid fixed-effect vector length before save.");
-            out.write(reinterpret_cast<const char*>(st.b.data()),
-                      static_cast<std::streamsize>(st.x_c * sizeof(float)));
-        }
-
-        out.write(reinterpret_cast<const char*>(st.varcmp.data()),
-                  static_cast<std::streamsize>(hdr.num_varcmp * sizeof(float)));
-    }
-
-    out.flush();
-    if (!out)
-        LOGGER.e(0, "write error on [" + filename + "] — disk full or I/O failure.");
 }
 
 void writeRemlStateFromCtx(const string& filename, const RemlCtx& ctx, bool no_adj_covar)
@@ -336,44 +254,58 @@ void writeRemlStateFromCtx(const string& filename, const RemlCtx& ctx, bool no_a
         hdr.num_r_indx = static_cast<int32_t>(ctx.varcmp.size());
         out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
 
-        constexpr int block_cols = 32;
+        // 0 = packed buffer is L, where V = L L^T (the common case: ctx.Vi_L
+        //     already IS this, straight out of calcu_Vi's dpotrf-only path —
+        //     no inversion needed, ever, for this branch).
+        // 1 = packed buffer is Li, where V^{-1} = Li Li^T (reml_diagV_adj
+        //     fallback only: ctx.Vi is already the dense explicit inverse,
+        //     so we factor it here — once — instead of leaving every
+        //     downstream MLMA run to re-derive a usable factor from a dense
+        //     matrix itself).
+        const int32_t factor_kind = ctx.Vi_use_llt ? 0 : 1;
+        out.write(reinterpret_cast<const char*>(&factor_kind), sizeof(int32_t));
 
+        // Buffered packer: streams the lower triangle of a resident n×n
+        // matrix out to disk without allocating a second n×n copy.
         auto write_lower_triangle = [&](const Eigen::MatrixXd& mat) {
-            for (int col0 = 0; col0 < ctx.n; col0 += block_cols) {
-                const int bs = std::min(block_cols, ctx.n - col0);
-                for (int c = 0; c < bs; ++c) {
-                    const int global_col = col0 + c;
-                    for (int i = global_col; i < ctx.n; ++i) {
-                        const float value = static_cast<float>(mat(i, global_col));
-                        out.write(reinterpret_cast<const char*>(&value), sizeof(float));
+            constexpr size_t io_chunk = 1 << 16;  // ~256KB of floats per flush
+            vector<float> io_buf;
+            io_buf.reserve(io_chunk);
+            for (int j = 0; j < ctx.n; ++j) {
+                for (int i = j; i < ctx.n; ++i) {
+                    io_buf.push_back(static_cast<float>(mat(i, j)));
+                    if (io_buf.size() == io_chunk) {
+                        out.write(reinterpret_cast<const char*>(io_buf.data()),
+                                  static_cast<std::streamsize>(io_buf.size() * sizeof(float)));
+                        io_buf.clear();
                     }
                 }
             }
+            if (!io_buf.empty())
+                out.write(reinterpret_cast<const char*>(io_buf.data()),
+                          static_cast<std::streamsize>(io_buf.size() * sizeof(float)));
         };
 
         if (ctx.Vi_use_llt) {
             if (ctx.Vi_L.rows() != ctx.n || ctx.Vi_L.cols() != ctx.n)
                 LOGGER.e(0, "invalid LLT REML context dimensions before save.");
-
-            for (int col0 = 0; col0 < ctx.n; col0 += block_cols) {
-                const int bs = std::min(block_cols, ctx.n - col0);
-                Eigen::MatrixXd rhs = Eigen::MatrixXd::Zero(ctx.n, bs);
-                for (int c = 0; c < bs; ++c)
-                    rhs(col0 + c, c) = 1.0;
-                ctx.Vi_L.triangularView<Eigen::Lower>().solveInPlace(rhs);
-                ctx.Vi_L.triangularView<Eigen::Lower>().adjoint().solveInPlace(rhs);
-                for (int c = 0; c < bs; ++c) {
-                    const int global_col = col0 + c;
-                    for (int i = global_col; i < ctx.n; ++i) {
-                        const float value = static_cast<float>(rhs(i, c));
-                        out.write(reinterpret_cast<const char*>(&value), sizeof(float));
-                    }
-                }
-            }
+            // ctx.Vi_L already IS L — pack it directly. O(n²) instead of the
+            // O(n³) blocked triangular-solve inversion this used to do only
+            // to throw the factorization away again on the read side.
+            write_lower_triangle(ctx.Vi_L);
         } else {
             if (ctx.Vi.rows() != ctx.n || ctx.Vi.cols() != ctx.n)
                 LOGGER.e(0, "invalid dense REML context dimensions before save.");
-            write_lower_triangle(ctx.Vi);
+            // ctx.Vi is already the dense inverse (paid O(n³) once inside
+            // calcu_Vi already). One more Cholesky here, ONCE, replaces the
+            // O(n³) LLT that MLMA_stream_common.hpp used to redo on every
+            // association run against a loaded dense Vi.
+            Eigen::LLT<Eigen::MatrixXd> Li(ctx.Vi);
+            if (Li.info() != Eigen::Success)
+                LOGGER.e(0, "Vi is not positive definite when factorising for save.");
+            write_lower_triangle(Eigen::MatrixXd(Li.matrixL()));
+            // Li and its transient n×n matrixL() materialisation go out of
+            // scope here, ahead of the b/varcmp writes below.
         }
 
         if (!no_adj_covar) {
@@ -559,11 +491,13 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         options_in.erase("--reml-priors-var");
         options_in.erase("--reml-no-HE-start");
         options_in.erase("--reml-woodbury-basis-eigen-mass");
-        options_in.erase("--reml-woodbury-basis-var-thresh");
+        options_in.erase("--reml-woodbury-basis-var-tail");
+        options_in.erase("--reml-woodbury-basis-range");
         options_in.erase("--svd-chunked-budget");
         options_in.erase("--reml-ai-robust");
         options_in.erase("--reml-ai-robust-tol");
         options_in.erase("--reml-ai-robust-risk");
+        options_in.erase("--reml-force-dense-V");
     } else {
         // Inline REML path: --grm is required.
         const bool has_grm = options_in.find("--grm") != options_in.end()
@@ -573,7 +507,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         options["grm"] = options_in["--grm"][0];
         options_in.erase("--grm");
 
-        // --reml-woodbury [k]  (k optional; -1 = MP-k, -2 = EIGMASS, -3 = variance)
+        // --reml-woodbury [k]  (k optional; -1 = MP-k, -2 = EIG, -3 = variance)
         if (options_in.find("--reml-woodbury-basis") != options_in.end()) {
             const auto& vals = options_in["--reml-woodbury-basis"];
             if (!vals.empty() && !vals[0].empty()) {
@@ -596,12 +530,12 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
             options_d["woodbury_basis_eigen_mass"] = std::stof(vals[0]);
             options_in.erase("--reml-woodbury-basis-eigen-mass");
         }
-        if (options_in.find("--reml-woodbury-basis-var-thresh") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-var-thresh"];
+        if (options_in.find("--reml-woodbury-basis-var-tail") != options_in.end()) {
+            const auto& vals = options_in["--reml-woodbury-basis-var-tail"];
             if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-var-thresh requires a relative Frobenius error argument (e.g. 0.001).");
-            options_d["woodbury_basis_var_thresh"] = std::stod(vals[0]);
-            options_in.erase("--reml-woodbury-basis-var-thresh");
+                LOGGER.e(0, "--reml-woodbury-basis-var-tail requires a relative Frobenius error argument (e.g. 0.001).");
+            options_d["woodbury_basis_var_tail"] = std::stod(vals[0]);
+            options_in.erase("--reml-woodbury-basis-var-tail");
         }
         // --svd-method <power|nystrom>: select the Woodbury basis sketch.
         // The default power path uses subspace iteration; Nystrom is single-pass.
@@ -639,6 +573,12 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
             options["no_HE_start"] = false;
             options_in.erase("--reml-no-HE-start");
         }
+        if (options_in.find("--reml-force-dense-V") != options_in.end()) {
+            if (!options_in["--reml-force-dense-V"].empty())
+                LOGGER.w(0, "--reml-force-dense-V takes no argument; ignoring the supplied value.");
+            options["force_dense_V"] = "1";
+            options_in.erase("--reml-force-dense-V");
+        }
         // --svd-chunked-budget: read K in lower-triangular tiles for the
         // Woodbury basis rSVD instead of holding a dense n x n K resident —
         // see chunked_grm_matvec.hpp. Requires the caller (below, once
@@ -651,33 +591,26 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
             options_d["svd_chunked_budget"] = std::stod(vals[0]);
             options_in.erase("--svd-chunked-budget");
         }
-        // These three were previously read from options_d further down
-        // (woodbury_basis_edge_margin / woodbury_basis_edge_confirm / woodbury_basis_EIGMASS_k_buffer)
-        // with no CLI parsing block actually populating them — silently
-        // always falling back to their hardcoded defaults regardless of what
-        // was passed on the command line. Fixed alongside adding the new
-        // memory-budget flag, since all four are the same kind of numeric
-        // --reml-woodbury-basis-* option and belong together.
-        if (options_in.find("--reml-woodbury-basis-edge-margin") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-edge-margin"];
+        if (options_in.find("--reml-woodbury-basis-MP-margin") != options_in.end()) {
+            const auto& vals = options_in["--reml-woodbury-basis-MP-margin"];
             if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-edge-margin requires a fractional argument (e.g. 0.15).");
+                LOGGER.e(0, "--reml-woodbury-basis-MP-margin requires a fractional argument (e.g. 0.15).");
             options_d["woodbury_basis_edge_margin"] = std::stod(vals[0]);
-            options_in.erase("--reml-woodbury-basis-edge-margin");
+            options_in.erase("--reml-woodbury-basis-MP-margin");
         }
-        if (options_in.find("--reml-woodbury-basis-edge-confirm") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-edge-confirm"];
+        if (options_in.find("--reml-woodbury-basis-MP-confirm") != options_in.end()) {
+            const auto& vals = options_in["--reml-woodbury-basis-MP-confirm"];
             if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-edge-confirm requires an integer argument.");
+                LOGGER.e(0, "--reml-woodbury-basis-MP-confirm requires an integer argument.");
             options_d["woodbury_basis_edge_confirm"] = std::stod(vals[0]);
-            options_in.erase("--reml-woodbury-basis-edge-confirm");
+            options_in.erase("--reml-woodbury-basis-MP-confirm");
         }
-        if (options_in.find("--reml-woodbury-basis-EIGMASS-k-buffer") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-EIGMASS-k-buffer"];
+        if (options_in.find("--reml-woodbury-basis-EIGM-k-buffer") != options_in.end()) {
+            const auto& vals = options_in["--reml-woodbury-basis-EIG-k-buffer"];
             if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-EIGMASS-k-buffer requires an integer argument.");
-            options_d["woodbury_basis_EIGMASS_k_buffer"] = std::stod(vals[0]);
-            options_in.erase("--reml-woodbury-basis-EIGMASS-k-buffer");
+                LOGGER.e(0, "--reml-woodbury-basis-EIG-k-buffer requires an integer argument.");
+            options_d["woodbury_basis_EIG_k_buffer"] = std::stod(vals[0]);
+            options_in.erase("--reml-woodbury-basis-EIG-k-buffer");
         }
         // --reml-woodbury-basis-mem-budget <GB>: hard cap on k_svd derived from an
         // approximate rSVD sketch memory budget, independent of n-1. See the
@@ -690,6 +623,19 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
                 LOGGER.e(0, "--reml-woodbury-basis-mem-budget requires a GB argument (e.g. 32).");
             options_d["woodbury_basis_mem_budget_gb"] = std::stod(vals[0]);
             options_in.erase("--reml-woodbury-basis-mem-budget");
+        }
+        if (options_in.find("--reml-woodbury-basis-range") != options_in.end()) {
+            const auto& vals = options_in["--reml-woodbury-basis-range"];
+            if (vals.size() < 2)
+                LOGGER.e(0, "--reml-woodbury-basis-range requires two integer arguments.");
+            options_d["woodbury_basis_range_init"] = std::stod(vals[0]);
+            options_d["woodbury_basis_range_max"] = std::stod(vals[1]);
+            options_in.erase("--reml-woodbury-basis-range");
+        }
+        if (options_in.find("--reml-woodbury-basis-posthoc-correction") != options_in.end()) {
+            options["woodbury_basis_posthoc_correction"] = "1";
+            options_in.erase("--reml-woodbury-basis-posthoc-correction");
+            LOGGER.w(0, "--reml-woodbury-basis-posthoc-correction is an experimental feature and likely to worsen results.");
         }
         if (options_in.find("--reml-trace-hutchpp") != options_in.end()) {
             options["trace_hutchpp"] = "1";
@@ -741,6 +687,16 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         options["no_adj_covar"] = "1";
         options_in.erase("--mlma-no-preadj-covar");
     }
+    if (options_in.find("--mlma-stream") != options_in.end()) {
+        const auto& vals = options_in["--mlma-stream"];
+        if (!vals.empty()) {
+            if (vals.size()==1)
+                options["mlma_tile_budget_gb"] = vals[0];
+            else
+                LOGGER.e(0, "--mlma-stream accepts at most one value: the memory budget in GB for tile-based streaming.");
+        }
+    }
+    options_in.erase("--mlma-stream");
     if (options_in.find("--log-pval") != options_in.end()) {
         options["log_pval"] = "1";
         options_in.erase("--log-pval");
@@ -761,7 +717,6 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
     }
 
     processFunctions.push_back("MLMA");
-    options_in.erase("--mlma-stream");
     return 1;
 }
 
@@ -868,6 +823,15 @@ void MLMA::processMain()
         Eigen::VectorXf y_vec(n);
         for (int i = 0; i < n; ++i) y_vec[i] = static_cast<float>(phenos_vec[i]);
 
+        // Streaming SNP-block width, sized from a memory budget rather than
+        // the previous fixed BLOCK=10000 (which allocated the same
+        // GenoBufItem::geno + X_block footprint regardless of n, reaching
+        // multi-GB at large n). Opt-in, matching --GRM-tile-budget /
+        // --svd-chunked-budget elsewhere: omitting the flag reproduces the
+        // old fixed-10000 behavior exactly (see resolve_mlma_block_size).
+        const double mlma_tile_budget_gb = options_d.count("mlma_tile_budget_gb")
+            ? options_d.at("mlma_tile_budget_gb") : 0.0;
+
         if (options.count("load_reml")) {
             const string load_reml_file = options.at("load_reml");
             LOGGER.i(0, "Loading REML state from [" + load_reml_file + "]...");
@@ -922,8 +886,8 @@ void MLMA::processMain()
                 ? options_d.at("woodbury_basis_edge_margin") : 0.15;
             const int    woodbury_basis_edge_confirm = options_d.count("woodbury_basis_edge_confirm")
                 ? static_cast<int>(options_d.at("woodbury_basis_edge_confirm")) : 20;
-            const int woodbury_basis_EIGMASS_k_buffer = options_d.count("woodbury_basis_EIGMASS_k_buffer")
-                ? static_cast<int>(options_d.at("woodbury_basis_EIGMASS_k_buffer")) : 0;
+            const int woodbury_basis_EIG_k_buffer = options_d.count("woodbury_basis_EIG_k_buffer")
+                ? static_cast<int>(options_d.at("woodbury_basis_EIG_k_buffer")) : 0;
             const double woodbury_basis_mem_budget_gb = options_d.count("woodbury_basis_mem_budget_gb")
                 ? options_d.at("woodbury_basis_mem_budget_gb") : 0.0;
             const bool no_HE_start = options.count("no_HE_start") > 0;
@@ -1067,6 +1031,7 @@ void MLMA::processMain()
             ctx.reml_max_iter            = reml_maxit;
             ctx.reml_inv_mtd             = 0;  // LLT
             ctx.reml_diagV_adj           = reml_diagV_adj;
+            ctx.reml_force_dense_vi     = options.count("force_dense_V") > 0;
             ctx.woodbury_basis_rank            = woodbury_basis_rank;
             if (svd_chunked && woodbury_basis_rank == 0)
                 LOGGER.e(0, "--svd-chunked-budget requires --reml-woodbury. Every REML code path "
@@ -1076,9 +1041,14 @@ void MLMA::processMain()
                             "a different reason, and nothing else knows the difference yet.");
             ctx.woodbury_basis_edge_margin        = woodbury_basis_edge_margin;
             ctx.woodbury_basis_edge_confirm       = woodbury_basis_edge_confirm;
-            ctx.woodbury_basis_eigmass_k_buffer  = woodbury_basis_EIGMASS_k_buffer;
+            ctx.woodbury_basis_EIG_k_buffer  = woodbury_basis_EIG_k_buffer;
             ctx.woodbury_basis_var_thresh         = options_d.count("woodbury_basis_var_thresh")
                 ? options_d.at("woodbury_basis_var_thresh") : 0.001;
+            ctx.woodbury_basis_k_init = options_d.count("woodbury_basis_range_init")
+                ? static_cast<int>(options_d.at("woodbury_basis_range_init")) : 2000;
+            ctx.woodbury_basis_k_max  = options_d.count("woodbury_basis_range_max")
+                ? static_cast<int>(options_d.at("woodbury_basis_range_max")) : 25000;
+            ctx.woodbury_basis_posthoc_correction = options.count("woodbury_basis_posthoc_correction") > 0;
             ctx.svd_mem_budget_gb   = woodbury_basis_mem_budget_gb;
             ctx.svd_nystrom         = svd_nystrom;
             ctx.svd_chunked_budget         = svd_chunked ? svd_chunked_budget : 0.0;
@@ -1122,8 +1092,6 @@ void MLMA::processMain()
                 continue;
             }
 
-            state = reml::build_reml_state(ctx);
-
             // y_adj = y - X*b
             {
                 const Eigen::MatrixXf Xf = X_design.cast<float>();
@@ -1140,7 +1108,8 @@ void MLMA::processMain()
                   << (log_pval ? "log_p" : "p") << "\n";
 
             Eigen::VectorXf w_sqrt = pheno->get_sqrt_weight_keep();
-            run_mlma_stream_association(ctx, y_vec, w_sqrt, geno, marker, n, log_pval, ofile);
+            run_mlma_stream_association(ctx, y_vec, w_sqrt, geno, marker, n, log_pval, ofile,
+                                        mlma_tile_budget_gb);
             LOGGER << "\nAssociation results saved to [" << out_file << "]." << std::endl;
             ofile.close();
         }
@@ -1161,7 +1130,8 @@ void MLMA::processMain()
 
         // ---- Stream SNPs ----
         Eigen::VectorXf w_sqrt = pheno->get_sqrt_weight_keep();
-        run_mlma_stream_association(state, y_vec, w_sqrt, geno, marker, n, log_pval, ofile);
+        run_mlma_stream_association(state, y_vec, w_sqrt, geno, marker, n, log_pval, ofile,
+                                    mlma_tile_budget_gb);
         LOGGER << "\nAssociation results saved to [" << out_file << "]." << std::endl;
         ofile.close();
 

@@ -284,7 +284,7 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
         assemble_V_lower(ctx, prev_varcmp);
 
         // LLT-only path (factorize_only, no diagV_adj)
-        if (factorize_only && !ctx.reml_diagV_adj) {
+        if (factorize_only && !ctx.reml_diagV_adj && !ctx.reml_force_dense_vi) {
             gcta_blas_int blas_n = static_cast<gcta_blas_int>(ctx.n);
             if (gcta_dpotrf(blas_n, ctx.Vi.data(), blas_n) == 0) {
                 logdet = 2.0 * ctx.Vi.diagonal().array().log().sum();

@@ -497,6 +497,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         options_in.erase("--reml-ai-robust");
         options_in.erase("--reml-ai-robust-tol");
         options_in.erase("--reml-ai-robust-risk");
+        options_in.erase("--reml-force-dense-V");
     } else {
         // Inline REML path: --grm is required.
         const bool has_grm = options_in.find("--grm") != options_in.end()
@@ -572,6 +573,12 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
             options["no_HE_start"] = false;
             options_in.erase("--reml-no-HE-start");
         }
+        if (options_in.find("--reml-force-dense-V") != options_in.end()) {
+            if (!options_in["--reml-force-dense-V"].empty())
+                LOGGER.w(0, "--reml-force-dense-V takes no argument; ignoring the supplied value.");
+            options["force_dense_V"] = "1";
+            options_in.erase("--reml-force-dense-V");
+        }
         // --svd-chunked-budget: read K in lower-triangular tiles for the
         // Woodbury basis rSVD instead of holding a dense n x n K resident —
         // see chunked_grm_matvec.hpp. Requires the caller (below, once
@@ -628,6 +635,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         if (options_in.find("--reml-woodbury-basis-posthoc-correction") != options_in.end()) {
             options["woodbury_basis_posthoc_correction"] = "1";
             options_in.erase("--reml-woodbury-basis-posthoc-correction");
+            LOGGER.w(0, "--reml-woodbury-basis-posthoc-correction is an experimental feature and likely to worsen results.");
         }
         if (options_in.find("--reml-trace-hutchpp") != options_in.end()) {
             options["trace_hutchpp"] = "1";
@@ -1023,6 +1031,7 @@ void MLMA::processMain()
             ctx.reml_max_iter            = reml_maxit;
             ctx.reml_inv_mtd             = 0;  // LLT
             ctx.reml_diagV_adj           = reml_diagV_adj;
+            ctx.reml_force_dense_vi     = options.count("force_dense_V") > 0;
             ctx.woodbury_basis_rank            = woodbury_basis_rank;
             if (svd_chunked && woodbury_basis_rank == 0)
                 LOGGER.e(0, "--svd-chunked-budget requires --reml-woodbury. Every REML code path "

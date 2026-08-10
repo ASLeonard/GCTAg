@@ -120,6 +120,7 @@ struct RemlCtx {
     int    reml_trace_hutchpp_nprobes = 200;
     int    reml_trace_power_iter     = 0;     // power-iter for Hutch++ range sketch
     bool   reml_force_inv            = false;
+    bool   reml_force_dense_vi       = false; // true → force dense V^{-1}
     bool   reml_force_converge       = false;
     bool   reml_no_converge          = false;
     bool   reml_fixed_var            = false;

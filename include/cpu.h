@@ -123,6 +123,32 @@ inline int gcta_dsyevd(gcta_blas_int n, double* a, gcta_blas_int lda, double* w)
 #endif
 }
 
+// ---- gcta_dsyev ----------------------------------------------------------
+// Full symmetric eigensolver (classic QR algorithm), column-major, upper triangle.
+// a[n×n] is overwritten with eigenvectors; w receives eigenvalues ascending.
+// Diagnostic-only: shares dsytrd (reduction to tridiagonal) with dsyevd/dsyevr —
+// used to isolate whether AOCL threading gaps are in the reduction phase vs.
+// the D&C/MRRR solve stage.
+// Returns 0 on success, non-zero LAPACK info otherwise.
+inline int gcta_dsyev(gcta_blas_int n, double* a, gcta_blas_int lda, double* w)
+{
+#if defined(GCTA_USE_ACCELERATE)
+    const char    jobz = 'V', uplo = 'U';
+    gcta_blas_int info = 0;
+    // Workspace query: pass lwork = -1 to obtain optimal size.
+    gcta_blas_int lwork_q = -1;
+    double        work_sz;
+    dsyev_(&jobz, &uplo, &n, a, &lda, w, &work_sz, &lwork_q, &info);
+    if (info != 0) return static_cast<int>(info);
+    gcta_blas_int lwork = static_cast<gcta_blas_int>(work_sz);
+    std::vector<double> work(lwork);
+    dsyev_(&jobz, &uplo, &n, a, &lda, w, work.data(), &lwork, &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(
+        LAPACKE_dsyev(LAPACK_COL_MAJOR, 'V', 'U', n, a, lda, w));
+#endif
+}
 // ---- gcta_dsyevr -------------------------------------------------------
 // Partial symmetric eigensolver (MRRR), index range [il, iu] (1-based, ascending).
 // a[n×n]: input matrix (upper triangle, column-major); overwritten on return.

@@ -1053,7 +1053,7 @@ void gcta::pca(std::string grm_file, std::string keep_indi_file, std::string rem
         // non-const; we accept the destruction because PCA no longer needs the GRM.
         double* grm_ptr = const_cast<double*>(grm_dbl.data());
 
-        if (out_pc_num == n) {
+        if (out_pc_num == n+1) {
             // Full spectrum via dsyevd: overwrites GRM in-place; eigenvectors are read
             // back via raw_evec (no extra n×n copy). Eigenvalues stored ascending → reversed.
             Eigen::VectorXd w(n);
@@ -1064,6 +1064,14 @@ void gcta::pca(std::string grm_file, std::string keep_indi_file, std::string rem
             eval = w.reverse();
             used_dsyevd = true;
             raw_evec = grm_ptr;
+        } else if (out_pc_num == n) {
+            Eigen::VectorXd w(n);
+int info = gcta_dsyev((gcta_blas_int)n, grm_ptr, (gcta_blas_int)n, w.data());
+if (info != 0)
+    LOGGER.e(0, "dsyev failed (info=" + std::to_string(info) + ").");
+eval = w.reverse();
+used_dsyevd = false;   // not D&C — flag if this bool gates any downstream logic
+raw_evec = grm_ptr;
         } else {
             // Partial spectrum: dsyevr overwrites the GRM in-place but writes the
             // requested eigenvectors to the separate Z buffer (n × out_pc_num),

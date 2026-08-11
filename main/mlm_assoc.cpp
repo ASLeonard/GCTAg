@@ -394,7 +394,8 @@ gcta::MlmaResult gcta::mlma_calcu_stat(std::span<const float> y, unsigned long m
     const auto n = static_cast<Eigen::Index>(y.size());
     constexpr Eigen::Index max_block_size = 10000;
     unsigned long i = 0;
-    std::vector<float> beta(m, 0.0f), se(m, 0.0f), pval(m, 2.0f);
+    std::vector<float> beta(m, 0.0f), se(m, 0.0f);
+    std::vector<double> pval(m, 2.0);
 
     Eigen::Map<const Eigen::VectorXf> y_vec(y.data(), n);
     Eigen::VectorXf Vi_y(n);
@@ -497,7 +498,7 @@ gcta::MlmaResult gcta::mlma_calcu_stat(std::span<const float> y, unsigned long m
             double pval_d;
             if (mlma_snp_stat(Xt_Vi_y_block[l], xvx_diag[l], _log_pval,
                               beta[i + l], se[i + l], pval_d))
-                pval[i + l] = static_cast<float>(pval_d);
+                pval[i + l] = static_cast<double>(pval_d);
         }
 
         i += bs;
@@ -523,7 +524,8 @@ gcta::MlmaResult gcta::mlma_calcu_stat_covar(std::span<const float> y, unsigned 
     const Eigen::Index p = static_cast<Eigen::Index>(_X_c);  // number of fixed covariates
     constexpr Eigen::Index max_block_size = 10000;
     unsigned long i = 0;
-    std::vector<float> beta(m, 0.0f), se(m, 0.0f), pval(m, 2.0f);
+    std::vector<float> beta(m, 0.0f), se(m, 0.0f);
+    std::vector<double> pval(m, 2.0);
 
     Eigen::Map<const Eigen::VectorXf> y_vec(y.data(), n);
     Eigen::VectorXf Vi_y(n);
@@ -774,7 +776,8 @@ void gcta::mlma_loco(std::string phen_file, std::string qcovar_file, std::string
     
     eigenVector y_buf=_y;
     std::vector<float> y(_n);
-    std::vector<std::vector<float>> beta(chrs.size()), se(chrs.size()), pval(chrs.size());
+    std::vector<std::vector<float>> beta(chrs.size()), se(chrs.size());
+    std::vector<std::vector<double>> pval(chrs.size());
     for(c1=0; c1<chrs.size(); c1++){
         LOGGER<<"\n-----------------------------------\n#Chr "<<chrs[c1]<<":"<<std::endl;
         extract_chr(chrs[c1], chrs[c1]);

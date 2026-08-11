@@ -78,6 +78,7 @@ private:
     uint64_t num_grm;
     pair<uint32_t, uint32_t> part_keep_indices; //the index in pheno keep index;
     vector<pair<int, int>> index_grm_pairs;
+    int stdGenoLD = 0;           // leading dimension of stdGeno: grm_n rounded up to multiple of 8 (64-byte column alignment)
 
     double *grm = NULL;
     uint32_t *N = NULL;

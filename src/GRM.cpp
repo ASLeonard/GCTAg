@@ -973,7 +973,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, const vector<uint32_t> &markerIndex
         cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans, n, curNumValidMarkers, alpha, stdGeno, stdGenoLD, beta, grm, m);
     }else{
         //dgemm(&notrans, &trans, &m, &n, &num_marker, &alpha, stdGeno + part_keep_indices.first, &n_sample, stdGeno, &n_sample, &beta, grm, &m);
-        cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans, m, s_n, curNumValidMarkers, alpha, stdGeno + part_keep_indices.first, stdGenoLD, beta, grm, m);
+        cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans, m, s_n, curNumValidMarkers, alpha, stdGeno + part_keep_indices.first, stdGenoLD,stdGeno, stdGenoLD, beta, grm, m);
         double * grm_start = grm + ((uint64_t)s_n) * m;
         cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans, m, curNumValidMarkers, alpha, stdGeno + part_keep_indices.first, stdGenoLD, beta, grm_start, m);
     }

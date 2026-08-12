@@ -30,9 +30,6 @@ int PCAStream::registerOption(map<string, vector<string>>& options_in)
     if (!options_in["out"].empty())
         options["out"] = options_in["out"][0];
 
-    if (options_in.find("--pca-stream") != options_in.end())
-        LOGGER.e(0, "--pca-stream has been retired in V2. Use --pca instead.");
-
     const bool has_pca = options_in.find("--pca") != options_in.end();
     if (!has_pca)
         return 0;
@@ -206,6 +203,8 @@ void PCAStream::processMain()
                 svd_chunked = false;
             }
         }
+
+        LOGGER.i(0, "Running PCA v2 for " + to_string(out_pc_num) + " PC(s) from " + to_string(n) + " individuals");
 
         // ---- GRM access: chunked tile reader, or dense (fallback / comparison) ----
         gcta_chunked::TileReader chunked_reader;

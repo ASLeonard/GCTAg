@@ -490,8 +490,8 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         options_in.erase("--reml-priors");
         options_in.erase("--reml-priors-var");
         options_in.erase("--reml-no-HE-start");
-        options_in.erase("--reml-woodbury-basis-eigen-mass");
-        options_in.erase("--reml-woodbury-basis-var-tail");
+        options_in.erase("--reml-woodbury-basis-EIG-mass");
+        options_in.erase("--reml-woodbury-basis-VAR-tail");
         options_in.erase("--reml-woodbury-basis-range");
         options_in.erase("--svd-chunked-budget");
         options_in.erase("--reml-ai-robust");
@@ -523,19 +523,19 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
                 options_d["woodbury_basis_rank"] = -1.0;   // MP-k
             options_in.erase("--reml-woodbury-basis");
         }
-        if (options_in.find("--reml-woodbury-basis-eigen-mass") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-eigen-mass"];
+        if (options_in.find("--reml-woodbury-basis-EIG-mass") != options_in.end()) {
+            const auto& vals = options_in["--reml-woodbury-basis-EIG-mass"];
             if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-eigen-mass requires a fractional argument (e.g. 0.15).");
+                LOGGER.e(0, "--reml-woodbury-basis-EIG-mass requires a fractional argument (e.g. 0.15).");
             options_d["woodbury_basis_eigen_mass"] = std::stof(vals[0]);
-            options_in.erase("--reml-woodbury-basis-eigen-mass");
+            options_in.erase("--reml-woodbury-basis-EIG-mass");
         }
-        if (options_in.find("--reml-woodbury-basis-var-tail") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-var-tail"];
+        if (options_in.find("--reml-woodbury-basis-VAR-tail") != options_in.end()) {
+            const auto& vals = options_in["--reml-woodbury-basis-VAR-tail"];
             if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-var-tail requires a relative Frobenius error argument (e.g. 0.001).");
+                LOGGER.e(0, "--reml-woodbury-basis-VAR-tail requires a relative Frobenius error argument (e.g. 0.001).");
             options_d["woodbury_basis_var_tail"] = std::stod(vals[0]);
-            options_in.erase("--reml-woodbury-basis-var-tail");
+            options_in.erase("--reml-woodbury-basis-VAR-tail");
         }
         // --svd-method <power|nystrom>: select the Woodbury basis sketch.
         // The default power path uses subspace iteration; Nystrom is single-pass.

@@ -314,7 +314,7 @@ void PCAStream::processMain()
                                 "(n >= 32766). Consider --pca-approx for large GRMs.");
 
                 double* grm_ptr = G_dense.data();
-                if (out_pc_num == n) {
+                if (out_pc_num == n+1) {
                     Eigen::VectorXd w(n);
                     const int info = gcta_dsyevd((gcta_blas_int)n, grm_ptr, (gcta_blas_int)n, w.data());
                     if (info != 0)
@@ -322,6 +322,14 @@ void PCAStream::processMain()
                                     "). For n > 32766, try --pca-approx.");
                     eval = w.reverse();
                     used_dsyevd = true;
+                    raw_evec = grm_ptr;
+                } else if (out_pc_num == n) {
+                    Eigen::VectorXd w(n);
+                    int info = gcta_dsyev((gcta_blas_int)n, grm_ptr, (gcta_blas_int)n, w.data());
+                    if (info != 0)
+                        LOGGER.e(0, "dsyev failed (info=" + std::to_string(info) + ").");
+                    eval = w.reverse();
+                    used_dsyevd = false;   // not D&C — flag if this bool gates any downstream logic
                     raw_evec = grm_ptr;
                 } else {
                     Eigen::VectorXd w(out_pc_num);

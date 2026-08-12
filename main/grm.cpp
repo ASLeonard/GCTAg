@@ -988,6 +988,7 @@ void gcta::pca(std::string grm_file, std::string keep_indi_file, std::string rem
     int n = _keep.size();
     if (out_pc_num > n || out_pc_num == 0) out_pc_num = n;
     LOGGER << "\nPerforming principal component analysis ..." << _grm.rows() << "x" << _grm.cols() << std::endl;
+    LOGGER << "\nNote: PCA V1 is deprecated, you should be hitting the V2 path by default." << std::endl;
 
     //_grm is either MatrixXf or MatrixXd; if it's MatrixXf, we need to cast it to MatrixXd. If it's already MatrixXd, we can use it directly.
     Eigen::MatrixXd grm_dbl_storage;

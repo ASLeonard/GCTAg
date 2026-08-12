@@ -1264,17 +1264,22 @@ static bool woodbury_mode_allows_warm_start(WoodburyMode mode) {
     return (mode == WoodburyMode::AutoMP);
 }
 
+static int woodbury_rank_cap(const RemlCtx& ctx, int k_budget_ceiling) {
+    const int n = ctx.n;
+    const int user_cap = (ctx.woodbury_basis_k_max > 0) ? ctx.woodbury_basis_k_max : n - 1;
+    return std::min({n - 1, k_budget_ceiling, user_cap});
+}
+
 static int woodbury_initial_k_svd(const RemlCtx& ctx, WoodburyMode mode, int k_budget_ceiling) {
-    const bool hard_cap = false;//(ctx.woodbury_basis_k_max > 0);
     const int n = ctx.n;
     switch (mode) {
         case WoodburyMode::AutoMP:
-            return hard_cap ? ctx.woodbury_basis_k_max : std::min({n - 1, k_budget_ceiling, ctx.woodbury_basis_k_init});
+            return std::min({n - 1, k_budget_ceiling, ctx.woodbury_basis_k_init});
         case WoodburyMode::EigMass:
             [[fallthrough]];
         case WoodburyMode::Variance: {
-            const int start_guess = std::clamp(n / 20, ctx.woodbury_basis_k_init, ctx.woodbury_basis_k_max);
-            return hard_cap ? ctx.woodbury_basis_k_max : std::min({n - 1, k_budget_ceiling, start_guess});
+            const int start_guess = std::clamp(n / 20, ctx.woodbury_basis_k_init, ctx.woodbury_basis_k_max > 0 ? ctx.woodbury_basis_k_max : n - 1);
+            return std::min({n - 1, k_budget_ceiling, start_guess});
         }
         case WoodburyMode::Fixed:
             [[fallthrough]];
@@ -1386,6 +1391,7 @@ static int finalize_and_log_woodbury_rank(
 {
     const int n = ctx.n;
     const bool k_max_is_hard_ceiling = (ctx.woodbury_basis_k_max > 0);
+    const int k_cap = woodbury_rank_cap(ctx, k_svd_budget_ceiling);
     int k = 0;
 
     switch (mode) {
@@ -1425,8 +1431,10 @@ static int finalize_and_log_woodbury_rank(
                 LOGGER.w(0, "Woodbury EIG-k: mass target not reached even at k=n-1=" + std::to_string(n - 1) + ".");
             else if (k_EIGMASS >= k_svd && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
                 LOGGER.w(0, "Woodbury EIG-k: mass target not reached within memory budget ceiling k=" + std::to_string(k_svd) + ".");
+            else if (k_EIGMASS >= k_svd && k_max_is_hard_ceiling)
+                LOGGER.w(0, "Woodbury EIG-k: mass target not reached within k_max=" + std::to_string(k_cap) + ".");
             else if (k_EIGMASS >= k_svd)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached within k_max=" + std::to_string(k_svd) + ".");
+                LOGGER.w(0, "Woodbury EIG-k: mass target not reached within k=" + std::to_string(k_svd) + ".");
             break;
         }
         case WoodburyMode::Variance: {
@@ -1455,8 +1463,10 @@ static int finalize_and_log_woodbury_rank(
                 LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached even at k=n-1=" + std::to_string(n - 1) + ".");
             else if (k_VAR >= k_svd && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
                 LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within memory budget ceiling k=" + std::to_string(k_svd) + ".");
+            else if (k_VAR >= k_svd && k_max_is_hard_ceiling)
+                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k_max=" + std::to_string(k_cap) + ".");
             else if (k_VAR >= k_svd)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k_max=" + std::to_string(k_svd) + ".");
+                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k=" + std::to_string(k_svd) + ".");
             break;
         }
         case WoodburyMode::Fixed:
@@ -1521,6 +1531,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     }
 
     const bool k_max_is_hard_ceiling = (ctx.woodbury_basis_k_max > 0);
+    const int k_svd_cap = woodbury_rank_cap(ctx, k_svd_budget_ceiling);
     int k_svd = woodbury_initial_k_svd(ctx, mode, k_svd_budget_ceiling);
 
     if (mode == WoodburyMode::Fixed) {
@@ -1532,15 +1543,17 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                         + std::to_string(ctx.svd_mem_budget_gb) + "GB; raise the budget or lower the rank.");
         LOGGER << "\nComputing Woodbury low-rank basis (k=" << k_svd << ") ..." << std::endl;
     } else {
-        LOGGER << "\nComputing Woodbury basis (" << woodbury_mode_name(mode) << ", k_max=" << k_svd
-               << (k_max_is_hard_ceiling ? "" : " [starting budget, expands if needed]") << ") ..." << std::endl;
+        LOGGER << "\nComputing Woodbury basis (" << woodbury_mode_name(mode)
+               << ", k_init=" << k_svd << ", k_max=" << k_svd_cap
+               << (k_max_is_hard_ceiling ? " [hard ceiling]" : " [soft cap]") << ") ..." << std::endl;
     }
 
-    if (k_max_is_hard_ceiling && k_svd > k_svd_budget_ceiling) {
-        LOGGER.w(0, "--reml-woodbury-basis-k-max=" + std::to_string(k_svd) +
+    if (k_svd > k_svd_cap) {
+        LOGGER.w(0, "--reml-woodbury-basis-range=(" + std::to_string(ctx.woodbury_basis_k_init) + "," + std::to_string(ctx.woodbury_basis_k_max) + ")" +
                     " exceeds the --reml-woodbury-basis-mem-budget-implied ceiling ("
-                    + std::to_string(k_svd_budget_ceiling) + "); clamping to the budget.");
-        k_svd = k_svd_budget_ceiling;
+                    + std::to_string(k_svd_budget_ceiling) + "); clamping to the effective cap "
+                    + std::to_string(k_svd_cap) + ".");
+        k_svd = k_svd_cap;
     }
     if (k_svd >= n) LOGGER.e(0, "--reml-woodbury-basis rank must be < n.");
 
@@ -1637,9 +1650,9 @@ void compute_woodbury_basis(RemlCtx& ctx) {
 
         eval_res = evaluate_rank_criterion(mode, eval_full, k_svd, lambda_plus, target_mass, trace_K_full, trace_K2, ctx);
 
-        if (eval_res.satisfied || k_max_is_hard_ceiling || k_svd >= n / 2 || k_svd >= k_svd_budget_ceiling) break;
+        if (eval_res.satisfied || k_svd >= k_svd_cap || k_svd >= n / 2 || k_svd >= k_svd_budget_ceiling) break;
 
-        const int k_svd_next = std::min({k_svd * 2, n - 1, k_svd_budget_ceiling});
+        const int k_svd_next = std::min({k_svd * 2, n - 1, k_svd_cap});
         const char* warm_status = ctx.svd_nystrom ? " (Nystrom: no warm start, full recompute)"
                                  : !allows_warm              ? " (no warm start, fresh probe)"
                                                              : " (warm-started)";

@@ -195,7 +195,6 @@ void init_varcomp(const RemlCtx& ctx,
         const int n = ctx.n;
         double trK = 0.0, trK2 = 0.0;
         RemlMat KX;
-        RemlMat K2X;
         RemlVec Ky(n);
 
         // Match REML's fixed-effect projection: for Q = I - X(X'X)^-1X',
@@ -212,7 +211,6 @@ void init_varcomp(const RemlCtx& ctx,
             trK2 = ctx.dk.squaredNorm()
                  + static_cast<double>(n - k) * (ctx.tail_d_var + ctx.lambda_tail * ctx.lambda_tail);
             KX   = woodbury_basis_KZ(ctx, ctx.X);
-            K2X  = woodbury_basis_KZ(ctx, KX);
             Ky   = woodbury_basis_Kv(ctx, y_r);
         } else if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
             // Full exact GRM K = ctx.A[r_indx[0]]
@@ -220,12 +218,11 @@ void init_varcomp(const RemlCtx& ctx,
             trK  = K.diagonal().sum();
             trK2 = K.squaredNorm(); // Frobenius norm squared = tr(K^2)
             KX   = K * ctx.X;
-            K2X  = K * KX;
             Ky   = K * y_r;
         }
         if (trK2 > 0.0) {
             const RemlMat XtKX = ctx.X.transpose() * KX;
-            const RemlMat XtK2X = ctx.X.transpose() * K2X;
+            const RemlMat XtK2X = KX.transpose() * KX;
             const RemlMat B_inv_XtKX = XtX_ldlt.solve(XtKX);
             const double trQK = trK - B_inv_XtKX.trace();
             const double trQKQK = trK2 - 2.0 * XtX_ldlt.solve(XtK2X).trace()

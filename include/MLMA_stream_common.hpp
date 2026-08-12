@@ -303,9 +303,10 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
             ctx.Vi_L.triangularView<Eigen::Lower>().solveInPlace(X_d);
             xvx_diag.head(bs) = X_d.colwise().squaredNorm().transpose().cast<float>();
         } else {
-            const Eigen::MatrixXd X_d = X_block.leftCols(bs).cast<double>();
-            const Eigen::MatrixXd proj = ctx.Vi.transpose().triangularView<Eigen::Upper>() * X_d;
-            xvx_diag.head(bs) = proj.colwise().squaredNorm().transpose().cast<float>();
+            Eigen::MatrixXd X_d = X_block.leftCols(bs).cast<double>();
+            cblas_dtrmm(CblasColMajor, CblasLeft, CblasLower, CblasTrans, CblasNonUnit,
+                        n, bs, 1.0, ctx.Vi.data(), n, X_d.data(), n);
+            xvx_diag.head(bs) = X_d.colwise().squaredNorm().transpose().cast<float>();
         }
     };
 

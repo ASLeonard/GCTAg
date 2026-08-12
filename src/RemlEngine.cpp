@@ -324,7 +324,7 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
         int rank = 0;
         bool ret = true;
 
-        if (method_try == INV_LLT && !factorize_only) {
+        if (method_try == INV_LLT && (!factorize_only || ctx.reml_force_dense_vi)) {
             gcta_blas_int blas_n_f = static_cast<gcta_blas_int>(ctx.n);
             bool llt_ok = (gcta_dpotrf(blas_n_f, ctx.Vi.data(), blas_n_f) == 0);
             if (llt_ok) {
@@ -332,7 +332,8 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
                 llt_ok = (gcta_dpotri(blas_n_f, ctx.Vi.data(), blas_n_f) == 0);
             }
             if (llt_ok) {
-                ctx.Vi.triangularView<Eigen::Upper>() = ctx.Vi.transpose();
+                if (!factorize_only)
+                    ctx.Vi.triangularView<Eigen::Upper>() = ctx.Vi.transpose();
                 return true;
             }
             // dpotrf/dpotri failed: reassemble for LU fallback

@@ -55,6 +55,12 @@ RemlVec woodbury_basis_Kv(const RemlCtx& ctx, const RemlVec& v) {
     return ctx.lambda_tail * v + ctx.Uk * Ukv;
 }
 
+RemlMat woodbury_basis_KZ(const RemlCtx& ctx, const RemlMat& Z) {
+    RemlMat UkZ = ctx.Uk.transpose() * Z;
+    UkZ.array().colwise() *= (ctx.dk.array() - ctx.lambda_tail);
+    return ctx.lambda_tail * Z + ctx.Uk * UkZ;
+}
+
 RemlVec woodbury_basis_Viv(const RemlCtx& ctx, const RemlVec& v) {
     RemlVec Ukv = ctx.Uk.transpose() * v;
     Ukv.array() *= ctx.ck.array();
@@ -187,39 +193,57 @@ void init_varcomp(const RemlCtx& ctx,
     // Single-GRM HE warm-start (applies to both Woodbury and Exact REML when no priors specified)
     if (!ctx.reml_no_HE_start && (int)ctx.r_indx.size() == 2 && priors.empty() && priors_var.empty()) {
         const int n = ctx.n;
-        const double Vy = ctx.y_Ssq;
         double trK = 0.0, trK2 = 0.0;
+        RemlMat KX;
+        RemlMat K2X;
         RemlVec Ky(n);
-         // HE moment identities (E[y'Ky] = sg*tr(K^2) + se*tr(K), E[y'y] = sg*tr(K) + se*n)
-        // assume y is mean-zero. ctx.y is left at its raw file scale everywhere else in
-        // REML (X/Vi_X project the mean out properly there), so center locally here only.
-        const RemlVec y_c = ctx.y.array() - ctx.y.mean();
+
+        // Match REML's fixed-effect projection: for Q = I - X(X'X)^-1X',
+        // solve E[y'QKQy] and E[y'Qy] for the two HE components.
+        const RemlMat XtX = ctx.X.transpose() * ctx.X;
+        Eigen::LDLT<RemlMat> XtX_ldlt(XtX);
+        const int dof = n - ctx.X_c;
+        if (XtX_ldlt.info() != Eigen::Success || dof <= 0) return;
+        const RemlVec y_r = ctx.y - ctx.X * XtX_ldlt.solve(ctx.X.transpose() * ctx.y);
 
         if (ctx.Vi_use_woodbury_basis) {
             const int k = ctx.woodbury_basis_rank_;
             trK  = ctx.dk.sum() + static_cast<double>(n - k) * ctx.lambda_tail;
             trK2 = ctx.dk.squaredNorm()
                  + static_cast<double>(n - k) * (ctx.tail_d_var + ctx.lambda_tail * ctx.lambda_tail);
-            Ky   = woodbury_basis_Kv(ctx, y_c);
+            KX   = woodbury_basis_KZ(ctx, ctx.X);
+            K2X  = woodbury_basis_KZ(ctx, KX);
+            Ky   = woodbury_basis_Kv(ctx, y_r);
         } else if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
             // Full exact GRM K = ctx.A[r_indx[0]]
             const auto& K = ctx.A[ctx.r_indx[0]];
             trK  = K.diagonal().sum();
             trK2 = K.squaredNorm(); // Frobenius norm squared = tr(K^2)
-            Ky   = K * y_c;
+            KX   = K * ctx.X;
+            K2X  = K * KX;
+            Ky   = K * y_r;
         }
         if (trK2 > 0.0) {
-            const double yKy   = y_c.dot(Ky);
-            const double yy    = y_c.squaredNorm();
-            const double denom = static_cast<double>(n) * trK2 - trK * trK;
-            double sg_he = (denom > 1e-10)
-                ? (static_cast<double>(n) * yKy - trK * yy) / denom
-                : Vy * 0.5;
-            sg_he = std::max(sg_he, 0.01 * Vy);
-            sg_he = std::min(sg_he, 0.99 * Vy);
-            varcmp(0) = sg_he;
-            varcmp(1) = std::max(Vy - sg_he, 0.01 * Vy);
-            LOGGER << "REML: used single-GRM HE warm-start for variance components = " << varcmp.transpose() << std::endl;
+            const RemlMat XtKX = ctx.X.transpose() * KX;
+            const RemlMat XtK2X = ctx.X.transpose() * K2X;
+            const RemlMat B_inv_XtKX = XtX_ldlt.solve(XtKX);
+            const double trQK = trK - B_inv_XtKX.trace();
+            const double trQKQK = trK2 - 2.0 * XtX_ldlt.solve(XtK2X).trace()
+                + (B_inv_XtKX * B_inv_XtKX).trace();
+            const double yKy = y_r.dot(Ky);
+            const double yy = y_r.squaredNorm();
+            const double denom = static_cast<double>(dof) * trQKQK - trQK * trQK;
+            const double scale = yy / static_cast<double>(dof);
+            if (denom > 1e-10 && std::isfinite(scale) && scale > 0.0) {
+                const double sg_he = (static_cast<double>(dof) * yKy - trQK * yy) / denom;
+                const double se_he = (trQKQK * yy - trQK * yKy) / denom;
+                if (std::isfinite(sg_he) && std::isfinite(se_he)
+                    && sg_he <= 100.0 * scale && se_he <= 100.0 * scale) {
+                    varcmp(0) = std::max(sg_he, 0.01 * scale);
+                    varcmp(1) = std::max(se_he, 0.01 * scale);
+                    LOGGER << "REML: used single-GRM HE warm-start for variance components = " << varcmp.transpose() << std::endl;
+                }
+            }
         }
     }
 }

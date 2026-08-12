@@ -747,6 +747,9 @@ void MLMA::processMain()
             LOGGER.i(0, "Using random seed: " + to_string(seed) + ".");
         }
 
+        if (options.count("reml_ai_robust") && options.count("trace_hutchpp") > 0 &&options.count("trace_hutchpp_fixed_probes") == 0)
+            LOGGER.w(0, "Using fresh Hutch++ probes without robust AI convergence can lead to unstable REML convergence. Consider using --reml-ai-robust or --reml-trace-hutchpp-fixed-probes.");
+
         // ---- Pheno / Marker / Geno (Geno re-reads pheno state in loopDouble) ----
         // Pheno alone reads the .fam (sample IDs); Marker/Geno additionally need
         // the .bim/.bed and are skipped entirely in --save-reml-only mode.

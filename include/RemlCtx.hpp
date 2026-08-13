@@ -138,6 +138,7 @@ struct RemlCtx {
     bool    Vi_use_woodbury_basis = false;
     int     woodbury_basis_rank_  = 0;     // actual rank used (<= woodbury_basis_rank or MP)
     float woodbury_basis_eigen_mass = 0.99f;    // fraction of eigenvalue mass captured by Uk
+    bool woodbury_basis_eigen_adaptive = false; // true → adaptively raise k until mass target is reached rather than doubling
     RemlMat Uk;                      // n x k leading eigenvectors of K
     RemlVec dk;                      // k eigenvalues (clamped >= 0)
     double  lambda_tail     = 0.0;   // average bulk eigenvalue

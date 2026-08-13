@@ -1499,6 +1499,19 @@ static int finalize_and_log_woodbury_rank(
     return k;
 }
 
+// Exact lower bound on additional eigenvalues needed to reach target_mass,
+// derived from eval_full being non-increasing (a property of eigenvalues,
+// not a fitted assumption). Every undiscovered eigenvalue is <= lambda_k,
+// so no k below this bound can possibly satisfy the EigMass criterion.
+static int eigmass_min_k_next(const Eigen::VectorXd& eval_full, int k_svd, double S1_k, double target_mass) {
+    const double lambda_k = eval_full[k_svd - 1];
+    if (!(lambda_k > 0.0)) return k_svd;  // degenerate: no positive tail mass left to exploit
+    const double mass_to_remove = target_mass - S1_k;
+    if (!(mass_to_remove > 0.0)) return k_svd;  // already satisfied or overshot; shouldn't reach here
+    const int m_needed = static_cast<int>(std::ceil(mass_to_remove / lambda_k));
+    return k_svd + std::max(1, m_needed);
+}
+
 } // anonymous namespace
 
 void compute_woodbury_basis(RemlCtx& ctx) {
@@ -1674,7 +1687,13 @@ void compute_woodbury_basis(RemlCtx& ctx) {
 
         if (eval_res.satisfied || k_svd >= k_svd_cap || k_svd >= n / 2 || k_svd >= k_svd_budget_ceiling) break;
 
-        const int k_svd_next = std::min({k_svd * 2, n - 1, k_svd_cap});
+        int k_svd_next = std::min({k_svd * 2, n - 1, k_svd_cap});
+        if (mode == WoodburyMode::EIG && ctx.woodbury_basis_eigen_adaptive) {
+            int k_svd_jump = eigmass_min_k_next(eval_full, k_svd, eval_full.head(k_svd).sum(), target_mass);
+            k_svd_next = std::min(std::max(k_svd_jump, k_svd_next), k_svd_cap);
+            LOGGER.i(0, "Woodbury EIG-k: adaptive jump from k=" + std::to_string(k_svd) + " to k=" + std::to_string(k_svd_jump)
+                        + " (bounded by " + std::to_string(k_svd_next) + ") to reach target mass (" + std::to_string(ctx.woodbury_basis_eigen_mass * 100.0) + "%).");
+        }
         const char* warm_status = ctx.svd_nystrom ? " (Nystrom: no warm start, full recompute)"
                                  : !allows_warm              ? " (no warm start, fresh probe)"
                                                              : " (warm-started)";

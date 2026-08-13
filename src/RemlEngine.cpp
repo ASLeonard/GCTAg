@@ -1006,7 +1006,7 @@ double reml_iteration(RemlCtx& ctx,
             prev_varcmp = varcomp_init;
             if (prior_var_flag) {
                 if (ctx.reml_fixed_var)
-                    LOGGER << "Variance components fixed at: " << varcmp.transpose() << std::endl;
+                    LOGGER << "VAR components fixed at: " << varcmp.transpose() << std::endl;
                 else
                     LOGGER << "Prior values of variance components: " << varcmp.transpose() << std::endl;
             } else {
@@ -1271,19 +1271,19 @@ namespace {
 
 static const char* woodbury_mode_name(WoodburyMode mode) {
     switch (mode) {
-        case WoodburyMode::AutoMP:   return "MP-k";
-        case WoodburyMode::EigMass:  return "EIG-k";
-        case WoodburyMode::Variance: return "VAR-k";
+        case WoodburyMode::MP:   return "MP-k";
+        case WoodburyMode::EIG:  return "EIG-k";
+        case WoodburyMode::VAR: return "VAR-k";
         case WoodburyMode::Fixed:    return "fixed-k";
         default:                     return "off";
     }
 }
 
 static bool woodbury_mode_allows_warm_start(WoodburyMode mode) {
-    // AutoMP benefits from warm-starting across rSVD budget expansions.
-    // EigMass and Variance require accurate tail/bulk summation each round,
+    // MP benefits from warm-starting across rSVD budget expansions.
+    // EIG and VAR require accurate tail/bulk summation each round,
     // so fresh probes avoid carrying over warm-start bias.
-    return (mode == WoodburyMode::AutoMP);
+    return (mode == WoodburyMode::MP);
 }
 
 static int woodbury_rank_cap(const RemlCtx& ctx, int k_budget_ceiling) {
@@ -1295,11 +1295,11 @@ static int woodbury_rank_cap(const RemlCtx& ctx, int k_budget_ceiling) {
 static int woodbury_initial_k_svd(const RemlCtx& ctx, WoodburyMode mode, int k_budget_ceiling) {
     const int n = ctx.n;
     switch (mode) {
-        case WoodburyMode::AutoMP:
+        case WoodburyMode::MP:
             return std::min({n - 1, k_budget_ceiling, ctx.woodbury_basis_k_init});
-        case WoodburyMode::EigMass:
+        case WoodburyMode::EIG:
             [[fallthrough]];
-        case WoodburyMode::Variance: {
+        case WoodburyMode::VAR: {
             const int start_guess = std::clamp(n / 20, ctx.woodbury_basis_k_init, ctx.woodbury_basis_k_max > 0 ? ctx.woodbury_basis_k_max : n - 1);
             return std::min({n - 1, k_budget_ceiling, start_guess});
         }
@@ -1330,7 +1330,7 @@ static RankEvalResult evaluate_rank_criterion(
     const int n = ctx.n;
 
     switch (mode) {
-        case WoodburyMode::AutoMP: {
+        case WoodburyMode::MP: {
             int k_signal = 0;
             while (k_signal < static_cast<int>(eval_full.size()) && eval_full[k_signal] > lambda_plus)
                 ++k_signal;
@@ -1350,7 +1350,7 @@ static RankEvalResult evaluate_rank_criterion(
             res.k_extra   = k_signal;
             break;
         }
-        case WoodburyMode::EigMass: {
+        case WoodburyMode::EIG: {
             double cumulative = 0.0;
             bool crossed_target = false;
             res.k_target = k_svd;
@@ -1366,7 +1366,7 @@ static RankEvalResult evaluate_rank_criterion(
                          && (res.k_target + ctx.woodbury_basis_EIG_k_buffer <= k_svd);
             break;
         }
-        case WoodburyMode::Variance: {
+        case WoodburyMode::VAR: {
             bool crossed_target = false;
             res.k_target = k_svd;
             double cum_sum = 0.0;
@@ -1417,7 +1417,7 @@ static int finalize_and_log_woodbury_rank(
     int k = 0;
 
     switch (mode) {
-        case WoodburyMode::AutoMP: {
+        case WoodburyMode::MP: {
             const int k_edge = eval_res.k_target;
             const int k_signal = eval_res.k_extra;
             k = std::max(20, std::min(k_svd, k_edge));
@@ -1439,7 +1439,7 @@ static int finalize_and_log_woodbury_rank(
                 LOGGER.w(0, "Woodbury MP-k: edge band not confirmed within k_max=" + std::to_string(k_svd) + "; clamped to k_max.");
             break;
         }
-        case WoodburyMode::EigMass: {
+        case WoodburyMode::EIG: {
             const int k_EIGMASS = eval_res.k_target;
             k = std::max(20, std::min(k_svd, k_EIGMASS + ctx.woodbury_basis_EIG_k_buffer));
             double cumulative = 0.0;
@@ -1459,7 +1459,7 @@ static int finalize_and_log_woodbury_rank(
                 LOGGER.w(0, "Woodbury EIG-k: mass target not reached within k=" + std::to_string(k_svd) + ".");
             break;
         }
-        case WoodburyMode::Variance: {
+        case WoodburyMode::VAR: {
             const int k_VAR = eval_res.k_target;
             k = std::max(20, std::min(k_svd, k_VAR));
             double cum_sum = 0.0;
@@ -1597,7 +1597,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     }
 
     double lambda_plus = 0.0;
-    if (mode == WoodburyMode::AutoMP) {
+    if (mode == WoodburyMode::MP) {
         double M = 0.0;
         if (ctx.grm_N.rows() == n && ctx.grm_N.cols() == n) {
             if (svd_chunked)
@@ -1613,7 +1613,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
         const double gamma = static_cast<double>(n) / M;
         lambda_plus = std::pow(1.0 + std::sqrt(gamma), 2.0);
     }
-    const double target_mass = (mode == WoodburyMode::EigMass) ? (ctx.woodbury_basis_eigen_mass * trace_K_full) : 0.0;
+    const double target_mass = (mode == WoodburyMode::EIG) ? (ctx.woodbury_basis_eigen_mass * trace_K_full) : 0.0;
     const bool allows_warm = woodbury_mode_allows_warm_start(mode);
 
     auto apply = [&](const auto& X) -> Eigen::MatrixXd {
@@ -1635,7 +1635,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                 gcta_eigh::EighResult res = gcta_eigh::nystrom_symmetric_eigh(
                     apply, n, k_svd,
                     gcta_eigh::recommended_oversample(k_svd));
-                if (mode == WoodburyMode::EigMass) {
+                if (mode == WoodburyMode::EIG) {
                     LOGGER << "Woodbury EIG-k: refining Nystrom basis with one Rayleigh-Ritz projection ..."
                            << std::endl;
                     res = gcta_eigh::rayleigh_ritz_refine(apply, std::move(res.eigenvectors), k_svd);

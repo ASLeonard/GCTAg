@@ -27,9 +27,9 @@ using RemlVec = Eigen::VectorXd;
 enum class WoodburyMode {
     Off      = 0,
     Fixed    = 1,
-    AutoMP   = -1, // Marchenko-Pastur bulk edge
-    EigMass  = -2, // Eigenvalue spectral mass fraction
-    Variance = -3  // Relative tail variance dispersion ratio
+    MP   = -1, // Marchenko-Pastur bulk edge
+    EIG  = -2, // Eigenvalue spectral mass fraction
+    VAR = -3  // Relative tail variance dispersion ratio
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -40,9 +40,9 @@ enum class WoodburyMode {
 // ──────────────────────────────────────────────────────────────────────────────
 struct RemlCtx {
     WoodburyMode woodbury_mode() const {
-        if (woodbury_basis_rank == -1) return WoodburyMode::AutoMP;
-        if (woodbury_basis_rank == -2) return WoodburyMode::EigMass;
-        if (woodbury_basis_rank == -3) return WoodburyMode::Variance;
+        if (woodbury_basis_rank == -1) return WoodburyMode::MP;
+        if (woodbury_basis_rank == -2) return WoodburyMode::EIG;
+        if (woodbury_basis_rank == -3) return WoodburyMode::VAR;
         if (woodbury_basis_rank > 0)   return WoodburyMode::Fixed;
         return WoodburyMode::Off;
     }

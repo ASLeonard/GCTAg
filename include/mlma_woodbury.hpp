@@ -14,6 +14,7 @@
 #include <Eigen/Dense>
 #include <cmath>
 #include "main/StatFunc.h"
+#include "cpu.h"
 
 // ---------------------------------------------------------------------------
 // WoodburyMLMACache
@@ -58,16 +59,42 @@ inline Eigen::MatrixXf woodbury_apply_Vi_mat_f(const WoodburyMLMACache& wb,
 // Compute diag(X^T V^{-1} X) for the first bs columns of X_block using:
 //   x^T V^{-1} x = (||x||² − ||sqrt_ck ⊙ (Uk x)||²) / σ²_eff
 // Result is clamped to >= 0 to guard against floating-point cancellation.
+// Uses pre-allocated UkX_scratch (k x BLOCK) and multi-threaded cblas_sgemm.
 // ---------------------------------------------------------------------------
+inline void woodbury_xvx_diag_block(const WoodburyMLMACache& wb,
+                                     const Eigen::MatrixXf& X_block, Eigen::Index bs,
+                                     Eigen::VectorXf& xvx_diag, Eigen::MatrixXf& UkX_scratch)
+{
+    const int k = static_cast<int>(wb.Uk_f.rows());
+    const int n = static_cast<int>(wb.Uk_f.cols());
+    const int bs_int = static_cast<int>(bs);
+
+    // cblas_sgemm: Uk_f (k×n) * X_block (n×bs) -> UkX_scratch (k×bs)
+    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                k, bs_int, n,
+                1.0f, wb.Uk_f.data(), k,
+                X_block.data(), n,
+                0.0f, UkX_scratch.data(), k);
+    auto UkX = UkX_scratch.leftCols(bs);
+
+    UkX.array().colwise() *= wb.sqrt_ck_f.array();
+
+
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < bs_int; ++j) {
+        const float x_norm   = X_block.col(j).squaredNorm();
+        const float ukx_norm = UkX.col(j).squaredNorm();
+        const float val      = (x_norm - ukx_norm) / wb.sigma2_eff_f;
+        xvx_diag[j] = std::max(0.0f, val);
+    }
+}
 inline void woodbury_xvx_diag_block(const WoodburyMLMACache& wb,
                                      const Eigen::MatrixXf& X_block, Eigen::Index bs,
                                      Eigen::VectorXf& xvx_diag)
 {
-    Eigen::MatrixXf UkX = wb.Uk_f * X_block.leftCols(bs);  // k×n * n×bs = k×bs
-    UkX.array().colwise() *= wb.sqrt_ck_f.array();
-    xvx_diag.head(bs) = (X_block.leftCols(bs).colwise().squaredNorm()
-                         - UkX.colwise().squaredNorm()) / wb.sigma2_eff_f;
-    xvx_diag.head(bs) = xvx_diag.head(bs).cwiseMax(0.0f);
+    const int k = static_cast<int>(wb.Uk_f.rows());
+    Eigen::MatrixXf UkX_scratch(k, bs);
+    woodbury_xvx_diag_block(wb, X_block, bs, xvx_diag, UkX_scratch);
 }
 
 // ---------------------------------------------------------------------------

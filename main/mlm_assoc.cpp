@@ -452,6 +452,9 @@ gcta::MlmaResult gcta::mlma_calcu_stat(std::span<const float> y, unsigned long m
     Eigen::MatrixXf X_block(n, max_block_size);
     Eigen::VectorXf Xt_Vi_y_block(max_block_size);
     Eigen::VectorXf xvx_diag(max_block_size);    // diag(X^T Vi X)
+    Eigen::MatrixXf UkX_scratch = use_woodbury
+        ? Eigen::MatrixXf(wb.Uk_f.rows(), max_block_size)
+        : Eigen::MatrixXf();
 
     std::vector<int> indx;
     indx.reserve(max_block_size);   // single alloc before the loop
@@ -474,7 +477,7 @@ gcta::MlmaResult gcta::mlma_calcu_stat(std::span<const float> y, unsigned long m
         Xt_Vi_y_block.head(bs).noalias() = X_block.leftCols(bs).transpose() * Vi_y;
 
         if (use_woodbury) {
-            woodbury_xvx_diag_block(wb, X_block, bs, xvx_diag);
+            woodbury_xvx_diag_block(wb, X_block, bs, xvx_diag, UkX_scratch);
         } else if (use_L) {
             // In-place STRSM: X_block = L^{-1} * X_block.
             // x^T V^{-1} x = ||L^{-1} x||^2  (L is lower Cholesky of V).
@@ -611,6 +614,9 @@ gcta::MlmaResult gcta::mlma_calcu_stat_covar(std::span<const float> y, unsigned 
     Eigen::VectorXf Dt_t_vec(max_block_size);        // D^T t             (bs×1)
     Eigen::VectorXf xvx_diag(max_block_size);        // diag(X^T Vi X)    (bs×1)
     Eigen::VectorXf d_dot_e_diag(max_block_size);    // diag(D^T E)       (bs×1)
+    Eigen::MatrixXf UkX_scratch = use_woodbury
+        ? Eigen::MatrixXf(wb.Uk_f.rows(), max_block_size)
+        : Eigen::MatrixXf();
 
     int last_pct_c = -1;
     for(i = 0; i < m; ){
@@ -644,7 +650,7 @@ gcta::MlmaResult gcta::mlma_calcu_stat_covar(std::span<const float> y, unsigned 
         d_dot_e_diag.head(bs) = (D_block.leftCols(bs).cwiseProduct(E_block.leftCols(bs))).colwise().sum();
 
         if (use_woodbury) {
-            woodbury_xvx_diag_block(wb, X_block, bs, xvx_diag);
+            woodbury_xvx_diag_block(wb, X_block, bs, xvx_diag, UkX_scratch);
         } else if (use_L) {
             // In-place STRSM: X_block = L^{-1} * X_block.
             // x^T V^{-1} x = ||L^{-1} x||^2  (L is lower Cholesky of V).

@@ -1002,14 +1002,14 @@ double reml_iteration(RemlCtx& ctx,
     double best_lgL = 0;
     RemlVec best_varcmp;
     for (iter = 0; iter < ctx.reml_max_iter; iter++) {
-        if (iter == 0) {
+        if (iter == 0) { //TODO: check if HE is good enough here to skip the first iteration as EM
             prev_varcmp = varcomp_init;
             if (prior_var_flag) {
                 if (ctx.reml_fixed_var)
                     LOGGER << "VAR components fixed at: " << varcmp.transpose() << std::endl;
                 else
                     LOGGER << "Prior values of variance components: " << varcmp.transpose() << std::endl;
-            } else {
+            } else if(true || ctx.reml_no_HE_start) {
                 ctx.reml_mtd = 2;
                 LOGGER << "Calculating prior values of variance components by EM-REML ..." << std::endl;
             }

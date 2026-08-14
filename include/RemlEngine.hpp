@@ -37,7 +37,8 @@ void compute(RemlCtx& ctx,
 void compute_woodbury_basis(RemlCtx& ctx);
 
 // Packs the post-convergence RemlCtx into a RemlState ready for MLMA.
-// Converts double-precision Vi/Uk/b to float for memory efficiency.
-RemlState build_reml_state(const RemlCtx& ctx);
+// Converts double-precision Vi/Uk/b to float for memory efficiency and then
+// releases the heavy double workspace immediately so the RSS stays low.
+RemlState build_reml_state(RemlCtx& ctx);
 
 } // namespace reml

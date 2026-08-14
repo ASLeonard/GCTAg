@@ -1835,7 +1835,7 @@ void compute(RemlCtx& ctx,
     }
 }
 
-RemlState build_reml_state(const RemlCtx& ctx) {
+RemlState build_reml_state(RemlCtx& ctx) {
     RemlState rs;
     rs.n           = static_cast<int32_t>(ctx.n);
     rs.x_c         = static_cast<int32_t>(ctx.X_c);
@@ -1845,7 +1845,9 @@ RemlState build_reml_state(const RemlCtx& ctx) {
     // store, and avoid holding a second full-size double buffer alive longer than
     // necessary. A true swap/move is impossible across Eigen's different scalar
     // types (MatrixXd vs MatrixXf), so the conversion must happen once while
-    // filling the final float storage directly.
+        // filling the final float storage directly. Once the float copies are created,
+    // we can immediately release the expensive double workspace: the streaming
+    // association path consumes only the float state from here onward.
     rs.b.resize(ctx.b.size());
     rs.b.noalias() = ctx.b.cast<float>();
 
@@ -1861,7 +1863,8 @@ RemlState build_reml_state(const RemlCtx& ctx) {
         rs.wb.Uk_f.noalias() = ctx.Uk.transpose().cast<float>();  // k×n
 
         rs.wb.ck_f.resize(ctx.ck.size());
-        rs.wb.ck_f.noalias() = ctx.ck.cast<float>();
+        rs.wb.ck_f.noalias() = ctx.ck.cast<float>(); //convert double to float
+        ctx.ck.resize(0); //free double buffer immediately (both are temporarily alive for 1.5x the size of Uk_f)
 
         rs.wb.sqrt_ck_f.resize(rs.wb.ck_f.size());
         rs.wb.sqrt_ck_f.noalias() = rs.wb.ck_f.cwiseSqrt();
@@ -1870,8 +1873,10 @@ RemlState build_reml_state(const RemlCtx& ctx) {
 
         rs.dk_f.resize(ctx.dk.size());
         rs.dk_f.noalias() = ctx.dk.cast<float>();
+        ctx.dk.resize(0);
 
         rs.lambda_tail_f = static_cast<float>(ctx.lambda_tail);
+        ctx.Uk.resize(0, 0);
     } else if (ctx.Vi_use_llt) {
         // Vi_L holds the lower Cholesky factor L of V (from dpotrf).
         // Store it as float — the streaming code uses STRSV/STRSM directly,
@@ -1879,6 +1884,7 @@ RemlState build_reml_state(const RemlCtx& ctx) {
         rs.is_llt = true;
         rs.Vi_L_f.resize(ctx.Vi_L.rows(), ctx.Vi_L.cols());
         rs.Vi_L_f.noalias() = ctx.Vi_L.cast<float>();   // n×n float, ~n²/2 significant bytes
+        ctx.Vi_L.resize(0, 0);
     } else {
         // reml_diagV_adj fallback: ctx.Vi is already the dense explicit
         // V^{-1} (computed once, O(n³), inside calcu_Vi). Factor it here —
@@ -1892,7 +1898,26 @@ RemlState build_reml_state(const RemlCtx& ctx) {
         const RemlMat& L = Li.matrixL();
         rs.Vi_L_f.resize(L.rows(), L.cols());
         rs.Vi_L_f.noalias() = L.cast<float>();
+        ctx.Vi.resize(0, 0);
     }
+
+    // Clear the remaining large, now-redundant double buffers after the float
+    // copies are created. The downstream MLMA stream uses only the float state.
+    ctx.A.clear();
+    ctx.grm_N.resize(0, 0);
+    ctx.Vi_X.resize(0, 0);
+    ctx.Xt_Vi_X_i.resize(0, 0);
+    ctx.Uk_Vi_X.resize(0, 0);
+    ctx.UkTX.resize(0, 0);
+    ctx.UkTy.resize(0, 0);
+    ctx.hutchpp_S.resize(0, 0);
+    ctx.hutchpp_G.resize(0, 0);
+    ctx.P.resize(0, 0);
+    ctx.varcmp.clear();
+    ctx.b.resize(0);
+    ctx.Vi_use_woodbury_basis = false;
+    ctx.Vi_use_llt = false;
+
     return rs;
 }
 

@@ -279,30 +279,6 @@ inline void run_mlma_stream_association(RemlState& state,
                                      log_pval, ofile);
 }
 
-inline void release_reml_ctx_after_state_build(RemlCtx& ctx) {
-    // Once the compact float-only RemlState is built, the large double-precision
-    // REML workspace is no longer required for the association step. Releasing it
-    // here cuts the RSS peak substantially without changing the downstream
-    // arithmetic, because all streaming work already reads from the float state.
-    ctx.A.clear();
-    ctx.grm_N.resize(0, 0);
-    ctx.Vi.resize(0, 0);
-    ctx.Vi_L.resize(0, 0);
-    ctx.Vi_X.resize(0, 0);
-    ctx.Xt_Vi_X_i.resize(0, 0);
-    ctx.Uk_Vi_X.resize(0, 0);
-    ctx.UkTX.resize(0, 0);
-    ctx.UkTy.resize(0, 0);
-    ctx.hutchpp_S.resize(0, 0);
-    ctx.hutchpp_G.resize(0, 0);
-    ctx.P.resize(0, 0);
-    ctx.Uk.resize(0, 0);
-    ctx.dk.resize(0);
-    ctx.ck.resize(0);
-    ctx.Vi_use_woodbury_basis = false;
-    ctx.Vi_use_llt = false;
-}
-
 //The "inline REML" path
 inline void run_mlma_stream_association(RemlCtx& ctx,
                                         const Eigen::VectorXf& y_adj,
@@ -315,7 +291,6 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
                                         double block_mem_budget_gb = 0.0)
 {
     RemlState state = reml::build_reml_state(ctx);
-    release_reml_ctx_after_state_build(ctx);
     run_mlma_stream_association(state, y_adj, w_sqrt, geno, marker, n, log_pval, ofile,
                                 block_mem_budget_gb);
 }

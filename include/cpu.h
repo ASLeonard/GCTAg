@@ -105,8 +105,8 @@ inline int gcta_dsyevd(gcta_blas_int n, double* a, gcta_blas_int lda, double* w)
     gcta_blas_int info = 0;
     // Workspace query: pass lwork = liwork = -1 to obtain optimal sizes.
     gcta_blas_int lwork_q = -1, liwork_q = -1;
-    double        work_sz;
-    gcta_blas_int iwork_sz;
+    double        work_sz = 0.0;
+    gcta_blas_int iwork_sz = 0;
     dsyevd_(&jobz, &uplo, &n, a, &lda, w,
             &work_sz, &lwork_q, &iwork_sz, &liwork_q, &info);
     if (info != 0) return static_cast<int>(info);
@@ -118,6 +118,15 @@ inline int gcta_dsyevd(gcta_blas_int n, double* a, gcta_blas_int lda, double* w)
             work.data(), &lwork, iwork.data(), &liwork, &info);
     return static_cast<int>(info);
 #else
+    // AOCL/OpenBLAS's LAPACKE_dsyevd workspace-size calculation (~2n^2)
+    // overflows a 32-bit int above n ~= 32766 and crashes rather than
+    // returning a nonzero info -- so callers checking info afterward can't
+    // catch it. MKL promotes internally and doesn't hit this, so it's
+    // exempted. -1 mirrors LAPACK's own "argument 1 (n) invalid" convention;
+    // safe to reuse here since a genuine n<0 from LAPACK can't otherwise occur.
+#if !defined(GCTA_USE_MKL)
+    if (n >= 32766) return -1;
+#endif
     return static_cast<int>(
         LAPACKE_dsyevd(LAPACK_COL_MAJOR, 'V', 'U', n, a, lda, w));
 #endif
@@ -144,8 +153,8 @@ inline int gcta_dsyevr(gcta_blas_int n, double* a, gcta_blas_int lda,
     gcta_blas_int info = 0;
     // Workspace query.
     gcta_blas_int lwork_q = -1, liwork_q = -1;
-    double        work_sz;
-    gcta_blas_int iwork_sz;
+    double        work_sz = 0.0;
+    gcta_blas_int iwork_sz = 0;
     dsyevr_(&jobz, &range, &uplo, &n, a, &lda,
             &vl, &vu, &il, &iu, &abstol,
             m_found, w, z, &ldz, isuppz,

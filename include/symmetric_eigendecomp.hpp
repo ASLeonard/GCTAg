@@ -36,6 +36,7 @@
 #include <random>
 #include <stdexcept>
 #include <utility>
+#include "cpu.h"  // gcta_dsyevd
 
 namespace gcta_eigh {
 
@@ -155,32 +156,20 @@ EighResult power_iterate_and_project(
     Eigen::MatrixXd B  = Q.transpose() * AQ;   // k_ext x k_ext, symmetric
     AQ.resize(0, 0);
 
-    // B can legitimately reach the tens-of-thousands under EIG99 escalation
-    // on a slowly-decaying spectrum. SelfAdjointEigenSolver, when
-    // EIGEN_USE_LAPACKE is defined, routes to LAPACKE_dsyevd — whose O(n^2)
-    // workspace size calculation overflows int32 at n >= 32766 (same
-    // threshold and same underlying issue as grm.cpp's dsyevd path; see the
-    // warning there). Unlike that path, this one doesn't yet have the
-    // gcta_dsyevr-based fix — flagging rather than silently risking it.
-    if (k_ext >= 32766)
-        throw std::runtime_error(
-            "power_iterate_and_project: k_ext=" + std::to_string(k_ext) +
-            " reaches SelfAdjointEigenSolver's known int32 workspace overflow threshold "
-            "(dsyevd, n>=32766 — see grm.cpp's equivalent warning). This needs the "
-            "gcta_dsyevr-based fix wired in before it's safe to run at this k_ext.");
-
-    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(B);
-    if (es.info() != Eigen::Success)
-        throw std::runtime_error("power_iterate_and_project: eigendecomposition of projected matrix failed.");
+    Eigen::VectorXd w(k_ext);
+    const int info = gcta_dsyevd((gcta_blas_int)k_ext, B.data(), (gcta_blas_int)k_ext, w.data());
+    if (info != 0)
+        throw std::runtime_error("power_iterate_and_project: dsyevd failed (info=" +
+                                  std::to_string(info) + "). For k_ext > 32766, this is likely why.");
 
     EighResult result;
-    // es.eigenvalues() is ascending; tail(k_target).reverse() -> descending top-k.
-    result.eigenvalues = es.eigenvalues().tail(k_target).reverse();
+    // w is ascending; tail(k_target).reverse() -> descending top-k.
+    result.eigenvalues = w.tail(k_target).reverse();
     // Materialise the reversed block into a plain contiguous matrix before the
     // n x k_target DGEMM — rowwise().reverse() on a block expression forces
     // column-by-column scatter during DGEMM, defeating tiling.
     const Eigen::MatrixXd evecs_sorted =
-        es.eigenvectors().rightCols(k_target).rowwise().reverse().eval();
+        B.rightCols(k_target).rowwise().reverse().eval();
     result.eigenvectors = Q * evecs_sorted;
     return result;
 }
@@ -219,14 +208,16 @@ EighResult rayleigh_ritz_refine(
     A_basis.resize(0, 0);
     B = 0.5 * (B + B.transpose());
 
-    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(B);
-    if (es.info() != Eigen::Success)
-        throw std::runtime_error("rayleigh_ritz_refine: eigendecomposition of projected matrix failed.");
+    Eigen::VectorXd w(k_ext);
+    const int info = gcta_dsyevd((gcta_blas_int)k_ext, B.data(), (gcta_blas_int)k_ext, w.data());
+    if (info != 0)
+        throw std::runtime_error("rayleigh_ritz_refine: dsyevd failed (info=" +
+                                  std::to_string(info) + "). For k_ext > 32766, this is likely why.");
 
     EighResult result;
-    result.eigenvalues = es.eigenvalues().tail(k_target).reverse();
+    result.eigenvalues = w.tail(k_target).reverse();
     const Eigen::MatrixXd evecs_sorted =
-        es.eigenvectors().rightCols(k_target).rowwise().reverse().eval();
+        B.rightCols(k_target).rowwise().reverse().eval();
     result.eigenvectors = basis * evecs_sorted;
     return result;
 }
@@ -350,12 +341,13 @@ EighResult nystrom_symmetric_eigh(
     const double eps_C = gamma_n * omega.norm() * Y.norm();
     omega.resize(0, 0);
 
-    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es_C(C);
-    if (es_C.info() != Eigen::Success)
-        throw std::runtime_error("nystrom_symmetric_eigh: eigendecomposition of sketch C failed.");
-    C.resize(0, 0);
+    Eigen::VectorXd w_C(k_ext);
+    const int info_C = gcta_dsyevd((gcta_blas_int)k_ext, C.data(), (gcta_blas_int)k_ext, w_C.data());
+    if (info_C != 0)
+        throw std::runtime_error("nystrom_symmetric_eigh: dsyevd on sketch C failed (info=" +
+                                  std::to_string(info_C) + "). For k_ext > 32766, this is likely why.");
 
-    const Eigen::VectorXd& lam_C = es_C.eigenvalues();
+    const Eigen::VectorXd& lam_C = w_C;
     const Eigen::VectorXd lam_sqrt_abs_inv = lam_C.unaryExpr(
         [eps_C](double lam) { return (std::abs(lam) > eps_C) ? 1.0 / std::sqrt(std::abs(lam)) : 0.0; });
     const Eigen::VectorXd signs = lam_C.unaryExpr(
@@ -364,8 +356,9 @@ EighResult nystrom_symmetric_eigh(
     // K_nys = Z sign(Lambda) Z^T, where
     // Z = Y V |Lambda|^{-1/2}. This retains the signed spectrum of an
     // indefinite GRM without an additional K matvec.
-    Eigen::MatrixXd Z = Y * (es_C.eigenvectors() * lam_sqrt_abs_inv.asDiagonal());
+    Eigen::MatrixXd Z = Y * (C * lam_sqrt_abs_inv.asDiagonal());
     Y.resize(0, 0);
+    C.resize(0, 0);
 
     Eigen::HouseholderQR<Eigen::MatrixXd> qr(Z);
     const Eigen::MatrixXd R = qr.matrixQR().topRows(k_ext).triangularView<Eigen::Upper>();
@@ -374,14 +367,16 @@ EighResult nystrom_symmetric_eigh(
 
     Eigen::MatrixXd T = R * signs.asDiagonal() * R.transpose();
     T = 0.5 * (T + T.transpose());
-    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es_T(T);
-    if (es_T.info() != Eigen::Success)
-        throw std::runtime_error("nystrom_symmetric_eigh: eigendecomposition of signed core failed.");
+    Eigen::VectorXd w_T(k_ext);
+    const int info_T = gcta_dsyevd((gcta_blas_int)k_ext, T.data(), (gcta_blas_int)k_ext, w_T.data());
+    if (info_T != 0)
+        throw std::runtime_error("nystrom_symmetric_eigh: dsyevd on signed core T failed (info=" +
+                                  std::to_string(info_T) + "). For k_ext > 32766, this is likely why.");
 
     EighResult result;
-    result.eigenvalues = es_T.eigenvalues().tail(k_target).reverse();
+    result.eigenvalues = w_T.tail(k_target).reverse();
     const Eigen::MatrixXd evecs_sorted =
-        es_T.eigenvectors().rightCols(k_target).rowwise().reverse().eval();
+        T.rightCols(k_target).rowwise().reverse().eval();
     result.eigenvectors = Q * evecs_sorted;
     return result;
 }

@@ -830,6 +830,11 @@ void MLMA::processMain()
             ? options_d.at("mlma_tile_budget_gb") : 0.0;
 
         if (options.count("load_reml")) {
+            // --load-reml uses the serialized RemlState path: the state is read
+            // from disk and then consumed by run_mlma_stream_association(RemlState&)
+            // below. This is the saved-state code path and uses the float-first
+            // Woodbury/L factor data in RemlState (see RemlState.hpp and the
+            // RemlState overload in MLMA_stream_common.hpp).
             const string load_reml_file = options.at("load_reml");
             LOGGER.i(0, "Loading REML state from [" + load_reml_file + "]...");
             state = readRemlState(load_reml_file, no_adj_covar);
@@ -849,7 +854,10 @@ void MLMA::processMain()
                 y_vec -= Xf * state.b;
             }
         } else {
-            // ---- Inline REML: read GRM, run reml::compute(), build RemlState ----
+            // --grm takes the inline REML path: we build a RemlCtx from the GRM,
+            // run reml::compute() to populate its V^{-1} / Woodbury state, and then
+            // pass that RemlCtx through run_mlma_stream_association(RemlCtx&) below.
+            // This is distinct from the --load-reml serialized RemlState path above.
             const string grm_pfx = options.at("grm");
             LOGGER.i(0, "Running inline REML using GRM [" + grm_pfx + "] ...");
 

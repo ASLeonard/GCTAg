@@ -199,7 +199,7 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
     flush_io();
 }
 
-
+// The "--save-reml and --load-reml" path
 inline void run_mlma_stream_association(RemlState& state,
                                         const Eigen::VectorXf& y_adj,
                                         const Eigen::VectorXf& w_sqrt,
@@ -277,6 +277,7 @@ inline void run_mlma_stream_association(RemlState& state,
                                      log_pval, ofile);
 }
 
+//The "inline REML" path
 inline void run_mlma_stream_association(RemlCtx& ctx,
                                         const Eigen::VectorXf& y_adj,
                                         const Eigen::VectorXf& w_sqrt,
@@ -288,45 +289,67 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
                                         double block_mem_budget_gb = 0.0)
 {
     Eigen::VectorXf Vi_y(n);
+    const float sigma2_eff_f = static_cast<float>(ctx.sigma2_eff);
 
     if (ctx.Vi_use_woodbury_basis) {
-        const Eigen::VectorXd y_d = y_adj.cast<double>();
-        Eigen::VectorXd UkTy = ctx.Uk.transpose() * y_d;
-        UkTy.array() *= ctx.ck.array();
-        Vi_y = ((y_d - ctx.Uk * UkTy) / ctx.sigma2_eff).cast<float>();
+        const Eigen::MatrixXf Uk_f = ctx.Uk.cast<float>();
+        const Eigen::VectorXf ck_f = ctx.ck.cast<float>();
+        Eigen::VectorXf UkTy = Uk_f.transpose() * y_adj;
+        UkTy.array() *= ck_f.array();
+        Vi_y = ((y_adj - Uk_f * UkTy) / sigma2_eff_f);
     } else if (ctx.Vi_use_llt) {
-        Eigen::VectorXd Vi_y_d = y_adj.cast<double>();
-        ctx.Vi_L.triangularView<Eigen::Lower>().solveInPlace(Vi_y_d);
-        ctx.Vi_L.triangularView<Eigen::Lower>().adjoint().solveInPlace(Vi_y_d);
-        Vi_y = Vi_y_d.cast<float>();
+        const Eigen::MatrixXf Vi_L_f = ctx.Vi_L.cast<float>();
+        Eigen::VectorXf y_f = y_adj;
+        cblas_strsv(CblasColMajor, CblasLower, CblasNoTrans, CblasNonUnit,
+                    n, Vi_L_f.data(), n, y_f.data(), 1);
+        cblas_strsv(CblasColMajor, CblasLower, CblasTrans, CblasNonUnit,
+                    n, Vi_L_f.data(), n, y_f.data(), 1);
+        Vi_y = y_f;
     } else {
-        gcta_blas_int blas_n = static_cast<gcta_blas_int>(n);
-        if (gcta_dpotrf(blas_n, ctx.Vi.data(), blas_n) != 0)
+        Eigen::MatrixXf Vi_f = ctx.Vi.cast<float>();
+        Eigen::LLT<Eigen::MatrixXf> llt(Vi_f);
+        if (llt.info() != Eigen::Success)
             LOGGER.e(0, "inline REML V^{-1} is not positive definite for MLMA streaming.");
-        const Eigen::VectorXd y_d = y_adj.cast<double>();
-        const Eigen::VectorXd tmp = ctx.Vi.transpose().triangularView<Eigen::Upper>() * y_d;
-        Vi_y = (ctx.Vi.triangularView<Eigen::Lower>() * tmp).cast<float>();
+        const Eigen::MatrixXf L = llt.matrixL();
+        Eigen::VectorXf tmp = L.transpose() * y_adj;
+        Vi_y = L * tmp;
     }
 
     Vi_y.array() *= w_sqrt.array();
 
     auto compute_xvx_diag = [&](Eigen::MatrixXf& X_block, int bs, Eigen::VectorXf& xvx_diag) {
         if (ctx.Vi_use_woodbury_basis) {
-            const Eigen::MatrixXd X_d = X_block.leftCols(bs).cast<double>();
-            const Eigen::MatrixXd UkX = ctx.Uk.transpose() * X_d;
-            const Eigen::VectorXd x_norm = X_d.colwise().squaredNorm().transpose();
-            const Eigen::VectorXd correction =
-                (UkX.array().square().colwise() * ctx.ck.array()).colwise().sum().transpose();
-            xvx_diag.head(bs) = ((x_norm.array() - correction.array()) / ctx.sigma2_eff).cast<float>();
+            const Eigen::MatrixXf Uk_f = ctx.Uk.cast<float>();
+            const Eigen::VectorXf ck_f = ctx.ck.cast<float>();
+            const Eigen::MatrixXf X_f = X_block.leftCols(bs);
+            const Eigen::MatrixXf UkX = Uk_f.transpose() * X_f;
+            const Eigen::VectorXf x_norm = X_f.colwise().squaredNorm().transpose();
+            const Eigen::VectorXf correction =
+                (UkX.array().square().colwise() * ck_f.array()).colwise().sum().transpose();
+            xvx_diag.head(bs) = ((x_norm.array() - correction.array()) / sigma2_eff_f);
         } else if (ctx.Vi_use_llt) {
-            Eigen::MatrixXd X_d = X_block.leftCols(bs).cast<double>();
-            ctx.Vi_L.triangularView<Eigen::Lower>().solveInPlace(X_d);
-            xvx_diag.head(bs) = X_d.colwise().squaredNorm().transpose().cast<float>();
+            Eigen::MatrixXf X_f = X_block.leftCols(bs);
+            const Eigen::MatrixXf Vi_L_f = ctx.Vi_L.cast<float>();
+            cblas_strsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasNonUnit,
+                        n, bs, 1.0f,
+                        Vi_L_f.data(), n,
+                        X_f.data(), n);
+            #pragma omp parallel for schedule(static)
+            for (int j = 0; j < bs; ++j) {
+                xvx_diag[j] = X_f.col(j).squaredNorm();
+            }
         } else {
-            Eigen::MatrixXd X_d = X_block.leftCols(bs).cast<double>();
-            cblas_dtrmm(CblasColMajor, CblasLeft, CblasLower, CblasTrans, CblasNonUnit,
-                        n, bs, 1.0, ctx.Vi.data(), n, X_d.data(), n);
-            xvx_diag.head(bs) = X_d.colwise().squaredNorm().transpose().cast<float>();
+            Eigen::MatrixXf X_f = X_block.leftCols(bs);
+            Eigen::MatrixXf Vi_f = ctx.Vi.cast<float>();
+            Eigen::LLT<Eigen::MatrixXf> llt(Vi_f);
+            if (llt.info() != Eigen::Success)
+                LOGGER.e(0, "inline REML V^{-1} is not positive definite for MLMA streaming.");
+            const Eigen::MatrixXf L = llt.matrixL();
+            X_f = L.transpose() * X_f;
+            #pragma omp parallel for schedule(static)
+            for (int j = 0; j < bs; ++j) {
+                xvx_diag[j] = X_f.col(j).squaredNorm();
+            }
         }
     };
 

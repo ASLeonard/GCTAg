@@ -27,9 +27,9 @@ using RemlVec = Eigen::VectorXd;
 enum class WoodburyMode {
     Off      = 0,
     Fixed    = 1,
-    AutoMP   = -1, // Marchenko-Pastur bulk edge
-    EigMass  = -2, // Eigenvalue spectral mass fraction
-    Variance = -3  // Relative tail variance dispersion ratio
+    MP   = -1, // Marchenko-Pastur bulk edge
+    EIG  = -2, // Eigenvalue spectral mass fraction
+    VAR = -3  // Relative tail variance dispersion ratio
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -40,9 +40,9 @@ enum class WoodburyMode {
 // ──────────────────────────────────────────────────────────────────────────────
 struct RemlCtx {
     WoodburyMode woodbury_mode() const {
-        if (woodbury_basis_rank == -1) return WoodburyMode::AutoMP;
-        if (woodbury_basis_rank == -2) return WoodburyMode::EigMass;
-        if (woodbury_basis_rank == -3) return WoodburyMode::Variance;
+        if (woodbury_basis_rank == -1) return WoodburyMode::MP;
+        if (woodbury_basis_rank == -2) return WoodburyMode::EIG;
+        if (woodbury_basis_rank == -3) return WoodburyMode::VAR;
         if (woodbury_basis_rank > 0)   return WoodburyMode::Fixed;
         return WoodburyMode::Off;
     }
@@ -138,6 +138,7 @@ struct RemlCtx {
     bool    Vi_use_woodbury_basis = false;
     int     woodbury_basis_rank_  = 0;     // actual rank used (<= woodbury_basis_rank or MP)
     float woodbury_basis_eigen_mass = 0.99f;    // fraction of eigenvalue mass captured by Uk
+    bool woodbury_basis_eigen_adaptive = false; // true → adaptively raise k until mass target is reached rather than doubling
     RemlMat Uk;                      // n x k leading eigenvectors of K
     RemlVec dk;                      // k eigenvalues (clamped >= 0)
     double  lambda_tail     = 0.0;   // average bulk eigenvalue

@@ -353,6 +353,11 @@ void PCAStream::processMain()
         chunked_reader = nullptr;
 
         // ---- Write .eigenval / .eigenvec — identical format to gcta::pca()'s writer ----
+        auto append_double = [](string &buf, double v) {
+            char tmp[32];
+            buf.append(tmp, std::to_chars(tmp, tmp + sizeof(tmp), v).ptr);
+        };
+
         const string eval_file = out_prefix + ".eigenval";
         std::ofstream o_eval(eval_file);
         if (!o_eval) LOGGER.e(0, "cannot open the file [" + eval_file + "] to write.");
@@ -368,6 +373,9 @@ void PCAStream::processMain()
         // by n elements between each PC value. Materialize transpose once so
         // each individual's PCs are contiguous for the output loop.
         const Eigen::MatrixXd evec_t = used_dsyevd ? Eigen::MatrixXd() : evec.transpose();
+
+        string buf;
+        buf.reserve(1 << 22);
         for (int i = 0; i < n; ++i) {
             // analysis_ids[i] is "FID\tIID" (Pheno::read_sublist convention,
             // same as match_ids_to_grm's expected input elsewhere); V1's
@@ -375,14 +383,16 @@ void PCAStream::processMain()
             string id = analysis_ids[i];
             const size_t tab = id.find('\t');
             if (tab != string::npos) id[tab] = ' ';
-            o_evec << id;
-            if (used_dsyevd)
-                for (int j = 0; j < out_pc_num; ++j)
-                    o_evec << " " << raw_evec[(size_t)(out_pc_num - 1 - j) * n + i];
-            else
-                for (int j = 0; j < out_pc_num; ++j) o_evec << " " << evec_t(j, i);
-            o_evec << "\n";
+            buf += id;
+            for (int j = 0; j < out_pc_num; ++j) {
+                buf += ' ';
+                append_double(buf, used_dsyevd ? raw_evec[(size_t)(out_pc_num - 1 - j) * n + i]
+                                                : evec_t(j, i));
+            }
+            buf += '\n';
+            if (buf.size() >= (1 << 21)) { o_evec.write(buf.data(), (std::streamsize)buf.size()); buf.clear(); }
         }
+        o_evec.write(buf.data(), (std::streamsize)buf.size());
         o_evec.close();
         LOGGER.i(0, to_string(n) + " individuals, " + to_string(out_pc_num) +
                     " eigenvectors saved in [" + evec_file + "].");

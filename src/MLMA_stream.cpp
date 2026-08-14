@@ -196,7 +196,7 @@ RemlState readRemlState(const string& filename, bool no_adj_covar)
     return st;
 }
 
-void writeRemlStateFromCtx(const string& filename, const RemlCtx& ctx, bool no_adj_covar)
+void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_covar)
 {
     std::ofstream out(filename, std::ios::binary);
     if (!out.is_open())
@@ -296,16 +296,10 @@ void writeRemlStateFromCtx(const string& filename, const RemlCtx& ctx, bool no_a
         } else {
             if (ctx.Vi.rows() != ctx.n || ctx.Vi.cols() != ctx.n)
                 LOGGER.e(0, "invalid dense REML context dimensions before save.");
-            // ctx.Vi is already the dense inverse (paid O(n³) once inside
-            // calcu_Vi already). One more Cholesky here, ONCE, replaces the
-            // O(n³) LLT that MLMA_stream_common.hpp used to redo on every
-            // association run against a loaded dense Vi.
-            Eigen::LLT<Eigen::MatrixXd> Li(ctx.Vi);
-            if (Li.info() != Eigen::Success)
+            gcta_blas_int blas_n = static_cast<gcta_blas_int>(ctx.n);
+            if (gcta_dpotrf(blas_n, ctx.Vi.data(), blas_n) != 0)
                 LOGGER.e(0, "Vi is not positive definite when factorising for save.");
-            write_lower_triangle(Eigen::MatrixXd(Li.matrixL()));
-            // Li and its transient n×n matrixL() materialisation go out of
-            // scope here, ahead of the b/varcmp writes below.
+            write_lower_triangle(ctx.Vi);
         }
 
         if (!no_adj_covar) {

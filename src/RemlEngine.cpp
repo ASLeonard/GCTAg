@@ -55,6 +55,12 @@ RemlVec woodbury_basis_Kv(const RemlCtx& ctx, const RemlVec& v) {
     return ctx.lambda_tail * v + ctx.Uk * Ukv;
 }
 
+RemlMat woodbury_basis_KZ(const RemlCtx& ctx, const RemlMat& Z) {
+    RemlMat UkZ = ctx.Uk.transpose() * Z;
+    UkZ.array().colwise() *= (ctx.dk.array() - ctx.lambda_tail);
+    return ctx.lambda_tail * Z + ctx.Uk * UkZ;
+}
+
 RemlVec woodbury_basis_Viv(const RemlCtx& ctx, const RemlVec& v) {
     RemlVec Ukv = ctx.Uk.transpose() * v;
     Ukv.array() *= ctx.ck.array();
@@ -187,39 +193,54 @@ void init_varcomp(const RemlCtx& ctx,
     // Single-GRM HE warm-start (applies to both Woodbury and Exact REML when no priors specified)
     if (!ctx.reml_no_HE_start && (int)ctx.r_indx.size() == 2 && priors.empty() && priors_var.empty()) {
         const int n = ctx.n;
-        const double Vy = ctx.y_Ssq;
         double trK = 0.0, trK2 = 0.0;
+        RemlMat KX;
         RemlVec Ky(n);
-         // HE moment identities (E[y'Ky] = sg*tr(K^2) + se*tr(K), E[y'y] = sg*tr(K) + se*n)
-        // assume y is mean-zero. ctx.y is left at its raw file scale everywhere else in
-        // REML (X/Vi_X project the mean out properly there), so center locally here only.
-        const RemlVec y_c = ctx.y.array() - ctx.y.mean();
+
+        // Match REML's fixed-effect projection: for Q = I - X(X'X)^-1X',
+        // solve E[y'QKQy] and E[y'Qy] for the two HE components.
+        const RemlMat XtX = ctx.X.transpose() * ctx.X;
+        Eigen::LDLT<RemlMat> XtX_ldlt(XtX);
+        const int dof = n - ctx.X_c;
+        if (XtX_ldlt.info() != Eigen::Success || dof <= 0) return;
+        const RemlVec y_r = ctx.y - ctx.X * XtX_ldlt.solve(ctx.X.transpose() * ctx.y);
 
         if (ctx.Vi_use_woodbury_basis) {
             const int k = ctx.woodbury_basis_rank_;
             trK  = ctx.dk.sum() + static_cast<double>(n - k) * ctx.lambda_tail;
             trK2 = ctx.dk.squaredNorm()
                  + static_cast<double>(n - k) * (ctx.tail_d_var + ctx.lambda_tail * ctx.lambda_tail);
-            Ky   = woodbury_basis_Kv(ctx, y_c);
+            KX   = woodbury_basis_KZ(ctx, ctx.X);
+            Ky   = woodbury_basis_Kv(ctx, y_r);
         } else if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
             // Full exact GRM K = ctx.A[r_indx[0]]
             const auto& K = ctx.A[ctx.r_indx[0]];
             trK  = K.diagonal().sum();
             trK2 = K.squaredNorm(); // Frobenius norm squared = tr(K^2)
-            Ky   = K * y_c;
+            KX   = K * ctx.X;
+            Ky   = K * y_r;
         }
         if (trK2 > 0.0) {
-            const double yKy   = y_c.dot(Ky);
-            const double yy    = y_c.squaredNorm();
-            const double denom = static_cast<double>(n) * trK2 - trK * trK;
-            double sg_he = (denom > 1e-10)
-                ? (static_cast<double>(n) * yKy - trK * yy) / denom
-                : Vy * 0.5;
-            sg_he = std::max(sg_he, 0.01 * Vy);
-            sg_he = std::min(sg_he, 0.99 * Vy);
-            varcmp(0) = sg_he;
-            varcmp(1) = std::max(Vy - sg_he, 0.01 * Vy);
-            LOGGER << "REML: used single-GRM HE warm-start for variance components = " << varcmp.transpose() << std::endl;
+            const RemlMat XtKX = ctx.X.transpose() * KX;
+            const RemlMat XtK2X = KX.transpose() * KX;
+            const RemlMat B_inv_XtKX = XtX_ldlt.solve(XtKX);
+            const double trQK = trK - B_inv_XtKX.trace();
+            const double trQKQK = trK2 - 2.0 * XtX_ldlt.solve(XtK2X).trace()
+                + (B_inv_XtKX * B_inv_XtKX).trace();
+            const double yKy = y_r.dot(Ky);
+            const double yy = y_r.squaredNorm();
+            const double denom = static_cast<double>(dof) * trQKQK - trQK * trQK;
+            const double scale = yy / static_cast<double>(dof);
+            if (denom > 1e-10 && std::isfinite(scale) && scale > 0.0) {
+                const double sg_he = (static_cast<double>(dof) * yKy - trQK * yy) / denom;
+                const double se_he = (trQKQK * yy - trQK * yKy) / denom;
+                if (std::isfinite(sg_he) && std::isfinite(se_he)
+                    && sg_he <= 100.0 * scale && se_he <= 100.0 * scale) {
+                    varcmp(0) = std::max(sg_he, 0.01 * scale);
+                    varcmp(1) = std::max(se_he, 0.01 * scale);
+                    LOGGER << "REML: used single-GRM HE warm-start for variance components = " << varcmp.transpose() << std::endl;
+                }
+            }
         }
     }
 }
@@ -303,7 +324,7 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
         int rank = 0;
         bool ret = true;
 
-        if (method_try == INV_LLT && !factorize_only) {
+        if (method_try == INV_LLT && (!factorize_only || ctx.reml_force_dense_vi)) {
             gcta_blas_int blas_n_f = static_cast<gcta_blas_int>(ctx.n);
             bool llt_ok = (gcta_dpotrf(blas_n_f, ctx.Vi.data(), blas_n_f) == 0);
             if (llt_ok) {
@@ -311,7 +332,8 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
                 llt_ok = (gcta_dpotri(blas_n_f, ctx.Vi.data(), blas_n_f) == 0);
             }
             if (llt_ok) {
-                ctx.Vi.triangularView<Eigen::Upper>() = ctx.Vi.transpose();
+                if (!factorize_only)
+                    ctx.Vi.triangularView<Eigen::Upper>() = ctx.Vi.transpose();
                 return true;
             }
             // dpotrf/dpotri failed: reassemble for LU fallback
@@ -984,7 +1006,7 @@ double reml_iteration(RemlCtx& ctx,
             prev_varcmp = varcomp_init;
             if (prior_var_flag) {
                 if (ctx.reml_fixed_var)
-                    LOGGER << "Variance components fixed at: " << varcmp.transpose() << std::endl;
+                    LOGGER << "VAR components fixed at: " << varcmp.transpose() << std::endl;
                 else
                     LOGGER << "Prior values of variance components: " << varcmp.transpose() << std::endl;
             } else {
@@ -1249,19 +1271,19 @@ namespace {
 
 static const char* woodbury_mode_name(WoodburyMode mode) {
     switch (mode) {
-        case WoodburyMode::AutoMP:   return "MP-k";
-        case WoodburyMode::EigMass:  return "EIG-k";
-        case WoodburyMode::Variance: return "VAR-k";
+        case WoodburyMode::MP:   return "MP-k";
+        case WoodburyMode::EIG:  return "EIG-k";
+        case WoodburyMode::VAR: return "VAR-k";
         case WoodburyMode::Fixed:    return "fixed-k";
         default:                     return "off";
     }
 }
 
 static bool woodbury_mode_allows_warm_start(WoodburyMode mode) {
-    // AutoMP benefits from warm-starting across rSVD budget expansions.
-    // EigMass and Variance require accurate tail/bulk summation each round,
+    // MP benefits from warm-starting across rSVD budget expansions.
+    // EIG and VAR require accurate tail/bulk summation each round,
     // so fresh probes avoid carrying over warm-start bias.
-    return (mode == WoodburyMode::AutoMP);
+    return (mode == WoodburyMode::MP);
 }
 
 static int woodbury_rank_cap(const RemlCtx& ctx, int k_budget_ceiling) {
@@ -1273,11 +1295,11 @@ static int woodbury_rank_cap(const RemlCtx& ctx, int k_budget_ceiling) {
 static int woodbury_initial_k_svd(const RemlCtx& ctx, WoodburyMode mode, int k_budget_ceiling) {
     const int n = ctx.n;
     switch (mode) {
-        case WoodburyMode::AutoMP:
+        case WoodburyMode::MP:
             return std::min({n - 1, k_budget_ceiling, ctx.woodbury_basis_k_init});
-        case WoodburyMode::EigMass:
+        case WoodburyMode::EIG:
             [[fallthrough]];
-        case WoodburyMode::Variance: {
+        case WoodburyMode::VAR: {
             const int start_guess = std::clamp(n / 20, ctx.woodbury_basis_k_init, ctx.woodbury_basis_k_max > 0 ? ctx.woodbury_basis_k_max : n - 1);
             return std::min({n - 1, k_budget_ceiling, start_guess});
         }
@@ -1308,7 +1330,7 @@ static RankEvalResult evaluate_rank_criterion(
     const int n = ctx.n;
 
     switch (mode) {
-        case WoodburyMode::AutoMP: {
+        case WoodburyMode::MP: {
             int k_signal = 0;
             while (k_signal < static_cast<int>(eval_full.size()) && eval_full[k_signal] > lambda_plus)
                 ++k_signal;
@@ -1328,7 +1350,7 @@ static RankEvalResult evaluate_rank_criterion(
             res.k_extra   = k_signal;
             break;
         }
-        case WoodburyMode::EigMass: {
+        case WoodburyMode::EIG: {
             double cumulative = 0.0;
             bool crossed_target = false;
             res.k_target = k_svd;
@@ -1344,7 +1366,7 @@ static RankEvalResult evaluate_rank_criterion(
                          && (res.k_target + ctx.woodbury_basis_EIG_k_buffer <= k_svd);
             break;
         }
-        case WoodburyMode::Variance: {
+        case WoodburyMode::VAR: {
             bool crossed_target = false;
             res.k_target = k_svd;
             double cum_sum = 0.0;
@@ -1395,7 +1417,7 @@ static int finalize_and_log_woodbury_rank(
     int k = 0;
 
     switch (mode) {
-        case WoodburyMode::AutoMP: {
+        case WoodburyMode::MP: {
             const int k_edge = eval_res.k_target;
             const int k_signal = eval_res.k_extra;
             k = std::max(20, std::min(k_svd, k_edge));
@@ -1417,7 +1439,7 @@ static int finalize_and_log_woodbury_rank(
                 LOGGER.w(0, "Woodbury MP-k: edge band not confirmed within k_max=" + std::to_string(k_svd) + "; clamped to k_max.");
             break;
         }
-        case WoodburyMode::EigMass: {
+        case WoodburyMode::EIG: {
             const int k_EIGMASS = eval_res.k_target;
             k = std::max(20, std::min(k_svd, k_EIGMASS + ctx.woodbury_basis_EIG_k_buffer));
             double cumulative = 0.0;
@@ -1437,7 +1459,7 @@ static int finalize_and_log_woodbury_rank(
                 LOGGER.w(0, "Woodbury EIG-k: mass target not reached within k=" + std::to_string(k_svd) + ".");
             break;
         }
-        case WoodburyMode::Variance: {
+        case WoodburyMode::VAR: {
             const int k_VAR = eval_res.k_target;
             k = std::max(20, std::min(k_svd, k_VAR));
             double cum_sum = 0.0;
@@ -1475,6 +1497,19 @@ static int finalize_and_log_woodbury_rank(
             break;
     }
     return k;
+}
+
+// Exact lower bound on additional eigenvalues needed to reach target_mass,
+// derived from eval_full being non-increasing (a property of eigenvalues,
+// not a fitted assumption). Every undiscovered eigenvalue is <= lambda_k,
+// so no k below this bound can possibly satisfy the EigMass criterion.
+static int eigmass_min_k_next(const Eigen::VectorXd& eval_full, int k_svd, double S1_k, double target_mass) {
+    const double lambda_k = eval_full[k_svd - 1];
+    if (!(lambda_k > 0.0)) return k_svd;  // degenerate: no positive tail mass left to exploit
+    const double mass_to_remove = target_mass - S1_k;
+    if (!(mass_to_remove > 0.0)) return k_svd;  // already satisfied or overshot; shouldn't reach here
+    const int m_needed = static_cast<int>(std::ceil(mass_to_remove / lambda_k));
+    return k_svd + std::max(1, m_needed);
 }
 
 } // anonymous namespace
@@ -1575,7 +1610,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     }
 
     double lambda_plus = 0.0;
-    if (mode == WoodburyMode::AutoMP) {
+    if (mode == WoodburyMode::MP) {
         double M = 0.0;
         if (ctx.grm_N.rows() == n && ctx.grm_N.cols() == n) {
             if (svd_chunked)
@@ -1591,7 +1626,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
         const double gamma = static_cast<double>(n) / M;
         lambda_plus = std::pow(1.0 + std::sqrt(gamma), 2.0);
     }
-    const double target_mass = (mode == WoodburyMode::EigMass) ? (ctx.woodbury_basis_eigen_mass * trace_K_full) : 0.0;
+    const double target_mass = (mode == WoodburyMode::EIG) ? (ctx.woodbury_basis_eigen_mass * trace_K_full) : 0.0;
     const bool allows_warm = woodbury_mode_allows_warm_start(mode);
 
     auto apply = [&](const auto& X) -> Eigen::MatrixXd {
@@ -1613,7 +1648,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                 gcta_eigh::EighResult res = gcta_eigh::nystrom_symmetric_eigh(
                     apply, n, k_svd,
                     gcta_eigh::recommended_oversample(k_svd));
-                if (mode == WoodburyMode::EigMass) {
+                if (mode == WoodburyMode::EIG) {
                     LOGGER << "Woodbury EIG-k: refining Nystrom basis with one Rayleigh-Ritz projection ..."
                            << std::endl;
                     res = gcta_eigh::rayleigh_ritz_refine(apply, std::move(res.eigenvectors), k_svd);
@@ -1652,7 +1687,13 @@ void compute_woodbury_basis(RemlCtx& ctx) {
 
         if (eval_res.satisfied || k_svd >= k_svd_cap || k_svd >= n / 2 || k_svd >= k_svd_budget_ceiling) break;
 
-        const int k_svd_next = std::min({k_svd * 2, n - 1, k_svd_cap});
+        int k_svd_next = std::min({k_svd * 2, n - 1, k_svd_cap});
+        if (mode == WoodburyMode::EIG && ctx.woodbury_basis_eigen_adaptive) {
+            int k_svd_jump = eigmass_min_k_next(eval_full, k_svd, eval_full.head(k_svd).sum(), target_mass);
+            k_svd_next = std::min(std::max(k_svd_jump, k_svd_next), k_svd_cap);
+            LOGGER.i(0, "Woodbury EIG-k: adaptive jump from k=" + std::to_string(k_svd) + " to k=" + std::to_string(k_svd_jump)
+                        + " (bounded by " + std::to_string(k_svd_next) + ") to reach target mass (" + std::to_string(ctx.woodbury_basis_eigen_mass * 100.0) + "%).");
+        }
         const char* warm_status = ctx.svd_nystrom ? " (Nystrom: no warm start, full recompute)"
                                  : !allows_warm              ? " (no warm start, fresh probe)"
                                                              : " (warm-started)";

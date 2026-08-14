@@ -15,6 +15,7 @@
 #include <cmath>
 #include "main/StatFunc.h"
 #include "cpu.h"
+#include "cpu.h"
 
 // ---------------------------------------------------------------------------
 // WoodburyMLMACache

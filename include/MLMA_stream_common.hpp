@@ -53,14 +53,14 @@ inline Eigen::MatrixXd compact_sample_rows(const Eigen::MatrixXd& values,
 }
 
 // Resolve the streaming block width (SNPs per tile) from a memory budget.
-// Two buffers dominate, both O(n * block):
-//   - GenoBufItem::geno : n doubles/SNP (8 bytes) — the raw genotype call
-//                         buffer Geno::getGenoDouble hands back per SNP,
-//                         resident for every SNP currently in flight.
-//   - X_block           : n floats/SNP  (4 bytes) — the centered, weighted
-//                         float design block actually consumed by BLAS.
+// The dominant O(n * block) allocation is now a single buffer:
+//   - X_block : n floats/SNP (4 bytes) — the centered, weighted float design
+//               block consumed by BLAS.  Written directly by getGenoFloat
+//               (BED: GenoarrLookup256x4bx4; PGEN/BGEN: cast from double).
+// The old GenoBufItem::geno double[] intermediate is no longer allocated on
+// the MLMA hot path.
 // Per-SNP scalars (Xt_Vi_y, xvx_diag, af_v, valid_v) are O(1) per column
-// and negligible next to the O(n) terms above.
+// and negligible next to the O(n) term above.
 // budget_gb <= 0 preserves the previous fixed BLOCK=10000 behavior exactly
 inline int resolve_mlma_block_size(int n, double budget_gb)
 {
@@ -101,9 +101,9 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
     int  snp_done = 0;
     int  last_pct = -1;
 
-    std::vector<GenoBufItem> gbuf_items(BLOCK);
-    std::vector<uint8_t>     valid_v(BLOCK, 0);
-    std::vector<float>       af_v(BLOCK, 0.0f);
+    std::vector<uint8_t> valid_v(BLOCK, 0);
+    std::vector<float>   af_v(BLOCK, 0.0f);
+    std::vector<float>   additive_af_v(BLOCK, 0.0f);
 
     std::string io_buf;
     io_buf.reserve(4 << 20);
@@ -118,22 +118,23 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
     auto callback = [&](uintptr_t* buf, std::span<const uint32_t> exIdx) {
         const int bs = static_cast<int>(exIdx.size());
 
+        // Decode genotypes directly into X_block columns as float.
+        // For BED format this uses GenoarrLookup256x4bx4 (SIMD, 4 KB L1 table).
+        // For PGEN/BGEN it decodes via the double path then casts.
+        #pragma omp parallel for schedule(dynamic, 16)
         for (int i = 0; i < bs; ++i) {
-            valid_v[i] = 0;
-            af_v[i]    = 0.0f;
-            GenoBufItem& item = gbuf_items[i];
-            item.extractedMarkerIndex = exIdx[i];
-            geno->getGenoDouble(buf, i, &item);
-            if (!item.valid) { X_block.col(i).setZero(); continue; }
-            if (static_cast<int>(item.geno.size()) != n) {
-                LOGGER.e(0, "internal error: SNP " + std::to_string(exIdx[i])
-                            + " returned geno.size=" + std::to_string(item.geno.size())
-                            + " but expected " + std::to_string(n) + ".");
+            bool valid = false;
+            float af = 0.0f, add_af = 0.0f;
+            geno->getGenoFloat(buf, i, X_block.col(i).data(),
+                               af, add_af, valid, exIdx[i]);
+            if (valid) {
+                X_block.col(i).array() *= w_sqrt.array();
+            } else {
+                X_block.col(i).setZero();
             }
-            valid_v[i] = 1;
-            af_v[i]    = static_cast<float>(item.additive_af);
-            X_block.col(i) = (Eigen::Map<const Eigen::VectorXd>(item.geno.data(), n)
-                                .cast<float>().array() * w_sqrt.array()).matrix();
+            valid_v[i]       = static_cast<uint8_t>(valid);
+            af_v[i]          = af;
+            additive_af_v[i] = add_af;
         }
 
         Xt_Vi_y.head(bs).noalias() = X_block.leftCols(bs).transpose() * Vi_y;
@@ -157,15 +158,22 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
                 std::format_to(std::back_inserter(io_buf),
                     "{}\t{}\t{}\t{}\t{}\tNA\tNA\tNA\tNA\n",
                     chr, name, bp, a1, a2);
+                std::format_to(std::back_inserter(io_buf),
+                    "{}\t{}\t{}\t{}\t{}\tNA\tNA\tNA\tNA\n",
+                    chr, name, bp, a1, a2);
             } else {
                 std::format_to(std::back_inserter(io_buf),
                     "{}\t{}\t{}\t{}\t{}\t{:.6g}\t{:.6g}\t{:.6g}\t{:.6g}\n",
                     chr, name, bp, a1, a2,
-                    static_cast<double>(af_v[i]),
+                    static_cast<double>(additive_af_v[i]),
                     static_cast<double>(beta_val),
                     static_cast<double>(se_val),
                     pval_val);
             }
+        }
+
+        if (io_buf.size() >= (4 << 20)) {
+            flush_io();
         }
 
         if (io_buf.size() >= (4 << 20)) {
@@ -193,6 +201,7 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
     flush_io();
 }
 
+// The "--save-reml and --load-reml" path
 inline void run_mlma_stream_association(RemlState& state,
                                         const Eigen::VectorXf& y_adj,
                                         const Eigen::VectorXf& w_sqrt,
@@ -270,6 +279,31 @@ inline void run_mlma_stream_association(RemlState& state,
                                      log_pval, ofile);
 }
 
+inline void release_reml_ctx_after_state_build(RemlCtx& ctx) {
+    // Once the compact float-only RemlState is built, the large double-precision
+    // REML workspace is no longer required for the association step. Releasing it
+    // here cuts the RSS peak substantially without changing the downstream
+    // arithmetic, because all streaming work already reads from the float state.
+    ctx.A.clear();
+    ctx.grm_N.resize(0, 0);
+    ctx.Vi.resize(0, 0);
+    ctx.Vi_L.resize(0, 0);
+    ctx.Vi_X.resize(0, 0);
+    ctx.Xt_Vi_X_i.resize(0, 0);
+    ctx.Uk_Vi_X.resize(0, 0);
+    ctx.UkTX.resize(0, 0);
+    ctx.UkTy.resize(0, 0);
+    ctx.hutchpp_S.resize(0, 0);
+    ctx.hutchpp_G.resize(0, 0);
+    ctx.P.resize(0, 0);
+    ctx.Uk.resize(0, 0);
+    ctx.dk.resize(0);
+    ctx.ck.resize(0);
+    ctx.Vi_use_woodbury_basis = false;
+    ctx.Vi_use_llt = false;
+}
+
+//The "inline REML" path
 inline void run_mlma_stream_association(RemlCtx& ctx,
                                         const Eigen::VectorXf& y_adj,
                                         const Eigen::VectorXf& w_sqrt,
@@ -281,6 +315,7 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
                                         double block_mem_budget_gb = 0.0)
 {
     RemlState state = reml::build_reml_state(ctx);
+    release_reml_ctx_after_state_build(ctx);
     run_mlma_stream_association(state, y_adj, w_sqrt, geno, marker, n, log_pval, ofile,
                                 block_mem_budget_gb);
 }

@@ -1009,7 +1009,7 @@ double reml_iteration(RemlCtx& ctx,
                     LOGGER << "VAR components fixed at: " << varcmp.transpose() << std::endl;
                 else
                     LOGGER << "Prior values of variance components: " << varcmp.transpose() << std::endl;
-            } else {
+            } else if(ctx.reml_no_HE_start) {
                 ctx.reml_mtd = 2;
                 LOGGER << "Calculating prior values of variance components by EM-REML ..." << std::endl;
             }
@@ -1841,27 +1841,44 @@ RemlState build_reml_state(const RemlCtx& ctx) {
     rs.x_c         = static_cast<int32_t>(ctx.X_c);
     rs.is_woodbury = ctx.Vi_use_woodbury_basis;
 
-    // Fixed-effects vector (double → float)
-    rs.b = ctx.b.cast<float>();
-    rs.varcmp = Eigen::Map<const Eigen::VectorXd>(ctx.varcmp.data(),
-                                                  static_cast<Eigen::Index>(ctx.varcmp.size()))
-                    .cast<float>();
+    // Design goal: keep the compact float-only RemlState as the final resident
+    // store, and avoid holding a second full-size double buffer alive longer than
+    // necessary. A true swap/move is impossible across Eigen's different scalar
+    // types (MatrixXd vs MatrixXf), so the conversion must happen once while
+    // filling the final float storage directly.
+    rs.b.resize(ctx.b.size());
+    rs.b.noalias() = ctx.b.cast<float>();
+
+    rs.varcmp.resize(static_cast<Eigen::Index>(ctx.varcmp.size()));
+    rs.varcmp.noalias() = Eigen::Map<const Eigen::VectorXd>(ctx.varcmp.data(),
+                                                            static_cast<Eigen::Index>(ctx.varcmp.size()))
+                            .cast<float>();
 
     if (ctx.Vi_use_woodbury_basis) {
         // WoodburyMLMACache stores Uk_f as k×n (transposed) for GEMM efficiency.
         // ctx.Uk is n×k — transpose before storing.
-        rs.wb.Uk_f         = ctx.Uk.transpose().cast<float>();  // k×n
-        rs.wb.ck_f         = ctx.ck.cast<float>();
-        rs.wb.sqrt_ck_f    = rs.wb.ck_f.cwiseSqrt();
+        rs.wb.Uk_f.resize(ctx.Uk.cols(), ctx.Uk.rows());
+        rs.wb.Uk_f.noalias() = ctx.Uk.transpose().cast<float>();  // k×n
+
+        rs.wb.ck_f.resize(ctx.ck.size());
+        rs.wb.ck_f.noalias() = ctx.ck.cast<float>();
+
+        rs.wb.sqrt_ck_f.resize(rs.wb.ck_f.size());
+        rs.wb.sqrt_ck_f.noalias() = rs.wb.ck_f.cwiseSqrt();
+
         rs.wb.sigma2_eff_f = static_cast<float>(ctx.sigma2_eff);
-        rs.dk_f            = ctx.dk.cast<float>();
-        rs.lambda_tail_f   = static_cast<float>(ctx.lambda_tail);
+
+        rs.dk_f.resize(ctx.dk.size());
+        rs.dk_f.noalias() = ctx.dk.cast<float>();
+
+        rs.lambda_tail_f = static_cast<float>(ctx.lambda_tail);
     } else if (ctx.Vi_use_llt) {
         // Vi_L holds the lower Cholesky factor L of V (from dpotrf).
         // Store it as float — the streaming code uses STRSV/STRSM directly,
         // avoiding dpotri (O(n³/3)) and a second Cholesky of V^{-1} (O(n³/3)).
         rs.is_llt = true;
-        rs.Vi_L_f = ctx.Vi_L.cast<float>();   // n×n float, ~n²/2 significant bytes
+        rs.Vi_L_f.resize(ctx.Vi_L.rows(), ctx.Vi_L.cols());
+        rs.Vi_L_f.noalias() = ctx.Vi_L.cast<float>();   // n×n float, ~n²/2 significant bytes
     } else {
         // reml_diagV_adj fallback: ctx.Vi is already the dense explicit
         // V^{-1} (computed once, O(n³), inside calcu_Vi). Factor it here —
@@ -1872,7 +1889,9 @@ RemlState build_reml_state(const RemlCtx& ctx) {
         if (Li.info() != Eigen::Success)
             LOGGER.e(0, "Vi is not positive definite when building REML state.");
         rs.is_llt = false;
-        rs.Vi_L_f = RemlMat(Li.matrixL()).cast<float>();
+        const RemlMat& L = Li.matrixL();
+        rs.Vi_L_f.resize(L.rows(), L.cols());
+        rs.Vi_L_f.noalias() = L.cast<float>();
     }
     return rs;
 }

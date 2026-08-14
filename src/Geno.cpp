@@ -181,6 +181,10 @@ Geno::Geno(Pheno* pheno, Marker* marker) {
     else if (genoFormat == "BGEN") getGenoDoubleFunc = &Geno::getGenoDouble_bgen;
     else LOGGER.e(0, "Geno: unknown genoFormat '" + genoFormat + "' — cannot resolve getGenoDouble.");
 
+    if      (genoFormat == "BED")  getGenoFloatFunc = &Geno::getGenoFloat_bed;
+    else if (genoFormat == "PGEN") getGenoFloatFunc = &Geno::getGenoFloat_pgen;
+    else if (genoFormat == "BGEN") getGenoFloatFunc = &Geno::getGenoFloat_bgen;
+
     string alleleFileName = "";
     if(options.find("update_freq_file") != options.end()){
         alleleFileName = options["update_freq_file"];
@@ -450,6 +454,143 @@ void Geno::setGenoItemSize(uint32_t &genoSize, uint32_t &missSize){
 void Geno::getGenoDouble(uintptr_t *buf, int bufIndex, GenoBufItem* gbuf){
     (this->*getGenoDoubleFunc)(buf, bufIndex, gbuf);
 }
+
+// ---------------------------------------------------------------------------
+// Float-native genotype decode
+// ---------------------------------------------------------------------------
+
+// buildCodingSpecF32: identical logic to buildCodingSpec but stores float.
+// All arithmetic is done in double so the rounding matches exactly.
+Geno::GenoCodingSpecF32 Geno::buildCodingSpecF32(double mu, double sd) const {
+    const GenoCodingSpec spec = buildCodingSpec(mu, sd);
+    GenoCodingSpecF32 f;
+    f.a0 = static_cast<float>(spec.a0);
+    f.a1 = static_cast<float>(spec.a1);
+    f.a2 = static_cast<float>(spec.a2);
+    f.na = static_cast<float>(spec.na);
+    return f;
+}
+
+// getGenoFloat dispatch (analogous to getGenoDouble)
+void Geno::getGenoFloat(uintptr_t *buf, int bufIndex, float *dest,
+                        float &af_out, float &additive_af_out,
+                        bool &valid_out, uint32_t extractedMarkerIndex) {
+    (this->*getGenoFloatFunc)(buf, bufIndex, dest, af_out, additive_af_out,
+                              valid_out, extractedMarkerIndex);
+}
+
+// BED path: 256×4 float lookup table decoded by GenoarrLookup256x4bx4.
+// The 256-entry table (256 * 4 * 4 B = 4 KB) fits entirely in L1D.
+void Geno::getGenoFloat_bed(uintptr_t *buf, int idx, float *dest,
+                             float &af_out, float &additive_af_out,
+                             bool &valid_out, uint32_t extractedMarkerIndex) {
+    valid_out = false;
+
+    SNPInfo snpinfo;
+    uintptr_t *cur_buf = buf + idx * bedRawGenoBuf1PtrSize;
+    uint8_t sexChromType = markerSexChromTypes[curBufferIndex];
+    bool hasNoHET = true;
+    if (sexChromType != 1) {
+        PgenReader::CountHardFreqMissExt(cur_buf, keepMaskInterPtr, rawSampleCT, keepSampleCT, &snpinfo, f_std);
+    } else {
+        string errmsg;
+        hasNoHET = PgenReader::CountHardFreqMissExtX(cur_buf, keepMaskInterPtr, heterogameticMaskInterPtr,
+                                                     rawSampleCT, keepSampleCT, keepHeterogameticSampleCT,
+                                                     &snpinfo, errmsg, iDC == 1, f_std);
+    }
+
+    double af = snpinfo.af;
+    if (bHasPreAF) {
+        af = AFA1[extractedMarkerIndex];
+        snpinfo.mean = 2 * af;
+        snpinfo.std  = 2 * af * (1.0 - af);
+    }
+    double maf = std::min(af, 1.0 - af);
+    if (maf < min_maf || maf > max_maf) return;
+    if (snpinfo.nMissRate < dFilterMiss) return;
+
+    double mu;
+    if (bGRM) {
+        mu = 2.0 * af;
+    } else {
+        mu = snpinfo.mean;
+    }
+    double sd = f_std ? snpinfo.std : mu * (1.0 - af);
+    if (sd < 1.0e-50) return;
+
+    af_out          = static_cast<float>(af);
+    additive_af_out = static_cast<float>(af);
+    valid_out       = true;
+
+    // Build 256×4 float lookup (QUAD_TABLE256 expands to 1024 floats = 4 KB).
+    const GenoCodingSpecF32 spec = buildCodingSpecF32(mu, sd);
+    const float gtable256x4[1024] __attribute__((aligned(16))) =
+        QUAD_TABLE256(spec.a0, spec.a1, spec.a2, spec.na);
+
+    PgenReader::ExtractFloatExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT,
+                                 gtable256x4, dest, /*missOut=*/nullptr);
+
+    if (sexChromType == 1) {
+        double weight;
+        bool needWeight;
+        setHeterogameticWeight(weight, needWeight);
+        if (needWeight) {
+            const float fw = static_cast<float>(weight);
+            if (bGRM) {
+                for (int i = 0; i < keepHeterogameticSampleCT; ++i)
+                    dest[keepHeterogameticExtractIndex[i]] *= fw;
+            } else {
+                // Correct centering under heterogametic weight:
+                //   recoded' = recoded * w + (w-1) * rdev * centerValue
+                // Both rdev and centerValue are embedded in spec already, but
+                // spec.{a0,a1,a2,na} are already (raw - center)*rdev.
+                // We need correctWeight = (w-1) * centerValue * rdev.
+                // Recompute via buildCodingSpec to avoid storing center+rdev in F32.
+                const GenoCodingSpec dspec = buildCodingSpec(mu, sd);
+                const float correctWeight = static_cast<float>((weight - 1.0) * dspec.centerValue * dspec.rdev);
+                for (int i = 0; i < keepHeterogameticSampleCT; ++i) {
+                    uint32_t ci = keepHeterogameticExtractIndex[i];
+                    dest[ci] *= fw;
+                    dest[ci] += correctWeight;
+                }
+            }
+        }
+    }
+}
+
+// PGEN path: reuse frequency/filter logic from getGenoDouble_pgen, then cast.
+void Geno::getGenoFloat_pgen(uintptr_t *buf, int idx, float *dest,
+                              float &af_out, float &additive_af_out,
+                              bool &valid_out, uint32_t extractedMarkerIndex) {
+    valid_out = false;
+    // Decode via the existing double path into a temporary GenoBufItem.
+    GenoBufItem tmp;
+    tmp.extractedMarkerIndex = extractedMarkerIndex;
+    getGenoDouble_pgen(buf, idx, &tmp);
+    if (!tmp.valid) return;
+    valid_out       = true;
+    af_out          = static_cast<float>(tmp.af);
+    additive_af_out = static_cast<float>(tmp.additive_af);
+    for (uint32_t j = 0; j < keepSampleCT; ++j)
+        dest[j] = static_cast<float>(tmp.geno[j]);
+}
+
+// BGEN path: same strategy as PGEN — delegate to the double path, then cast.
+void Geno::getGenoFloat_bgen(uintptr_t *buf, int idx, float *dest,
+                              float &af_out, float &additive_af_out,
+                              bool &valid_out, uint32_t extractedMarkerIndex) {
+    valid_out = false;
+    GenoBufItem tmp;
+    tmp.extractedMarkerIndex = extractedMarkerIndex;
+    getGenoDouble_bgen(buf, idx, &tmp);
+    if (!tmp.valid) return;
+    valid_out       = true;
+    af_out          = static_cast<float>(tmp.af);
+    additive_af_out = static_cast<float>(tmp.additive_af);
+    for (uint32_t j = 0; j < static_cast<uint32_t>(tmp.geno.size()); ++j)
+        dest[j] = static_cast<float>(tmp.geno[j]);
+}
+
 
 void Geno::setHeterogameticWeight(double &weight, bool &needWeight){
     weight = 1.0;

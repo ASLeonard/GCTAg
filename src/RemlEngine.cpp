@@ -1773,8 +1773,12 @@ void compute(RemlCtx& ctx,
            << ctx.r_indx.size() << " variance component(s) (including residual)." << std::endl;
 
     // Woodbury basis (must be done before init_varcomp for HE warm-start)
-    if (ctx.woodbury_basis_rank != 0)
+    if (ctx.woodbury_basis_rank != 0) {
+        LOGGER.ts("woodbury");
         compute_woodbury_basis(ctx);
+        float duration = LOGGER.tp("main");
+        LOGGER.i(0, "Woodbury basis computation took " + std::to_string(duration) + " seconds.");
+    }
 
     RemlMat Vi_X_out(ctx.n, ctx.X_c), Xt_Vi_X_i_out(ctx.X_c, ctx.X_c);
     RemlMat Hi(ctx.r_indx.size(), ctx.r_indx.size());

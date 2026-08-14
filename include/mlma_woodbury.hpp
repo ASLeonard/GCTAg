@@ -15,6 +15,7 @@
 #include <cmath>
 #include "main/StatFunc.h"
 #include "cpu.h"
+#include "cpu.h"
 
 // ---------------------------------------------------------------------------
 // WoodburyMLMACache
@@ -63,7 +64,8 @@ inline Eigen::MatrixXf woodbury_apply_Vi_mat_f(const WoodburyMLMACache& wb,
 // ---------------------------------------------------------------------------
 inline void woodbury_xvx_diag_block(const WoodburyMLMACache& wb,
                                      const Eigen::MatrixXf& X_block, Eigen::Index bs,
-                                     Eigen::VectorXf& xvx_diag, Eigen::MatrixXf& UkX_scratch)
+                                     Eigen::VectorXf& xvx_diag,
+                                     Eigen::MatrixXf& UkX_scratch)
 {
     const int k = static_cast<int>(wb.Uk_f.rows());
     const int n = static_cast<int>(wb.Uk_f.cols());
@@ -75,10 +77,9 @@ inline void woodbury_xvx_diag_block(const WoodburyMLMACache& wb,
                 1.0f, wb.Uk_f.data(), k,
                 X_block.data(), n,
                 0.0f, UkX_scratch.data(), k);
+
     auto UkX = UkX_scratch.leftCols(bs);
-
     UkX.array().colwise() *= wb.sqrt_ck_f.array();
-
 
     #pragma omp parallel for schedule(static)
     for (int j = 0; j < bs_int; ++j) {
@@ -88,6 +89,7 @@ inline void woodbury_xvx_diag_block(const WoodburyMLMACache& wb,
         xvx_diag[j] = std::max(0.0f, val);
     }
 }
+
 inline void woodbury_xvx_diag_block(const WoodburyMLMACache& wb,
                                      const Eigen::MatrixXf& X_block, Eigen::Index bs,
                                      Eigen::VectorXf& xvx_diag)

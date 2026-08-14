@@ -3,8 +3,7 @@
 #include "Geno.h"
 #include "Marker.h"
 #include "Logger.h"
-#include "RemlState.hpp"
-#include "RemlCtx.hpp"
+#include "RemlEngine.hpp"
 #include "cpu.h"
 #include "mlma_woodbury.hpp"
 
@@ -69,9 +68,8 @@ inline int resolve_mlma_block_size(int n, double budget_gb)
         return 10000; // Somewhat arbitrary, but balance of peak RSS and throughout. Increasing may help STRSM efficiency but increases memory.
 
     constexpr double bytes_per_snp_per_sample =
-        static_cast<double>(sizeof(float)) /* X_block */;
-    //  static_cast<double>(sizeof(typename decltype(GenoBufItem::geno)::value_type)) /* GenoBufItem::geno */
-    //  + static_cast<double>(sizeof(float)) /* X_block */;
+        static_cast<double>(sizeof(typename decltype(GenoBufItem::geno)::value_type)) /* GenoBufItem::geno */
+        + static_cast<double>(sizeof(float)) /* X_block */;
     constexpr int    min_block = 256;    // floor: keep BLAS3 tiles meaningful
     constexpr int    max_block = 65536;  // ceiling: cap per-column scalar creep
 
@@ -156,11 +154,10 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
                 mlma_snp_stat(Xt_Vi_y[i], xvx_diag[i], log_pval,
                               beta_val, se_val, pval_val);
 
-            std::format_to(std::back_inserter(io_buf),
-                "{}\t{}\t{}\t{}\t{}",
-                chr, name, bp, a1, a2);
-
             if (!stat_ok) {
+                std::format_to(std::back_inserter(io_buf),
+                    "{}\t{}\t{}\t{}\t{}\tNA\tNA\tNA\tNA\n",
+                    chr, name, bp, a1, a2);
                 std::format_to(std::back_inserter(io_buf),
                     "{}\t{}\t{}\t{}\t{}\tNA\tNA\tNA\tNA\n",
                     chr, name, bp, a1, a2);
@@ -178,6 +175,11 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
         if (io_buf.size() >= (4 << 20)) {
             flush_io();
         }
+
+        if (io_buf.size() >= (4 << 20)) {
+            flush_io();
+        }
+
         snp_done += bs;
         const int cur_pct = (total_m > 0)
             ? static_cast<int>((uint64_t)snp_done * 100 / total_m) : 100;
@@ -288,73 +290,7 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
                                         std::ofstream& ofile,
                                         double block_mem_budget_gb = 0.0)
 {
-    Eigen::VectorXf Vi_y(n);
-    const float sigma2_eff_f = static_cast<float>(ctx.sigma2_eff);
-
-    if (ctx.Vi_use_woodbury_basis) {
-        const Eigen::MatrixXf Uk_f = ctx.Uk.cast<float>();
-        const Eigen::VectorXf ck_f = ctx.ck.cast<float>();
-        Eigen::VectorXf UkTy = Uk_f.transpose() * y_adj;
-        UkTy.array() *= ck_f.array();
-        Vi_y = ((y_adj - Uk_f * UkTy) / sigma2_eff_f);
-    } else if (ctx.Vi_use_llt) {
-        const Eigen::MatrixXf Vi_L_f = ctx.Vi_L.cast<float>();
-        Eigen::VectorXf y_f = y_adj;
-        cblas_strsv(CblasColMajor, CblasLower, CblasNoTrans, CblasNonUnit,
-                    n, Vi_L_f.data(), n, y_f.data(), 1);
-        cblas_strsv(CblasColMajor, CblasLower, CblasTrans, CblasNonUnit,
-                    n, Vi_L_f.data(), n, y_f.data(), 1);
-        Vi_y = y_f;
-    } else {
-        Eigen::MatrixXf Vi_f = ctx.Vi.cast<float>();
-        Eigen::LLT<Eigen::MatrixXf> llt(Vi_f);
-        if (llt.info() != Eigen::Success)
-            LOGGER.e(0, "inline REML V^{-1} is not positive definite for MLMA streaming.");
-        const Eigen::MatrixXf L = llt.matrixL();
-        Eigen::VectorXf tmp = L.transpose() * y_adj;
-        Vi_y = L * tmp;
-    }
-
-    Vi_y.array() *= w_sqrt.array();
-
-    auto compute_xvx_diag = [&](Eigen::MatrixXf& X_block, int bs, Eigen::VectorXf& xvx_diag) {
-        if (ctx.Vi_use_woodbury_basis) {
-            const Eigen::MatrixXf Uk_f = ctx.Uk.cast<float>();
-            const Eigen::VectorXf ck_f = ctx.ck.cast<float>();
-            const Eigen::MatrixXf X_f = X_block.leftCols(bs);
-            const Eigen::MatrixXf UkX = Uk_f.transpose() * X_f;
-            const Eigen::VectorXf x_norm = X_f.colwise().squaredNorm().transpose();
-            const Eigen::VectorXf correction =
-                (UkX.array().square().colwise() * ck_f.array()).colwise().sum().transpose();
-            xvx_diag.head(bs) = ((x_norm.array() - correction.array()) / sigma2_eff_f);
-        } else if (ctx.Vi_use_llt) {
-            Eigen::MatrixXf X_f = X_block.leftCols(bs);
-            const Eigen::MatrixXf Vi_L_f = ctx.Vi_L.cast<float>();
-            cblas_strsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasNonUnit,
-                        n, bs, 1.0f,
-                        Vi_L_f.data(), n,
-                        X_f.data(), n);
-            #pragma omp parallel for schedule(static)
-            for (int j = 0; j < bs; ++j) {
-                xvx_diag[j] = X_f.col(j).squaredNorm();
-            }
-        } else {
-            Eigen::MatrixXf X_f = X_block.leftCols(bs);
-            Eigen::MatrixXf Vi_f = ctx.Vi.cast<float>();
-            Eigen::LLT<Eigen::MatrixXf> llt(Vi_f);
-            if (llt.info() != Eigen::Success)
-                LOGGER.e(0, "inline REML V^{-1} is not positive definite for MLMA streaming.");
-            const Eigen::MatrixXf L = llt.matrixL();
-            X_f = L.transpose() * X_f;
-            #pragma omp parallel for schedule(static)
-            for (int j = 0; j < bs; ++j) {
-                xvx_diag[j] = X_f.col(j).squaredNorm();
-            }
-        }
-    };
-
-    run_mlma_stream_association_impl(Vi_y, compute_xvx_diag, w_sqrt,
-                                     geno, marker, n,
-                                     resolve_mlma_block_size(n, block_mem_budget_gb),
-                                     log_pval, ofile);
+    RemlState state = reml::build_reml_state(ctx);
+    run_mlma_stream_association(state, y_adj, w_sqrt, geno, marker, n, log_pval, ofile,
+                                block_mem_budget_gb);
 }

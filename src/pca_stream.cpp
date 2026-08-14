@@ -308,10 +308,6 @@ void PCAStream::processMain()
                 if (pca_nystrom)
                     LOGGER.w(0, "--svd-method is ignored in exact mode (it only applies to --pca-approx rSVD).");
 
-                if (out_pc_num == n && n >= 32766)
-                    LOGGER.w(0, "n = " + std::to_string(n) + " may exceed dsyevd's safe workspace limit "
-                                "(n >= 32766). Consider --pca-approx for large GRMs.");
-
                 double* grm_ptr = G_dense.data();
                 if (out_pc_num == n) {
                     Eigen::VectorXd w(n);

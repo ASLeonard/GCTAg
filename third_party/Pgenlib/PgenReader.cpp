@@ -627,6 +627,22 @@ void PgenReader::ExtractDoubleExt(uintptr_t *in, const uintptr_t *subsets, uint3
     }
 }
 
+void PgenReader::ExtractFloatExt(uintptr_t *in, const uintptr_t *subsets, uint32_t rawSampleSize, uint32_t keepSize, const float *gtable, float *gOut, uintptr_t *missOut){
+    uintptr_t *bufptr = nullptr;
+    std::vector<uintptr_t> tmpbuf;
+    if(rawSampleSize == keepSize){
+        bufptr = in;
+    }else{
+        tmpbuf.resize(GetGenoBufPtrSize(keepSize));
+        bufptr = tmpbuf.data();
+        ExtractGenoExt(in, subsets, rawSampleSize, keepSize, bufptr);
+    }
+    plink2::GenoarrLookup256x4bx4(bufptr, gtable, keepSize, gOut);
+    if(missOut != nullptr){
+        plink2::GenoarrToMissingnessUnsafe(bufptr, keepSize, missOut);
+    }
+}
+
 
 
 void PgenReader::ReadHardcalls(vector<double> &buf, int variant_idx, int allele_idx) {

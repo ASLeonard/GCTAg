@@ -54,22 +54,24 @@ inline Eigen::MatrixXd compact_sample_rows(const Eigen::MatrixXd& values,
 }
 
 // Resolve the streaming block width (SNPs per tile) from a memory budget.
-// Two buffers dominate, both O(n * block):
-//   - GenoBufItem::geno : n doubles/SNP (8 bytes) — the raw genotype call
-//                         buffer Geno::getGenoDouble hands back per SNP,
-//                         resident for every SNP currently in flight.
-//   - X_block           : n floats/SNP  (4 bytes) — the centered, weighted
-//                         float design block actually consumed by BLAS.
+// The dominant O(n * block) allocation is now a single buffer:
+//   - X_block : n floats/SNP (4 bytes) — the centered, weighted float design
+//               block consumed by BLAS.  Written directly by getGenoFloat
+//               (BED: GenoarrLookup256x4bx4; PGEN/BGEN: cast from double).
+// The old GenoBufItem::geno double[] intermediate is no longer allocated on
+// the MLMA hot path.
 // Per-SNP scalars (Xt_Vi_y, xvx_diag, af_v, valid_v) are O(1) per column
-// and negligible next to the O(n) terms above.
+// and negligible next to the O(n) term above.
 // budget_gb <= 0 preserves the previous fixed BLOCK=10000 behavior exactly
 inline int resolve_mlma_block_size(int n, double budget_gb)
 {
     if (budget_gb <= 0.0 || n <= 0)
         return 10000; // Somewhat arbitrary, but balance of peak RSS and throughout. Increasing may help STRSM efficiency but increases memory.
 
-    constexpr double bytes_per_snp_per_sample = 8.0 /* GenoBufItem::geno */
-                                               + 4.0 /* X_block */;
+    constexpr double bytes_per_snp_per_sample =
+        static_cast<double>(sizeof(float)) /* X_block */;
+    //  static_cast<double>(sizeof(typename decltype(GenoBufItem::geno)::value_type)) /* GenoBufItem::geno */
+    //  + static_cast<double>(sizeof(float)) /* X_block */;
     constexpr int    min_block = 256;    // floor: keep BLAS3 tiles meaningful
     constexpr int    max_block = 65536;  // ceiling: cap per-column scalar creep
 
@@ -78,6 +80,7 @@ inline int resolve_mlma_block_size(int n, double budget_gb)
     const int    block         = static_cast<int>(budget_bytes / per_snp_bytes);
     return std::clamp(block, min_block, max_block);
 }
+
 
 template <typename XVXDiagFn>
 inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
@@ -101,9 +104,9 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
     int  snp_done = 0;
     int  last_pct = -1;
 
-    std::vector<GenoBufItem> gbuf_items(BLOCK);
-    std::vector<uint8_t>     valid_v(BLOCK, 0);
-    std::vector<float>       af_v(BLOCK, 0.0f);
+    std::vector<uint8_t> valid_v(BLOCK, 0);
+    std::vector<float>   af_v(BLOCK, 0.0f);
+    std::vector<float>   additive_af_v(BLOCK, 0.0f);
 
     std::string io_buf;
     io_buf.reserve(4 << 20);
@@ -118,22 +121,23 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
     auto callback = [&](uintptr_t* buf, std::span<const uint32_t> exIdx) {
         const int bs = static_cast<int>(exIdx.size());
 
+        // Decode genotypes directly into X_block columns as float.
+        // For BED format this uses GenoarrLookup256x4bx4 (SIMD, 4 KB L1 table).
+        // For PGEN/BGEN it decodes via the double path then casts.
+        #pragma omp parallel for schedule(dynamic, 16)
         for (int i = 0; i < bs; ++i) {
-            valid_v[i] = 0;
-            af_v[i]    = 0.0f;
-            GenoBufItem& item = gbuf_items[i];
-            item.extractedMarkerIndex = exIdx[i];
-            geno->getGenoDouble(buf, i, &item);
-            if (!item.valid) { X_block.col(i).setZero(); continue; }
-            if (static_cast<int>(item.geno.size()) != n) {
-                LOGGER.e(0, "internal error: SNP " + std::to_string(exIdx[i])
-                            + " returned geno.size=" + std::to_string(item.geno.size())
-                            + " but expected " + std::to_string(n) + ".");
+            bool valid = false;
+            float af = 0.0f, add_af = 0.0f;
+            geno->getGenoFloat(buf, i, X_block.col(i).data(),
+                               af, add_af, valid, exIdx[i]);
+            if (valid) {
+                X_block.col(i).array() *= w_sqrt.array();
+            } else {
+                X_block.col(i).setZero();
             }
-            valid_v[i] = 1;
-            af_v[i]    = static_cast<float>(item.additive_af);
-            X_block.col(i) = (Eigen::Map<const Eigen::VectorXd>(item.geno.data(), n)
-                                .cast<float>().array() * w_sqrt.array()).matrix();
+            valid_v[i]       = static_cast<uint8_t>(valid);
+            af_v[i]          = af;
+            additive_af_v[i] = add_af;
         }
 
         Xt_Vi_y.head(bs).noalias() = X_block.leftCols(bs).transpose() * Vi_y;
@@ -162,7 +166,7 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
             } else {
                 std::format_to(std::back_inserter(io_buf),
                     "\t{:.6g}\t{:.6g}\t{:.6g}\t{:.6g}\n",
-                    static_cast<double>(af_v[i]),
+                    static_cast<double>(additive_af_v[i]),
                     static_cast<double>(beta_val),
                     static_cast<double>(se_val),
                     pval_val);
@@ -189,6 +193,7 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
 
     flush_io();
 }
+
 
 inline void run_mlma_stream_association(RemlState& state,
                                         const Eigen::VectorXf& y_adj,

@@ -121,6 +121,13 @@ public:
     // coroutine-based loop — pre/end now handled by GenoBackend RAII
     void getGenoDouble(uintptr_t *buf, int bufIndex, GenoBufItem* gbuf);
 
+    // Direct float-valued genotype decode: writes n float values into dest[].
+    // Sets *af_out and *valid_out from the same allele-frequency / filter logic.
+    // Uses single-precision lookup tables (BED) or casts from double (BGEN/PGEN).
+    void getGenoFloat(uintptr_t *buf, int bufIndex, float *dest,
+                      float &af_out, float &additive_af_out,
+                      bool &valid_out, uint32_t extractedMarkerIndex);
+
     void loopDouble(const vector<uint32_t> &extractIndex, int numMarkerBuf, bool bMakeGeno, bool bGenoCenter, bool bGenoStd, bool bMakeMiss, vector<function<void (uintptr_t *buf, std::span<const uint32_t> exIndex)>> callbacks = vector<function<void (uintptr_t *buf, std::span<const uint32_t> exIndex)>>(), bool showLog = true);
 
     bool getGenoHasInfo();
@@ -214,9 +221,17 @@ private:
         double a2 = 0.0;
         double na = 0.0;
     };
+    // Single-precision variant: same logical layout but float entries.
+    struct GenoCodingSpecF32 {
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+        float a2 = 0.0f;
+        float na = 0.0f;
+    };
     GenoCodingModel getCodingModel() const;
     double mapDosageToModel(double    dosage, double mu, GenoCodingModel model) const;
-    GenoCodingSpec buildCodingSpec(double mu, double sd) const;
+    GenoCodingSpec    buildCodingSpec(double mu, double sd) const;
+    GenoCodingSpecF32 buildCodingSpecF32(double mu, double sd) const;
     GenoCodingModel genoCodingModel = GenoCodingModel::ADDITIVE;
 
     int8_t alleModel = 1; // 1: add; 2: Dom; 3: Reces; 4: Het; //currently unused affect a0 a1 a2 na;
@@ -232,6 +247,23 @@ private:
     void getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf);
     void getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf);
     void getGenoDouble_pgen(uintptr_t *buf, int idx, GenoBufItem* gbuf);
+
+    // Float-native decode helpers: write directly into a caller-supplied float*.
+    // getGenoFloat_bed: uses the 256×4 float lookup table (GenoarrLookup256x4bx4).
+    // getGenoFloat_pgen / getGenoFloat_bgen: share the frequency/filter logic
+    //   of their double counterparts, then cast the dosage array to float.
+    void getGenoFloat_bed(uintptr_t *buf, int idx, float *dest,
+                          float &af_out, float &additive_af_out, bool &valid_out,
+                          uint32_t extractedMarkerIndex);
+    void getGenoFloat_pgen(uintptr_t *buf, int idx, float *dest,
+                           float &af_out, float &additive_af_out, bool &valid_out,
+                           uint32_t extractedMarkerIndex);
+    void getGenoFloat_bgen(uintptr_t *buf, int idx, float *dest,
+                           float &af_out, float &additive_af_out, bool &valid_out,
+                           uint32_t extractedMarkerIndex);
+
+    using GetGenoFloatFunc = void (Geno::*)(uintptr_t*, int, float*, float&, float&, bool&, uint32_t);
+    GetGenoFloatFunc getGenoFloatFunc = nullptr;
  
     //BED
     int bedRawGenoBuf1PtrSize; // how many 64bit geno of raw sample save 

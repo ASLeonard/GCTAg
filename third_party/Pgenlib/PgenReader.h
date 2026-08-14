@@ -160,6 +160,7 @@ class PgenReader {
         void ExtractGeno(const uintptr_t *in, uintptr_t *out);
         static void ExtractGenoExt(const uintptr_t *in, const uintptr_t * subsets, uint32_t rawSampleSize, uint32_t keepSize, uintptr_t *out);
         static void ExtractDoubleExt(uintptr_t *in, const uintptr_t *subsets, uint32_t rawSampleSize, uint32_t keepSize, const double *gtable, double *gOut, uintptr_t *missOut);
+        static void ExtractFloatExt(uintptr_t *in, const uintptr_t *subsets, uint32_t rawSampleSize, uint32_t keepSize, const float *gtable, float *gOut, uintptr_t *missOut);
 
         static void SetSampleSubsets(const vector<uint32_t> &sample_subset_0based, uint32_t rawSampleSize, uintptr_t *subset_incl_vec, uintptr_t *subset_inter_vec);
         static int GetGenoBufPtrSize(uint32_t sample_ct);

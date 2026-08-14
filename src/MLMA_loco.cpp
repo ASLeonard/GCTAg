@@ -603,6 +603,7 @@ void MLMALoco::processMain()
 
             // ---- 7e. Build RemlState ----
             RemlState rs = reml::build_reml_state(ctx);
+            release_reml_ctx_after_state_build(ctx);
 
             // ---- 7f. Pre-adjusted phenotype: y_adj = y - X*b ----
             Eigen::VectorXf y_adj(n);

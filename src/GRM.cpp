@@ -1617,28 +1617,39 @@ void GRM::deduce_GRM(){
 // Write one tile's normalised rows to already-open output files.
 // Uses grm (tile_rows × tile_cols column-major doubles) and
 // N   (tile_rows × tile_cols uint32s, rectangular layout) from object state.
+//
+// w_grm/w_N/grm_block/sparse_buf are caller-owned scratch, sized once by
+// processMakeGRM to the worst-case (final, widest) tile and reused across
+// every call -- previously these were function-local vectors, reallocated
+// fresh (and growing) on every tile call in the tiled loop, the same
+// "allocate worst-case once, reuse" treatment the grm/N buffers just above
+// this function in processMakeGRM already get, with a comment explaining
+// exactly why (avoid the malloc/page-fault churn across many tiles).
 void GRM::flush_grm_tile(FILE *grm_out, FILE *N_out,
-                         float thresh, bool isSparse, float mtd_weight){
+                         float thresh, bool isSparse, float mtd_weight,
+                         std::vector<float>& w_grm, std::vector<float>& w_N,
+                         std::vector<float>& grm_block, std::string& sparse_buf){
     const int tile_rs   = grm_tile_rs;
     const int tile_re   = grm_tile_re;
     const int tile_rows = grm_tile_rows;
     const int tile_cols = grm_tile_cols;   // == tile_re
 
-    std::vector<float> w_grm(tile_re);
-    std::vector<float> w_N(tile_re);
+    if (static_cast<int>(w_grm.size()) < tile_re) w_grm.resize(tile_re);
+    if (static_cast<int>(w_N.size())   < tile_re) w_N.resize(tile_re);
 
     constexpr int BLAS_OUT_BLOCK = 1024;
 
-    // Worst-case block: BLAS_OUT_BLOCK rows × tile_cols cols (last block).
-    // Allocate once outside the loop to avoid per-iteration malloc/free overhead.
-    std::vector<float> grm_block(static_cast<size_t>(BLAS_OUT_BLOCK) * tile_cols);
+    // Worst-case block for THIS tile: BLAS_OUT_BLOCK rows × tile_cols cols.
+    // grm_block is sized by the caller to the final (widest) tile, so this
+    // is a no-op resize on every call after the first.
+    const size_t needed = static_cast<size_t>(BLAS_OUT_BLOCK) * tile_cols;
+    if (grm_block.size() < needed) grm_block.resize(needed);
     // Sparse path: accumulate formatted text for an entire BLAS_OUT_BLOCK into a
     // pre-reserved string, then fputs once per block.  Avoids O(n²) small heap
     // allocations from constructing a new stringstream per row.
     // Reserve heuristic: BLAS_OUT_BLOCK rows × tile_cols cols × ~25 chars/entry × 5% density.
-    std::string sparse_buf;
-    if(isSparse) sparse_buf.reserve(
-        static_cast<size_t>(BLAS_OUT_BLOCK) * tile_cols / 20 * 25);
+    if(isSparse) sparse_buf.reserve(std::max(sparse_buf.capacity(),
+        static_cast<size_t>(BLAS_OUT_BLOCK) * tile_cols / 20 * 25));
 
     for(int block_start = tile_rs; block_start < tile_re; block_start += BLAS_OUT_BLOCK){
         const int block_end  = std::min(block_start + BLAS_OUT_BLOCK, tile_re);
@@ -2365,6 +2376,19 @@ void GRM::processMakeGRM(){
         if(posix_memalign((void**)&N, 64, max_tile_elems * sizeof(uint32_t)) != 0)
             LOGGER.e(0, "Can't allocate N tile buffer.");
 
+        // flush_grm_tile's output-formatting scratch, sized once to the final
+        // (widest) tile -- tile_ranges is monotonically widening, so
+        // tile_ranges.back() is always the worst case. Reused across every
+        // flush_grm_tile call below via resize-if-needed, same rationale as
+        // the grm/N allocation just above (avoid malloc/page-fault churn
+        // repeated once per tile).
+        constexpr int BLAS_OUT_BLOCK = 1024;
+        const int widest_tile_cols = tile_ranges.back().second;
+        std::vector<float> flush_w_grm(widest_tile_cols);
+        std::vector<float> flush_w_N(widest_tile_cols);
+        std::vector<float> flush_grm_block(static_cast<size_t>(BLAS_OUT_BLOCK) * widest_tile_cols);
+        std::string flush_sparse_buf;
+
         // sub_miss / sd / numValidMarkers / finished_marker depend only on global
         // genotype state (all markers × all samples), not on which tile row-range is
         // being processed.  Initialise them once here and let calculate_GRM_blas
@@ -2376,6 +2400,7 @@ void GRM::processMakeGRM(){
         finished_marker = 0;
         sd.clear();
         grm_skip_global_state = false;  // first tile must accumulate global state
+        float mtd_weight = 1.0f;        // computed once, after the first tile's decode (see below)
 
         for(const auto &range : tile_ranges){
             const int tile_rs = range.first;
@@ -2403,15 +2428,16 @@ void GRM::processMakeGRM(){
             for(int i = 1; i < (int)tile_parts.size(); i++)
                 index_grm_pairs.push_back(std::make_pair(tile_parts[i-1] + 1, tile_parts[i]));
 
+            const bool is_first_tile = !grm_skip_global_state;
             geno->loopDouble(processIndex, nMarkerBlock, true, true, isSTD, true, callBacks);
 
             // After the first tile sub_miss/sd/numValidMarkers are complete.
             // All subsequent tiles skip that work.
             grm_skip_global_state = true;
 
-            // Compute mtd_weight from this tile's sd (same values each tile).
-            float mtd_weight = 1.0f;
-            if(options_b["isMtd"]){
+            // mtd_weight depends only on sd[]/numValidMarkers, which are frozen after
+            // the first tile (see above) -- compute once here rather than every tile.
+            if(is_first_tile && options_b["isMtd"]){
                 float weight = 0.0f;
                 if(!isDominance)
                     for(uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i];
@@ -2420,7 +2446,8 @@ void GRM::processMakeGRM(){
                 if(weight > 0.0f) mtd_weight = static_cast<float>(numValidMarkers) / weight;
             }
 
-            flush_grm_tile(grm_out, N_out, thresh, isSparse, mtd_weight);
+            flush_grm_tile(grm_out, N_out, thresh, isSparse, mtd_weight,
+                          flush_w_grm, flush_w_N, flush_grm_block, flush_sparse_buf);
         }
 
         posix_mem_free(grm); grm = nullptr;

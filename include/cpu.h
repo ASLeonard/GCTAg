@@ -177,4 +177,138 @@ inline int gcta_dsyevr(gcta_blas_int n, double* a, gcta_blas_int lda,
 #endif
 }
 
+// Raw Fortran ABI declarations are only needed on Accelerate, where veclib does
+// not expose the LAPACKE C wrappers. On OpenBLAS/MKL/AOCL we use the LAPACKE
+// entry points directly, matching the pattern used by gcta_dsyevr.
+#if defined(GCTA_USE_ACCELERATE)
+extern "C" {
+void sgeqrf_(const gcta_blas_int* m, const gcta_blas_int* n, float* A,
+             const gcta_blas_int* lda, float* tau, float* work,
+             const gcta_blas_int* lwork, gcta_blas_int* info);
+void sorgqr_(const gcta_blas_int* m, const gcta_blas_int* n, const gcta_blas_int* k,
+             float* A, const gcta_blas_int* lda, const float* tau,
+             float* work, const gcta_blas_int* lwork, gcta_blas_int* info);
+void dgeqrf_(const gcta_blas_int* m, const gcta_blas_int* n, double* A,
+             const gcta_blas_int* lda, double* tau, double* work,
+             const gcta_blas_int* lwork, gcta_blas_int* info);
+void dorgqr_(const gcta_blas_int* m, const gcta_blas_int* n, const gcta_blas_int* k,
+             double* A, const gcta_blas_int* lda, const double* tau,
+             double* work, const gcta_blas_int* lwork, gcta_blas_int* info);
+}
+#endif
+
+inline int gcta_sgeqrf(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, float* tau) {
+#if defined(GCTA_USE_ACCELERATE)
+    gcta_blas_int lwork = -1, info = 0;
+    float wkopt = 0.0f;
+    sgeqrf_(&m, &k, A, &lda, tau, &wkopt, &lwork, &info);
+    if (info != 0) return static_cast<int>(info);
+    lwork = static_cast<gcta_blas_int>(wkopt);
+    Eigen::VectorXf work(lwork);
+    sgeqrf_(&m, &k, A, &lda, tau, work.data(), &lwork, &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(LAPACKE_sgeqrf(LAPACK_COL_MAJOR, m, k, A, lda, tau));
+#endif
+}
+
+inline int gcta_sorgqr(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, const float* tau) {
+#if defined(GCTA_USE_ACCELERATE)
+    gcta_blas_int lwork = -1, info = 0;
+    float wkopt = 0.0f;
+    sorgqr_(&m, &k, &k, A, &lda, tau, &wkopt, &lwork, &info);
+    if (info != 0) return static_cast<int>(info);
+    lwork = static_cast<gcta_blas_int>(wkopt);
+    Eigen::VectorXf work(lwork);
+    sorgqr_(&m, &k, &k, A, &lda, tau, work.data(), &lwork, &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(LAPACKE_sorgqr(LAPACK_COL_MAJOR, m, k, k, A, lda, tau));
+#endif
+}
+
+// Factor A (m x k, column-major, m >= k) in place: on return, the upper
+// k x k triangle of A holds R, the rest holds Householder reflectors, and
+// tau (size k) holds their scalars. This matches the portable pattern used by
+// gcta_dsyevr: raw Fortran ABI on Accelerate, LAPACKE elsewhere.
+inline int gcta_dgeqrf(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_int lda, double* tau) {
+#if defined(GCTA_USE_ACCELERATE)
+    gcta_blas_int lwork = -1, info = 0;
+    double wkopt = 0.0;
+    dgeqrf_(&m, &k, A, &lda, tau, &wkopt, &lwork, &info);
+    if (info != 0) return static_cast<int>(info);
+    lwork = static_cast<gcta_blas_int>(wkopt);
+    Eigen::VectorXd work(lwork);
+    dgeqrf_(&m, &k, A, &lda, tau, work.data(), &lwork, &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(LAPACKE_dgeqrf(LAPACK_COL_MAJOR, m, k, A, lda, tau));
+#endif
+}
+
+// Overwrite A (post-dgeqrf) with the explicit m x k orthonormal Q factor,
+// in place, from the reflectors produced by gcta_dgeqrf. Destroys R — call
+// after extracting R if the caller needs it.
+inline int gcta_dorgqr(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_int lda, const double* tau) {
+#if defined(GCTA_USE_ACCELERATE)
+    gcta_blas_int lwork = -1, info = 0;
+    double wkopt = 0.0;
+    dorgqr_(&m, &k, &k, A, &lda, tau, &wkopt, &lwork, &info);
+    if (info != 0) return static_cast<int>(info);
+    lwork = static_cast<gcta_blas_int>(wkopt);
+    Eigen::VectorXd work(lwork);
+    dorgqr_(&m, &k, &k, A, &lda, tau, work.data(), &lwork, &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(LAPACKE_dorgqr(LAPACK_COL_MAJOR, m, k, k, A, lda, tau));
+#endif
+}
+
+// Convenience fusion for callers that only need Q (R discarded) — the
+// power-iteration QR passes in symmetric_eigendecomp.hpp never use R.
+inline int gcta_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_int lda) {
+    Eigen::VectorXd tau(k);
+    int info = gcta_dgeqrf(m, k, A, lda, tau.data());
+    if (info != 0) return info;
+    return gcta_dorgqr(m, k, A, lda, tau.data());
+}
+
+// Scalar-generic QR factor/form-Q, dispatched at compile time so
+// symmetric_eigendecomp.hpp doesn't need an #ifdef per call site — the
+// SVDScalar typedef there picks the specialization.
+template <typename Scalar>
+inline int gcta_geqrf(gcta_blas_int m, gcta_blas_int k, Scalar* A, gcta_blas_int lda, Scalar* tau);
+
+template <>
+inline int gcta_geqrf<double>(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_int lda, double* tau) {
+    return gcta_dgeqrf(m, k, A, lda, tau);
+}
+
+template <>
+inline int gcta_geqrf<float>(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, float* tau) {
+    return gcta_sgeqrf(m, k, A, lda, tau);
+}
+
+template <typename Scalar>
+inline int gcta_orgqr(gcta_blas_int m, gcta_blas_int k, Scalar* A, gcta_blas_int lda, const Scalar* tau);
+
+template <>
+inline int gcta_orgqr<double>(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_int lda, const double* tau) {
+    return gcta_dorgqr(m, k, A, lda, tau);
+}
+
+template <>
+inline int gcta_orgqr<float>(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, const float* tau) {
+    return gcta_sorgqr(m, k, A, lda, tau);
+}
+
+template <typename Scalar>
+inline int gcta_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, Scalar* A, gcta_blas_int lda) {
+    Eigen::Matrix<Scalar, Eigen::Dynamic, 1> tau(k);
+    int info = gcta_geqrf<Scalar>(m, k, A, lda, tau.data());
+    if (info != 0) return info;
+    return gcta_orgqr<Scalar>(m, k, A, lda, tau.data());
+}
+
+
 #endif  //END GCTA_CPU_H

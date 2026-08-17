@@ -159,6 +159,21 @@ struct RemlCtx {
     RemlMat hutchpp_S;          // Hutch++ Rademacher probes  (n x k)
     RemlMat hutchpp_G;          // Hutch++ Rademacher probes  (n x k)
     bool reml_hutchpp_fixed_probes = false; // true → don't redraw every call/iteration (default false)
+    // Persistent working-set scratch for calcu_tr_PA_hutchpp, sized once per
+    // (n,k) and reused across every REML iteration and every component (ci)
+    // -- this call sits in the hottest loop in the engine (once per ci per
+    // AI-REML iteration). QG/MQG are n x 2k: Q and G are pushed through the
+    // PA operator in one fused call rather than two (see calcu_tr_PA_hutchpp).
+    // All cleared (resized to 0) in build_reml_state once REML exits.
+    RemlMat hutchpp_qr_scratch; // n x k
+    RemlMat hutchpp_K;          // n x k
+    RemlMat hutchpp_Q;          // n x k
+    RemlMat hutchpp_QG;         // n x 2k
+    RemlMat hutchpp_MQG;        // n x 2k
+    RemlMat hutchpp_QtG;        // k x k
+    RemlMat hutchpp_R;          // n x k
+    RemlMat hutchpp_MR;         // n x k
+    RemlVec reml_tmp_n;         // n — shared scratch for reml_equation / em_reml
     RemlMat P;                  // projection matrix (freed after convergence)
     bool   reml_ai_robust      = false;   // opt-in: legacy dlogL gate is default until validated
     double reml_ai_robust_tol  = 1e-4;    // logL-unit tolerance; lambda_sq_floor = 2*this

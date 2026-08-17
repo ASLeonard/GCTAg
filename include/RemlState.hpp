@@ -15,6 +15,18 @@
 #include <cstdint>
 
 struct RemlState {
+    RemlState() = default;
+    // Vi_L_f (and wb.Uk_f, for the Woodbury path) can be tens of GB at large
+    // n -- deleting copy and defaulting move turns any future accidental
+    // copy (e.g. a by-value parameter, or a return path that defeats NRVO)
+    // into a compile error instead of a silent multi-GB duplication. Move
+    // stays exactly as cheap as before: every member here is an Eigen type
+    // or scalar, so the generated move constructor is pointer swaps only.
+    RemlState(const RemlState&)            = delete;
+    RemlState& operator=(const RemlState&) = delete;
+    RemlState(RemlState&&)                 = default;
+    RemlState& operator=(RemlState&&)      = default;
+
     int32_t n           = 0;
     int32_t x_c         = 0;
     bool    is_woodbury = false;

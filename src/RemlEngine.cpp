@@ -510,6 +510,22 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
     if (need_resize) {
         ctx.hutchpp_S.resize(ctx.n, k);
         ctx.hutchpp_G.resize(ctx.n, k);
+
+        // Persistent working-set scratch, sized once per (n,k) and reused
+        // across every REML iteration and every component (ci) below --
+        // this call sits in the hottest loop in the engine (once per ci per
+        // AI-REML iteration), and every one of these was previously a fresh
+        // stack RemlMat, i.e. malloc/free churn on each call. QG/MQG are
+        // n x 2k: Q and G are pushed through the PA operator in one fused
+        // call instead of two (see the ci loop below).
+        ctx.hutchpp_qr_scratch.resize(ctx.n, k);
+        ctx.hutchpp_K.resize(ctx.n, k);
+        ctx.hutchpp_Q.resize(ctx.n, k);
+        ctx.hutchpp_QG.resize(ctx.n, 2 * k);
+        ctx.hutchpp_MQG.resize(ctx.n, 2 * k);
+        ctx.hutchpp_QtG.resize(k, k);
+        ctx.hutchpp_R.resize(ctx.n, k);
+        ctx.hutchpp_MR.resize(ctx.n, k);
     }
     if (need_resize || !ctx.reml_hutchpp_fixed_probes) {
         std::uniform_int_distribution<int> coin(0, 1);
@@ -519,9 +535,6 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
                 ctx.hutchpp_G(r, j) = coin(gcta_eigh::shared_rng()) ? 1.0 : -1.0;
             }
     }
-
-    // Pre-allocate thin-Q scratch (n×k) to avoid per-iteration Identity construction.
-    RemlMat qr_scratch = RemlMat::Identity(ctx.n, k);
 
     for (int ci = 0; ci < ncomp; ci++) {
         const bool is_I = (ctx.A[ctx.r_indx[ci]].size() == 0);
@@ -537,28 +550,45 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
                         : applyP_mat(ctx, RemlMat(ctx.A[ctx.r_indx[ci]] * Z));
         };
 
-        RemlMat K = applyPA_mat(ctx.hutchpp_S);
+        ctx.hutchpp_K.noalias() = applyPA_mat(ctx.hutchpp_S);
+        // reml_trace_power_iter is 0 in normal operation, so this loop is a
+        // no-op there; left on local temporaries rather than further hoisted
+        // scratch -- revisit if power_iter is ever turned back on.
         for (int pw = 0; pw < ctx.reml_trace_power_iter; pw++) {
-            Eigen::HouseholderQR<RemlMat> qr_pw(K);
-            qr_scratch.setIdentity();
-            K = applyPA_mat(qr_pw.householderQ() * qr_scratch);
+            Eigen::HouseholderQR<RemlMat> qr_pw(ctx.hutchpp_K);
+            ctx.hutchpp_qr_scratch.setIdentity();
+            ctx.hutchpp_K.noalias() = applyPA_mat(qr_pw.householderQ() * ctx.hutchpp_qr_scratch);
         }
-        Eigen::HouseholderQR<RemlMat> qr(K);
-        qr_scratch.setIdentity();
-        RemlMat Q = qr.householderQ() * qr_scratch;
+        Eigen::HouseholderQR<RemlMat> qr(ctx.hutchpp_K);
+        ctx.hutchpp_qr_scratch.setIdentity();
+        ctx.hutchpp_Q.noalias() = qr.householderQ() * ctx.hutchpp_qr_scratch;
 
-        const RemlMat MQ = applyPA_mat(Q);
-        const double t_lr = Q.cwiseProduct(MQ).sum();
-        const RemlMat MG = applyPA_mat(ctx.hutchpp_G);
+        // Fused MQ/MG evaluation: applyPA_mat is linear in its argument for
+        // fixed ci, so applyPA_mat([Q G]) == [applyPA_mat(Q) applyPA_mat(G)]
+        // exactly -- no numerical change from the previous two-call form.
+        // One n x 2k call instead of two n x k calls halves the number of
+        // applyP_mat invocations (each pays the Vi_X^T*Z / correction-term
+        // overhead, plus a triangular solve on the LLT path) and gives the
+        // underlying GEMMs double the RHS width to amortize call overhead
+        // against. MQ/MG below are contiguous column-blocks of MQG (same
+        // leading dimension as the parent matrix), so they still dispatch to
+        // BLAS as plain submatrix GEMM operands, not a scalar fallback.
+        ctx.hutchpp_QG.leftCols(k)  = ctx.hutchpp_Q;
+        ctx.hutchpp_QG.rightCols(k) = ctx.hutchpp_G;
+        ctx.hutchpp_MQG.noalias() = applyPA_mat(ctx.hutchpp_QG);
+        const auto MQ = ctx.hutchpp_MQG.leftCols(k);
+        const auto MG = ctx.hutchpp_MQG.rightCols(k);
 
-        const RemlMat QtG = Q.transpose() * ctx.hutchpp_G;
-        const RemlMat R_  = ctx.hutchpp_G - Q * QtG;
-        const RemlMat MR  = MG - MQ * QtG;
+        const double t_lr = ctx.hutchpp_Q.cwiseProduct(MQ).sum();
+
+        ctx.hutchpp_QtG.noalias() = ctx.hutchpp_Q.transpose() * ctx.hutchpp_G;
+        ctx.hutchpp_R.noalias()  = ctx.hutchpp_G - ctx.hutchpp_Q * ctx.hutchpp_QtG;
+        ctx.hutchpp_MR.noalias() = MG - MQ * ctx.hutchpp_QtG;
 
         // per_col(j) is the j-th probe column's contribution to the residual
         // trace estimate; their mean is the estimate itself (unchanged from
         // before), their sample variance-of-the-mean is the noise-floor input.
-        const RemlVec per_col = R_.cwiseProduct(MR).colwise().sum();  // k values
+        const RemlVec per_col = ctx.hutchpp_R.cwiseProduct(ctx.hutchpp_MR).colwise().sum();  // k values
         const double mean_r = per_col.mean();
         tr_PA(ci) = t_lr + mean_r;
         tr_PA_var(ci) = !ctx.reml_hutchpp_fixed_probes
@@ -648,13 +678,13 @@ void reml_equation(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py, RemlVec& 
 
     const int m = static_cast<int>(ctx.r_indx.size());
     RemlVec R(m);
-    RemlVec tmp(ctx.n);
+    if (ctx.reml_tmp_n.size() != ctx.n) ctx.reml_tmp_n.resize(ctx.n);
     for (int i = 0; i < m; i++) {
         if (ctx.A[ctx.r_indx[i]].size() == 0) {
             R(i) = Py.squaredNorm();
         } else {
-            tmp.noalias() = ctx.A[ctx.r_indx[i]] * Py;
-            R(i) = Py.dot(tmp);
+            ctx.reml_tmp_n.noalias() = ctx.A[ctx.r_indx[i]] * Py;
+            R(i) = Py.dot(ctx.reml_tmp_n);
         }
     }
 
@@ -932,16 +962,16 @@ void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
 
     const int m = static_cast<int>(ctx.r_indx.size());
     RemlVec R(m);
-    RemlVec tmp(ctx.n);
+    if (ctx.reml_tmp_n.size() != ctx.n) ctx.reml_tmp_n.resize(ctx.n);
     for (int i = 0; i < m; i++) {
         if (woodbury_basis_active && i == 0) {
-            tmp = woodbury_basis_Kv(ctx, Py);
-            R(i) = Py.dot(tmp);
+            ctx.reml_tmp_n = woodbury_basis_Kv(ctx, Py);
+            R(i) = Py.dot(ctx.reml_tmp_n);
         } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
             R(i) = Py.squaredNorm();
         } else {
-            tmp.noalias() = ctx.A[ctx.r_indx[i]] * Py;
-            R(i) = Py.dot(tmp);
+            ctx.reml_tmp_n.noalias() = ctx.A[ctx.r_indx[i]] * Py;
+            R(i) = Py.dot(ctx.reml_tmp_n);
         }
         varcmp(i) = prev_varcmp(i) - prev_varcmp(i) * prev_varcmp(i) * (tr_PA(i) - R(i)) / ctx.n;
     }
@@ -1861,6 +1891,10 @@ RemlState build_reml_state(RemlCtx& ctx) {
         // ctx.Uk is n×k — transpose before storing.
         rs.wb.Uk_f.resize(ctx.Uk.cols(), ctx.Uk.rows());
         rs.wb.Uk_f.noalias() = ctx.Uk.transpose().cast<float>();  // k×n
+        ctx.Uk.resize(0, 0); //free double buffer immediately -- nothing below reads it again,
+                              //same rationale as the ck/dk frees just below (was previously held
+                              //alive through the ck/dk conversions for no reason; n×k doubles,
+                              //typically the largest buffer in this branch)
 
         rs.wb.ck_f.resize(ctx.ck.size());
         rs.wb.ck_f.noalias() = ctx.ck.cast<float>(); //convert double to float
@@ -1876,7 +1910,6 @@ RemlState build_reml_state(RemlCtx& ctx) {
         ctx.dk.resize(0);
 
         rs.lambda_tail_f = static_cast<float>(ctx.lambda_tail);
-        ctx.Uk.resize(0, 0);
     } else if (ctx.Vi_use_llt) {
         // Vi_L holds the lower Cholesky factor L of V (from dpotrf).
         // Store it as float — the streaming code uses STRSV/STRSM directly,
@@ -1891,13 +1924,24 @@ RemlState build_reml_state(RemlCtx& ctx) {
         // once — so the streaming code always applies V^{-1} via a
         // triangular product (TRMM/STRMM) instead of holding a dense matrix
         // and re-deriving a usable factor from it at association time.
-        Eigen::LLT<RemlMat> Li(ctx.Vi);
-        if (Li.info() != Eigen::Success)
+        //
+        // Factorize in place via gcta_dpotrf (as calcu_Vi already does)
+        // rather than Eigen::LLT(ctx.Vi): Eigen::LLT's constructor copies
+        // its input into internal storage before factorizing, so it can't
+        // operate in place on a caller-owned buffer -- that doubles peak
+        // RSS transiently (ctx.Vi + LLT's internal copy, both n×n doubles,
+        // alive simultaneously) for no reason, since ctx.Vi is read via
+        // selfadjointView<Lower> everywhere else in this file (only the
+        // lower triangle is guaranteed valid, matching dpotrf's contract)
+        // and is freed immediately below regardless.
+        gcta_blas_int blas_n_bs = static_cast<gcta_blas_int>(ctx.n);
+        if (gcta_dpotrf(blas_n_bs, ctx.Vi.data(), blas_n_bs) != 0)
             LOGGER.e(0, "Vi is not positive definite when building REML state.");
         rs.is_llt = false;
-        const RemlMat& L = Li.matrixL();
-        rs.Vi_L_f.resize(L.rows(), L.cols());
-        rs.Vi_L_f.noalias() = L.cast<float>();
+        rs.Vi_L_f.resize(ctx.n, ctx.n);
+        rs.Vi_L_f.noalias() = ctx.Vi.cast<float>();   // lower triangle valid; upper is dpotrf
+                                                       // leftover and never read downstream --
+                                                       // same convention as the Vi_use_llt branch above
         ctx.Vi.resize(0, 0);
     }
 
@@ -1912,6 +1956,15 @@ RemlState build_reml_state(RemlCtx& ctx) {
     ctx.UkTy.resize(0, 0);
     ctx.hutchpp_S.resize(0, 0);
     ctx.hutchpp_G.resize(0, 0);
+    ctx.hutchpp_qr_scratch.resize(0, 0);
+    ctx.hutchpp_K.resize(0, 0);
+    ctx.hutchpp_Q.resize(0, 0);
+    ctx.hutchpp_QG.resize(0, 0);
+    ctx.hutchpp_MQG.resize(0, 0);
+    ctx.hutchpp_QtG.resize(0, 0);
+    ctx.hutchpp_R.resize(0, 0);
+    ctx.hutchpp_MR.resize(0, 0);
+    ctx.reml_tmp_n.resize(0);
     ctx.P.resize(0, 0);
     ctx.varcmp.clear();
     ctx.b.resize(0);

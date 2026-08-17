@@ -135,27 +135,38 @@ EighResult power_iterate_and_project(
     if (k_target > k_ext)
         throw std::invalid_argument("power_iterate_and_project: k_target exceeds sketch width k_ext.");
 
-    // Pre-allocated thin-Q scratch, reused across every QR in this call so
-    // each pass avoids a fresh n x k_ext zero-init allocation (this matters:
-    // at n=500k, k_ext~1200, each Identity(n,k_ext) is ~4.9 GB).
-    Eigen::MatrixXd qr_scratch = Eigen::MatrixXd::Identity(n, k_ext);
+
 
     for (int pi = 0; pi < power_iter; ++pi) {
-        Eigen::HouseholderQR<Eigen::MatrixXd> qr(Y);
-        Y.resize(0, 0);  // qr(Y)'s constructor already copied what it needs internally
-        qr_scratch.setIdentity();
-        Y = apply(qr.householderQ() * qr_scratch);
+        // In-place QR via direct LAPACK: Y becomes Q. No HouseholderQR
+        // internal copy, no Identity(n,k_ext) scratch, and Q formation goes
+        // through dorgqr (threaded BLAS) instead of Eigen's own sequential
+        // Householder-application loop (which EIGEN_USE_LAPACKE does NOT
+        // accelerate — only the dgeqrf factorization step is LAPACKE-backed).
+        int info = gcta_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)k_ext, Y.data(), (gcta_blas_int)n);
+        if (info != 0)
+            throw std::runtime_error("power_iterate_and_project: dgeqrf/dorgqr failed (info=" +
+                                      std::to_string(info) + ").");
+        Y = apply(Y);
     }
 
-    Eigen::HouseholderQR<Eigen::MatrixXd> qr(Y);
-    Y.resize(0, 0);  // same: redundant with qr's internal copy from here on
-    qr_scratch.setIdentity();
-    Eigen::MatrixXd Q = qr.householderQ() * qr_scratch;
+    {
+        int info = gcta_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)k_ext, Y.data(), (gcta_blas_int)n);
+        if (info != 0)
+            throw std::runtime_error("power_iterate_and_project: dgeqrf/dorgqr failed (info=" +
+                                      std::to_string(info) + ").");
+    }
+    Eigen::MatrixXd Q = std::move(Y);
 
     Eigen::MatrixXd AQ = apply(Q);
-    Eigen::MatrixXd B  = Q.transpose() * AQ;   // k_ext x k_ext, symmetric
+    Eigen::MatrixXd B  = Q.transpose() * AQ;   // k_ext x k_ext, symmetric in exact arithmetic
     AQ.resize(0, 0);
-
+    // Match rayleigh_ritz_refine: dsyevd only reads one triangle, so without
+    // this, which triangle's rounding error gets discarded is arbitrary and
+    // the two Rayleigh-Ritz call sites silently disagree. Matters here more
+    // than most places — Woodbury's EIG99/MP-edge logic reads tail
+    // eigenvalues straight out of this call.
+    B = 0.5 * (B + B.transpose());
     Eigen::VectorXd w(k_ext);
     const int info = gcta_dsyevd((gcta_blas_int)k_ext, B.data(), (gcta_blas_int)k_ext, w.data());
     if (info != 0)
@@ -285,15 +296,28 @@ inline ThinSVDResult tall_skinny_thin_svd(const Eigen::MatrixXd& Z) {
     const int n = static_cast<int>(Z.rows());
     const int k = static_cast<int>(Z.cols());
 
-    Eigen::HouseholderQR<Eigen::MatrixXd> qr(Z);
-    const Eigen::MatrixXd R = qr.matrixQR().topRows(k).triangularView<Eigen::Upper>();
-    const Eigen::MatrixXd Q = qr.householderQ() * Eigen::MatrixXd::Identity(n, k);
+    // Z is const& (caller retains ownership), so one n x k copy is
+    // unavoidable here — same as HouseholderQR's internal copy today, no
+    // regression. The win is skipping the untreaded householderQ() apply
+    // and the separate Identity(n,k) buffer it required.
+    Eigen::MatrixXd QR = Z;
+    Eigen::VectorXd tau(k);
+    int info = gcta_dgeqrf((gcta_blas_int)n, (gcta_blas_int)k, QR.data(), (gcta_blas_int)n, tau.data());
+    if (info != 0)
+        throw std::runtime_error("tall_skinny_thin_svd: dgeqrf failed (info=" + std::to_string(info) + ").");
+
+    const Eigen::MatrixXd R = QR.topRows(k).triangularView<Eigen::Upper>();
+
+    info = gcta_dorgqr((gcta_blas_int)n, (gcta_blas_int)k, QR.data(), (gcta_blas_int)n, tau.data());
+    if (info != 0)
+        throw std::runtime_error("tall_skinny_thin_svd: dorgqr failed (info=" + std::to_string(info) + ").");
+    // QR now holds explicit Q in place.
 
     Eigen::BDCSVD<Eigen::MatrixXd, Eigen::ComputeThinU> svd_r(R);
 
     ThinSVDResult result;
     result.singular_values = svd_r.singularValues();
-    result.U = Q * svd_r.matrixU();   // n x k GEMM
+    result.U = QR * svd_r.matrixU();   // n x k GEMM
     return result;
 }
 
@@ -360,10 +384,20 @@ EighResult nystrom_symmetric_eigh(
     Y.resize(0, 0);
     C.resize(0, 0);
 
-    Eigen::HouseholderQR<Eigen::MatrixXd> qr(Z);
-    const Eigen::MatrixXd R = qr.matrixQR().topRows(k_ext).triangularView<Eigen::Upper>();
-    const Eigen::MatrixXd Q = qr.householderQ() * Eigen::MatrixXd::Identity(n, k_ext);
-    Z.resize(0, 0);
+    // Z is owned and mutable here (unlike tall_skinny_thin_svd's const&), so
+    // this needs zero extra n x k_ext buffers: no HouseholderQR internal
+    // copy, no Identity scratch, no separate Q — dgeqrf/dorgqr factor Z into
+    // its own explicit Q in place. Do NOT resize Z away below; it doubles
+    // as Q for the rest of the function.
+    Eigen::VectorXd tau(k_ext);
+    int info_qr = gcta_dgeqrf((gcta_blas_int)n, (gcta_blas_int)k_ext, Z.data(), (gcta_blas_int)n, tau.data());
+    if (info_qr != 0)
+        throw std::runtime_error("nystrom_symmetric_eigh: dgeqrf failed (info=" + std::to_string(info_qr) + ").");
+    const Eigen::MatrixXd R = Z.topRows(k_ext).triangularView<Eigen::Upper>();
+    info_qr = gcta_dorgqr((gcta_blas_int)n, (gcta_blas_int)k_ext, Z.data(), (gcta_blas_int)n, tau.data());
+    if (info_qr != 0)
+        throw std::runtime_error("nystrom_symmetric_eigh: dorgqr failed (info=" + std::to_string(info_qr) + ").");
+    const Eigen::MatrixXd& Q = Z;   // Z now holds explicit Q; alias, not a copy
 
     Eigen::MatrixXd T = R * signs.asDiagonal() * R.transpose();
     T = 0.5 * (T + T.transpose());

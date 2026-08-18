@@ -121,7 +121,7 @@ int main(int argc, char *argv[]){
         "--reml-ai-robust", "--reml-ai-robust-tol", "--reml-ai-robust-risk",
         "--mlma-loco-stream", "--loco-manifest",
         "--mlma-no-preadj-covar",
-        "--mlma-stream", "--mlma-tile-budget-gb", "--save-reml", "--load-reml", "--log-pval", "--model",
+        "--mlma-stream", "--save-reml", "--load-reml", "--log-pval", "--model",
 
     };
     map<string, vector<string>> options;

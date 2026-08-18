@@ -133,8 +133,8 @@ void option(int option_num, char* option_str[])
     double massoc_out_pC_thresh = -1;
 
     // mixed linear model association 
-    bool mlma_flag = false, mlma_loco_flag = false, mlma_no_adj_covar = false;
-    string subtract_grm_file = "";
+    bool mlma_flag = false, mlma_loco_flag = false, mlma_no_adj_covar = false, save_reml_flag=false;
+    string subtract_grm_file = "", load_reml_state = "";
 
     // Fst
     bool fst_flag = false;
@@ -922,7 +922,14 @@ void option(int option_num, char* option_str[])
             massoc_sblup_fac = atof(argv[++i]);
             LOGGER << "--cojo-sblup " << massoc_sblup_fac << endl;
             if (massoc_sblup_fac < 0) LOGGER.e(0, "\n invalid value for --cojo-sblup.\n");
-        } else if (strcmp(argv[i], "--mlma") == 0) {
+        } else if (strcmp(argv[i], "--save-reml") == 0) {
+            save_reml_flag = true;
+            LOGGER << "--save-reml" << endl;
+        } else if (strcmp(argv[i], "--load-reml") == 0) {
+            load_reml_state = argv[++i];
+            LOGGER << "--load-reml " << load_reml_state << endl;
+        }
+        else if (strcmp(argv[i], "--mlma") == 0) {
             reml_flag = false;
             mlma_flag = true;
             thread_flag = true;
@@ -1398,7 +1405,27 @@ void option(int option_num, char* option_str[])
             else if (ld_mean_rsq_seg_flag) pter_gcta->ld_seg(LD_file, LD_seg, LD_wind, LD_rsq_cutoff, dominance_flag);
             else if (ld_max_rsq_flag) pter_gcta ->calcu_max_ld_rsq(LD_wind, LD_rsq_cutoff, dominance_flag);
             else if (blup_snp_flag) pter_gcta->blup_snp_geno();
-            else if (mlma_flag) pter_gcta->mlma(grm_file, m_grm_flag, subtract_grm_file, phen_file, qcovar_file, covar_file, mphen, MaxIter, reml_priors, reml_priors_var, no_constrain, within_family, make_grm_inbred_flag, mlma_no_adj_covar);
+
+            else if (mlma_flag) {
+                if (!load_reml_state.empty() && save_reml_flag) {
+                    LOGGER.e(0, "--save-reml and --load-reml cannot be used together.");
+                }
+                else if (!load_reml_state.empty()) {
+                    // stage 2: genotype data (--bfile etc.) must already be loaded by
+                    // this point in main, same as it would be ahead of a normal
+                    // pter_gcta->mlma(...) call.
+                    pter_gcta->mlma_assoc_stage(load_reml_state, mlma_no_adj_covar);
+                }
+                else if (save_reml_flag) {
+                    // stage 1: fits REML only, writes <out>.reml, does not scan SNPs.
+                    pter_gcta->mlma_reml_stage(grm_file, m_grm_flag, subtract_grm_file, phen_file, qcovar_file, covar_file, mphen, MaxIter, reml_priors, reml_priors_var, no_constrain, within_family, make_grm_inbred_flag);
+                }
+                else {
+                    // unchanged, single-invocation path
+                    pter_gcta->mlma(grm_file, m_grm_flag, subtract_grm_file, phen_file, qcovar_file, covar_file, mphen, MaxIter, reml_priors, reml_priors_var, no_constrain, within_family, make_grm_inbred_flag, mlma_no_adj_covar);
+                }
+            }
+            //else if (mlma_flag) pter_gcta->mlma(grm_file, m_grm_flag, subtract_grm_file, phen_file, qcovar_file, covar_file, mphen, MaxIter, reml_priors, reml_priors_var, no_constrain, within_family, make_grm_inbred_flag, mlma_no_adj_covar);
             else if (mlma_loco_flag) pter_gcta->mlma_loco(phen_file, qcovar_file, covar_file, mphen, MaxIter, reml_priors, reml_priors_var, no_constrain, make_grm_inbred_flag, mlma_no_adj_covar);
             else if (massoc_slct_flag | massoc_joint_flag) {pter_gcta->set_massoc_pC_thresh(massoc_out_pC_thresh); pter_gcta->run_massoc_slct(massoc_file, massoc_wind, massoc_p, massoc_collinear, massoc_top_SNPs, massoc_joint_flag, massoc_gc_flag, massoc_gc_val, massoc_actual_geno_flag, massoc_mld_slct_alg);}
             else if (!massoc_cond_snplist.empty()) {pter_gcta->set_massoc_pC_thresh(massoc_out_pC_thresh); pter_gcta->run_massoc_cond(massoc_file, massoc_cond_snplist, massoc_wind, massoc_collinear, massoc_gc_flag, massoc_gc_val, massoc_actual_geno_flag);}

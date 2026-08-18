@@ -582,7 +582,7 @@ foreach(target IN LISTS GCTA_TARGETS)
         GCTA_BLAS_BACKEND_STR="${GCTA_BLAS_PROVIDER}")
     target_compile_options(${target} PRIVATE
         $<$<BOOL:${APPLE}>:-Wno-nullability-completeness>
-        -pipe
+        -pipe -g
         $<$<CONFIG:Release>:$<IF:$<BOOL:${APPLE}>,-mcpu=native,-march=native>>
         $<$<CONFIG:Release>:-O3>)
     target_link_libraries(${target} PRIVATE OpenMP::OpenMP_CXX

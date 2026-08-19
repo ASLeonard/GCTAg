@@ -726,7 +726,8 @@ double newton_decrement_null_quantile(const RemlMat& Hi, const RemlVec& var_U, d
 // — see call site.
 void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
              RemlVec& prev_varcmp, RemlVec& varcmp, double dlogL,
-             double& lambda_sq, RemlVec& var_U) {
+             double& lambda_sq, RemlVec& var_U,
+             bool last_step_trustworthy, double& step_scale_out) {
     const bool use_approx     = ctx.reml_trace_hutchpp;
     const bool woodbury_basis_active = ctx.Vi_use_woodbury_basis;
 
@@ -811,9 +812,21 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     double step_scale = 1.0;
     if (dlogL > 1.0) step_scale = 0.316;
     if (ctx.reml_mtd == 0 && ctx.reml_ai_robust) {
+        // last_step_trustworthy: the *previous* iteration's own quadratic
+        // model (lambda_sq/step_scale at the time) predicted a certain logL
+        // gain; if the actual gain came in close to that prediction, Hi has
+        // just been validated as locally trustworthy and this step takes
+        // the full Newton step rather than re-damping from scratch. This is
+        // one bit of memory, not a persistent radius -- no ratchet, no cap,
+        // no expand/shrink schedule. Falls back to exactly the pre-existing
+        // formula (unchanged target_decrement=0.5) whenever the previous
+        // step hasn't (yet) proven itself.
         constexpr double target_decrement = 0.5;
-        step_scale = std::min(1.0, std::sqrt(target_decrement / std::max(lambda_sq, 1e-12)));
+        step_scale = last_step_trustworthy
+            ? 1.0
+            : std::min(1.0, std::sqrt(target_decrement / std::max(lambda_sq, 1e-12)));
     }
+    step_scale_out = step_scale;
 
     // Var(U_i) = 0.25 * Var(tr_PA_i) since only tr_PA is stochastic (Hutch++).
     // 0 for exact/Woodbury since tr_PA_var == 0. Left as a vector (not reduced
@@ -821,6 +834,7 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     // null-distribution weight matrix, not just its trace.
     var_U = 0.25 * tr_PA_var;
     varcmp = prev_varcmp + step_scale * delta;
+    LOGGER << "REML iteration: lambda_sq = " << std::to_string(lambda_sq) << ", step scale = " << std::to_string(step_scale) << ", delta = " << delta.transpose() << std::endl;
 }
 
 // Post-hoc, Woodbury-only tail correction. Called exactly once, only at
@@ -992,6 +1006,26 @@ double reml_iteration(RemlCtx& ctx,
     RemlVec var_U;              // ditto -- Var(U) per component, from Hutch++ probe noise (0 for exact/Woodbury)
     RemlVec prev_prev_varcmp(varcmp), prev_varcmp(varcmp), varcomp_init(varcmp);
 
+    // One-bit trust state for --reml-ai-robust's step scale (see ai_reml).
+    // rho_threshold=0.75 is the standard trust-region "model was good"
+    // cutoff (Nocedal & Wright), used here as a single yes/no gate rather
+    // than a graduated radius. Unused when reml_ai_robust is off.
+    //
+    // Starts true (optimistic): attempt a full Newton step immediately on
+    // iteration 0 rather than damping-by-default before there is any
+    // evidence damping is needed. Self-correcting -- if iteration 0's full
+    // step disappoints (rho <= rho_threshold, checked below), iteration 1
+    // falls straight back to the damped formula. This does remove all
+    // protection specifically on the single highest-risk step (zero prior
+    // evidence on Hi's trustworthiness) -- validate against a poorly-
+    // conditioned GRM, not just well-behaved data, before relying on this
+    // for production runs.
+    constexpr double rho_threshold = 0.75;
+    bool last_step_trustworthy = true;
+    double step_scale_taken = 1.0;
+    bool have_predicted = false;
+    double predicted_dlogL = 0.0;
+
     // ctx.reml_ai_robust_risk is the one number you set: the (Bonferroni,
     // approximate) probability that ANY iteration across this whole run
     // falsely declares convergence under H0, treating each iteration's fresh
@@ -1042,9 +1076,13 @@ double reml_iteration(RemlCtx& ctx,
             LOGGER << varcmp.transpose() << std::endl;
 
             if (!prior_var_flag) {
-                //else if(ctx.reml_no_HE_start) {
-                ctx.reml_mtd = 2;
-                LOGGER << "Round 0 iteration using EM-REML ..." << std::endl;
+                LOGGER << "Round 0 iteration using ";
+                if(ctx.reml_no_HE_start) {
+                  ctx.reml_mtd = 2;
+                  LOGGER << "EM-REML ..." << std::endl;
+                } else {
+                  LOGGER << "AI-REML ..." << std::endl;
+                }
             }
         }
         if (iter == 1) {
@@ -1079,7 +1117,8 @@ double reml_iteration(RemlCtx& ctx,
         logdet_Xt_Vi_X = logdet_Xt_Vi_X2;
 
         if (ctx.reml_mtd == 0)
-            ai_reml(ctx, ctx.P, Hi, Py, prev_varcmp, varcmp, dlogL, lambda_sq, var_U);
+            ai_reml(ctx, ctx.P, Hi, Py, prev_varcmp, varcmp, dlogL, lambda_sq, var_U,
+                    last_step_trustworthy, step_scale_taken);
         else if (ctx.reml_mtd == 1)
             reml_equation(ctx, ctx.P, Hi, Py, varcmp);
         else if (ctx.reml_mtd == 2)
@@ -1123,6 +1162,26 @@ double reml_iteration(RemlCtx& ctx,
         }
 
         dlogL = lgL - prev_lgL;
+
+        // Judge the step just taken against its own prediction, for use by
+        // the *next* iteration's ai_reml call. Predicted gain for a step of
+        // size s along the Newton direction is lambda_sq*s*(1-s/2) (from
+        // delta'*AI*delta = delta'*U = lambda_sq, same identity used for the
+        // Newton-decrement convergence test below) -- no extra solve, reuses
+        // quantities ai_reml already computed. iter>0 guard: prev_lgL is
+        // still the -1e20 sentinel at iter==0, so round 0's step has nothing
+        // meaningful to be judged against yet -- last_step_trustworthy keeps
+        // its optimistic initial value through iteration 0 and only starts
+        // being judged from iteration 1 onward.
+        const bool ai_robust_active_step = (ctx.reml_mtd == 0 && ctx.reml_ai_robust);
+        if (ai_robust_active_step && iter > 0 && have_predicted && predicted_dlogL > 1e-12) {
+            const double rho = dlogL / predicted_dlogL;
+            last_step_trustworthy = (rho > rho_threshold);
+        }
+        if (ai_robust_active_step) {
+            predicted_dlogL = lambda_sq * step_scale_taken * (1.0 - 0.5 * step_scale_taken);
+            have_predicted = true;
+        }
 
         // Convergence test. AI-REML (mtd==0) already computes AI^{-1} (Hi) and
         // the score U every iteration to take its Newton step, so the Newton

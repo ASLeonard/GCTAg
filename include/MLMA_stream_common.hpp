@@ -67,18 +67,21 @@ inline Eigen::MatrixXd compact_sample_rows(const Eigen::MatrixXd& values,
 // budget_gb <= 0 preserves the previous fixed BLOCK=10000 behavior exactly
 inline int resolve_mlma_block_size(int n, double budget_gb)
 {
-    if (budget_gb <= 0.0 || n <= 0)
-        return 10000; // Somewhat arbitrary, but balance of peak RSS and throughout. Increasing may help STRSM efficiency but increases memory.
+    int block = 10000; // Somewhat arbitrary, but balance of peak RSS and throughout. Increasing may help STRSM efficiency but increases memory.
+    if (budget_gb > 0.0 && n > 0) {
 
-    constexpr double bytes_per_snp_per_sample =
-        static_cast<double>(sizeof(float)) /* X_block */;
-    constexpr int    min_block = 256;    // floor: keep BLAS3 tiles meaningful
-    constexpr int    max_block = 65536;  // ceiling: cap per-column scalar creep
+      LOGGER << "MLMA streaming memory budget: " << budget_gb << " GB" << std::endl;
+      constexpr double bytes_per_snp_per_sample =
+          static_cast<double>(sizeof(float)) /* X_block */;
+      constexpr int    min_block = 256;    // floor: keep BLAS3 tiles meaningful
+      constexpr int    max_block = 65536;  // ceiling: cap per-column scalar creep
 
-    const double budget_bytes  = budget_gb * 1e9;
-    const double per_snp_bytes = static_cast<double>(n) * bytes_per_snp_per_sample;
-    const int    block         = static_cast<int>(budget_bytes / per_snp_bytes);
-    return std::clamp(block, min_block, max_block);
+      const double budget_bytes  = budget_gb * 1e9;
+      const double per_snp_bytes = static_cast<double>(n) * bytes_per_snp_per_sample;
+      block   =  std::clamp(static_cast<int>(budget_bytes / per_snp_bytes), min_block, max_block);
+    }
+    LOGGER << "MLMA streaming block size: " << block << " SNPs per tile" << std::endl;
+    return block;
 }
 
 template <typename XVXDiagFn>

@@ -709,7 +709,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         const auto& vals = options_in["--mlma-stream"];
         if (!vals.empty()) {
             if (vals.size()==1)
-                options["mlma_tile_budget_gb"] = vals[0];
+                options_d["mlma_tile_budget_gb"] = {std::stod(vals[0])};
             else
                 LOGGER.e(0, "--mlma-stream accepts at most one value: the memory budget in GB for tile-based streaming.");
         }

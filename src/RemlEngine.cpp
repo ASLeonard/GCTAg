@@ -1028,20 +1028,23 @@ double reml_iteration(RemlCtx& ctx,
     // single iteration is sufficient by construction (see
     // newton_decrement_null_quantile for the caveats on that calibration).
     int small_delta_streak = 0;
-    const int M = 2;   // consecutive small deltas required; small, fixed, not data-dependent
+    const int M = 1;   // consecutive small deltas required; small, fixed, not data-dependent
     double best_lgL = 0;
     RemlVec best_varcmp;
     for (iter = 0; iter < ctx.reml_max_iter; iter++) {
         if (iter == 0) {
             prev_varcmp = varcomp_init;
-            if (prior_var_flag) {
-                if (ctx.reml_fixed_var)
-                    LOGGER << "VAR components fixed at: " << varcmp.transpose() << std::endl;
-                else
-                    LOGGER << "Prior values of variance components: " << varcmp.transpose() << std::endl;
-            } else if(ctx.reml_no_HE_start) {
+            if (ctx.reml_fixed_var) {
+                LOGGER << "Variance components fixed at: ";
+            } else {
+                LOGGER << "Variance components initialised at: ";
+            }
+            LOGGER << varcmp.transpose() << std::endl;
+
+            if (!prior_var_flag) {
+                //else if(ctx.reml_no_HE_start) {
                 ctx.reml_mtd = 2;
-                LOGGER << "Calculating prior values of variance components by EM-REML ..." << std::endl;
+                LOGGER << "Round 0 iteration using EM-REML ..." << std::endl;
             }
         }
         if (iter == 1) {

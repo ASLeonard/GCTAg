@@ -58,25 +58,30 @@ inline Eigen::MatrixXd compact_sample_rows(const Eigen::MatrixXd& values,
 //               block consumed by BLAS.  Written directly by getGenoFloat
 //               (BED: GenoarrLookup256x4bx4; PGEN/BGEN: cast from double).
 // The old GenoBufItem::geno double[] intermediate is no longer allocated on
-// the MLMA hot path.
+// the MLMA hot path, so the budget below is sized on X_block alone -- it
+// previously also charged sizeof(double) per sample for that retired
+// buffer, which under-sized BLOCK by ~3x against a given --mlma-stream
+// budget for no RSS benefit (smaller STRSM/STRMM/GEMM tiles for nothing).
 // Per-SNP scalars (Xt_Vi_y, xvx_diag, af_v, valid_v) are O(1) per column
 // and negligible next to the O(n) term above.
 // budget_gb <= 0 preserves the previous fixed BLOCK=10000 behavior exactly
 inline int resolve_mlma_block_size(int n, double budget_gb)
 {
-    if (budget_gb <= 0.0 || n <= 0)
-        return 10000; // Somewhat arbitrary, but balance of peak RSS and throughout. Increasing may help STRSM efficiency but increases memory.
+    int block = 10000; // Somewhat arbitrary, but balance of peak RSS and throughout. Increasing may help STRSM efficiency but increases memory.
+    if (budget_gb > 0.0 && n > 0) {
 
-    constexpr double bytes_per_snp_per_sample =
-        static_cast<double>(sizeof(typename decltype(GenoBufItem::geno)::value_type)) /* GenoBufItem::geno */
-        + static_cast<double>(sizeof(float)) /* X_block */;
-    constexpr int    min_block = 256;    // floor: keep BLAS3 tiles meaningful
-    constexpr int    max_block = 65536;  // ceiling: cap per-column scalar creep
+      LOGGER << "MLMA streaming memory budget: " << budget_gb << " GB" << std::endl;
+      constexpr double bytes_per_snp_per_sample =
+          static_cast<double>(sizeof(float)) /* X_block */;
+      constexpr int    min_block = 256;    // floor: keep BLAS3 tiles meaningful
+      constexpr int    max_block = 65536;  // ceiling: cap per-column scalar creep
 
-    const double budget_bytes  = budget_gb * 1e9;
-    const double per_snp_bytes = static_cast<double>(n) * bytes_per_snp_per_sample;
-    const int    block         = static_cast<int>(budget_bytes / per_snp_bytes);
-    return std::clamp(block, min_block, max_block);
+      const double budget_bytes  = budget_gb * 1e9;
+      const double per_snp_bytes = static_cast<double>(n) * bytes_per_snp_per_sample;
+      block   =  std::clamp(static_cast<int>(budget_bytes / per_snp_bytes), min_block, max_block);
+    }
+    LOGGER << "MLMA streaming block size: " << block << " SNPs per tile" << std::endl;
+    return block;
 }
 
 template <typename XVXDiagFn>
@@ -158,9 +163,6 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
                 std::format_to(std::back_inserter(io_buf),
                     "{}\t{}\t{}\t{}\t{}\tNA\tNA\tNA\tNA\n",
                     chr, name, bp, a1, a2);
-                std::format_to(std::back_inserter(io_buf),
-                    "{}\t{}\t{}\t{}\t{}\tNA\tNA\tNA\tNA\n",
-                    chr, name, bp, a1, a2);
             } else {
                 std::format_to(std::back_inserter(io_buf),
                     "{}\t{}\t{}\t{}\t{}\t{:.6g}\t{:.6g}\t{:.6g}\t{:.6g}\n",
@@ -170,10 +172,6 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
                     static_cast<double>(se_val),
                     pval_val);
             }
-        }
-
-        if (io_buf.size() >= (4 << 20)) {
-            flush_io();
         }
 
         if (io_buf.size() >= (4 << 20)) {

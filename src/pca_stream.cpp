@@ -342,6 +342,17 @@ void PCAStream::processMain()
             LOGGER.e(0, string("--pca failed: ") + e.what());
         }
 
+        // Capture the full trace once here so that a partial spectrum can still be
+        // reported as a proportion of total variance, rather than as if it were the
+        // full sum of eigenvalues. For chunked execution we intentionally read only
+        // the diagonal tiles, not the full matrix.
+        const double trace_total = [&]() {
+            if (svd_chunked) return gcta_chunked::chunked_diagonal(chunked_reader, n, chunk_size).sum();
+            if (G_dense.size() == 0) return 0.0;
+            return G_dense.diagonal().sum();
+        }();
+        LOGGER.i(0, "Total variance (tr(G)) = " + to_string(trace_total));
+
         // Neither is needed past this point — G_dense (up to n x n) and the
         // chunked reader's mmap can both be released before the O(n) file
         // writes below, rather than sitting at peak size through them.

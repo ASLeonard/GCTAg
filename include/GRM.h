@@ -174,8 +174,12 @@ private:
     bool grm_skip_global_state = false;
 
     // Write the current tile's normalised rows to already-open output files.
+    // w_grm/w_N/grm_block/sparse_buf are caller-owned scratch (sized once by
+    // processMakeGRM to the widest tile, reused across every tile call).
     void flush_grm_tile(FILE *grm_out, FILE *N_out,
-                        float thresh, bool isSparse, float mtd_weight);
+                        float thresh, bool isSparse, float mtd_weight,
+                        std::vector<float>& w_grm, std::vector<float>& w_N,
+                        std::vector<float>& grm_block, std::string& sparse_buf);
 
     //Just for testing
 #ifndef NDEBUG

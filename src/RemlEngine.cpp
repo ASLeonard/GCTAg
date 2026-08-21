@@ -244,6 +244,8 @@ void init_varcomp(const RemlCtx& ctx,
         }
     }
 }
+bool verbose=false;
+
 
 // Fill ctx.Vi (lower triangle + diagonal) with sum_ci varcmp[ci] * A[ci].
 // Caller must have already called ctx.Vi.resize(n, n) and zeroed it.
@@ -510,6 +512,22 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
     if (need_resize) {
         ctx.hutchpp_S.resize(ctx.n, k);
         ctx.hutchpp_G.resize(ctx.n, k);
+
+        // Persistent working-set scratch, sized once per (n,k) and reused
+        // across every REML iteration and every component (ci) below --
+        // this call sits in the hottest loop in the engine (once per ci per
+        // AI-REML iteration), and every one of these was previously a fresh
+        // stack RemlMat, i.e. malloc/free churn on each call. QG/MQG are
+        // n x 2k: Q and G are pushed through the PA operator in one fused
+        // call instead of two (see the ci loop below).
+        ctx.hutchpp_qr_scratch.resize(ctx.n, k);
+        ctx.hutchpp_K.resize(ctx.n, k);
+        ctx.hutchpp_Q.resize(ctx.n, k);
+        ctx.hutchpp_QG.resize(ctx.n, 2 * k);
+        ctx.hutchpp_MQG.resize(ctx.n, 2 * k);
+        ctx.hutchpp_QtG.resize(k, k);
+        ctx.hutchpp_R.resize(ctx.n, k);
+        ctx.hutchpp_MR.resize(ctx.n, k);
     }
     if (need_resize || !ctx.reml_hutchpp_fixed_probes) {
         std::uniform_int_distribution<int> coin(0, 1);
@@ -519,9 +537,6 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
                 ctx.hutchpp_G(r, j) = coin(gcta_eigh::shared_rng()) ? 1.0 : -1.0;
             }
     }
-
-    // Pre-allocate thin-Q scratch (n×k) to avoid per-iteration Identity construction.
-    RemlMat qr_scratch = RemlMat::Identity(ctx.n, k);
 
     for (int ci = 0; ci < ncomp; ci++) {
         const bool is_I = (ctx.A[ctx.r_indx[ci]].size() == 0);
@@ -537,28 +552,45 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
                         : applyP_mat(ctx, RemlMat(ctx.A[ctx.r_indx[ci]] * Z));
         };
 
-        RemlMat K = applyPA_mat(ctx.hutchpp_S);
+        ctx.hutchpp_K.noalias() = applyPA_mat(ctx.hutchpp_S);
+        // reml_trace_power_iter is 0 in normal operation, so this loop is a
+        // no-op there; left on local temporaries rather than further hoisted
+        // scratch -- revisit if power_iter is ever turned back on.
         for (int pw = 0; pw < ctx.reml_trace_power_iter; pw++) {
-            Eigen::HouseholderQR<RemlMat> qr_pw(K);
-            qr_scratch.setIdentity();
-            K = applyPA_mat(qr_pw.householderQ() * qr_scratch);
+            Eigen::HouseholderQR<RemlMat> qr_pw(ctx.hutchpp_K);
+            ctx.hutchpp_qr_scratch.setIdentity();
+            ctx.hutchpp_K.noalias() = applyPA_mat(qr_pw.householderQ() * ctx.hutchpp_qr_scratch);
         }
-        Eigen::HouseholderQR<RemlMat> qr(K);
-        qr_scratch.setIdentity();
-        RemlMat Q = qr.householderQ() * qr_scratch;
+        Eigen::HouseholderQR<RemlMat> qr(ctx.hutchpp_K);
+        ctx.hutchpp_qr_scratch.setIdentity();
+        ctx.hutchpp_Q.noalias() = qr.householderQ() * ctx.hutchpp_qr_scratch;
 
-        const RemlMat MQ = applyPA_mat(Q);
-        const double t_lr = Q.cwiseProduct(MQ).sum();
-        const RemlMat MG = applyPA_mat(ctx.hutchpp_G);
+        // Fused MQ/MG evaluation: applyPA_mat is linear in its argument for
+        // fixed ci, so applyPA_mat([Q G]) == [applyPA_mat(Q) applyPA_mat(G)]
+        // exactly -- no numerical change from the previous two-call form.
+        // One n x 2k call instead of two n x k calls halves the number of
+        // applyP_mat invocations (each pays the Vi_X^T*Z / correction-term
+        // overhead, plus a triangular solve on the LLT path) and gives the
+        // underlying GEMMs double the RHS width to amortize call overhead
+        // against. MQ/MG below are contiguous column-blocks of MQG (same
+        // leading dimension as the parent matrix), so they still dispatch to
+        // BLAS as plain submatrix GEMM operands, not a scalar fallback.
+        ctx.hutchpp_QG.leftCols(k)  = ctx.hutchpp_Q;
+        ctx.hutchpp_QG.rightCols(k) = ctx.hutchpp_G;
+        ctx.hutchpp_MQG.noalias() = applyPA_mat(ctx.hutchpp_QG);
+        const auto MQ = ctx.hutchpp_MQG.leftCols(k);
+        const auto MG = ctx.hutchpp_MQG.rightCols(k);
 
-        const RemlMat QtG = Q.transpose() * ctx.hutchpp_G;
-        const RemlMat R_  = ctx.hutchpp_G - Q * QtG;
-        const RemlMat MR  = MG - MQ * QtG;
+        const double t_lr = ctx.hutchpp_Q.cwiseProduct(MQ).sum();
+
+        ctx.hutchpp_QtG.noalias() = ctx.hutchpp_Q.transpose() * ctx.hutchpp_G;
+        ctx.hutchpp_R.noalias()  = ctx.hutchpp_G - ctx.hutchpp_Q * ctx.hutchpp_QtG;
+        ctx.hutchpp_MR.noalias() = MG - MQ * ctx.hutchpp_QtG;
 
         // per_col(j) is the j-th probe column's contribution to the residual
         // trace estimate; their mean is the estimate itself (unchanged from
         // before), their sample variance-of-the-mean is the noise-floor input.
-        const RemlVec per_col = R_.cwiseProduct(MR).colwise().sum();  // k values
+        const RemlVec per_col = ctx.hutchpp_R.cwiseProduct(ctx.hutchpp_MR).colwise().sum();  // k values
         const double mean_r = per_col.mean();
         tr_PA(ci) = t_lr + mean_r;
         tr_PA_var(ci) = !ctx.reml_hutchpp_fixed_probes
@@ -648,13 +680,13 @@ void reml_equation(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py, RemlVec& 
 
     const int m = static_cast<int>(ctx.r_indx.size());
     RemlVec R(m);
-    RemlVec tmp(ctx.n);
+    if (ctx.reml_tmp_n.size() != ctx.n) ctx.reml_tmp_n.resize(ctx.n);
     for (int i = 0; i < m; i++) {
         if (ctx.A[ctx.r_indx[i]].size() == 0) {
             R(i) = Py.squaredNorm();
         } else {
-            tmp.noalias() = ctx.A[ctx.r_indx[i]] * Py;
-            R(i) = Py.dot(tmp);
+            ctx.reml_tmp_n.noalias() = ctx.A[ctx.r_indx[i]] * Py;
+            R(i) = Py.dot(ctx.reml_tmp_n);
         }
     }
 
@@ -696,7 +728,8 @@ double newton_decrement_null_quantile(const RemlMat& Hi, const RemlVec& var_U, d
 // — see call site.
 void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
              RemlVec& prev_varcmp, RemlVec& varcmp, double dlogL,
-             double& lambda_sq, RemlVec& var_U) {
+             double& lambda_sq, RemlVec& var_U,
+             bool last_step_trustworthy, double& step_scale_out) {
     const bool use_approx     = ctx.reml_trace_hutchpp;
     const bool woodbury_basis_active = ctx.Vi_use_woodbury_basis;
 
@@ -760,6 +793,34 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     RemlVec delta = Hi * R;
     lambda_sq = R.dot(delta);
 
+    // Fraction-to-boundary rule (standard interior-point safeguard, e.g.
+    // Wachter & Biegler / Nocedal & Wright Ch.19; tau=0.995 is the
+    // conventional default, not tuned to any dataset). Applied unconditionally
+    // (both legacy and --reml-ai-robust paths), independent of the trust/
+    // curvature-confidence logic below: this is a geometry constraint, not a
+    // model-confidence one. A raw Newton step that would drive a variance
+    // component negative gets globally rescaled (not clamped component-wise
+    // after the fact) so it lands just short of the boundary instead of
+    // overrunning it and being force-floored by constrain_varcmp. This
+    // matters because a hard-clamped, artificially degenerate point (rather
+    // than wherever Newton's own trajectory would have stopped) produces an
+    // unreliable AI-matrix estimate on the *next* call -- observed directly
+    // on real data: a full step onto a clamped near-zero component was
+    // followed by a step with a genuine logL decrease, costing several
+    // iterations of recovery. This rule is a no-op whenever no component is
+    // within tau of the boundary, which is the overwhelming majority of
+    // steps.
+    double fraction_to_boundary_cap = 1.0;
+    {
+        constexpr double tau = 0.995;
+        for (int i = 0; i < delta.size(); ++i) {
+            if (delta[i] < 0.0 && prev_varcmp[i] > 0.0) {
+                const double boundary_scale = -tau * prev_varcmp[i] / delta[i];
+                fraction_to_boundary_cap = std::min(fraction_to_boundary_cap, boundary_scale);
+            }
+        }
+    }
+
     // Step-size damping. Legacy behaviour (default): GCTA's original fixed
     // 0.316 (~1/sqrt(10)) shrink whenever the *previous* iteration's logL
     // change exceeded 1.0 -- an undocumented magic constant, and a backward-
@@ -781,9 +842,22 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     double step_scale = 1.0;
     if (dlogL > 1.0) step_scale = 0.316;
     if (ctx.reml_mtd == 0 && ctx.reml_ai_robust) {
+        // last_step_trustworthy: the *previous* iteration's own quadratic
+        // model (lambda_sq/step_scale at the time) predicted a certain logL
+        // gain; if the actual gain came in close to that prediction, Hi has
+        // just been validated as locally trustworthy and this step takes
+        // the full Newton step rather than re-damping from scratch. This is
+        // one bit of memory, not a persistent radius -- no ratchet, no cap,
+        // no expand/shrink schedule. Falls back to exactly the pre-existing
+        // formula (unchanged target_decrement=0.5) whenever the previous
+        // step hasn't (yet) proven itself.
         constexpr double target_decrement = 0.5;
-        step_scale = std::min(1.0, std::sqrt(target_decrement / std::max(lambda_sq, 1e-12)));
+        step_scale = last_step_trustworthy
+            ? 1.0
+            : std::min(1.0, std::sqrt(target_decrement / std::max(lambda_sq, 1e-12)));
     }
+    step_scale = std::min(step_scale, fraction_to_boundary_cap);
+    step_scale_out = step_scale;
 
     // Var(U_i) = 0.25 * Var(tr_PA_i) since only tr_PA is stochastic (Hutch++).
     // 0 for exact/Woodbury since tr_PA_var == 0. Left as a vector (not reduced
@@ -791,6 +865,8 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     // null-distribution weight matrix, not just its trace.
     var_U = 0.25 * tr_PA_var;
     varcmp = prev_varcmp + step_scale * delta;
+    if (verbose)
+        LOGGER << "REML iteration: lambda_sq = " << std::to_string(lambda_sq) << ", step scale = " << std::to_string(step_scale) << ", delta = " << delta.transpose() << std::endl;
 }
 
 // Post-hoc, Woodbury-only tail correction. Called exactly once, only at
@@ -932,20 +1008,21 @@ void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
 
     const int m = static_cast<int>(ctx.r_indx.size());
     RemlVec R(m);
-    RemlVec tmp(ctx.n);
+    if (ctx.reml_tmp_n.size() != ctx.n) ctx.reml_tmp_n.resize(ctx.n);
     for (int i = 0; i < m; i++) {
         if (woodbury_basis_active && i == 0) {
-            tmp = woodbury_basis_Kv(ctx, Py);
-            R(i) = Py.dot(tmp);
+            ctx.reml_tmp_n = woodbury_basis_Kv(ctx, Py);
+            R(i) = Py.dot(ctx.reml_tmp_n);
         } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
             R(i) = Py.squaredNorm();
         } else {
-            tmp.noalias() = ctx.A[ctx.r_indx[i]] * Py;
-            R(i) = Py.dot(tmp);
+            ctx.reml_tmp_n.noalias() = ctx.A[ctx.r_indx[i]] * Py;
+            R(i) = Py.dot(ctx.reml_tmp_n);
         }
         varcmp(i) = prev_varcmp(i) - prev_varcmp(i) * prev_varcmp(i) * (tr_PA(i) - R(i)) / ctx.n;
     }
-
+    if (verbose)
+        LOGGER << "REML iteration: step scale = 1.000000, delta = " << (varcmp - prev_varcmp).transpose() << std::endl;
 }
 
 double reml_iteration(RemlCtx& ctx,
@@ -961,6 +1038,26 @@ double reml_iteration(RemlCtx& ctx,
     double lambda_sq = 1e300;   // only meaningful when reml_mtd == 0
     RemlVec var_U;              // ditto -- Var(U) per component, from Hutch++ probe noise (0 for exact/Woodbury)
     RemlVec prev_prev_varcmp(varcmp), prev_varcmp(varcmp), varcomp_init(varcmp);
+
+    // One-bit trust state for --reml-ai-robust's step scale (see ai_reml).
+    // rho_threshold=0.75 is the standard trust-region "model was good"
+    // cutoff (Nocedal & Wright), used here as a single yes/no gate rather
+    // than a graduated radius. Unused when reml_ai_robust is off.
+    //
+    // Starts true (optimistic): attempt a full Newton step immediately on
+    // iteration 0 rather than damping-by-default before there is any
+    // evidence damping is needed. Self-correcting -- if iteration 0's full
+    // step disappoints (rho <= rho_threshold, checked below), iteration 1
+    // falls straight back to the damped formula. This does remove all
+    // protection specifically on the single highest-risk step (zero prior
+    // evidence on Hi's trustworthiness) -- validate against a poorly-
+    // conditioned GRM, not just well-behaved data, before relying on this
+    // for production runs.
+    constexpr double rho_threshold = 0.75;
+    bool last_step_trustworthy = true;
+    double step_scale_taken = 1.0;
+    bool have_predicted = false;
+    double predicted_dlogL = 0.0;
 
     // ctx.reml_ai_robust_risk is the one number you set: the (Bonferroni,
     // approximate) probability that ANY iteration across this whole run
@@ -998,20 +1095,27 @@ double reml_iteration(RemlCtx& ctx,
     // single iteration is sufficient by construction (see
     // newton_decrement_null_quantile for the caveats on that calibration).
     int small_delta_streak = 0;
-    const int M = 2;   // consecutive small deltas required; small, fixed, not data-dependent
+    const int M = 1;   // consecutive small deltas required; small, fixed, not data-dependent
     double best_lgL = 0;
     RemlVec best_varcmp;
     for (iter = 0; iter < ctx.reml_max_iter; iter++) {
         if (iter == 0) {
             prev_varcmp = varcomp_init;
-            if (prior_var_flag) {
-                if (ctx.reml_fixed_var)
-                    LOGGER << "VAR components fixed at: " << varcmp.transpose() << std::endl;
-                else
-                    LOGGER << "Prior values of variance components: " << varcmp.transpose() << std::endl;
-            } else if(ctx.reml_no_HE_start) {
-                ctx.reml_mtd = 2;
-                LOGGER << "Calculating prior values of variance components by EM-REML ..." << std::endl;
+            if (ctx.reml_fixed_var) {
+                LOGGER << "Variance components fixed at: ";
+            } else {
+                LOGGER << "Variance components initialised at: ";
+            }
+            LOGGER << varcmp.transpose() << std::endl;
+
+            if (!prior_var_flag) {
+                LOGGER << "Round 0 iteration using ";
+                if(ctx.reml_no_HE_start) {
+                  ctx.reml_mtd = 2;
+                  LOGGER << "EM-REML ..." << std::endl;
+                } else {
+                  LOGGER << "AI-REML ..." << std::endl;
+                }
             }
         }
         if (iter == 1) {
@@ -1046,7 +1150,8 @@ double reml_iteration(RemlCtx& ctx,
         logdet_Xt_Vi_X = logdet_Xt_Vi_X2;
 
         if (ctx.reml_mtd == 0)
-            ai_reml(ctx, ctx.P, Hi, Py, prev_varcmp, varcmp, dlogL, lambda_sq, var_U);
+            ai_reml(ctx, ctx.P, Hi, Py, prev_varcmp, varcmp, dlogL, lambda_sq, var_U,
+                    last_step_trustworthy, step_scale_taken);
         else if (ctx.reml_mtd == 1)
             reml_equation(ctx, ctx.P, Hi, Py, varcmp);
         else if (ctx.reml_mtd == 2)
@@ -1090,6 +1195,33 @@ double reml_iteration(RemlCtx& ctx,
         }
 
         dlogL = lgL - prev_lgL;
+
+        // Judge the step just taken against its own prediction, for use by
+        // the *next* iteration's ai_reml call. Predicted gain for a step of
+        // size s along the Newton direction is lambda_sq*s*(1-s/2) (from
+        // delta'*AI*delta = delta'*U = lambda_sq, same identity used for the
+        // Newton-decrement convergence test below) -- no extra solve, reuses
+        // quantities ai_reml already computed. iter>0 guard: prev_lgL is
+        // still the -1e20 sentinel at iter==0, so round 0's step has nothing
+        // meaningful to be judged against yet -- last_step_trustworthy keeps
+        // its optimistic initial value through iteration 0 and only starts
+        // being judged from iteration 1 onward.
+        const bool ai_robust_active_step = (ctx.reml_mtd == 0 && ctx.reml_ai_robust);
+        if (ai_robust_active_step && iter > 0 && have_predicted && predicted_dlogL > 1e-12) {
+            const double rho = dlogL / predicted_dlogL;
+            last_step_trustworthy = (rho > rho_threshold);
+            if (verbose) {
+                LOGGER << "  [ai-robust: predicted dlogL = " << std::fixed << LOGGER.setprecision(4)
+                    << predicted_dlogL << ", actual dlogL = " << dlogL
+                    << ", rho = " << LOGGER.setprecision(3) << rho
+                    << " (" << (last_step_trustworthy ? "trustworthy" : "not trustworthy") << ")]"
+                    << std::endl;
+            }
+        }
+        if (ai_robust_active_step) {
+            predicted_dlogL = lambda_sq * step_scale_taken * (1.0 - 0.5 * step_scale_taken);
+            have_predicted = true;
+        }
 
         // Convergence test. AI-REML (mtd==0) already computes AI^{-1} (Hi) and
         // the score U every iteration to take its Newton step, so the Newton
@@ -1861,6 +1993,10 @@ RemlState build_reml_state(RemlCtx& ctx) {
         // ctx.Uk is n×k — transpose before storing.
         rs.wb.Uk_f.resize(ctx.Uk.cols(), ctx.Uk.rows());
         rs.wb.Uk_f.noalias() = ctx.Uk.transpose().cast<float>();  // k×n
+        ctx.Uk.resize(0, 0); //free double buffer immediately -- nothing below reads it again,
+                              //same rationale as the ck/dk frees just below (was previously held
+                              //alive through the ck/dk conversions for no reason; n×k doubles,
+                              //typically the largest buffer in this branch)
 
         rs.wb.ck_f.resize(ctx.ck.size());
         rs.wb.ck_f.noalias() = ctx.ck.cast<float>(); //convert double to float
@@ -1876,7 +2012,6 @@ RemlState build_reml_state(RemlCtx& ctx) {
         ctx.dk.resize(0);
 
         rs.lambda_tail_f = static_cast<float>(ctx.lambda_tail);
-        ctx.Uk.resize(0, 0);
     } else if (ctx.Vi_use_llt) {
         // Vi_L holds the lower Cholesky factor L of V (from dpotrf).
         // Store it as float — the streaming code uses STRSV/STRSM directly,
@@ -1891,13 +2026,24 @@ RemlState build_reml_state(RemlCtx& ctx) {
         // once — so the streaming code always applies V^{-1} via a
         // triangular product (TRMM/STRMM) instead of holding a dense matrix
         // and re-deriving a usable factor from it at association time.
-        Eigen::LLT<RemlMat> Li(ctx.Vi);
-        if (Li.info() != Eigen::Success)
+        //
+        // Factorize in place via gcta_dpotrf (as calcu_Vi already does)
+        // rather than Eigen::LLT(ctx.Vi): Eigen::LLT's constructor copies
+        // its input into internal storage before factorizing, so it can't
+        // operate in place on a caller-owned buffer -- that doubles peak
+        // RSS transiently (ctx.Vi + LLT's internal copy, both n×n doubles,
+        // alive simultaneously) for no reason, since ctx.Vi is read via
+        // selfadjointView<Lower> everywhere else in this file (only the
+        // lower triangle is guaranteed valid, matching dpotrf's contract)
+        // and is freed immediately below regardless.
+        gcta_blas_int blas_n_bs = static_cast<gcta_blas_int>(ctx.n);
+        if (gcta_dpotrf(blas_n_bs, ctx.Vi.data(), blas_n_bs) != 0)
             LOGGER.e(0, "Vi is not positive definite when building REML state.");
         rs.is_llt = false;
-        const RemlMat& L = Li.matrixL();
-        rs.Vi_L_f.resize(L.rows(), L.cols());
-        rs.Vi_L_f.noalias() = L.cast<float>();
+        rs.Vi_L_f.resize(ctx.n, ctx.n);
+        rs.Vi_L_f.noalias() = ctx.Vi.cast<float>();   // lower triangle valid; upper is dpotrf
+                                                       // leftover and never read downstream --
+                                                       // same convention as the Vi_use_llt branch above
         ctx.Vi.resize(0, 0);
     }
 
@@ -1912,6 +2058,15 @@ RemlState build_reml_state(RemlCtx& ctx) {
     ctx.UkTy.resize(0, 0);
     ctx.hutchpp_S.resize(0, 0);
     ctx.hutchpp_G.resize(0, 0);
+    ctx.hutchpp_qr_scratch.resize(0, 0);
+    ctx.hutchpp_K.resize(0, 0);
+    ctx.hutchpp_Q.resize(0, 0);
+    ctx.hutchpp_QG.resize(0, 0);
+    ctx.hutchpp_MQG.resize(0, 0);
+    ctx.hutchpp_QtG.resize(0, 0);
+    ctx.hutchpp_R.resize(0, 0);
+    ctx.hutchpp_MR.resize(0, 0);
+    ctx.reml_tmp_n.resize(0);
     ctx.P.resize(0, 0);
     ctx.varcmp.clear();
     ctx.b.resize(0);

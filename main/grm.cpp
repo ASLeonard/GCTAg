@@ -1088,6 +1088,9 @@ void gcta::pca(std::string grm_file, std::string keep_indi_file, std::string rem
         }
     }
 
+    const double trace_total = grm_dbl.trace();
+    LOGGER.i(0, "Total variance (tr(G)) = " + std::to_string(trace_total));
+
     std::string eval_file = _out + ".eigenval";
     std::ofstream o_eval(eval_file.c_str());
     if (!o_eval) LOGGER.e(0, "cannot open the file [" + eval_file + "] to read.");

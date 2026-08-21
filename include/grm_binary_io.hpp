@@ -29,8 +29,10 @@ namespace gcta_grm_io {
 // Implementation notes:
 //   - .grm.bin is mmap'd with MADV_SEQUENTIAL for OS read-ahead; avoids a
 //     userspace heap allocation of up to several GB at large n.
-//   - float→double conversion is batched into a single std::transform pass,
-//     keeping buf reads sequential and compiler-vectorisable (AVX2 on Zen 4).
+//   - float→double conversion happens inline during the scatter into G,
+//     not via a separate full-size staging buffer (that would roughly
+//     double this function's transient RSS for no benefit -- see the
+//     comment at the scatter loop below).
 //   - Only the lower triangle of G is filled in the scatter loop; the upper
 //     triangle is then materialised via selfadjointView<Lower> to avoid
 //     cache-hostile scattered writes into non-sequential columns.
@@ -72,19 +74,27 @@ inline void read_grm_binary(const std::string& prefix,
     ::madvise(raw, byte_len, MADV_SEQUENTIAL | MADV_WILLNEED);
     const float* fbuf = static_cast<const float*>(raw);
 
-    std::vector<double> dbuf(tri);
-    std::transform(fbuf, fbuf + tri, dbuf.begin(),
-                   [](float f) noexcept { return static_cast<double>(f); });
-
-    ::munmap(raw, byte_len);
-
+    // Cast directly into G during the scatter below rather than through a
+    // separate n(n+1)/2-double dbuf staging buffer first. At n=100k that
+    // buffer was ~40GB held alongside G's own 80GB (~120GB peak in this
+    // function alone) for no real benefit: the scatter loop already read
+    // dbuf sequentially (dbuf[idx], ++idx) -- the exact same access pattern
+    // it gets reading fbuf directly below -- so dbuf's own "sequential
+    // source" property wasn't enabling anything the fused version doesn't
+    // already have. This does give up dbuf's dedicated AVX2-vectorized
+    // cast pass (the cast is now interleaved with G's write, which the
+    // comment below explains can't be made fully sequential given Eigen's
+    // column-major layout), but that's a single scalar conversion per
+    // element, negligible next to removing 40GB of transient allocation
+    // and the write+read traffic of filling and draining it.
     G.resize(n, n);
     {
         size_t idx = 0;
         for (int i = 0; i < n; ++i)
             for (int j = 0; j <= i; ++j, ++idx)
-                G(i, j) = dbuf[idx];
+                G(i, j) = static_cast<double>(fbuf[idx]);
     }
+    ::munmap(raw, byte_len);
     G = G.selfadjointView<Eigen::Lower>();
 
     // ------------------------------------------------------------------ //
@@ -251,6 +261,12 @@ public:
     // Fused y = Kx for the packed lower-triangular mmap, specialized for the
     // single-vector case that dominates chunked Lanczos. This bypasses the
     // tile -> MatrixXd materialization path entirely.
+    //
+    // partials_scratch_/y_scratch_ are mutable, lazily sized on first call,
+    // and reused across every subsequent call -- this runs once per Lanczos
+    // matvec (hundreds of times per eigendecomposition), and was previously
+    // a fresh n x num_threads allocation (+ a fresh per-thread n-length
+    // Zero() vector) on every single call.
     Eigen::VectorXd matvec_blocked(const Eigen::Ref<const Eigen::VectorXd>& x,
                                    int block_size) const {
         const int n = static_cast<int>(kp_.size());
@@ -260,11 +276,13 @@ public:
 #ifdef _OPENMP
         const int num_threads = omp_get_max_threads();
         if (num_threads > 1) {
-            Eigen::MatrixXd partials = Eigen::MatrixXd::Zero(n, num_threads);
+            if (partials_scratch_.rows() != n || partials_scratch_.cols() != num_threads)
+                partials_scratch_.resize(n, num_threads);
+            partials_scratch_.setZero();
             #pragma omp parallel
             {
                 const int tid = omp_get_thread_num();
-                Eigen::VectorXd y_local = Eigen::VectorXd::Zero(n);
+                auto y_local = partials_scratch_.col(tid);  // view into scratch, not a fresh alloc
                 #pragma omp for schedule(static, block_size > 0 ? block_size : 1)
                 for (int r = 0; r < n; ++r) {
                     const double xr = x[r];
@@ -291,12 +309,15 @@ public:
 
                     y_local[r] += acc;
                 }
-                partials.col(tid) = std::move(y_local);
             }
-            return partials.rowwise().sum();
+            return partials_scratch_.rowwise().sum();
         }
 #endif
 
+        // Single-threaded fallback (rare in practice -- any real SLURM
+        // allocation runs with cpus-per-task > 1). Left as a plain local: it
+        // already gets RVO/guaranteed-move on return, so persistent scratch
+        // here would trade that for a mandatory copy on every call instead.
         Eigen::VectorXd y = Eigen::VectorXd::Zero(n);
         for (int r = 0; r < n; ++r) {
             const double xr = x[r];
@@ -328,6 +349,8 @@ public:
     }
 
 private:
+    mutable Eigen::MatrixXd partials_scratch_;  // n x num_threads, reused across matvec_blocked calls
+
     double read_raw(int gi, int gj) const {
         const int file_row = std::max(gi, gj);
         const int file_col = std::min(gi, gj);

@@ -613,7 +613,14 @@ void PgenReader::ExtractGenoExt(const uintptr_t *in, const uintptr_t * subsets, 
 
 void PgenReader::ExtractDoubleExt(uintptr_t *in, const uintptr_t *subsets, uint32_t rawSampleSize, uint32_t keepSize, const double *gtable, double *gOut, uintptr_t *missOut){
     uintptr_t *bufptr = nullptr;
-    std::vector<uintptr_t> tmpbuf;
+    // thread_local, not a per-call local: this runs once per marker inside the
+    // caller's #pragma omp parallel-for-over-markers loop, and rawSampleSize !=
+    // keepSize (i.e. this branch taken) is the normal case for any run using
+    // --keep/--remove -- a fresh std::vector here was a malloc/free on every
+    // SNP on every thread. GetGenoBufPtrSize(keepSize) is constant for the run
+    // (keepSize is fixed at construction), so after each thread's first call
+    // this resize() is a same-size no-op.
+    thread_local std::vector<uintptr_t> tmpbuf;
     if(rawSampleSize == keepSize){
         bufptr = in;
     }else{
@@ -629,7 +636,8 @@ void PgenReader::ExtractDoubleExt(uintptr_t *in, const uintptr_t *subsets, uint3
 
 void PgenReader::ExtractFloatExt(uintptr_t *in, const uintptr_t *subsets, uint32_t rawSampleSize, uint32_t keepSize, const float *gtable, float *gOut, uintptr_t *missOut){
     uintptr_t *bufptr = nullptr;
-    std::vector<uintptr_t> tmpbuf;
+    // See ExtractDoubleExt above -- same rationale, same fix.
+    thread_local std::vector<uintptr_t> tmpbuf;
     if(rawSampleSize == keepSize){
         bufptr = in;
     }else{

@@ -178,10 +178,19 @@ RemlState readRemlState(const string& filename, bool no_adj_covar)
         const size_t tri = static_cast<size_t>(hdr.n) * (hdr.n + 1) / 2;
         vector<float> buf(tri);
         must_read(buf.data(), static_cast<std::streamsize>(tri * sizeof(float)));
+        // Unpack column-by-column via memcpy instead of a scalar
+        // per-element assignment loop -- both buf's packed segment and
+        // st.Vi_L_f's column-tail are contiguous, so this is O(n) memcpy
+        // calls instead of the ~n^2/2 scalar Eigen-indexed assignments the
+        // old loop did (mirrors the write_lower_triangle fix in
+        // writeRemlStateFromCtx below).
         size_t idx = 0;
-        for (int32_t j = 0; j < hdr.n; ++j)
-            for (int32_t i = j; i < hdr.n; ++i, ++idx)
-                st.Vi_L_f(i, j) = buf[idx];
+        for (int32_t j = 0; j < hdr.n; ++j) {
+            const int32_t len = hdr.n - j;
+            std::memcpy(st.Vi_L_f.col(j).tail(len).data(), buf.data() + idx,
+                        static_cast<size_t>(len) * sizeof(float));
+            idx += static_cast<size_t>(len);
+        }
     }  // buf (~n²/2 floats) freed here, ahead of the b/varcmp reads below
 
     if (!no_adj_covar) {
@@ -267,13 +276,28 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
 
         // Buffered packer: streams the lower triangle of a resident n×n
         // matrix out to disk without allocating a second n×n copy.
+        // Casts and appends one column-segment at a time (each segment is
+        // contiguous in mat's column-major storage) instead of a scalar
+        // per-element push_back loop -- the old loop ran O(n^2) scalar
+        // cast+push_back iterations (~5e9 at n=100k); this is O(n) vectorized
+        // Eigen casts plus bulk buffer inserts, same output byte order.
         auto write_lower_triangle = [&](const Eigen::MatrixXd& mat) {
             constexpr size_t io_chunk = 1 << 16;  // ~256KB of floats per flush
             vector<float> io_buf;
             io_buf.reserve(io_chunk);
+            vector<float> col_scratch(static_cast<size_t>(ctx.n));
             for (int j = 0; j < ctx.n; ++j) {
-                for (int i = j; i < ctx.n; ++i) {
-                    io_buf.push_back(static_cast<float>(mat(i, j)));
+                const int len = ctx.n - j;
+                Eigen::Map<Eigen::VectorXf>(col_scratch.data(), len) =
+                    mat.col(j).tail(len).cast<float>();
+                size_t written = 0;
+                while (written < static_cast<size_t>(len)) {
+                    const size_t take = std::min(static_cast<size_t>(len) - written,
+                                                  io_chunk - io_buf.size());
+                    io_buf.insert(io_buf.end(),
+                                   col_scratch.data() + written,
+                                   col_scratch.data() + written + take);
+                    written += take;
                     if (io_buf.size() == io_chunk) {
                         out.write(reinterpret_cast<const char*>(io_buf.data()),
                                   static_cast<std::streamsize>(io_buf.size() * sizeof(float)));
@@ -685,7 +709,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         const auto& vals = options_in["--mlma-stream"];
         if (!vals.empty()) {
             if (vals.size()==1)
-                options["mlma_tile_budget_gb"] = vals[0];
+                options_d["mlma_tile_budget_gb"] = {std::stod(vals[0])};
             else
                 LOGGER.e(0, "--mlma-stream accepts at most one value: the memory budget in GB for tile-based streaming.");
         }
@@ -817,8 +841,8 @@ void MLMA::processMain()
         // ---- Obtain REML state (either from file or inline) ----
         RemlState state;
         bool use_inline_ctx = false;
-        Eigen::VectorXf y_vec(n);
-        for (int i = 0; i < n; ++i) y_vec[i] = static_cast<float>(phenos_vec[i]);
+        Eigen::VectorXf y_vec = Eigen::Map<const Eigen::VectorXd>(phenos_vec.data(), n).cast<float>();
+        //for (int i = 0; i < n; ++i) y_vec[i] = static_cast<float>(phenos_vec[i]);
 
         // Streaming SNP-block width, sized from a memory budget rather than
         // the previous fixed BLOCK=10000 (which allocated the same
@@ -987,6 +1011,13 @@ void MLMA::processMain()
                 if (!is_identity) {
                     Eigen::MatrixXd G_sub(n, n);
                     // Column-first traversal for column-major Eigen storage.
+                    // Columns are independent (each writes its own G_sub
+                    // column, reads only from G_n), so this parallelizes
+                    // directly -- was single-threaded, O(n^2) scalar gather,
+                    // inconsistent with the OMP convention used for the same
+                    // shape of loop elsewhere (RemlEngine.cpp's
+                    // assemble_V_lower, trace_K2 computation).
+                    #pragma omp parallel for schedule(static)
                     for (int j = 0; j < n; ++j) {
                         const int src_col = kp[j];
                         for (int i = 0; i < n; ++i)

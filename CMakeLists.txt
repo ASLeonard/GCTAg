@@ -910,7 +910,7 @@ set_target_properties(Pgenlib PROPERTIES UNITY_BUILD OFF)
 target_include_directories(Pgenlib PUBLIC "${CMAKE_SOURCE_DIR}/third_party/plink-ng/2.0/include")
 if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     # plink2_base.h requires FMA3 whenever 32-byte AVX2 float vectors are enabled.
-    target_compile_options(Pgenlib PRIVATE -mavx2 -mfma -mbmi -mbmi2 -mlzcnt)
+    target_compile_options(Pgenlib PRIVATE $<$<CONFIG:Release>:$<IF:$<BOOL:${APPLE}>,-mcpu=native,-march=native>>)
 endif()
 
 

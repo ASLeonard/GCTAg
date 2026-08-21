@@ -244,6 +244,8 @@ void init_varcomp(const RemlCtx& ctx,
         }
     }
 }
+bool verbose=false;
+
 
 // Fill ctx.Vi (lower triangle + diagonal) with sum_ci varcmp[ci] * A[ci].
 // Caller must have already called ctx.Vi.resize(n, n) and zeroed it.
@@ -791,6 +793,34 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     RemlVec delta = Hi * R;
     lambda_sq = R.dot(delta);
 
+    // Fraction-to-boundary rule (standard interior-point safeguard, e.g.
+    // Wachter & Biegler / Nocedal & Wright Ch.19; tau=0.995 is the
+    // conventional default, not tuned to any dataset). Applied unconditionally
+    // (both legacy and --reml-ai-robust paths), independent of the trust/
+    // curvature-confidence logic below: this is a geometry constraint, not a
+    // model-confidence one. A raw Newton step that would drive a variance
+    // component negative gets globally rescaled (not clamped component-wise
+    // after the fact) so it lands just short of the boundary instead of
+    // overrunning it and being force-floored by constrain_varcmp. This
+    // matters because a hard-clamped, artificially degenerate point (rather
+    // than wherever Newton's own trajectory would have stopped) produces an
+    // unreliable AI-matrix estimate on the *next* call -- observed directly
+    // on real data: a full step onto a clamped near-zero component was
+    // followed by a step with a genuine logL decrease, costing several
+    // iterations of recovery. This rule is a no-op whenever no component is
+    // within tau of the boundary, which is the overwhelming majority of
+    // steps.
+    double fraction_to_boundary_cap = 1.0;
+    {
+        constexpr double tau = 0.995;
+        for (int i = 0; i < delta.size(); ++i) {
+            if (delta[i] < 0.0 && prev_varcmp[i] > 0.0) {
+                const double boundary_scale = -tau * prev_varcmp[i] / delta[i];
+                fraction_to_boundary_cap = std::min(fraction_to_boundary_cap, boundary_scale);
+            }
+        }
+    }
+
     // Step-size damping. Legacy behaviour (default): GCTA's original fixed
     // 0.316 (~1/sqrt(10)) shrink whenever the *previous* iteration's logL
     // change exceeded 1.0 -- an undocumented magic constant, and a backward-
@@ -826,6 +856,7 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
             ? 1.0
             : std::min(1.0, std::sqrt(target_decrement / std::max(lambda_sq, 1e-12)));
     }
+    step_scale = std::min(step_scale, fraction_to_boundary_cap);
     step_scale_out = step_scale;
 
     // Var(U_i) = 0.25 * Var(tr_PA_i) since only tr_PA is stochastic (Hutch++).
@@ -834,7 +865,8 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     // null-distribution weight matrix, not just its trace.
     var_U = 0.25 * tr_PA_var;
     varcmp = prev_varcmp + step_scale * delta;
-    LOGGER << "REML iteration: lambda_sq = " << std::to_string(lambda_sq) << ", step scale = " << std::to_string(step_scale) << ", delta = " << delta.transpose() << std::endl;
+    if (verbose)
+        LOGGER << "REML iteration: lambda_sq = " << std::to_string(lambda_sq) << ", step scale = " << std::to_string(step_scale) << ", delta = " << delta.transpose() << std::endl;
 }
 
 // Post-hoc, Woodbury-only tail correction. Called exactly once, only at
@@ -989,7 +1021,8 @@ void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
         }
         varcmp(i) = prev_varcmp(i) - prev_varcmp(i) * prev_varcmp(i) * (tr_PA(i) - R(i)) / ctx.n;
     }
-
+    if (verbose)
+        LOGGER << "REML iteration: step scale = 1.000000, delta = " << (varcmp - prev_varcmp).transpose() << std::endl;
 }
 
 double reml_iteration(RemlCtx& ctx,
@@ -1177,6 +1210,13 @@ double reml_iteration(RemlCtx& ctx,
         if (ai_robust_active_step && iter > 0 && have_predicted && predicted_dlogL > 1e-12) {
             const double rho = dlogL / predicted_dlogL;
             last_step_trustworthy = (rho > rho_threshold);
+            if (verbose) {
+                LOGGER << "  [ai-robust: predicted dlogL = " << std::fixed << LOGGER.setprecision(4)
+                    << predicted_dlogL << ", actual dlogL = " << dlogL
+                    << ", rho = " << LOGGER.setprecision(3) << rho
+                    << " (" << (last_step_trustworthy ? "trustworthy" : "not trustworthy") << ")]"
+                    << std::endl;
+            }
         }
         if (ai_robust_active_step) {
             predicted_dlogL = lambda_sq * step_scale_taken * (1.0 - 0.5 * step_scale_taken);

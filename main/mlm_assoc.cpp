@@ -926,7 +926,7 @@ void gcta::mlma_reml_stage(string grm_file, bool m_grm_flag, string subtract_grm
 
 void gcta::mlma_assoc_stage(string load_reml_name, bool no_adj_covar)
 {
-    string reml_file = load_reml_name + ".reml";
+    string reml_file = load_reml_name;
     LOGGER << "Reading the REML fit from [" << reml_file << "] ..." << endl;
 
     vector<string> saved_ids;

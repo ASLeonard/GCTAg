@@ -548,7 +548,7 @@ foreach(lib_src ${SRCS})
 endforeach(lib_src)
 
 add_executable(gcta64 ${MAIN_SOURCE})
-
+target_compile_definitions(gcta64 PRIVATE EIGEN_MAX_ALIGN_BYTES=16)
 add_subdirectory(main)
 target_include_directories(mainV1 PUBLIC ${COMMON_INCLUDES})
 
@@ -661,7 +661,7 @@ add_library(Pgenlib
 set_target_properties(Pgenlib PROPERTIES UNITY_BUILD OFF)
 target_include_directories(Pgenlib PUBLIC "${CMAKE_SOURCE_DIR}/third_party/plink-ng/2.0/include")
 if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    target_compile_options(Pgenlib PRIVATE -mavx2 -mfma -mbmi -mbmi2 -mlzcnt)
+    target_compile_options(Pgenlib PRIVATE -mfma -mbmi -mbmi2 -mlzcnt)
 endif()
 target_include_directories(Pgenlib PRIVATE ${GCTA_ZLIB_INCLUDE_DIRS})
 

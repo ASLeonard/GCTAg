@@ -1,7 +1,10 @@
 #ifndef GCTA_CPU_H
 #define GCTA_CPU_H
 
+#include <cmath>
+#include <limits>
 #include <vector>
+#include "Logger.h"
 
 #if defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)) || defined(__amd64)
   #define GCTA_CPU_x86 1
@@ -194,8 +197,42 @@ void dgeqrf_(const gcta_blas_int* m, const gcta_blas_int* n, double* A,
 void dorgqr_(const gcta_blas_int* m, const gcta_blas_int* n, const gcta_blas_int* k,
              double* A, const gcta_blas_int* lda, const double* tau,
              double* work, const gcta_blas_int* lwork, gcta_blas_int* info);
+double dlansy_(const char* norm, const char* uplo, const gcta_blas_int* n, const double* a,
+               const gcta_blas_int* lda, double* work);
+void dpocon_(const char* uplo, const gcta_blas_int* n, const double* a, const gcta_blas_int* lda,
+             const double* anorm, double* rcond, double* work, gcta_blas_int* iwork, gcta_blas_int* info);
 }
 #endif
+
+// Portable one-norm of a symmetric matrix (only the lower triangle is
+// referenced), feeding gcta_dpocon's pre-factorization anorm argument.
+inline double gcta_dlansy_one(gcta_blas_int n, const double* a, gcta_blas_int lda) {
+#if defined(GCTA_USE_ACCELERATE)
+    char norm = '1', uplo = 'L';
+    std::vector<double> work(n);
+    return dlansy_(&norm, &uplo, &n, a, &lda, work.data());
+#else
+    return LAPACKE_dlansy(LAPACK_COL_MAJOR, '1', 'L', n, a, lda);
+#endif
+}
+
+// Reciprocal condition number estimate (DPOCON) of an SPD matrix already
+// Cholesky-factored in place (lower triangle), given its pre-factorization
+// one-norm `anorm` from gcta_dlansy_one. Returns 0 on success (rcond
+// written), non-zero LAPACK info otherwise.
+inline int gcta_dpocon(gcta_blas_int n, const double* chol_lower, gcta_blas_int lda, double anorm, double* rcond) {
+#if defined(GCTA_USE_ACCELERATE)
+    char uplo = 'L';
+    gcta_blas_int info = 0;
+    std::vector<double> work(3 * n);
+    std::vector<gcta_blas_int> iwork(n);
+    dpocon_(&uplo, &n, chol_lower, &lda, &anorm, rcond, work.data(), iwork.data(), &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(LAPACKE_dpocon(LAPACK_COL_MAJOR, 'L', n, chol_lower, lda, anorm, rcond));
+#endif
+}
+
 
 inline int gcta_sgeqrf(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, float* tau) {
 #if defined(GCTA_USE_ACCELERATE)
@@ -271,6 +308,86 @@ inline int gcta_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas
     int info = gcta_dgeqrf(m, k, A, lda, tau.data());
     if (info != 0) return info;
     return gcta_dorgqr(m, k, A, lda, tau.data());
+}
+
+// CholeskyQR2: forms the m x k orthonormal factor Q of Y in place using two
+// rounds of DSYRK + DPOTRF + DTRSM. Unlike gcta_qr_thin_Q (dgeqrf/dorgqr),
+// whose Householder panel factorization is Level-2-BLAS-bound and stops
+// scaling with thread count once k gets large (e.g. k in the thousands for
+// rSVD on n ~ 1e5), every FLOP here goes through a Level-3 BLAS kernel that
+// OpenBLAS/MKL/AOCL/Accelerate all parallelize across the full thread pool.
+// Two Cholesky-QR passes restore orthogonality to working precision as long
+// as Y isn't extremely ill-conditioned. A pass-0 DPOTRF failure falls back to
+// the LAPACK QR path; a pass-1 failure just keeps pass-0's already-valid Q
+// (falling through to gcta_qr_thin_Q there would run the expensive Householder
+// path on data that's already orthonormal to working precision).
+// `workspace`, if supplied, is reused for the k x k Gram matrix across
+// repeated calls (e.g. power_iterate_and_project's loop) instead of
+// reallocating it every call; resize() is a no-op once it's the right size.
+inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* Y, gcta_blas_int ldY,
+                                    Eigen::MatrixXd* workspace = nullptr) {
+    Eigen::MatrixXd local_G;
+    Eigen::MatrixXd& G = workspace ? *workspace : local_G;
+    G.resize(k, k);
+    for (int pass = 0; pass < 2; ++pass) {
+        cblas_dsyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0, Y, ldY, 0.0, G.data(), k);
+        const double anorm = (pass == 0) ? gcta_dlansy_one(k, G.data(), k) : 0.0;
+        const int info = gcta_dpotrf(k, G.data(), k);
+        if (info != 0) {
+            if (pass != 0) break;  // pass 0's Q already orthonormal; skip the refinement.
+            return gcta_qr_thin_Q(m, k, Y, ldY);
+        }
+        if (pass == 0) {
+            double rcond = 0.0;
+            gcta_dpocon(k, G.data(), k, anorm, &rcond);
+            const double kappa_Y = (rcond > 0.0) ? std::sqrt(1.0 / rcond) : std::numeric_limits<double>::infinity();
+            LOGGER.i(0, "gcta_cholesky_qr_thin_Q: k=" + std::to_string(k) + " kappa(Y)=" + std::to_string(kappa_Y));
+        }
+        cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
+                    m, k, 1.0, G.data(), k, Y, ldY);
+    }
+    return 0;
+}
+
+// Same as gcta_cholesky_qr_thin_Q, but also returns the composed upper
+// triangular factor R (k x k, column-major, leading dimension ldR) such that
+// the original Y equals Q*R. Used by callers (Nystrom) that need R for a
+// follow-on small SVD but, unlike tall_skinny_thin_svd, can't afford an extra
+// n x k copy of Y to recover it afterwards as Q^T*Y_original. Falls back to
+// gcta_qr_thin_Q's dgeqrf/dorgqr (R read off its upper triangle) if the first
+// DPOTRF fails; a rare second-pass failure just keeps the first pass's
+// already-valid Q/R and skips the refinement.
+inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, double* Y, gcta_blas_int ldY,
+                                     double* R, gcta_blas_int ldR, Eigen::MatrixXd* workspace = nullptr) {
+    Eigen::Map<Eigen::MatrixXd, 0, Eigen::OuterStride<>> Rmat(R, k, k, Eigen::OuterStride<>(ldR));
+    Eigen::MatrixXd local_G;
+    Eigen::MatrixXd& G = workspace ? *workspace : local_G;
+    G.resize(k, k);
+    for (int pass = 0; pass < 2; ++pass) {
+        cblas_dsyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0, Y, ldY, 0.0, G.data(), k);
+        const double anorm = (pass == 0) ? gcta_dlansy_one(k, G.data(), k) : 0.0;
+        const int info = gcta_dpotrf(k, G.data(), k);
+        if (info != 0) {
+            if (pass != 0) break;  // pass 0's Q/R already valid; skip the refinement.
+            Eigen::VectorXd tau(k);
+            const int info_qr = gcta_dgeqrf(m, k, Y, ldY, tau.data());
+            if (info_qr != 0) return info_qr;
+            Rmat = Eigen::Map<Eigen::MatrixXd, 0, Eigen::OuterStride<>>(Y, k, k, Eigen::OuterStride<>(ldY))
+                       .triangularView<Eigen::Upper>();
+            return gcta_dorgqr(m, k, Y, ldY, tau.data());
+        }
+        if (pass == 0) {
+            double rcond = 0.0;
+            gcta_dpocon(k, G.data(), k, anorm, &rcond);
+            const double kappa_Y = (rcond > 0.0) ? std::sqrt(1.0 / rcond) : std::numeric_limits<double>::infinity();
+            LOGGER.i(0, "gcta_cholesky_qr_thin_QR: k=" + std::to_string(k) + " kappa(Y)=" + std::to_string(kappa_Y));
+        }
+        const Eigen::MatrixXd R_pass = Eigen::MatrixXd(G.triangularView<Eigen::Lower>()).transpose();
+        cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
+                    m, k, 1.0, G.data(), k, Y, ldY);
+        Rmat = (pass == 0) ? R_pass : Eigen::MatrixXd(R_pass * Rmat);
+    }
+    return 0;
 }
 
 // Scalar-generic QR factor/form-Q, dispatched at compile time so

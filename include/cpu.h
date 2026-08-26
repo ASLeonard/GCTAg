@@ -331,18 +331,20 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* Y, 
     G.resize(k, k);
     for (int pass = 0; pass < 2; ++pass) {
         cblas_dsyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0, Y, ldY, 0.0, G.data(), k);
-        const double anorm = (pass == 0) ? gcta_dlansy_one(k, G.data(), k) : 0.0;
+        //const double anorm = (pass == 0) ? gcta_dlansy_one(k, G.data(), k) : 0.0;
         const int info = gcta_dpotrf(k, G.data(), k);
         if (info != 0) {
             if (pass != 0) break;  // pass 0's Q already orthonormal; skip the refinement.
             return gcta_qr_thin_Q(m, k, Y, ldY);
         }
+        /*
         if (pass == 0) {
             double rcond = 0.0;
             gcta_dpocon(k, G.data(), k, anorm, &rcond);
             const double kappa_Y = (rcond > 0.0) ? std::sqrt(1.0 / rcond) : std::numeric_limits<double>::infinity();
             LOGGER.i(0, "gcta_cholesky_qr_thin_Q: k=" + std::to_string(k) + " kappa(Y)=" + std::to_string(kappa_Y));
         }
+        */
         cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
                     m, k, 1.0, G.data(), k, Y, ldY);
     }
@@ -365,7 +367,7 @@ inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, double* Y,
     G.resize(k, k);
     for (int pass = 0; pass < 2; ++pass) {
         cblas_dsyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0, Y, ldY, 0.0, G.data(), k);
-        const double anorm = (pass == 0) ? gcta_dlansy_one(k, G.data(), k) : 0.0;
+        //const double anorm = (pass == 0) ? gcta_dlansy_one(k, G.data(), k) : 0.0;
         const int info = gcta_dpotrf(k, G.data(), k);
         if (info != 0) {
             if (pass != 0) break;  // pass 0's Q/R already valid; skip the refinement.
@@ -376,12 +378,14 @@ inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, double* Y,
                        .triangularView<Eigen::Upper>();
             return gcta_dorgqr(m, k, Y, ldY, tau.data());
         }
+        /*
         if (pass == 0) {
             double rcond = 0.0;
             gcta_dpocon(k, G.data(), k, anorm, &rcond);
             const double kappa_Y = (rcond > 0.0) ? std::sqrt(1.0 / rcond) : std::numeric_limits<double>::infinity();
             LOGGER.i(0, "gcta_cholesky_qr_thin_QR: k=" + std::to_string(k) + " kappa(Y)=" + std::to_string(kappa_Y));
         }
+        */
         const Eigen::MatrixXd R_pass = Eigen::MatrixXd(G.triangularView<Eigen::Lower>()).transpose();
         cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
                     m, k, 1.0, G.data(), k, Y, ldY);

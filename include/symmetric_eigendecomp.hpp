@@ -71,19 +71,13 @@ inline void fill_standard_normal(Eigen::Ref<Eigen::MatrixXd> matrix) {
             matrix(row, col) = normal(shared_rng());
 }
 
-// Oversampling doesn't need to grow with k_target for generic top-k subspace
-// accuracy (HMT's error bound doesn't require it). But callers that use
-// eigenvalues near the *tail* of a large k_target block to locate a spectral
-// threshold (e.g. Woodbury's auto-k Marchenko-Pastur edge, or its EIG99 mass
-// target) are relying on exactly the estimates that are least accurate —
-// Rayleigh-Ritz quality degrades toward the edge of the requested block, and
-// GRM eigenvalues cluster tightly there by construction (that's the point of
-// the MP bulk edge). A fixed p=20 is a 3x buffer at k=6 (PCA; top eigenvalues
-// are well-separated population-structure signal, not the bottleneck) but a
-// 0.4% buffer at k=5000. Scale with k_target instead; the extra sketch
-// columns are cheap once k_ext is already in the thousands.
-inline int recommended_oversample(int k_target, int floor = 20, int cap = 200) {
-    return std::clamp(k_target / 10, floor, cap);
+// Keep the sketch width proportional to the target rank, but avoid the old
+// fixed 20-column floor on small k_target. The randomized range finder does
+// not need a large oversample when the target rank is only a handful of PCs.
+inline int recommended_oversample(int k_target, int floor = 8, int cap = 128) {
+    if (k_target <= 0) return 0;
+    const int soft_target = std::max(8, k_target);
+    return std::clamp(k_target / 8, std::min(floor, soft_target), cap);
 }
 
 // ─────────────────────────────────────────────────────────────────────────

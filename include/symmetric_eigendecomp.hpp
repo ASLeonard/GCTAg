@@ -64,11 +64,54 @@ inline std::mt19937& shared_rng() {
     return rng;
 }
 
+/*
 inline void fill_standard_normal(Eigen::Ref<Eigen::MatrixXd> matrix) {
     std::normal_distribution<double> normal(0.0, 1.0);
     for (Eigen::Index col = 0; col < matrix.cols(); ++col)
         for (Eigen::Index row = 0; row < matrix.rows(); ++row)
             matrix(row, col) = normal(shared_rng());
+}
+*/
+// Parallel fill: each thread gets its own mt19937, seeded from a draw off
+// the shared generator rather than from seed_seq{base, tid} -- a handful of
+// scalar differences fed to seed_seq can leave early generator states
+// weakly correlated across threads; drawing each thread's seed directly
+// off shared_rng() avoids that, at the cost of a handful of extra serial
+// draws done up front.
+//
+// NOTE: output now depends on thread count/column partitioning -- no
+// longer bit-reproducible across different thread-count runs. Omega is an
+// ephemeral random sketch, so this shouldn't matter for correctness, but
+// flag it if any test depends on exact reproducibility of the sketch.
+inline void fill_standard_normal(Eigen::Ref<Eigen::MatrixXd> matrix) {
+    const Eigen::Index rows = matrix.rows();
+    const Eigen::Index cols = matrix.cols();
+    if (rows == 0 || cols == 0) return;
+
+    const int num_threads = static_cast<int>(std::min<Eigen::Index>(omp_get_max_threads(), cols));
+
+    // Serial, cheap (num_threads draws) -- keeps shared_rng() as the sole
+    // entropy source and avoids any parallel access to it.
+    std::vector<std::uint32_t> thread_seeds(num_threads);
+    for (int t = 0; t < num_threads; ++t)
+        thread_seeds[t] = static_cast<std::uint32_t>(shared_rng()());
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+        const int tid = omp_get_thread_num();
+        std::mt19937 local_rng(thread_seeds[tid]);
+        std::normal_distribution<double> normal(0.0, 1.0);
+
+        // Column-major storage: each thread's columns are contiguous,
+        // disjoint memory -- no false sharing beyond block boundaries.
+        const Eigen::Index cols_per_thread = (cols + num_threads - 1) / num_threads;
+        const Eigen::Index col_begin = std::min(cols, static_cast<Eigen::Index>(tid) * cols_per_thread);
+        const Eigen::Index col_end   = std::min(cols, col_begin + cols_per_thread);
+
+        for (Eigen::Index col = col_begin; col < col_end; ++col)
+            for (Eigen::Index row = 0; row < rows; ++row)
+                matrix(row, col) = normal(local_rng);
+    }
 }
 
 // Keep the sketch width proportional to the target rank, but avoid the old

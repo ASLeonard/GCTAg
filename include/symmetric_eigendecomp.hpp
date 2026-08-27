@@ -64,26 +64,63 @@ inline std::mt19937& shared_rng() {
     return rng;
 }
 
+/*
 inline void fill_standard_normal(Eigen::Ref<Eigen::MatrixXd> matrix) {
     std::normal_distribution<double> normal(0.0, 1.0);
     for (Eigen::Index col = 0; col < matrix.cols(); ++col)
         for (Eigen::Index row = 0; row < matrix.rows(); ++row)
             matrix(row, col) = normal(shared_rng());
 }
+*/
+// Parallel fill: each thread gets its own mt19937, seeded from a draw off
+// the shared generator rather than from seed_seq{base, tid} -- a handful of
+// scalar differences fed to seed_seq can leave early generator states
+// weakly correlated across threads; drawing each thread's seed directly
+// off shared_rng() avoids that, at the cost of a handful of extra serial
+// draws done up front.
+//
+// NOTE: output now depends on thread count/column partitioning -- no
+// longer bit-reproducible across different thread-count runs. Omega is an
+// ephemeral random sketch, so this shouldn't matter for correctness, but
+// flag it if any test depends on exact reproducibility of the sketch.
+inline void fill_standard_normal(Eigen::Ref<Eigen::MatrixXd> matrix) {
+    const Eigen::Index rows = matrix.rows();
+    const Eigen::Index cols = matrix.cols();
+    if (rows == 0 || cols == 0) return;
 
-// Oversampling doesn't need to grow with k_target for generic top-k subspace
-// accuracy (HMT's error bound doesn't require it). But callers that use
-// eigenvalues near the *tail* of a large k_target block to locate a spectral
-// threshold (e.g. Woodbury's auto-k Marchenko-Pastur edge, or its EIG99 mass
-// target) are relying on exactly the estimates that are least accurate —
-// Rayleigh-Ritz quality degrades toward the edge of the requested block, and
-// GRM eigenvalues cluster tightly there by construction (that's the point of
-// the MP bulk edge). A fixed p=20 is a 3x buffer at k=6 (PCA; top eigenvalues
-// are well-separated population-structure signal, not the bottleneck) but a
-// 0.4% buffer at k=5000. Scale with k_target instead; the extra sketch
-// columns are cheap once k_ext is already in the thousands.
-inline int recommended_oversample(int k_target, int floor = 20, int cap = 200) {
-    return std::clamp(k_target / 10, floor, cap);
+    const int num_threads = static_cast<int>(std::min<Eigen::Index>(omp_get_max_threads(), cols));
+
+    // Serial, cheap (num_threads draws) -- keeps shared_rng() as the sole
+    // entropy source and avoids any parallel access to it.
+    std::vector<std::uint32_t> thread_seeds(num_threads);
+    for (int t = 0; t < num_threads; ++t)
+        thread_seeds[t] = static_cast<std::uint32_t>(shared_rng()());
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+        const int tid = omp_get_thread_num();
+        std::mt19937 local_rng(thread_seeds[tid]);
+        std::normal_distribution<double> normal(0.0, 1.0);
+
+        // Column-major storage: each thread's columns are contiguous,
+        // disjoint memory -- no false sharing beyond block boundaries.
+        const Eigen::Index cols_per_thread = (cols + num_threads - 1) / num_threads;
+        const Eigen::Index col_begin = std::min(cols, static_cast<Eigen::Index>(tid) * cols_per_thread);
+        const Eigen::Index col_end   = std::min(cols, col_begin + cols_per_thread);
+
+        for (Eigen::Index col = col_begin; col < col_end; ++col)
+            for (Eigen::Index row = 0; row < rows; ++row)
+                matrix(row, col) = normal(local_rng);
+    }
+}
+
+// Keep the sketch width proportional to the target rank, but avoid the old
+// fixed 20-column floor on small k_target. The randomized range finder does
+// not need a large oversample when the target rank is only a handful of PCs.
+inline int recommended_oversample(int k_target, int floor = 8, int cap = 128) {
+    if (k_target <= 0) return 0;
+    const int soft_target = std::max(8, k_target);
+    return std::clamp(k_target / 8, std::min(floor, soft_target), cap);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -135,25 +172,27 @@ EighResult power_iterate_and_project(
     if (k_target > k_ext)
         throw std::invalid_argument("power_iterate_and_project: k_target exceeds sketch width k_ext.");
 
-
-
     for (int pi = 0; pi < power_iter; ++pi) {
-        // In-place QR via direct LAPACK: Y becomes Q. No HouseholderQR
-        // internal copy, no Identity(n,k_ext) scratch, and Q formation goes
-        // through dorgqr (threaded BLAS) instead of Eigen's own sequential
-        // Householder-application loop (which EIGEN_USE_LAPACKE does NOT
-        // accelerate — only the dgeqrf factorization step is LAPACKE-backed).
-        int info = gcta_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)k_ext, Y.data(), (gcta_blas_int)n);
+        // Cholesky QR2 (DSYRK+DPOTRF+DTRSM) rather than LAPACK Householder QR:
+        // all Level-3 BLAS, so it keeps scaling with thread count at large
+        // k_ext where dgeqrf/dorgqr's panel factorization stops parallelizing.
+        // Deliberately not hoisting the k_ext x k_ext Gram scratch across
+        // iterations: at k_ext in the thousands its malloc/free cost is
+        // negligible next to the O(n*k_ext^2) SYRK/TRSM work, while keeping
+        // it alive for this whole function's scope would hold it resident
+        // alongside the much larger n x k_ext buffers below, raising peak RSS
+        // (and, empirically, wall time too) for no measured benefit here.
+        int info = gcta_cholesky_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)k_ext, Y.data(), (gcta_blas_int)n);
         if (info != 0)
-            throw std::runtime_error("power_iterate_and_project: dgeqrf/dorgqr failed (info=" +
+            throw std::runtime_error("power_iterate_and_project: orthogonalization failed (info=" +
                                       std::to_string(info) + ").");
         Y = apply(Y);
     }
 
     {
-        int info = gcta_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)k_ext, Y.data(), (gcta_blas_int)n);
+        int info = gcta_cholesky_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)k_ext, Y.data(), (gcta_blas_int)n);
         if (info != 0)
-            throw std::runtime_error("power_iterate_and_project: dgeqrf/dorgqr failed (info=" +
+            throw std::runtime_error("power_iterate_and_project: orthogonalization failed (info=" +
                                       std::to_string(info) + ").");
     }
     Eigen::MatrixXd Q = std::move(Y);
@@ -298,26 +337,23 @@ inline ThinSVDResult tall_skinny_thin_svd(const Eigen::MatrixXd& Z) {
 
     // Z is const& (caller retains ownership), so one n x k copy is
     // unavoidable here — same as HouseholderQR's internal copy today, no
-    // regression. The win is skipping the untreaded householderQ() apply
-    // and the separate Identity(n,k) buffer it required.
-    Eigen::MatrixXd QR = Z;
-    Eigen::VectorXd tau(k);
-    int info = gcta_dgeqrf((gcta_blas_int)n, (gcta_blas_int)k, QR.data(), (gcta_blas_int)n, tau.data());
+    // regression. CholeskyQR2 (DSYRK+DPOTRF+DTRSM) replaces dgeqrf/dorgqr:
+    // pure Level-3 BLAS, so it keeps scaling with thread count at large k
+    // where dgeqrf/dorgqr's panel factorization stops parallelizing. R is
+    // recovered as Q^T*Z (BLAS3 GEMM) rather than threaded through the
+    // factorization, since the copy already makes the original Z available.
+    Eigen::MatrixXd Q = Z;
+    const int info = gcta_cholesky_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)k, Q.data(), (gcta_blas_int)n);
     if (info != 0)
-        throw std::runtime_error("tall_skinny_thin_svd: dgeqrf failed (info=" + std::to_string(info) + ").");
+        throw std::runtime_error("tall_skinny_thin_svd: orthogonalization failed (info=" + std::to_string(info) + ").");
 
-    const Eigen::MatrixXd R = QR.topRows(k).triangularView<Eigen::Upper>();
-
-    info = gcta_dorgqr((gcta_blas_int)n, (gcta_blas_int)k, QR.data(), (gcta_blas_int)n, tau.data());
-    if (info != 0)
-        throw std::runtime_error("tall_skinny_thin_svd: dorgqr failed (info=" + std::to_string(info) + ").");
-    // QR now holds explicit Q in place.
+    const Eigen::MatrixXd R = Q.transpose() * Z;
 
     Eigen::BDCSVD<Eigen::MatrixXd, Eigen::ComputeThinU> svd_r(R);
 
     ThinSVDResult result;
     result.singular_values = svd_r.singularValues();
-    result.U = QR * svd_r.matrixU();   // n x k GEMM
+    result.U = Q * svd_r.matrixU();   // n x k GEMM
     return result;
 }
 
@@ -385,18 +421,16 @@ EighResult nystrom_symmetric_eigh(
     C.resize(0, 0);
 
     // Z is owned and mutable here (unlike tall_skinny_thin_svd's const&), so
-    // this needs zero extra n x k_ext buffers: no HouseholderQR internal
-    // copy, no Identity scratch, no separate Q — dgeqrf/dorgqr factor Z into
-    // its own explicit Q in place. Do NOT resize Z away below; it doubles
+    // this needs zero extra n x k_ext buffers: gcta_cholesky_qr_thin_QR
+    // (DSYRK+DPOTRF+DTRSM, pure Level-3 BLAS) factors Z into its own
+    // explicit Q in place and returns the tiny k_ext x k_ext R separately,
+    // without an extra n-scale copy. Do NOT resize Z away below; it doubles
     // as Q for the rest of the function.
-    Eigen::VectorXd tau(k_ext);
-    int info_qr = gcta_dgeqrf((gcta_blas_int)n, (gcta_blas_int)k_ext, Z.data(), (gcta_blas_int)n, tau.data());
+    Eigen::MatrixXd R(k_ext, k_ext);
+    const int info_qr = gcta_cholesky_qr_thin_QR((gcta_blas_int)n, (gcta_blas_int)k_ext, Z.data(), (gcta_blas_int)n,
+                                                  R.data(), (gcta_blas_int)k_ext);
     if (info_qr != 0)
-        throw std::runtime_error("nystrom_symmetric_eigh: dgeqrf failed (info=" + std::to_string(info_qr) + ").");
-    const Eigen::MatrixXd R = Z.topRows(k_ext).triangularView<Eigen::Upper>();
-    info_qr = gcta_dorgqr((gcta_blas_int)n, (gcta_blas_int)k_ext, Z.data(), (gcta_blas_int)n, tau.data());
-    if (info_qr != 0)
-        throw std::runtime_error("nystrom_symmetric_eigh: dorgqr failed (info=" + std::to_string(info_qr) + ").");
+        throw std::runtime_error("nystrom_symmetric_eigh: orthogonalization failed (info=" + std::to_string(info_qr) + ").");
     const Eigen::MatrixXd& Q = Z;   // Z now holds explicit Q; alias, not a copy
 
     Eigen::MatrixXd T = R * signs.asDiagonal() * R.transpose();

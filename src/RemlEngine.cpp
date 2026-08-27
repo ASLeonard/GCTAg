@@ -941,6 +941,7 @@ RemlVec compute_woodbury_posthoc_delta(RemlCtx& ctx, const RemlMat& Hi, const Re
     // ctx to that point first (same skip_P=true, dense-P-free path the main
     // convergence refresh uses -- Woodbury cannot materialise dense P/Vi).
     RemlVec varcmp_trial = prev_varcmp + d;
+    LOGGER << "REML: post-hoc secant trial point: varcmp_trial = " << varcmp_trial.transpose() << std::endl;
 
     double logdet_trial = 0.0;
     double t_star = 0.0;
@@ -983,6 +984,101 @@ RemlVec compute_woodbury_posthoc_delta(RemlCtx& ctx, const RemlMat& Hi, const Re
     calcu_P_impl(ctx, nullptr);
 
     return t_star * d;
+}
+
+// Closed-form, non-iterative tail correction to the HE-moment variance
+// component estimate. This is NOT a Newton step and does not touch the
+// score, Hi, P, or Vi -- it recomputes sigma_g^2 via the same
+// method-of-moments ratio used for the HE warm start (init_varcomp), but
+// with tail statistics corrected using lambda_tail and tail_d_var.
+//
+// tr(K) and tr(K^2) are made fully EXACT here, not just improved: a sum of
+// a degree-<=2 polynomial in the tail eigenvalues (tr(K) is degree 1,
+// tr(K^2) is degree 2) is completely recoverable from the tail's mean and
+// variance alone -- there is no Taylor remainder for these two terms, unlike
+// log|V| or tr(V^-1 K), which needed higher moments for further accuracy.
+//
+// y'Ky cannot be made exact this way -- same obstruction as R: its tail
+// contribution sum_{i>k} d_i*(w_i'y)^2 needs eigenvector alignment
+// information tau^2 does not contain. Two options are given: the cheap
+// flat-tail approximation (matches what the rest of REML already computes
+// with, O(n*k)), or an exact O(n^2) pass against the true GRM if ctx.A is
+// still resident. Neither is a correction to this specific term -- exact
+// uses the real matrix, flat leaves the existing approximation as-is.
+//
+// The result is a standalone point estimate, entirely decoupled from
+// whatever varcmp AI-REML converged to. It is NOT a refinement of that
+// estimate and does not require it -- it can be computed and reported
+// independently, e.g. purely as a diagnostic alongside the AI-REML result.
+RemlVec compute_he_tail_corrected_varcmp(RemlCtx& ctx, bool use_exact_yKy) {
+    const int k = ctx.woodbury_basis_rank_;
+    const int n = ctx.n;
+
+    // tr(K), tr(K^2): exact, from basis statistics already computed --
+    // no extra cost, no matvec.
+    const double trK  = ctx.dk.sum() + static_cast<double>(n - k) * ctx.lambda_tail;
+    const double trK2 = ctx.dk.squaredNorm()
+                       + static_cast<double>(n - k) * (ctx.tail_d_var + ctx.lambda_tail * ctx.lambda_tail);
+
+    // y'Ky: flat-tail (cheap, O(n*k)) unless exact was requested and ctx.A
+    // is available.
+    double yKy;
+    if (use_exact_yKy && !ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
+        yKy = ctx.y.dot(RemlVec(ctx.A[ctx.r_indx[0]] * ctx.y));   // one O(n^2) pass
+    } else {
+        if (use_exact_yKy) {
+            LOGGER.w(0, "compute_he_tail_corrected_varcmp: exact y'Ky requested but ctx.A "
+                        "is not resident -- falling back to the flat-tail approximation.");
+        }
+        yKy = ctx.y.dot(woodbury_basis_Kv(ctx, ctx.y));
+    }
+
+    const double yy = ctx.y.squaredNorm();
+    const double Vy = ctx.y_Ssq;
+    const double denom = static_cast<double>(n) * trK2 - trK * trK;
+
+    RemlVec varcmp_he(2);
+    double sg_he = (denom > 1e-10)
+        ? (static_cast<double>(n) * yKy - trK * yy) / denom
+        : Vy * 0.5;
+    // Same clamps as init_varcomp's HE warm start, for the same reason:
+    // this is the identical estimator family and can fail the same way
+    // (near-singular denominator, negative raw estimate).
+    sg_he = std::max(sg_he, 0.01 * Vy);
+    sg_he = std::min(sg_he, 0.99 * Vy);
+    varcmp_he(0) = sg_he;
+    varcmp_he(1) = std::max(Vy - sg_he, 0.01 * Vy);
+
+    LOGGER << "REML: HE tail-corrected estimate (" << (use_exact_yKy ? "exact" : "flat") << " y'Ky): "
+           << varcmp_he.transpose()
+           << "  [trK=" << trK << " trK2=" << trK2 << " yKy=" << yKy << "]" << std::endl;
+
+    return varcmp_he;
+}
+
+// tr_PA-only-corrected post-hoc step. No new matvec beyond what a converged
+// AI-REML run already computed -- Hi is reused as-is, R stays the existing
+// flat-tail approximation (woodbury_basis_Kv, O(n*k), no ctx.A needed).
+// Applied as a single step, NOT iterated, NOT secant-refined: iterating or
+// extrapolating this was shown earlier to accelerate rather than converge
+// (growing corrections at successively closer starting points), so this is
+// deliberately just one step from the actual converged point, nothing more.
+RemlVec compute_woodbury_posthoc_delta_simple(RemlCtx& ctx, const RemlMat& Hi, const RemlVec& Py) {
+    const int m = static_cast<int>(ctx.r_indx.size());
+
+    RemlVec tr_PA(m), tr_PA_corrected(m);
+    calcu_tr_PA_woodbury(ctx, tr_PA, &tr_PA_corrected);
+
+    RemlVec R_flat(m);
+    R_flat(0) = Py.dot(woodbury_basis_Kv(ctx, Py));
+    for (int i = 1; i < m; i++) {
+        R_flat(i) = (ctx.A[ctx.r_indx[i]].size() == 0)
+            ? Py.dot(Py)
+            : Py.dot(RemlVec(ctx.A[ctx.r_indx[i]] * Py));
+    }
+
+    const RemlVec U_partial = -0.5 * (tr_PA_corrected - R_flat);
+    return Hi * U_partial;
 }
 
 void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
@@ -1287,6 +1383,10 @@ double reml_iteration(RemlCtx& ctx,
         if (converged_flag) {
             //varcmp = best_varcmp;   // report best-seen, not last-iterate //Deactivated on purpose without testing, as this would no longer be a "convergence" method.
             if (ctx.Vi_use_woodbury_basis && ctx.reml_mtd == 0 && ctx.woodbury_basis_posthoc_correction) {
+                const RemlVec delta_simple = compute_woodbury_posthoc_delta_simple(ctx, Hi, Py);   // side effect: logs the tr_PA correction
+                 LOGGER << "REML: Woodbury post-hoc tail correction: delta = " << delta_simple.transpose() << std::endl;
+            }   
+            if (false) { //hard disable the secant step for now, as it is not well tested and may be unstable
                 // Hi/Py here are exactly what the final ai_reml call above left
                 // behind -- still consistent with prev_varcmp, the converged
                 // (flat-tail) fixed point. Nothing above this point in the loop

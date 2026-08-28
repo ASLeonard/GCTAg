@@ -1223,10 +1223,14 @@ void gcta::read_imp_dose_mach_gz(std::string zdosefile, std::string kp_indi_file
     zinf2.push(boost::iostreams::gzip_decompressor(15, 1 << 18));
     zinf2.push(raw_file2);
 
-    // Row-major staging buffer: matches the file's row-wise layout for
-    // sequential, cache-friendly writes during parsing.
-    Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> tmp;
-    tmp.setZero(_indi_num, static_cast<int>(_include.size()));
+    // Single-row staging buffer: matches the file's row-wise layout for a
+    // sequential, cache-friendly parse target, without materializing a
+    // second full-size n*m copy alongside _geno_dose (previously a
+    // RowMajor n*m staging matrix + a bulk `_geno_dose = tmp` transpose,
+    // which doubled peak memory for the duration of the assignment).
+    const int m_cols = static_cast<int>(_include.size());
+    _geno_dose.resize(_indi_num, m_cols);
+    std::vector<float> row_buf(m_cols);
 
     for (line = 0, k = 0; line < kp_it.size(); line++) {
         std::getline(zinf2, buf);
@@ -1258,18 +1262,19 @@ void gcta::read_imp_dose_mach_gz(std::string zdosefile, std::string kp_indi_file
             }
 
             if (rsnp[i]) {
-                tmp(k, j) = f_buf;
+                row_buf[j] = f_buf;
                 j++;
             }
         }
+        // One strided row-write into the column-major matrix per individual,
+        // instead of a full-matrix RowMajor->ColMajor copy at the end.
+        _geno_dose.row(k) = Eigen::Map<const Eigen::RowVectorXf>(row_buf.data(), m_cols);
         k++;
     }
     zinf2.reset();
     raw_file2.close();
 
-    // Single bulk transpose into the column-major storage used downstream.
-    _geno_dose = tmp;
-    if (_geno_dose.rows() != _indi_num || _geno_dose.cols() != static_cast<int>(_include.size()))
+    if (_geno_dose.rows() != _indi_num || _geno_dose.cols() != m_cols)
     LOGGER.e(0, "internal error: _geno_dose dimension mismatch after dosage load.");
 
     LOGGER << "Imputed dosage data for " << kept_id.size() << " individuals are included from [" << zdosefile << "]." << std::endl;
@@ -1367,13 +1372,14 @@ void gcta::read_imp_dose_mach(std::string dosefile, std::string kp_indi_file, st
     idose.open(dosefile.c_str());
     if (!idose) LOGGER.e(0, "cannot open the file [" + dosefile + "] to read.");
 
-    // Row-major staging buffer: matches the file's row-wise layout for
-    // sequential, cache-friendly writes during parsing. _geno_dose itself
-    // stays column-major (required downstream), so we fill this contiguously
-    // and do one bulk copy/transpose at the end instead of striding through
-    // _geno_dose on every element write.
-    Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> tmp;
-    tmp.setZero(_indi_num, static_cast<int>(_include.size()));
+    // Single-row staging buffer: matches the file's row-wise layout for a
+    // sequential, cache-friendly parse target, without materializing a
+    // second full-size n*m copy alongside _geno_dose (previously a
+    // RowMajor n*m staging matrix + a bulk `_geno_dose = tmp` transpose,
+    // which doubled peak memory for the duration of the assignment).
+    const int m_cols = static_cast<int>(_include.size());
+    _geno_dose.resize(_indi_num, m_cols);
+    std::vector<float> row_buf(m_cols);
 
     for (line = 0, k = 0; line < kp_it.size(); line++) {
         std::getline(idose, buf);
@@ -1405,17 +1411,18 @@ void gcta::read_imp_dose_mach(std::string dosefile, std::string kp_indi_file, st
             }
 
             if (rsnp[i]) {
-                tmp(k, j) = f_buf;
+                row_buf[j] = f_buf;
                 j++;
             }
         }
+        // One strided row-write into the column-major matrix per individual,
+        // instead of a full-matrix RowMajor->ColMajor copy at the end.
+        _geno_dose.row(k) = Eigen::Map<const Eigen::RowVectorXf>(row_buf.data(), m_cols);
         k++;
     }
     idose.close();
 
-    // Single bulk transpose into the column-major storage used downstream.
-    _geno_dose = tmp;
-    if (_geno_dose.rows() != _indi_num || _geno_dose.cols() != static_cast<int>(_include.size()))
+    if (_geno_dose.rows() != _indi_num || _geno_dose.cols() != m_cols)
     LOGGER.e(0, "internal error: _geno_dose dimension mismatch after dosage load.");
 
     LOGGER << "Imputed dosage data for " << kept_id.size() << " individuals are included from [" << dosefile << "]." << std::endl;

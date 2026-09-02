@@ -32,6 +32,7 @@
 #include <Eigen/Dense>
 #include <Spectra/SymEigsSolver.h>
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <random>
 #include <stdexcept>
@@ -39,6 +40,34 @@
 #include "cpu.h"  // gcta_dsyevd
 
 namespace gcta_eigh {
+
+// Wall-clock breakdown across the matvec (apply(), block GEMM-bound),
+// orthogonalization (CholeskyQR2, BLAS3-bound) and small dense eigensolve
+// (gcta_dsyevd on the k_ext x k_ext projected matrix, dsytrd-tridiagonalize
+// front end is Level-2-BLAS-bound and threads far worse than the other two
+// phases) legs of the rSVD/Nystrom code below. Not thread-safe, but every
+// caller here (compute_woodbury_basis, PCA rSVD) drives these functions from
+// a single thread, only fanning out inside BLAS calls -- reset/read from
+// that same calling thread only.
+struct RsvdProfile {
+    double apply_sec = 0.0;
+    double qr_sec    = 0.0;
+    double eig_sec   = 0.0;
+    void reset() { apply_sec = qr_sec = eig_sec = 0.0; }
+};
+inline RsvdProfile& rsvd_profile() {
+    static RsvdProfile prof;
+    return prof;
+}
+
+struct ScopedTimer {
+    double& target;
+    std::chrono::steady_clock::time_point start;
+    explicit ScopedTimer(double& target_) : target(target_), start(std::chrono::steady_clock::now()) {}
+    ~ScopedTimer() {
+        target += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    }
+};
 
 inline Eigen::VectorXd threaded_dense_matvec(
     const Eigen::MatrixXd& A,
@@ -150,7 +179,11 @@ std::pair<Eigen::MatrixXd, Eigen::MatrixXd> build_randomized_sketch(
         omega.resize(n, k_ext);
         fill_standard_normal(omega);
     }
-    Eigen::MatrixXd Y = apply(omega);
+    Eigen::MatrixXd Y;
+    {
+        ScopedTimer timer(rsvd_profile().apply_sec);
+        Y = apply(omega);
+    }
     return {std::move(omega), std::move(Y)};
 }
 
@@ -182,14 +215,20 @@ EighResult power_iterate_and_project(
         // it alive for this whole function's scope would hold it resident
         // alongside the much larger n x k_ext buffers below, raising peak RSS
         // (and, empirically, wall time too) for no measured benefit here.
-        int info = gcta_cholesky_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)k_ext, Y.data(), (gcta_blas_int)n);
+        int info;
+        {
+            ScopedTimer timer(rsvd_profile().qr_sec);
+            info = gcta_cholesky_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)k_ext, Y.data(), (gcta_blas_int)n);
+        }
         if (info != 0)
             throw std::runtime_error("power_iterate_and_project: orthogonalization failed (info=" +
                                       std::to_string(info) + ").");
+        ScopedTimer timer(rsvd_profile().apply_sec);
         Y = apply(Y);
     }
 
     {
+        ScopedTimer timer(rsvd_profile().qr_sec);
         int info = gcta_cholesky_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)k_ext, Y.data(), (gcta_blas_int)n);
         if (info != 0)
             throw std::runtime_error("power_iterate_and_project: orthogonalization failed (info=" +
@@ -197,7 +236,11 @@ EighResult power_iterate_and_project(
     }
     Eigen::MatrixXd Q = std::move(Y);
 
-    Eigen::MatrixXd AQ = apply(Q);
+    Eigen::MatrixXd AQ;
+    {
+        ScopedTimer timer(rsvd_profile().apply_sec);
+        AQ = apply(Q);
+    }
     Eigen::MatrixXd B  = Q.transpose() * AQ;   // k_ext x k_ext, symmetric in exact arithmetic
     AQ.resize(0, 0);
     // Match rayleigh_ritz_refine: dsyevd only reads one triangle, so without
@@ -207,7 +250,11 @@ EighResult power_iterate_and_project(
     // eigenvalues straight out of this call.
     B = 0.5 * (B + B.transpose());
     Eigen::VectorXd w(k_ext);
-    const int info = gcta_dsyevd((gcta_blas_int)k_ext, B.data(), (gcta_blas_int)k_ext, w.data());
+    int info;
+    {
+        ScopedTimer timer(rsvd_profile().eig_sec);
+        info = gcta_dsyevd((gcta_blas_int)k_ext, B.data(), (gcta_blas_int)k_ext, w.data());
+    }
     if (info != 0)
         throw std::runtime_error("power_iterate_and_project: dsyevd failed (info=" +
                                   std::to_string(info) + "). For k_ext > 32766, this is likely why.");
@@ -253,13 +300,21 @@ EighResult rayleigh_ritz_refine(
     if (k_target > k_ext)
         throw std::invalid_argument("rayleigh_ritz_refine: k_target exceeds basis width.");
 
-    Eigen::MatrixXd A_basis = apply(basis);
+    Eigen::MatrixXd A_basis;
+    {
+        ScopedTimer timer(rsvd_profile().apply_sec);
+        A_basis = apply(basis);
+    }
     Eigen::MatrixXd B = basis.transpose() * A_basis;
     A_basis.resize(0, 0);
     B = 0.5 * (B + B.transpose());
 
     Eigen::VectorXd w(k_ext);
-    const int info = gcta_dsyevd((gcta_blas_int)k_ext, B.data(), (gcta_blas_int)k_ext, w.data());
+    int info;
+    {
+        ScopedTimer timer(rsvd_profile().eig_sec);
+        info = gcta_dsyevd((gcta_blas_int)k_ext, B.data(), (gcta_blas_int)k_ext, w.data());
+    }
     if (info != 0)
         throw std::runtime_error("rayleigh_ritz_refine: dsyevd failed (info=" +
                                   std::to_string(info) + "). For k_ext > 32766, this is likely why.");
@@ -402,7 +457,11 @@ EighResult nystrom_symmetric_eigh(
     omega.resize(0, 0);
 
     Eigen::VectorXd w_C(k_ext);
-    const int info_C = gcta_dsyevd((gcta_blas_int)k_ext, C.data(), (gcta_blas_int)k_ext, w_C.data());
+    int info_C;
+    {
+        ScopedTimer timer(rsvd_profile().eig_sec);
+        info_C = gcta_dsyevd((gcta_blas_int)k_ext, C.data(), (gcta_blas_int)k_ext, w_C.data());
+    }
     if (info_C != 0)
         throw std::runtime_error("nystrom_symmetric_eigh: dsyevd on sketch C failed (info=" +
                                   std::to_string(info_C) + "). For k_ext > 32766, this is likely why.");
@@ -427,8 +486,12 @@ EighResult nystrom_symmetric_eigh(
     // without an extra n-scale copy. Do NOT resize Z away below; it doubles
     // as Q for the rest of the function.
     Eigen::MatrixXd R(k_ext, k_ext);
-    const int info_qr = gcta_cholesky_qr_thin_QR((gcta_blas_int)n, (gcta_blas_int)k_ext, Z.data(), (gcta_blas_int)n,
-                                                  R.data(), (gcta_blas_int)k_ext);
+    int info_qr;
+    {
+        ScopedTimer timer(rsvd_profile().qr_sec);
+        info_qr = gcta_cholesky_qr_thin_QR((gcta_blas_int)n, (gcta_blas_int)k_ext, Z.data(), (gcta_blas_int)n,
+                                            R.data(), (gcta_blas_int)k_ext);
+    }
     if (info_qr != 0)
         throw std::runtime_error("nystrom_symmetric_eigh: orthogonalization failed (info=" + std::to_string(info_qr) + ").");
     const Eigen::MatrixXd& Q = Z;   // Z now holds explicit Q; alias, not a copy
@@ -436,7 +499,11 @@ EighResult nystrom_symmetric_eigh(
     Eigen::MatrixXd T = R * signs.asDiagonal() * R.transpose();
     T = 0.5 * (T + T.transpose());
     Eigen::VectorXd w_T(k_ext);
-    const int info_T = gcta_dsyevd((gcta_blas_int)k_ext, T.data(), (gcta_blas_int)k_ext, w_T.data());
+    int info_T;
+    {
+        ScopedTimer timer(rsvd_profile().eig_sec);
+        info_T = gcta_dsyevd((gcta_blas_int)k_ext, T.data(), (gcta_blas_int)k_ext, w_T.data());
+    }
     if (info_T != 0)
         throw std::runtime_error("nystrom_symmetric_eigh: dsyevd on signed core T failed (info=" +
                                   std::to_string(info_T) + "). For k_ext > 32766, this is likely why.");

@@ -556,14 +556,21 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
         // reml_trace_power_iter is 0 in normal operation, so this loop is a
         // no-op there; left on local temporaries rather than further hoisted
         // scratch -- revisit if power_iter is ever turned back on.
+        /* //disabled for now, as it is not used in the current implementation
         for (int pw = 0; pw < ctx.reml_trace_power_iter; pw++) {
             Eigen::HouseholderQR<RemlMat> qr_pw(ctx.hutchpp_K);
             ctx.hutchpp_qr_scratch.setIdentity();
             ctx.hutchpp_K.noalias() = applyPA_mat(qr_pw.householderQ() * ctx.hutchpp_qr_scratch);
         }
-        Eigen::HouseholderQR<RemlMat> qr(ctx.hutchpp_K);
-        ctx.hutchpp_qr_scratch.setIdentity();
-        ctx.hutchpp_Q.noalias() = qr.householderQ() * ctx.hutchpp_qr_scratch;
+        */
+        ctx.hutchpp_Q = ctx.hutchpp_K;
+        const int info = gcta_cholesky_qr_thin_Q(
+            static_cast<gcta_blas_int>(ctx.n),
+            static_cast<gcta_blas_int>(k),
+            ctx.hutchpp_Q.data(),
+            static_cast<gcta_blas_int>(ctx.n));
+        if (info != 0)
+            LOGGER.e(0, "Hutch++ Cholesky QR failed (info=" + std::to_string(info) + ").");
 
         // Fused MQ/MG evaluation: applyPA_mat is linear in its argument for
         // fixed ci, so applyPA_mat([Q G]) == [applyPA_mat(Q) applyPA_mat(G)]
@@ -1824,6 +1831,11 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     }
     if (k_svd >= n) LOGGER.e(0, "--reml-woodbury-basis rank must be < n.");
 
+    // Wall time here is a fixed, k-independent O(n^2) full-matrix sweep
+    // (one read of the whole dense K, memory-bandwidth-bound); tagged
+    // separately from the apply/QR/eig breakdown below because it can't be
+    // shrunk by choosing a smaller Woodbury rank.
+    LOGGER.ts("woodbury_prep");
     const Eigen::MatrixXd& K_dbl = ctx.A[ctx.r_indx[0]];
     const double trace_K_full = svd_chunked
         ? gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, svd_chunk_rows).sum()
@@ -1840,6 +1852,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
             off_sq += K_dbl.col(j).tail(n - j - 1).squaredNorm();
         trace_K2 = diag_sq + 2.0 * off_sq;
     }
+    const float prep_sec = LOGGER.tp("woodbury_prep");
 
     double lambda_plus = 0.0;
     if (mode == WoodburyMode::MP) {
@@ -1870,6 +1883,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     Eigen::VectorXd eval_full;
     Eigen::MatrixXd evec_full;
     RankEvalResult eval_res;
+    gcta_eigh::rsvd_profile().reset();
 
     for (;;) {
         const int oversample = gcta_eigh::recommended_oversample(k_svd);
@@ -1969,6 +1983,10 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     LOGGER << "Woodbury basis: k=" << k
            << ", lambda_tail=" << ctx.lambda_tail
            << ", tail_d_var=" << ctx.tail_d_var << std::endl;
+    LOGGER.i(0, "Woodbury basis timing: prep(trace)=" + std::to_string(prep_sec)
+                + "s, matvec(apply)=" + std::to_string(gcta_eigh::rsvd_profile().apply_sec)
+                + "s, QR=" + std::to_string(gcta_eigh::rsvd_profile().qr_sec)
+                + "s, eigensolve=" + std::to_string(gcta_eigh::rsvd_profile().eig_sec) + "s.");
 }
 
 void compute(RemlCtx& ctx,
@@ -2008,7 +2026,7 @@ void compute(RemlCtx& ctx,
     if (ctx.woodbury_basis_rank != 0) {
         LOGGER.ts("woodbury");
         compute_woodbury_basis(ctx);
-        float duration = LOGGER.tp("main");
+        float duration = LOGGER.tp("woodbury");
         LOGGER.i(0, "Woodbury basis computation took " + std::to_string(duration) + " seconds.");
     }
 
@@ -2040,6 +2058,22 @@ void compute(RemlCtx& ctx,
     const double VarVp = Hi.topLeftCorner(me, me).sum();
     ctx.Vp = Vp;
     ctx.Vp_se = std::sqrt(std::max(0.0, VarVp));
+
+    // --- Diagnostic (log-only; no behavior change) -------------------------
+    // Woodbury truncation empirically underestimates Vg substantially more
+    // than Ve, so the fitted total Vp = sum(varcmp) undershoots the true
+    // phenotypic variance. The ratio Vp_est / y_Ssq (both already computed
+    // above) tracks the downstream MLMA significance inflation closely
+    // enough on validation data to be worth logging for every Woodbury run.
+    // Not yet wired into MLMA p-values -- staged rollout: log-only here,
+    // gated flag once validated on a broader k/phenotype sweep, then default.
+    if (ctx.Vi_use_woodbury_basis && ctx.y_Ssq > 0.0) {
+        const double vp_ratio = ctx.Vp / ctx.y_Ssq;
+        LOGGER << "Woodbury diagnostic: Vp_est=" << ctx.Vp
+               << ", y_Ssq(empirical Var(y))=" << ctx.y_Ssq
+               << ", Vp_est/y_Ssq=" << vp_ratio
+               << " (candidate MLMA p-value deflation factor)" << std::endl;
+    }
 
     const int ngen = std::max(0, m - 1);
     ctx.hsq.assign(ngen, 0.0);

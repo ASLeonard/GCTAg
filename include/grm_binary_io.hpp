@@ -166,15 +166,15 @@ inline std::vector<int> match_ids_to_grm(const std::vector<std::string>& ref_ids
 //
 // Why mmap rather than manual pread(): kp (analysis index -> GRM-file row
 // index) is an arbitrary permutation in general — match_ids_to_grm doesn't
-// promise anything about ordering — so a tile that's contiguous in analysis
-// space can touch scattered, non-monotonic file rows. Rather than trying to
-// batch reads under that uncertainty, mmap the whole file (cheap: virtual
-// address space only, RSS is driven by which pages actually get touched,
-// not file size) and index it directly per entry — the kernel's page cache
-// absorbs any locality that's there and does the right thing regardless of
-// how scrambled kp turns out to be. MADV_RANDOM (not SEQUENTIAL/WILLNEED,
-// unlike read_grm_binary's dense path) since access here is tile-scattered
-// by construction, not a single top-to-bottom pass.
+// promise anything about ordering. When kp turns out to be monotonic
+// (identity, or an order-preserving subset — by far the common case, since
+// analysis sample order usually tracks the GRM's own .grm.id order),
+// read_tile below exploits that to bulk-read one contiguous run per output
+// row and the constructor advises the kernel to read ahead accordingly. A
+// genuinely scrambled kp degrades to one mmap touch per scalar entry —
+// still correct, but each touch can land on a different page of a
+// possibly huge file, which is real, unavoidable, and can dominate runtime;
+// the constructor warns loudly in that case.
 class ChunkedGrmMmap {
 public:
     // kp[i] = row index (in whatever file this wraps) for analysis
@@ -203,21 +203,34 @@ public:
             LOGGER.e(0, "unexpected size in [" + path + "].");
         }
 
+        kp_is_identity_ = true;
+        kp_is_monotonic_ = true;
+        for (int i = 0; i < static_cast<int>(kp_.size()); ++i) {
+            if (kp_[i] != i) kp_is_identity_ = false;
+            if (i > 0 && kp_[i] <= kp_[i - 1]) kp_is_monotonic_ = false;
+        }
+
         void* raw = ::mmap(nullptr, byte_len_, PROT_READ, MAP_PRIVATE, fd_, 0);
         if (raw == MAP_FAILED) {
             ::close(fd_);
             LOGGER.e(0, "mmap failed for [" + path + "].");
         }
-        ::madvise(raw, byte_len_, MADV_RANDOM);
+        // Identity/order-preserving-subset kp (the common case: analysis
+        // sample order tracks the GRM's .grm.id order, possibly with some
+        // individuals dropped) makes read_tile's per-row access a single
+        // increasing run of file offsets (see read_tile below) — tell the
+        // kernel to read ahead for that case. A genuinely scrambled kp
+        // (sample order shuffled relative to the GRM) has no such locality;
+        // keep the no-readahead hint there so we don't pollute the page
+        // cache with pages that won't be reused.
+        ::madvise(raw, byte_len_, kp_is_monotonic_ ? (MADV_SEQUENTIAL | MADV_WILLNEED) : MADV_RANDOM);
         fbuf_ = static_cast<const float*>(raw);
 
-        kp_is_identity_ = true;
-        for (int i = 0; i < static_cast<int>(kp_.size()); ++i) {
-            if (kp_[i] != i) {
-                kp_is_identity_ = false;
-                break;
-            }
-        }
+        if (!kp_is_monotonic_)
+            LOGGER.w(0, "--svd-chunked-budget: the analysis sample order does not match [" +
+                        path + "]'s order (individuals were reordered, not just subsetted). "
+                        "GRM tile reads degrade to scattered per-entry access in this case and "
+                        "can be dramatically slower than the reported chunk count suggests.");
     }
 
     ~ChunkedGrmMmap() {
@@ -227,23 +240,71 @@ public:
     ChunkedGrmMmap(const ChunkedGrmMmap&)            = delete;
     ChunkedGrmMmap& operator=(const ChunkedGrmMmap&) = delete;
 
-    // K_analysis[rs:re, cs:ce]. No assumption that cs-block <= rs-block
-    // implies file-row >= file-col — kp can reorder that relationship
-    // entirely — so every entry independently resolves which physical file
-    // row (the larger of the two mapped indices) it lives in. This means
-    // the returned tile is always fully symmetric on its own, even for a
-    // diagonal-block call — chunked_symmetric_matvec's selfadjointView
-    // mirroring step is a safe no-op on it, not required for correctness
-    // here specifically, but left untouched since that's a general contract
-    // other readers may need.
+    // K_analysis[rs:re, cs:ce]. Every consumer (chunked_symmetric_matvec,
+    // chunked_diagonal, chunked_trace_K_squared) only ever reads a
+    // diagonal-block tile (rs==cs) through selfadjointView<Lower>() or
+    // .diagonal() — so only the tile's lower triangle (lq <= lp) needs to
+    // be valid there; the monotonic fast path below relies on that and
+    // leaves the upper triangle uninitialized for diagonal tiles. For a
+    // genuinely scrambled (non-monotonic) kp there's no cheaper option, so
+    // the fallback below still fills the whole tile per entry.
     Eigen::MatrixXd read_tile(int rs, int re, int cs, int ce) const {
         const int tile_rows = re - rs, tile_cols = ce - cs;
         Eigen::MatrixXd tile(tile_rows, tile_cols);
+
+        if (!kp_is_monotonic_) {
+            // Genuinely scrambled kp: no exploitable locality, every entry
+            // can live on a different page of a possibly huge file.
+            for (int lp = 0; lp < tile_rows; ++lp) {
+                const int gi = kp_[rs + lp];
+                for (int lq = 0; lq < tile_cols; ++lq) {
+                    const int gj = kp_[cs + lq];
+                    tile(lp, lq) = read_raw(gi, gj);
+                }
+            }
+            return tile;
+        }
+
+        if (kp_is_identity_) {
+            // No reindexing at all: gj - gj_lo == lq exactly, so the source
+            // span maps onto the destination row with no gaps. Skip kp_[]
+            // (and the per-entry gj/subtraction arithmetic below) entirely
+            // and let Eigen vectorize the float->double widen as one cast
+            // instead of a hand-rolled scalar gather loop.
+            const bool diagonal_tile = (rs == cs);
+            for (int lp = 0; lp < tile_rows; ++lp) {
+                const int gi = rs + lp;
+                const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
+                if (lq_end == 0) continue;
+                const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2;
+                const float* row_span = fbuf_ + row_base + cs;
+                tile.row(lp).head(lq_end) =
+                    Eigen::Map<const Eigen::RowVectorXf>(row_span, lq_end).cast<double>();
+            }
+            return tile;
+        }
+
+        // Monotonic kp (an order-preserving subset, not full identity): kp
+        // is strictly increasing, so every gj needed by row lp satisfies
+        // gj <= gi (true for off-diagonal tiles because the whole column
+        // block precedes the row block; true for the diagonal tile's lower
+        // triangle because lq <= lp there) — so file_row == gi is constant
+        // across the row and the needed file_col's form one increasing run.
+        // Bulk-read that run once instead of touching the mmap per entry;
+        // this is what turns a per-entry page-fault storm on a huge file
+        // into one sequential read per output row.
+        const bool diagonal_tile = (rs == cs);
         for (int lp = 0; lp < tile_rows; ++lp) {
             const int gi = kp_[rs + lp];
-            for (int lq = 0; lq < tile_cols; ++lq) {
+            const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;  // upper triangle unused for diagonal tiles
+            if (lq_end == 0) continue;
+            const int gj_lo = kp_[cs];
+            const int gj_hi = kp_[cs + lq_end - 1];
+            const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2;
+            const float* row_span = fbuf_ + row_base + gj_lo;
+            for (int lq = 0; lq < lq_end; ++lq) {
                 const int gj = kp_[cs + lq];
-                tile(lp, lq) = read_raw(gi, gj);
+                tile(lp, lq) = static_cast<double>(row_span[gj - gj_lo]);
             }
         }
         return tile;
@@ -364,6 +425,7 @@ private:
     size_t byte_len_ = 0;
     const float* fbuf_ = nullptr;
     bool kp_is_identity_ = false;
+    bool kp_is_monotonic_ = false;
 };
 
 // .grm.N.bin diagonal only (mean SNP count) — same file, same packed layout,

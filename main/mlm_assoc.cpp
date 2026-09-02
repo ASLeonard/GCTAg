@@ -1173,7 +1173,7 @@ void gcta::save_reml_state(const std::string& filename, bool no_adj_covar)
     //   - Woodbury path:   _Vi_use_woodbury == true; V^{-1} is stored implicitly
     //                      as (I − U_k diag(c_k) U_k^T) / σ²_eff.
     //                      Materialise it explicitly here before packing.
-    // ---- Woodbury path: compact "TUNA" format ----
+    // ---- Woodbury path: compact "CLAM" format ----
     // V^{-1} is never needed as a dense matrix in the Woodbury MLMA path —
     // mlma_calcu_stat{,_covar} use _Uk/_dk/_ck/_sigma2_eff directly.
     // Save just the Woodbury factors (~n*k floats) instead of the packed
@@ -1183,7 +1183,7 @@ void gcta::save_reml_state(const std::string& filename, bool no_adj_covar)
         if(!outfile.is_open()) LOGGER.e(0, "cannot open the file ["+filename+"] to write.");
 
         struct WBHeader {
-            char    magic[4]    = {'T','U','N','A'};
+            char    magic[4]    = {'C','L','A','M'};
             int32_t n           = 0;
             int32_t x_c         = 0;
             int32_t num_varcmp  = 0;
@@ -1248,7 +1248,7 @@ void gcta::save_reml_state(const std::string& filename, bool no_adj_covar)
         return;
     }
 
-    // ---- Dense path: "GOBY" packed-triangle format ----
+    // ---- Dense path: "SEAL" packed-triangle format ----
     if (_Vi_use_llt) {
         _Vi.swap(_Vi_L);  // O(1): _Vi gets L's storage, _Vi_L becomes empty
         gcta_blas_int blas_n_s = static_cast<gcta_blas_int>(_n);
@@ -1262,9 +1262,9 @@ void gcta::save_reml_state(const std::string& filename, bool no_adj_covar)
     if(!outfile.is_open()) LOGGER.e(0, "cannot open the file ["+filename+"] to write.");
 
     // ---- Header ----
-    // Magic "GOBY": packed-triangle symmetric format.
+    // Magic "SEAL": packed-triangle symmetric format.
     struct Header {
-        char    magic[4]    = {'G','O','B','Y'};
+        char    magic[4]    = {'S','E','A','L'};
         int32_t n           = 0;
         int32_t x_c         = 0;
         int32_t num_varcmp  = 0;
@@ -1346,8 +1346,8 @@ void gcta::load_reml_state(const std::string& filename, bool no_adj_covar)
     } hdr;
     must_read(&hdr, sizeof(hdr));
 
-    // ---- Woodbury "TUNA" format ----
-    if(std::string_view(hdr.magic, 4) == "TUNA") {
+    // ---- Woodbury "CLAM" format ----
+    if(std::string_view(hdr.magic, 4) == "CLAM") {
         // The Woodbury-format header has one extra int32 (woodbury_k).
         int32_t woodbury_k = 0;
         must_read(&woodbury_k, sizeof(int32_t));
@@ -1420,8 +1420,8 @@ void gcta::load_reml_state(const std::string& filename, bool no_adj_covar)
         return;
     }
 
-    // ---- Dense "GOBY" packed-triangle format ----
-    if(std::string_view(hdr.magic, 4) != "GOBY")
+    // ---- Dense "SEAL" packed-triangle format ----
+    if(std::string_view(hdr.magic, 4) != "SEAL")
         LOGGER.e(0, "file ["+filename+"] is not a valid REML state file.");
     if(hdr.n <= 0 || hdr.x_c < 0 || hdr.num_varcmp <= 0 || hdr.num_r_indx <= 0)
         LOGGER.e(0, "file ["+filename+"] contains invalid dimensions — file may be corrupt.");

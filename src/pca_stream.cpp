@@ -242,15 +242,16 @@ void PCAStream::processMain()
                 G_dense = std::move(G_full);
             } else {
                 G_dense.resize(n, n);
-                // Column-first traversal for column-major Eigen storage —
-                // same pattern as MLMA_stream.cpp's G_n subsetting: for fixed
-                // j, varying i reads down one column of G_full (contiguous
-                // range, even though kp[i] visits it out of order), rather
-                // than jumping across the whole matrix.
+                // Populate the upper triangle (i <= j) from G_full's upper triangle
+                // using symmetrized index coordinates min/max(kp[i], src_col).
+                #pragma omp parallel for schedule(static)
                 for (int j = 0; j < n; ++j) {
                     const int src_col = kp[j];
-                    for (int i = 0; i < n; ++i)
-                        G_dense(i, j) = G_full(kp[i], src_col);
+                    for (int i = 0; i <= j; ++i) {
+                        const int r = std::min(kp[i], src_col);
+                        const int c = std::max(kp[i], src_col);
+                        G_dense(i, j) = G_full(r, c);
+                    }
                 }
                 // G_full (n_grm x n_grm, potentially much larger than G_dense
                 // when heavily filtered) goes out of scope at the end of this
@@ -274,7 +275,7 @@ void PCAStream::processMain()
                 return Y;
             }
 
-            Eigen::MatrixXd Y = G_dense * X;
+            Eigen::MatrixXd Y = G_dense.selfadjointView<Eigen::Upper>() * X;
             return Y;
         };
 

@@ -7,6 +7,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -18,30 +21,91 @@
 
 #include "chunked_grm_matvec.hpp"
 
+#ifndef MADV_WILLNEED
+  #define MADV_WILLNEED POSIX_MADV_WILLNEED
+#endif
+
 namespace gcta_grm_io {
 
-// Read a GCTA GRM binary file set (prefix.grm.id, prefix.grm.bin, prefix.grm.N.bin).
+// Row boundaries [0, b1, b2, ..., n] splitting a packed lower-triangle-by-row
+// file (row i holds i+1 elements) into num_parts contiguous ranges with
+// roughly equal total element count.
+inline std::vector<int> triangular_row_partition(int n, int num_parts) {
+    std::vector<int> bounds(1, 0);
+    const double total = static_cast<double>(n) * (n + 1) / 2.0;
+    int rs = 0;
+    for (int p = 1; p < num_parts && rs < n; ++p) {
+        const double target = total * p / static_cast<double>(num_parts);
+        int re = static_cast<int>(std::floor((-1.0 + std::sqrt(1.0 + 8.0 * target)) / 2.0));
+        re = std::clamp(re, rs + 1, n);
+        bounds.push_back(re);
+        rs = re;
+    }
+    bounds.push_back(n);
+    return bounds;
+}
+
+// Largest row index r > lo such that r*(r+1)/2 <= target_elems, clamped to
+// [lo+1, n]. Same closed form as triangular_row_partition above; used to
+// pick row-aligned chunk boundaries so a chunk never splits a row across
+// two reads.
+inline int row_bound_for_cumulative(size_t target_elems, int lo, int n) {
+    if (target_elems == 0) return std::min(lo + 1, n);
+    const double t = static_cast<double>(target_elems);
+    const int r = static_cast<int>(std::floor((-1.0 + std::sqrt(1.0 + 8.0 * t)) / 2.0));
+    return std::clamp(r, lo + 1, n);
+}
+
+// Blocking read of exactly `count` bytes into `buf`, retrying on EINTR and
+// on short reads (both routine on network filesystems). Errors out via
+// LOGGER on unexpected EOF or a hard read error.
+inline void read_exact(int fd, void* buf, size_t count, const std::string& path) {
+    char* p = static_cast<char*>(buf);
+    size_t done = 0;
+    while (done < count) {
+        const ssize_t r = ::read(fd, p + done, count - done);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            LOGGER.e(0, "read() failed on [" + path + "]: " + std::string(std::strerror(errno)));
+        }
+        if (r == 0)
+            LOGGER.e(0, "unexpected EOF reading [" + path + "].");
+        done += static_cast<size_t>(r);
+    }
+}
+
+
 // Returns:
 //   ids      — "FID\tIID" strings in GRM file order
 //   G        — full symmetric n×n matrix (double precision)
 //   m_snps   — SNP count from element (0,0) of .grm.N.bin; 0 if N file missing
 //
 // Implementation notes:
-//   - .grm.bin is mmap'd with MADV_SEQUENTIAL for OS read-ahead; avoids a
-//     userspace heap allocation of up to several GB at large n.
-//   - float→double conversion happens inline during the scatter into G,
-//     not via a separate full-size staging buffer (that would roughly
-//     double this function's transient RSS for no benefit -- see the
-//     comment at the scatter loop below).
-//   - Only the lower triangle of G is filled in the scatter loop; the upper
-//     triangle is then materialised via selfadjointView<Lower> to avoid
-//     cache-hostile scattered writes into non-sequential columns.
+//   - .grm.bin is read sequentially in row-aligned chunks (grm_read_chunk_
+//     bytes each, default 1GiB) via a single blocking read() stream, not
+//     mmap'd. This was a deliberate change from an earlier mmap-based
+//     version: even with each thread faulting in its own monotonically
+//     increasing row range, N threads doing so *concurrently* against the
+//     same mapping still presents the kernel/filesystem with N interleaved
+//     access offsets, which defeated page-cache readahead and, on this
+//     project's Lustre-backed cluster storage, fragmented reads across
+//     whichever OSTs happened to back each thread's current extent --
+//     regressions from ~2s to 900+s were observed at n=75000. A single
+//     sequential reader avoids this by construction, independent of
+//     filesystem/OS specifics -- no platform-specific calls needed.
+//   - Only the read itself is single-threaded; float→double conversion
+//     and the scatter into G are parallelized per chunk, once that
+//     chunk's bytes are already in memory (see the loop below).
+//   - The chunk buffer is the only extra transient allocation (bounded by
+//     grm_read_chunk_bytes, independent of n) -- negligible next to G's
+//     own n²·8 bytes and to what every downstream consumer of G already
+//     needs at peak.
 inline void read_grm_binary(const std::string& prefix,
                              std::vector<std::string>& ids,
                              Eigen::MatrixXd& G,
                              double& m_snps)
 {
-    LOGGER.ts("grm");
+    LOGGER.ts("grm_fill");
     using std::to_string;
 
     ids = Pheno::read_sublist(prefix + ".grm.id");
@@ -51,7 +115,9 @@ inline void read_grm_binary(const std::string& prefix,
     const size_t tri      = static_cast<size_t>(n) * (n + 1) / 2;
     const size_t byte_len = tri * sizeof(float);
 
-    // ---- (unchanged) mmap .grm.bin, fill G -----------------------------
+    // ------------------------------------------------------------------ //
+    // 1. Read GRM Binary Data (.grm.bin) & Populate Matrix               //
+    // ------------------------------------------------------------------ //
     const std::string bin_path = prefix + ".grm.bin";
     const int fd = ::open(bin_path.c_str(), O_RDONLY);
     if (fd == -1)
@@ -72,87 +138,59 @@ inline void read_grm_binary(const std::string& prefix,
     if (raw == MAP_FAILED)
         LOGGER.e(0, "mmap failed for [" + bin_path + "].");
 
-    ::madvise(raw, byte_len, MADV_SEQUENTIAL | MADV_WILLNEED);
+#ifdef MADV_WILLNEED
+    ::madvise(raw, byte_len, MADV_WILLNEED);
+#endif
+
     const float* fbuf = static_cast<const float*>(raw);
 
-    // Scatter the lower-triangle float32 entries into G (double precision).
-    // Cast directly into G during the scatter below rather than through a
-    // separate n(n+1)/2-double dbuf staging buffer first.
     G.resize(n, n);
-    #pragma omp parallel for schedule(dynamic, 64)
-        for (int i = 0; i < n; ++i) {
-            const size_t row_base = static_cast<size_t>(i) * (i + 1) / 2;
-            G.col(i).head(i + 1) =
-                Eigen::Map<const Eigen::VectorXf>(fbuf + row_base, i + 1).cast<double>();
-        }
-    ::munmap(raw, byte_len);
-    // Mirror upper -> lower via a blocked transpose: the naive per-element
-    // version below (`G(r,c) = G(c,r)` for r>c) has a column-contiguous
-    // write but a stride-n single-element read (one cache line touched per
-    // double). Tiling into BSxBS blocks makes both sides contiguous column
-    // reads/writes -- read block G(j0:j1, i0:i1) (valid, upper) column by
-    // column into a small cache-resident buffer, transpose there, then
-    // write block G(i0:i1, j0:j1) (lower, being filled) column by column.
-    // BS=64 -> a 64x64 double buffer is 32KB, comfortably L1-resident.
-    // Diagonal blocks are cheap enough (BSxBS) to mirror directly, no
-    // buffering needed.
-    constexpr int BS = 64;
-    const int nblocks = (n + BS - 1) / BS;
-    #pragma omp parallel for schedule(dynamic)
-    for (int bi = 0; bi < nblocks; ++bi) {
-        const int i0 = bi * BS, i1 = std::min(i0 + BS, n);
 
-        for (int c = i0; c < i1; ++c)
-            for (int r = c + 1; r < i1; ++r)
-                G(r, c) = G(c, r);
-
-        double buf[BS][BS];
-        for (int bj = 0; bj < bi; ++bj) {
-            const int j0 = bj * BS, j1 = std::min(j0 + BS, n);
-            for (int col = i0; col < i1; ++col)
-                for (int row = j0; row < j1; ++row)
-                    buf[row - j0][col - i0] = G(row, col);
-            for (int j = j0; j < j1; ++j)
-                for (int i = i0; i < i1; ++i)
-                    G(i, j) = buf[j - j0][i - i0];
-        }
+    // Stream lower-triangle-by-row entries from disk directly into column-major
+    // upper triangle: file row i contains entries for j = 0..i, which maps
+    // contiguously to G.col(i).head(i + 1) without striding or mirroring.
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; ++i) {
+        const size_t row_base = static_cast<size_t>(i) * (i + 1) / 2;
+        G.col(i).head(i + 1) =
+            Eigen::Map<const Eigen::VectorXf>(fbuf + row_base, i + 1).cast<double>();
     }
-    float duration = LOGGER.tp("grm");
-    LOGGER.e(0, "The .grm.bin reading took " + std::to_string(duration) + " seconds.");
+
+    ::munmap(raw, byte_len);
+    LOGGER.i(0, "The .grm.bin fill took " + std::to_string(LOGGER.tp("grm_fill")) + " seconds.");
 
     // ------------------------------------------------------------------ //
-    // Read SNP count (.grm.N.bin) — same lower-triangle layout as        //
-    // .grm.bin. We only need the diagonal (each individual's own         //
-    // non-missing SNP count), so extract it without materialising the    //
-    // full n×n N matrix.                                                 //
+    // 2. Extract Diagonal from SNP count (.grm.N.bin)                    //
     // ------------------------------------------------------------------ //
     m_snps = 0.0;
     {
         const std::string n_path = prefix + ".grm.N.bin";
         const int nfd = ::open(n_path.c_str(), O_RDONLY);
         if (nfd == -1) {
-            LOGGER.w(0, "GRM N file [" + n_path + "] not found; SNP count "
-                        "unavailable (affects --reml-woodbury auto-k).");
+            LOGGER.w(0, "GRM N file [" + n_path + "] not found; SNP count unavailable.");
         } else {
             struct stat st{};
             if (::fstat(nfd, &st) != 0 || static_cast<size_t>(st.st_size) < byte_len) {
                 ::close(nfd);
-                LOGGER.w(0, "GRM N file [" + n_path + "] has unexpected size; "
-                            "SNP count unavailable (affects --reml-woodbury auto-k).");
+                LOGGER.w(0, "GRM N file [" + n_path + "] has unexpected size.");
             } else {
                 void* nraw = ::mmap(nullptr, byte_len, PROT_READ, MAP_PRIVATE, nfd, 0);
                 ::close(nfd);
                 if (nraw == MAP_FAILED) {
-                    LOGGER.w(0, "mmap failed for [" + n_path + "]; SNP count unavailable.");
+                    LOGGER.w(0, "mmap failed for [" + n_path + "].");
                 } else {
+#ifdef MADV_RANDOM
+                    ::madvise(nraw, byte_len, MADV_RANDOM);
+#endif
                     const float* nbuf = static_cast<const float*>(nraw);
-                    // Diagonal entries sit at triangular indices i*(i+1)/2 + i
-                    // for row i (0-based, lower-triangle-by-row layout).
                     double sum = 0.0;
+
+                    #pragma omp parallel for reduction(+:sum) schedule(static)
                     for (int i = 0; i < n; ++i) {
                         const size_t diag_idx = static_cast<size_t>(i) * (i + 1) / 2 + i;
                         sum += static_cast<double>(nbuf[diag_idx]);
                     }
+
                     ::munmap(nraw, byte_len);
                     m_snps = sum / n;
                 }

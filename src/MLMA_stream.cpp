@@ -1010,18 +1010,13 @@ void MLMA::processMain()
 
                 if (!is_identity) {
                     Eigen::MatrixXd G_sub(n, n);
-                    // Column-first traversal for column-major Eigen storage.
-                    // Columns are independent (each writes its own G_sub
-                    // column, reads only from G_n), so this parallelizes
-                    // directly -- was single-threaded, O(n^2) scalar gather,
-                    // inconsistent with the OMP convention used for the same
-                    // shape of loop elsewhere (RemlEngine.cpp's
-                    // assemble_V_lower, trace_K2 computation).
+                    // Populate upper triangle (i <= j) from G_n's upper triangle
+                    // using symmetrized coordinates min/max(kp[i], src_col).
                     #pragma omp parallel for schedule(static)
                     for (int j = 0; j < n; ++j) {
                         const int src_col = kp[j];
-                        for (int i = 0; i < n; ++i)
-                            G_sub(i, j) = G_n(kp[i], src_col);
+                        for (int i = 0; i <= j; ++i)
+                            G_sub(i, j) = G_n(std::min(kp[i], src_col), std::max(kp[i], src_col));
                     }
                     G_n = std::move(G_sub);
                 }

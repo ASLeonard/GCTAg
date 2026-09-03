@@ -420,12 +420,13 @@ void MLMALoco::processMain()
                 G_all_n = std::move(G_all);  // O(1): GRM sample == analysis sample
             } else {
                 G_all_n.resize(n, n);
-                // Column-first traversal: accesses contiguous columns of G_all
-                // (column-major Eigen storage), reducing cache misses by ~n×.
+                // Populate upper triangle (i <= j) from G_all's upper triangle
+                // using symmetrized coordinates min/max(grm_rows[i], src_col).
+                #pragma omp parallel for schedule(static)
                 for (int j = 0; j < n; ++j) {
                     const int src_col = grm_rows[j];
-                    for (int i = 0; i < n; ++i)
-                        G_all_n(i, j) = G_all(grm_rows[i], src_col);
+                    for (int i = 0; i <= j; ++i)
+                        G_all_n(i, j) = G_all(std::min(grm_rows[i], src_col), std::max(grm_rows[i], src_col));
                 }
                 G_all.resize(0, 0);
             }
@@ -521,11 +522,13 @@ void MLMALoco::processMain()
                     G_chr = std::move(G_chr_raw);
                 } else {
                     G_chr.resize(n, n);
-                    // Column-first traversal for column-major Eigen storage.
+                    // Populate upper triangle (i <= j) from G_chr_raw's upper triangle
+                    // using symmetrized coordinates min/max(kp_chr[i], src_col).
+                    #pragma omp parallel for schedule(static)
                     for (int j = 0; j < n; ++j) {
                         const int src_col = kp_chr[j];
-                        for (int i = 0; i < n; ++i)
-                            G_chr(i, j) = G_chr_raw(kp_chr[i], src_col);
+                        for (int i = 0; i <= j; ++i)
+                            G_chr(i, j) = G_chr_raw(std::min(kp_chr[i], src_col), std::max(kp_chr[i], src_col));
                     }
                     G_chr_raw.resize(0, 0);
                 }
@@ -539,8 +542,12 @@ void MLMALoco::processMain()
                 LOGGER.e(0, "[LOCO] Chr " + to_string(row.chrom) + ": m_chr=" +
                             to_string(static_cast<long long>(m_chr))
                           + " >= m_all=" + to_string(static_cast<long long>(m_all)) + ".");
-            G_chr.array() *= (-m_chr / m_loco);
-            G_chr.noalias() += (m_all / m_loco) * G_all_n;
+            #pragma omp parallel for schedule(static)
+            for (int j = 0; j < n; ++j) {
+                G_chr.col(j).head(j + 1) =
+                    (-m_chr / m_loco) * G_chr.col(j).head(j + 1) +
+                    (m_all / m_loco) * G_all_n.col(j).head(j + 1);
+            }
             // G_chr now holds G_loco; G_chr_raw is already freed.
 
             // ---- 7c. Fill RemlCtx ----

@@ -213,12 +213,17 @@ void init_varcomp(const RemlCtx& ctx,
             KX   = woodbury_basis_KZ(ctx, ctx.X);
             Ky   = woodbury_basis_Kv(ctx, y_r);
         } else if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
-            // Full exact GRM K = ctx.A[r_indx[0]]
+            // Full exact GRM K = ctx.A[r_indx[0]] (upper triangle valid)
             const auto& K = ctx.A[ctx.r_indx[0]];
             trK  = K.diagonal().sum();
-            trK2 = K.squaredNorm(); // Frobenius norm squared = tr(K^2)
-            KX   = K * ctx.X;
-            Ky   = K * y_r;
+            const double diag_sq = K.diagonal().squaredNorm();
+            double off_sq = 0.0;
+            #pragma omp parallel for reduction(+:off_sq) schedule(static)
+            for (int j = 0; j < n; ++j)
+                off_sq += K.col(j).head(j).squaredNorm();
+            trK2 = diag_sq + 2.0 * off_sq;
+            KX   = K.selfadjointView<Eigen::Upper>() * ctx.X;
+            Ky   = K.selfadjointView<Eigen::Upper>() * y_r;
         }
         if (trK2 > 0.0) {
             const RemlMat XtKX = ctx.X.transpose() * KX;
@@ -255,10 +260,15 @@ void assemble_V_lower(RemlCtx& ctx, const RemlVec& varcmp) {
     ctx.Vi.triangularView<Eigen::Lower>().setZero();
     #pragma omp parallel for schedule(static)
     for (int j = 0; j < ctx.n; j++) {
-        for (int ci = 0; ci < num_comp; ci++)
-            if (ctx.A[ctx.r_indx[ci]].size() > 0)
-                ctx.Vi.col(j).tail(ctx.n - j) +=
-                    varcmp[ci] * ctx.A[ctx.r_indx[ci]].col(j).tail(ctx.n - j);
+        for (int ci = 0; ci < num_comp; ci++) {
+            if (ctx.A[ctx.r_indx[ci]].size() > 0) {
+                const auto& A_ci = ctx.A[ctx.r_indx[ci]];
+                const double vc = varcmp[ci];
+                for (int i = j; i < ctx.n; i++) {
+                    ctx.Vi(i, j) += vc * A_ci(j, i);
+                }
+            }
+        }
     }
     for (int ci = 0; ci < num_comp; ci++)
         if (ctx.A[ctx.r_indx[ci]].size() == 0)
@@ -549,21 +559,28 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
                 return applyP_mat(ctx, KZ);
             }
             return is_I ? applyP_mat(ctx, Z)
-                        : applyP_mat(ctx, RemlMat(ctx.A[ctx.r_indx[ci]] * Z));
+                        : applyP_mat(ctx, RemlMat(ctx.A[ctx.r_indx[ci]].selfadjointView<Eigen::Upper>() * Z));
         };
 
         ctx.hutchpp_K.noalias() = applyPA_mat(ctx.hutchpp_S);
         // reml_trace_power_iter is 0 in normal operation, so this loop is a
         // no-op there; left on local temporaries rather than further hoisted
         // scratch -- revisit if power_iter is ever turned back on.
+        /* //disabled for now, as it is not used in the current implementation
         for (int pw = 0; pw < ctx.reml_trace_power_iter; pw++) {
             Eigen::HouseholderQR<RemlMat> qr_pw(ctx.hutchpp_K);
             ctx.hutchpp_qr_scratch.setIdentity();
             ctx.hutchpp_K.noalias() = applyPA_mat(qr_pw.householderQ() * ctx.hutchpp_qr_scratch);
         }
-        Eigen::HouseholderQR<RemlMat> qr(ctx.hutchpp_K);
-        ctx.hutchpp_qr_scratch.setIdentity();
-        ctx.hutchpp_Q.noalias() = qr.householderQ() * ctx.hutchpp_qr_scratch;
+        */
+        ctx.hutchpp_Q = ctx.hutchpp_K;
+        const int info = gcta_cholesky_qr_thin_Q(
+            static_cast<gcta_blas_int>(ctx.n),
+            static_cast<gcta_blas_int>(k),
+            ctx.hutchpp_Q.data(),
+            static_cast<gcta_blas_int>(ctx.n));
+        if (info != 0)
+            LOGGER.e(0, "Hutch++ Cholesky QR failed (info=" + std::to_string(info) + ").");
 
         // Fused MQ/MG evaluation: applyPA_mat is linear in its argument for
         // fixed ci, so applyPA_mat([Q G]) == [applyPA_mat(Q) applyPA_mat(G)]
@@ -612,10 +629,9 @@ void calcu_tr_PA(const RemlCtx& ctx, const RemlMat& P, RemlVec& tr_PA) {
             double s = 0.0;
             #pragma omp parallel for reduction(+:s) schedule(guided)
             for (int col = 0; col < ctx.n; col++) {
-                const int tail = ctx.n - col - 1;
                 s += P(col, col) * Ai(col, col);
-                if (tail > 0)
-                    s += 2.0 * P.col(col).tail(tail).dot(Ai.col(col).tail(tail));
+                if (col > 0)
+                    s += 2.0 * P.col(col).head(col).dot(Ai.col(col).head(col));
             }
             tr_PA(i) = s;
         }
@@ -639,11 +655,9 @@ void calcu_Hi(RemlCtx& ctx, RemlMat& P, RemlMat& Hi) {
         } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
             PA[i].resize(0, 0);
         } else {
-            // ctx.A is lower-triangle only; use selfadjointView on A (not on the
-            // already-full P) to avoid reading uninitialised upper-triangle elements.
-            // A is symmetric so A*P == P*A; pass P.transpose() (==P) as the dense
-            // RHS so dsymm fires with A as the symmetric operand.
-            PA[i].noalias() = ctx.A[ctx.r_indx[i]] * P;
+            // ctx.A is upper-triangle only; use selfadjointView on A (not on the
+            // already-full P) to avoid reading uninitialised lower-triangle elements.
+            PA[i].noalias() = ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * P;
         }
     }
 
@@ -685,7 +699,7 @@ void reml_equation(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py, RemlVec& 
         if (ctx.A[ctx.r_indx[i]].size() == 0) {
             R(i) = Py.squaredNorm();
         } else {
-            ctx.reml_tmp_n.noalias() = ctx.A[ctx.r_indx[i]] * Py;
+            ctx.reml_tmp_n.noalias() = ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py;
             R(i) = Py.dot(ctx.reml_tmp_n);
         }
     }
@@ -746,7 +760,7 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
         else if (ctx.A[ctx.r_indx[i]].size() == 0)
             APy.col(i) = Py;
         else
-            APy.col(i).noalias() = ctx.A[ctx.r_indx[i]] * Py;
+            APy.col(i).noalias() = ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py;
     }
 
     RemlVec R(m);
@@ -914,12 +928,12 @@ RemlVec compute_woodbury_posthoc_delta(RemlCtx& ctx, const RemlMat& Hi, const Re
             else if (ctx.A[ctx.r_indx[i]].size() == 0)
                 R_raw_l(i) = Py_at.dot(Py_at);
             else
-                R_raw_l(i) = Py_at.dot(RemlVec(ctx.A[ctx.r_indx[i]] * Py_at));
+                R_raw_l(i) = Py_at.dot(RemlVec(ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py_at));
         }
 
         RemlVec R_for_correction_l = R_raw_l;
         if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
-            const RemlVec APy_exact_l = ctx.A[ctx.r_indx[0]] * Py_at;   // the O(n^2) pass
+            const RemlVec APy_exact_l = ctx.A[ctx.r_indx[0]].selfadjointView<Eigen::Upper>() * Py_at;   // the O(n^2) pass
             R_for_correction_l(0) = Py_at.dot(APy_exact_l);
         } else {
             LOGGER.w(0, "ctx.woodbury_basis_posthoc_correction is set but the exact GRM "
@@ -1024,7 +1038,7 @@ RemlVec compute_he_tail_corrected_varcmp(RemlCtx& ctx, bool use_exact_yKy) {
     // is available.
     double yKy;
     if (use_exact_yKy && !ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
-        yKy = ctx.y.dot(RemlVec(ctx.A[ctx.r_indx[0]] * ctx.y));   // one O(n^2) pass
+        yKy = ctx.y.dot(RemlVec(ctx.A[ctx.r_indx[0]].selfadjointView<Eigen::Upper>() * ctx.y));   // one O(n^2) pass
     } else {
         if (use_exact_yKy) {
             LOGGER.w(0, "compute_he_tail_corrected_varcmp: exact y'Ky requested but ctx.A "
@@ -1074,7 +1088,7 @@ RemlVec compute_woodbury_posthoc_delta_simple(RemlCtx& ctx, const RemlMat& Hi, c
     for (int i = 1; i < m; i++) {
         R_flat(i) = (ctx.A[ctx.r_indx[i]].size() == 0)
             ? Py.dot(Py)
-            : Py.dot(RemlVec(ctx.A[ctx.r_indx[i]] * Py));
+            : Py.dot(RemlVec(ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py));
     }
 
     const RemlVec U_partial = -0.5 * (tr_PA_corrected - R_flat);
@@ -1112,7 +1126,7 @@ void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
         } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
             R(i) = Py.squaredNorm();
         } else {
-            ctx.reml_tmp_n.noalias() = ctx.A[ctx.r_indx[i]] * Py;
+            ctx.reml_tmp_n.noalias() = ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py;
             R(i) = Py.dot(ctx.reml_tmp_n);
         }
         varcmp(i) = prev_varcmp(i) - prev_varcmp(i) * prev_varcmp(i) * (tr_PA(i) - R(i)) / ctx.n;
@@ -1430,7 +1444,7 @@ double reml_iteration(RemlCtx& ctx,
                     else if (ctx.A[ctx.r_indx[i]].size() == 0)
                         APy_post.col(i) = Py;
                     else
-                        APy_post.col(i).noalias() = ctx.A[ctx.r_indx[i]] * Py;
+                        APy_post.col(i).noalias() = ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py;
                 }
                 const RemlMat PAPy_post = applyP_mat(ctx, APy_post);
                 Hi.noalias() = APy_post.transpose() * PAPy_post;
@@ -1824,6 +1838,11 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     }
     if (k_svd >= n) LOGGER.e(0, "--reml-woodbury-basis rank must be < n.");
 
+    // Wall time here is a fixed, k-independent O(n^2) full-matrix sweep
+    // (one read of the whole dense K, memory-bandwidth-bound); tagged
+    // separately from the apply/QR/eig breakdown below because it can't be
+    // shrunk by choosing a smaller Woodbury rank.
+    LOGGER.ts("woodbury_prep");
     const Eigen::MatrixXd& K_dbl = ctx.A[ctx.r_indx[0]];
     const double trace_K_full = svd_chunked
         ? gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, svd_chunk_rows).sum()
@@ -1837,9 +1856,10 @@ void compute_woodbury_basis(RemlCtx& ctx) {
         double off_sq  = 0.0;
         #pragma omp parallel for reduction(+:off_sq) schedule(static)
         for (int j = 0; j < n; ++j)
-            off_sq += K_dbl.col(j).tail(n - j - 1).squaredNorm();
+            off_sq += K_dbl.col(j).head(j).squaredNorm();
         trace_K2 = diag_sq + 2.0 * off_sq;
     }
+    const float prep_sec = LOGGER.tp("woodbury_prep");
 
     double lambda_plus = 0.0;
     if (mode == WoodburyMode::MP) {
@@ -1864,7 +1884,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     auto apply = [&](const auto& X) -> Eigen::MatrixXd {
         if (svd_chunked)
             return gcta_chunked::chunked_symmetric_matvec(ctx.grm_tile_reader, n, svd_chunk_rows, X);
-        return K_dbl * X;
+        return K_dbl.selfadjointView<Eigen::Upper>() * X;
     };
 
     Eigen::VectorXd eval_full;
@@ -2008,7 +2028,7 @@ void compute(RemlCtx& ctx,
     if (ctx.woodbury_basis_rank != 0) {
         LOGGER.ts("woodbury");
         compute_woodbury_basis(ctx);
-        float duration = LOGGER.tp("main");
+        float duration = LOGGER.tp("woodbury");
         LOGGER.i(0, "Woodbury basis computation took " + std::to_string(duration) + " seconds.");
     }
 
@@ -2040,6 +2060,22 @@ void compute(RemlCtx& ctx,
     const double VarVp = Hi.topLeftCorner(me, me).sum();
     ctx.Vp = Vp;
     ctx.Vp_se = std::sqrt(std::max(0.0, VarVp));
+
+    // --- Diagnostic (log-only; no behavior change) -------------------------
+    // Woodbury truncation empirically underestimates Vg substantially more
+    // than Ve, so the fitted total Vp = sum(varcmp) undershoots the true
+    // phenotypic variance. The ratio Vp_est / y_Ssq (both already computed
+    // above) tracks the downstream MLMA significance inflation closely
+    // enough on validation data to be worth logging for every Woodbury run.
+    // Not yet wired into MLMA p-values -- staged rollout: log-only here,
+    // gated flag once validated on a broader k/phenotype sweep, then default.
+    if (ctx.Vi_use_woodbury_basis && ctx.y_Ssq > 0.0) {
+        const double vp_ratio = ctx.Vp / ctx.y_Ssq;
+        LOGGER << "Woodbury diagnostic: Vp_est=" << ctx.Vp
+               << ", y_Ssq(empirical Var(y))=" << ctx.y_Ssq
+               << ", Vp_est/y_Ssq=" << vp_ratio
+               << " (candidate MLMA p-value deflation factor)" << std::endl;
+    }
 
     const int ngen = std::max(0, m - 1);
     ctx.hsq.assign(ngen, 0.0);

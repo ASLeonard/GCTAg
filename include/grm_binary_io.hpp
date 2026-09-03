@@ -7,6 +7,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -20,26 +23,84 @@
 
 namespace gcta_grm_io {
 
-// Read a GCTA GRM binary file set (prefix.grm.id, prefix.grm.bin, prefix.grm.N.bin).
+// Row boundaries [0, b1, b2, ..., n] splitting a packed lower-triangle-by-row
+// file (row i holds i+1 elements) into num_parts contiguous ranges with
+// roughly equal total element count.
+inline std::vector<int> triangular_row_partition(int n, int num_parts) {
+    std::vector<int> bounds(1, 0);
+    const double total = static_cast<double>(n) * (n + 1) / 2.0;
+    int rs = 0;
+    for (int p = 1; p < num_parts && rs < n; ++p) {
+        const double target = total * p / static_cast<double>(num_parts);
+        int re = static_cast<int>(std::floor((-1.0 + std::sqrt(1.0 + 8.0 * target)) / 2.0));
+        re = std::clamp(re, rs + 1, n);
+        bounds.push_back(re);
+        rs = re;
+    }
+    bounds.push_back(n);
+    return bounds;
+}
+
+// Largest row index r > lo such that r*(r+1)/2 <= target_elems, clamped to
+// [lo+1, n]. Same closed form as triangular_row_partition above; used to
+// pick row-aligned chunk boundaries so a chunk never splits a row across
+// two reads.
+inline int row_bound_for_cumulative(size_t target_elems, int lo, int n) {
+    if (target_elems == 0) return std::min(lo + 1, n);
+    const double t = static_cast<double>(target_elems);
+    const int r = static_cast<int>(std::floor((-1.0 + std::sqrt(1.0 + 8.0 * t)) / 2.0));
+    return std::clamp(r, lo + 1, n);
+}
+
+// Blocking read of exactly `count` bytes into `buf`, retrying on EINTR and
+// on short reads (both routine on network filesystems). Errors out via
+// LOGGER on unexpected EOF or a hard read error.
+inline void read_exact(int fd, void* buf, size_t count, const std::string& path) {
+    char* p = static_cast<char*>(buf);
+    size_t done = 0;
+    while (done < count) {
+        const ssize_t r = ::read(fd, p + done, count - done);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            LOGGER.e(0, "read() failed on [" + path + "]: " + std::string(std::strerror(errno)));
+        }
+        if (r == 0)
+            LOGGER.e(0, "unexpected EOF reading [" + path + "].");
+        done += static_cast<size_t>(r);
+    }
+}
+
+
 // Returns:
 //   ids      — "FID\tIID" strings in GRM file order
 //   G        — full symmetric n×n matrix (double precision)
 //   m_snps   — SNP count from element (0,0) of .grm.N.bin; 0 if N file missing
 //
 // Implementation notes:
-//   - .grm.bin is mmap'd with MADV_SEQUENTIAL for OS read-ahead; avoids a
-//     userspace heap allocation of up to several GB at large n.
-//   - float→double conversion happens inline during the scatter into G,
-//     not via a separate full-size staging buffer (that would roughly
-//     double this function's transient RSS for no benefit -- see the
-//     comment at the scatter loop below).
-//   - Only the lower triangle of G is filled in the scatter loop; the upper
-//     triangle is then materialised via selfadjointView<Lower> to avoid
-//     cache-hostile scattered writes into non-sequential columns.
+//   - .grm.bin is read sequentially in row-aligned chunks (grm_read_chunk_
+//     bytes each, default 1GiB) via a single blocking read() stream, not
+//     mmap'd. This was a deliberate change from an earlier mmap-based
+//     version: even with each thread faulting in its own monotonically
+//     increasing row range, N threads doing so *concurrently* against the
+//     same mapping still presents the kernel/filesystem with N interleaved
+//     access offsets, which defeated page-cache readahead and, on this
+//     project's Lustre-backed cluster storage, fragmented reads across
+//     whichever OSTs happened to back each thread's current extent --
+//     regressions from ~2s to 900+s were observed at n=75000. A single
+//     sequential reader avoids this by construction, independent of
+//     filesystem/OS specifics -- no platform-specific calls needed.
+//   - Only the read itself is single-threaded; float→double conversion
+//     and the scatter into G are parallelized per chunk, once that
+//     chunk's bytes are already in memory (see the loop below).
+//   - The chunk buffer is the only extra transient allocation (bounded by
+//     grm_read_chunk_bytes, independent of n) -- negligible next to G's
+//     own n²·8 bytes and to what every downstream consumer of G already
+//     needs at peak.
 inline void read_grm_binary(const std::string& prefix,
                              std::vector<std::string>& ids,
                              Eigen::MatrixXd& G,
-                             double& m_snps)
+                             double& m_snps,
+                             size_t grm_read_chunk_bytes = (1ull << 30) /* 1GiB */)
 {
     LOGGER.ts("grm");
     using std::to_string;
@@ -51,7 +112,7 @@ inline void read_grm_binary(const std::string& prefix,
     const size_t tri      = static_cast<size_t>(n) * (n + 1) / 2;
     const size_t byte_len = tri * sizeof(float);
 
-    // ---- (unchanged) mmap .grm.bin, fill G -----------------------------
+    // ---- read .grm.bin in row-aligned chunks, fill G -------------------
     const std::string bin_path = prefix + ".grm.bin";
     const int fd = ::open(bin_path.c_str(), O_RDONLY);
     if (fd == -1)
@@ -67,58 +128,56 @@ inline void read_grm_binary(const std::string& prefix,
         }
     }
 
-    void* raw = ::mmap(nullptr, byte_len, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (raw == MAP_FAILED)
-        LOGGER.e(0, "mmap failed for [" + bin_path + "].");
-
-    ::madvise(raw, byte_len, MADV_SEQUENTIAL | MADV_WILLNEED);
-    const float* fbuf = static_cast<const float*>(raw);
-
-    // Scatter the lower-triangle float32 entries into G (double precision).
-    // Cast directly into G during the scatter below rather than through a
-    // separate n(n+1)/2-double dbuf staging buffer first.
+    // Scatter the lower-triangle float32 entries into G (double precision)
+    // one row-aligned chunk at a time: a single blocking read() pulls the
+    // next chunk in fully (read_exact, above -- one coherent sequential
+    // stream, no concurrent-offset I/O), then the cast+scatter of that
+    // chunk's rows into G is parallelized (schedule(dynamic, 64) balances
+    // the triangular per-row workload). Column-contiguous write per row
+    // (G.col(i).head(i+1)) for the same reason as before: it matches the
+    // chunk buffer's own contiguous row-major-packed layout, keeping the
+    // cast vectorizable.
     G.resize(n, n);
-    #pragma omp parallel for schedule(dynamic, 64)
-        for (int i = 0; i < n; ++i) {
-            const size_t row_base = static_cast<size_t>(i) * (i + 1) / 2;
+    const size_t max_elems_per_chunk = std::max<size_t>(1, grm_read_chunk_bytes / sizeof(float));
+    std::vector<float> chunk_buf(max_elems_per_chunk);
+    int row_cursor = 0;
+    while (row_cursor < n) {
+        const size_t row_base_cursor = static_cast<size_t>(row_cursor) * (row_cursor + 1) / 2;
+        const size_t target = row_base_cursor + max_elems_per_chunk;
+        const int row_end = row_bound_for_cumulative(target, row_cursor, n);
+        const size_t row_base_end = static_cast<size_t>(row_end) * (row_end + 1) / 2;
+        const size_t elems_this_chunk = row_base_end - row_base_cursor;
+
+        if (elems_this_chunk > chunk_buf.size())
+            chunk_buf.resize(elems_this_chunk); // only ever needed if a single row exceeds the chunk budget
+        read_exact(fd, chunk_buf.data(), elems_this_chunk * sizeof(float), bin_path);
+
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (int i = row_cursor; i < row_end; ++i) {
+            const size_t local_off = static_cast<size_t>(i) * (i + 1) / 2 - row_base_cursor;
             G.col(i).head(i + 1) =
-                Eigen::Map<const Eigen::VectorXf>(fbuf + row_base, i + 1).cast<double>();
+                Eigen::Map<const Eigen::VectorXf>(chunk_buf.data() + local_off, i + 1).cast<double>();
         }
-    ::munmap(raw, byte_len);
-    // Mirror upper -> lower via a blocked transpose: the naive per-element
-    // version below (`G(r,c) = G(c,r)` for r>c) has a column-contiguous
-    // write but a stride-n single-element read (one cache line touched per
-    // double). Tiling into BSxBS blocks makes both sides contiguous column
-    // reads/writes -- read block G(j0:j1, i0:i1) (valid, upper) column by
-    // column into a small cache-resident buffer, transpose there, then
-    // write block G(i0:i1, j0:j1) (lower, being filled) column by column.
-    // BS=64 -> a 64x64 double buffer is 32KB, comfortably L1-resident.
-    // Diagonal blocks are cheap enough (BSxBS) to mirror directly, no
-    // buffering needed.
-    constexpr int BS = 64;
-    const int nblocks = (n + BS - 1) / BS;
-    #pragma omp parallel for schedule(dynamic)
-    for (int bi = 0; bi < nblocks; ++bi) {
-        const int i0 = bi * BS, i1 = std::min(i0 + BS, n);
-
-        for (int c = i0; c < i1; ++c)
-            for (int r = c + 1; r < i1; ++r)
-                G(r, c) = G(c, r);
-
-        double buf[BS][BS];
-        for (int bj = 0; bj < bi; ++bj) {
-            const int j0 = bj * BS, j1 = std::min(j0 + BS, n);
-            for (int col = i0; col < i1; ++col)
-                for (int row = j0; row < j1; ++row)
-                    buf[row - j0][col - i0] = G(row, col);
-            for (int j = j0; j < j1; ++j)
-                for (int i = i0; i < i1; ++i)
-                    G(i, j) = buf[j - j0][i - i0];
-        }
+        row_cursor = row_end;
     }
-    float duration = LOGGER.tp("grm");
-    LOGGER.e(0, "The .grm.bin reading took " + std::to_string(duration) + " seconds.");
+    ::close(fd);
+    LOGGER.i(0, "The .grm.bin fill took " + std::to_string(LOGGER.tp("grm")) + " seconds.");
+    LOGGER.ts("grm_mirror");
+    // Mirror upper -> lower, column-contiguous on the write side (fixed
+    // column c, rows c+1..n-1) and scattered only on the read side (G(c,r)
+    // across row c). A blocked-transpose version of this (tiling into
+    // BSxBS blocks to make the read side contiguous too) was tried and
+    // hung/regressed badly at n=75000 -- root cause not yet identified
+    // (suspect concurrent first-touch page faults on the still-unwritten
+    // lower triangle across many threads, but not confirmed). Reverted to
+    // this simpler version, which is validated (ran cleanly across the
+    // K10-K25 Woodbury sweep). Do not reintroduce blocking without
+    // isolating and timing it separately first.
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (int c = 0; c < n; ++c)
+        for (int r = c + 1; r < n; ++r)
+            G(r, c) = G(c, r);
+    LOGGER.i(0, "The .grm.bin mirror took " + std::to_string(LOGGER.tp("grm_mirror")) + " seconds.");
 
     // ------------------------------------------------------------------ //
     // Read SNP count (.grm.N.bin) — same lower-triangle layout as        //

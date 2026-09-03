@@ -87,15 +87,31 @@ inline void read_grm_binary(const std::string& prefix,
     // column-major layout), but that's a single scalar conversion per
     // element, negligible next to removing 40GB of transient allocation
     // and the write+read traffic of filling and draining it.
+    //
+    // Row start offsets are computed directly (i*(i+1)/2) rather than via
+    // a running idx++ so rows are independent -- at n=150000 this loop is
+    // ~1.1e10 scattered (stride-n) double stores; serially that's minutes
+    // of wall time on one core's worth of memory bandwidth alone, identical
+    // regardless of any Woodbury/Hutch rank chosen downstream, and was
+    // silently dominating whole-run wall clock. schedule(dynamic) balances
+    // row lengths (row i does i+1 elements), matching GRM.cpp's convention
+    // for the same kind of triangular workload.
     G.resize(n, n);
-    {
-        size_t idx = 0;
-        for (int i = 0; i < n; ++i)
-            for (int j = 0; j <= i; ++j, ++idx)
-                G(i, j) = static_cast<double>(fbuf[idx]);
+    #pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < n; ++i) {
+        const size_t row_off = static_cast<size_t>(i) * (i + 1) / 2;
+        for (int j = 0; j <= i; ++j)
+            G(i, j) = static_cast<double>(fbuf[row_off + j]);
     }
     ::munmap(raw, byte_len);
-    G = G.selfadjointView<Eigen::Lower>();
+    // Mirror lower -> upper explicitly (column-contiguous writes, matching
+    // the scatter loop's write-side-over-read-side priority above) rather
+    // than `G = G.selfadjointView<Eigen::Lower>()`, which is plain
+    // single-threaded Eigen and just as serial/O(n^2) as the fill loop was.
+    #pragma omp parallel for schedule(dynamic)
+    for (int c = 0; c < n; ++c)
+        for (int r = 0; r < c; ++r)
+            G(r, c) = G(c, r);
 
     // ------------------------------------------------------------------ //
     // Read SNP count (.grm.N.bin) — same lower-triangle layout as        //

@@ -179,41 +179,46 @@ inline void read_grm_binary(const std::string& prefix,
             G(r, c) = G(c, r);
     LOGGER.i(0, "The .grm.bin mirror took " + std::to_string(LOGGER.tp("grm_mirror")) + " seconds.");
 
-    // ------------------------------------------------------------------ //
-    // Read SNP count (.grm.N.bin) — same lower-triangle layout as        //
-    // .grm.bin. We only need the diagonal (each individual's own         //
-    // non-missing SNP count), so extract it without materialising the    //
-    // full n×n N matrix.                                                 //
-    // ------------------------------------------------------------------ //
-    m_snps = 0.0;
-    {
-        const std::string n_path = prefix + ".grm.N.bin";
-        const int nfd = ::open(n_path.c_str(), O_RDONLY);
-        if (nfd == -1) {
-            LOGGER.w(0, "GRM N file [" + n_path + "] not found; SNP count "
-                        "unavailable (affects --reml-woodbury auto-k).");
-        } else {
-            struct stat st{};
-            if (::fstat(nfd, &st) != 0 || static_cast<size_t>(st.st_size) < byte_len) {
-                ::close(nfd);
-                LOGGER.w(0, "GRM N file [" + n_path + "] has unexpected size; "
-                            "SNP count unavailable (affects --reml-woodbury auto-k).");
+    if (m_snps < 0.0) {
+        LOGGER.i(0,"Skipping SNP count read from .grm.N.bin.");
+    }
+    else {
+        // ------------------------------------------------------------------ //
+        // Read SNP count (.grm.N.bin) — same lower-triangle layout as        //
+        // .grm.bin. We only need the diagonal (each individual's own         //
+        // non-missing SNP count), so extract it without materialising the    //
+        // full n×n N matrix.                                                 //
+        // ------------------------------------------------------------------ //
+        m_snps = 0.0;
+        {
+            const std::string n_path = prefix + ".grm.N.bin";
+            const int nfd = ::open(n_path.c_str(), O_RDONLY);
+            if (nfd == -1) {
+                LOGGER.w(0, "GRM N file [" + n_path + "] not found; SNP count "
+                            "unavailable (affects --reml-woodbury auto-k).");
             } else {
-                void* nraw = ::mmap(nullptr, byte_len, PROT_READ, MAP_PRIVATE, nfd, 0);
-                ::close(nfd);
-                if (nraw == MAP_FAILED) {
-                    LOGGER.w(0, "mmap failed for [" + n_path + "]; SNP count unavailable.");
+                struct stat st{};
+                if (::fstat(nfd, &st) != 0 || static_cast<size_t>(st.st_size) < byte_len) {
+                    ::close(nfd);
+                    LOGGER.w(0, "GRM N file [" + n_path + "] has unexpected size; "
+                                "SNP count unavailable (affects --reml-woodbury auto-k).");
                 } else {
-                    const float* nbuf = static_cast<const float*>(nraw);
-                    // Diagonal entries sit at triangular indices i*(i+1)/2 + i
-                    // for row i (0-based, lower-triangle-by-row layout).
-                    double sum = 0.0;
-                    for (int i = 0; i < n; ++i) {
-                        const size_t diag_idx = static_cast<size_t>(i) * (i + 1) / 2 + i;
-                        sum += static_cast<double>(nbuf[diag_idx]);
+                    void* nraw = ::mmap(nullptr, byte_len, PROT_READ, MAP_PRIVATE, nfd, 0);
+                    ::close(nfd);
+                    if (nraw == MAP_FAILED) {
+                        LOGGER.w(0, "mmap failed for [" + n_path + "]; SNP count unavailable.");
+                    } else {
+                        const float* nbuf = static_cast<const float*>(nraw);
+                        // Diagonal entries sit at triangular indices i*(i+1)/2 + i
+                        // for row i (0-based, lower-triangle-by-row layout).
+                        double sum = 0.0;
+                        for (int i = 0; i < n; ++i) {
+                            const size_t diag_idx = static_cast<size_t>(i) * (i + 1) / 2 + i;
+                            sum += static_cast<double>(nbuf[diag_idx]);
+                        }
+                        ::munmap(nraw, byte_len);
+                        m_snps = sum / n;
                     }
-                    ::munmap(nraw, byte_len);
-                    m_snps = sum / n;
                 }
             }
         }

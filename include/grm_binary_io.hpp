@@ -41,6 +41,7 @@ inline void read_grm_binary(const std::string& prefix,
                              Eigen::MatrixXd& G,
                              double& m_snps)
 {
+    LOGGER.ts("grm");
     using std::to_string;
 
     ids = Pheno::read_sublist(prefix + ".grm.id");
@@ -74,44 +75,50 @@ inline void read_grm_binary(const std::string& prefix,
     ::madvise(raw, byte_len, MADV_SEQUENTIAL | MADV_WILLNEED);
     const float* fbuf = static_cast<const float*>(raw);
 
+    // Scatter the lower-triangle float32 entries into G (double precision).
     // Cast directly into G during the scatter below rather than through a
-    // separate n(n+1)/2-double dbuf staging buffer first. At n=100k that
-    // buffer was ~40GB held alongside G's own 80GB (~120GB peak in this
-    // function alone) for no real benefit: the scatter loop already read
-    // dbuf sequentially (dbuf[idx], ++idx) -- the exact same access pattern
-    // it gets reading fbuf directly below -- so dbuf's own "sequential
-    // source" property wasn't enabling anything the fused version doesn't
-    // already have. This does give up dbuf's dedicated AVX2-vectorized
-    // cast pass (the cast is now interleaved with G's write, which the
-    // comment below explains can't be made fully sequential given Eigen's
-    // column-major layout), but that's a single scalar conversion per
-    // element, negligible next to removing 40GB of transient allocation
-    // and the write+read traffic of filling and draining it.
-    //
-    // Row start offsets are computed directly (i*(i+1)/2) rather than via
-    // a running idx++ so rows are independent -- at n=150000 this loop is
-    // ~1.1e10 scattered (stride-n) double stores; serially that's minutes
-    // of wall time on one core's worth of memory bandwidth alone, identical
-    // regardless of any Woodbury/Hutch rank chosen downstream, and was
-    // silently dominating whole-run wall clock. schedule(dynamic) balances
-    // row lengths (row i does i+1 elements), matching GRM.cpp's convention
-    // for the same kind of triangular workload.
+    // separate n(n+1)/2-double dbuf staging buffer first.
     G.resize(n, n);
-    #pragma omp parallel for schedule(dynamic)
-    for (int i = 0; i < n; ++i) {
-        const size_t row_off = static_cast<size_t>(i) * (i + 1) / 2;
-        for (int j = 0; j <= i; ++j)
-            G(i, j) = static_cast<double>(fbuf[row_off + j]);
-    }
+    #pragma omp parallel for schedule(dynamic, 64)
+        for (int i = 0; i < n; ++i) {
+            const size_t row_base = static_cast<size_t>(i) * (i + 1) / 2;
+            G.col(i).head(i + 1) =
+                Eigen::Map<const Eigen::VectorXf>(fbuf + row_base, i + 1).cast<double>();
+        }
     ::munmap(raw, byte_len);
-    // Mirror lower -> upper explicitly (column-contiguous writes, matching
-    // the scatter loop's write-side-over-read-side priority above) rather
-    // than `G = G.selfadjointView<Eigen::Lower>()`, which is plain
-    // single-threaded Eigen and just as serial/O(n^2) as the fill loop was.
+    // Mirror upper -> lower via a blocked transpose: the naive per-element
+    // version below (`G(r,c) = G(c,r)` for r>c) has a column-contiguous
+    // write but a stride-n single-element read (one cache line touched per
+    // double). Tiling into BSxBS blocks makes both sides contiguous column
+    // reads/writes -- read block G(j0:j1, i0:i1) (valid, upper) column by
+    // column into a small cache-resident buffer, transpose there, then
+    // write block G(i0:i1, j0:j1) (lower, being filled) column by column.
+    // BS=64 -> a 64x64 double buffer is 32KB, comfortably L1-resident.
+    // Diagonal blocks are cheap enough (BSxBS) to mirror directly, no
+    // buffering needed.
+    constexpr int BS = 64;
+    const int nblocks = (n + BS - 1) / BS;
     #pragma omp parallel for schedule(dynamic)
-    for (int c = 0; c < n; ++c)
-        for (int r = 0; r < c; ++r)
-            G(r, c) = G(c, r);
+    for (int bi = 0; bi < nblocks; ++bi) {
+        const int i0 = bi * BS, i1 = std::min(i0 + BS, n);
+
+        for (int c = i0; c < i1; ++c)
+            for (int r = c + 1; r < i1; ++r)
+                G(r, c) = G(c, r);
+
+        double buf[BS][BS];
+        for (int bj = 0; bj < bi; ++bj) {
+            const int j0 = bj * BS, j1 = std::min(j0 + BS, n);
+            for (int col = i0; col < i1; ++col)
+                for (int row = j0; row < j1; ++row)
+                    buf[row - j0][col - i0] = G(row, col);
+            for (int j = j0; j < j1; ++j)
+                for (int i = i0; i < i1; ++i)
+                    G(i, j) = buf[j - j0][i - i0];
+        }
+    }
+    float duration = LOGGER.tp("grm");
+    LOGGER.e(0, "The .grm.bin reading took " + std::to_string(duration) + " seconds.");
 
     // ------------------------------------------------------------------ //
     // Read SNP count (.grm.N.bin) — same lower-triangle layout as        //

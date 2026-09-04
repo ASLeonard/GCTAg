@@ -44,6 +44,7 @@
 #include <limits>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 
 using std::map;
 using std::string;
@@ -83,135 +84,198 @@ string to_text(T x)
 // RemlState is now defined in include/RemlState.hpp (shared with MLMA_loco).
 // The readRemlState() function below remains file-local (only MLMA_stream needs it).
 
+static void read_exact(int fd, void* dst, size_t nbytes, const std::string& path)
+{
+    char* ptr = static_cast<char*>(dst);
+    size_t total_read = 0;
+    while (total_read < nbytes) {
+        const ssize_t res = ::read(fd, ptr + total_read, nbytes - total_read);
+        if (res == 0) {
+            close(fd);
+            LOGGER.e(0, "Unexpected EOF while reading [" + path + "] (expected " +
+                        to_string(nbytes) + " bytes, got " + to_string(total_read) + ").");
+        }
+        if (res < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            LOGGER.e(0, "I/O error while reading [" + path + "] (errno=" +
+                        std::to_string(errno) + ").");
+        }
+        total_read += static_cast<size_t>(res);
+    }
+}
+
 // Read the binary REML state written by save_reml_state().
 // When !no_adj_covar the 'b' vector is loaded; otherwise it is skipped.
-RemlState readRemlState(const string& filename, bool no_adj_covar)
+// The file is read serially in one contiguous pass to avoid HPC/Lustre I/O
+// storms from many threads touching scattered offsets concurrently; only the
+// in-memory unpack/decode is parallelized afterwards.
+RemlState readRemlState(const std::string& filename, bool no_adj_covar)
 {
-    std::ifstream f(filename, std::ios::binary);
-    if (!f.is_open())
-        LOGGER.e(0, "cannot open [" + filename + "] — run --mlma-stream --grm <prefix> --save-reml first.");
+    int fd = open(filename.c_str(), O_RDONLY);
+    if (fd == -1) LOGGER.e(0, "Cannot open file [" + filename + "].");
 
-    auto must_read = [&](void* dst, std::streamsize nbytes) {
-        f.read(reinterpret_cast<char*>(dst), nbytes);
-        if (f.gcount() != nbytes)
-            LOGGER.e(0, "unexpected EOF in REML state file [" + filename + "].");
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) {
+        close(fd);
+        LOGGER.e(0, "Failed to stat file [" + filename + "].");
+    }
+    const size_t file_size = static_cast<size_t>(sb.st_size);
+    if (file_size == 0) {
+        close(fd);
+        LOGGER.e(0, "[" + filename + "] is empty.");
+    }
+
+    std::vector<char> file_buf(file_size);
+    read_exact(fd, file_buf.data(), file_size, filename);
+    close(fd);
+
+    const char* mapped = file_buf.data();
+    size_t offset = 0;
+    auto read_bytes = [&](void* dst, size_t nbytes) {
+        if (offset + nbytes > file_size) {
+            LOGGER.e(0, "Unexpected EOF in [" + filename + "].");
+        }
+        std::memcpy(dst, mapped + offset, nbytes);
+        offset += nbytes;
     };
 
-    struct Header {
-        char    magic[4];
-        int32_t n, x_c, num_varcmp, num_r_indx;
-    } hdr;
-    must_read(&hdr, sizeof(hdr));
+    // --- Read Header ---
+    Header hdr;
+    read_bytes(&hdr, sizeof(Header));
 
-    if (hdr.n <= 0 || hdr.x_c < 0 || hdr.num_varcmp <= 0)
+    if (hdr.n <= 0 || hdr.x_c < 0 || hdr.num_varcmp <= 0) {
         LOGGER.e(0, "[" + filename + "] has invalid header dimensions.");
+    }
 
     const std::string_view magic(hdr.magic, 4);
     RemlState st;
     st.n   = hdr.n;
     st.x_c = hdr.x_c;
 
+    // ------------------------------------------------------------------ GOBY
+    if (magic == "GOBY") {
+        int32_t factor_kind = 0;
+        read_bytes(&factor_kind, sizeof(int32_t));
+        st.is_llt = (factor_kind == 0);
+
+        st.Vi_L_f.resize(hdr.n, hdr.n);
+
+        const size_t tri = static_cast<size_t>(hdr.n) * (hdr.n + 1) / 2;
+        std::vector<float> packed_buf(tri);
+        read_bytes(packed_buf.data(), tri * sizeof(float));
+
+        // Pre-compute starting indices per column to avoid serial loop dependencies.
+        // The file bytes are already resident in memory; the parallel work here is only
+        // the unpack/decode step, not the disk-facing read path.
+        std::vector<size_t> col_offsets(hdr.n);
+        size_t current_idx = 0;
+        for (int32_t j = 0; j < hdr.n; ++j) {
+            col_offsets[j] = current_idx;
+            current_idx += static_cast<size_t>(hdr.n - j);
+        }
+
+        #pragma omp parallel for schedule(static)
+        for (int32_t j = 0; j < hdr.n; ++j) {
+            const int32_t len = hdr.n - j;
+            std::memcpy(st.Vi_L_f.col(j).tail(len).data(),
+                        packed_buf.data() + col_offsets[j],
+                        static_cast<size_t>(len) * sizeof(float));
+        }
+
+        if (!no_adj_covar) {
+            st.b.resize(hdr.x_c);
+            read_bytes(st.b.data(), static_cast<size_t>(hdr.x_c) * sizeof(float));
+        }
+
+        st.varcmp.resize(hdr.num_varcmp);
+        read_bytes(st.varcmp.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float));
+
+        return st;
+    }
+
     // ------------------------------------------------------------------ TUNA
     if (magic == "TUNA") {
         st.is_woodbury = true;
         int32_t k = 0;
-        must_read(&k, sizeof(int32_t));
-        if (k <= 0)
+        read_bytes(&k, sizeof(int32_t));
+        if (k <= 0) {
             LOGGER.e(0, "[" + filename + "] has invalid Woodbury rank k=" + to_string(k) + ".");
+        }
 
         double lambda_tail = 0.0;
-        must_read(&lambda_tail, sizeof(double));
+        read_bytes(&lambda_tail, sizeof(double));
         st.lambda_tail_f = static_cast<float>(lambda_tail);
 
-        // Store as k×n (transposed) for cache-efficient GEMM in the hot MLMA loop.
         Eigen::MatrixXf Uk(k, hdr.n);
-        must_read(Uk.data(),
-                  static_cast<std::streamsize>((size_t)hdr.n * k * sizeof(float)));
+        {
+            const size_t uk_elems = static_cast<size_t>(k) * hdr.n;
+            std::vector<float> uk_buf(uk_elems);
+            read_bytes(uk_buf.data(), uk_elems * sizeof(float));
+            #pragma omp parallel for schedule(static)
+            for (int32_t col = 0; col < hdr.n; ++col) {
+                std::memcpy(Uk.data() + static_cast<size_t>(col) * k,
+                            uk_buf.data() + static_cast<size_t>(col) * k,
+                            static_cast<size_t>(k) * sizeof(float));
+            }
+        }
 
         Eigen::VectorXf dk(k);
-        must_read(dk.data(), static_cast<std::streamsize>(k * sizeof(float)));
+        read_bytes(dk.data(), static_cast<size_t>(k) * sizeof(float));
         st.dk_f = dk;
 
         if (!no_adj_covar) {
             st.b.resize(hdr.x_c);
-            must_read(st.b.data(),
-                      static_cast<std::streamsize>(hdr.x_c * sizeof(float)));
+            read_bytes(st.b.data(), static_cast<size_t>(hdr.x_c) * sizeof(float));
         }
 
-        // Read varcmp to reconstruct ck
         Eigen::VectorXf vc(hdr.num_varcmp);
-        must_read(vc.data(),
-                  static_cast<std::streamsize>(hdr.num_varcmp * sizeof(float)));
+        read_bytes(vc.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float));
         st.varcmp = vc;
 
-        const double sg2    = static_cast<double>(vc[0]);
-        const double se2    = static_cast<double>(vc[hdr.num_varcmp - 1]);
-        const double sig2e  = sg2 * lambda_tail + se2;
+        const double sg2   = static_cast<double>(vc[0]);
+        const double se2   = static_cast<double>(vc[hdr.num_varcmp - 1]);
+        const double sig2e = sg2 * lambda_tail + se2;
 
         st.wb.Uk_f.swap(Uk);
         st.wb.ck_f.resize(k);
-        for (int j = 0; j < k; ++j) {
-            double delta   = std::max(0.0, static_cast<double>(dk[j]) - lambda_tail);
-            double sd      = sg2 * delta;
-            st.wb.ck_f[j]  = static_cast<float>(sd / (sig2e + sd));
+        for (int32_t j = 0; j < k; ++j) {
+            const double delta = std::max(0.0, static_cast<double>(dk[j]) - lambda_tail);
+            const double sd    = sg2 * delta;
+            st.wb.ck_f[j] = static_cast<float>(sd / (sig2e + sd));
         }
         st.wb.sqrt_ck_f    = st.wb.ck_f.cwiseSqrt();
         st.wb.sigma2_eff_f = static_cast<float>(sig2e);
+
         return st;
     }
 
-    // ------------------------------------------------------------------ GOBY
-    if (magic != "GOBY")
-        LOGGER.e(0, "[" + filename + "] is not a valid REML state file (bad magic bytes).");
-
-    int32_t factor_kind = 0;  // 0 = L(V), apply via TRSM; 1 = Li(Vi), apply via TRMM
-    must_read(&factor_kind, sizeof(int32_t));
-    st.is_llt = (factor_kind == 0);
-
-    // Unpack the lower triangle directly into a contiguous n×n factor
-    // buffer. This is a Cholesky factor, not a symmetric matrix — only the
-    // lower triangle is meaningful (every consumer applies it via
-    // triangularView<Lower>()), so there is no mirroring step and no
-    // temptation to ever materialise the dense V^{-1} this factor represents.
-    st.Vi_L_f.resize(hdr.n, hdr.n);
-    {
-        const size_t tri = static_cast<size_t>(hdr.n) * (hdr.n + 1) / 2;
-        vector<float> buf(tri);
-        must_read(buf.data(), static_cast<std::streamsize>(tri * sizeof(float)));
-        // Unpack column-by-column via memcpy instead of a scalar
-        // per-element assignment loop -- both buf's packed segment and
-        // st.Vi_L_f's column-tail are contiguous, so this is O(n) memcpy
-        // calls instead of the ~n^2/2 scalar Eigen-indexed assignments the
-        // old loop did (mirrors the write_lower_triangle fix in
-        // writeRemlStateFromCtx below).
-        size_t idx = 0;
-        for (int32_t j = 0; j < hdr.n; ++j) {
-            const int32_t len = hdr.n - j;
-            std::memcpy(st.Vi_L_f.col(j).tail(len).data(), buf.data() + idx,
-                        static_cast<size_t>(len) * sizeof(float));
-            idx += static_cast<size_t>(len);
-        }
-    }  // buf (~n²/2 floats) freed here, ahead of the b/varcmp reads below
-
-    if (!no_adj_covar) {
-        st.b.resize(hdr.x_c);
-        must_read(st.b.data(),
-                  static_cast<std::streamsize>(hdr.x_c * sizeof(float)));
-    }
-
-    st.varcmp.resize(hdr.num_varcmp);
-    must_read(st.varcmp.data(),
-              static_cast<std::streamsize>(hdr.num_varcmp * sizeof(float)));
+    LOGGER.e(0, "[" + filename + "] unsupported format.");
     return st;
 }
 
-void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_covar)
+void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_adj_covar)
 {
-    std::ofstream out(filename, std::ios::binary);
-    if (!out.is_open())
+    // Use POSIX low-level I/O for direct control over OS write buffering
+    int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd == -1)
         LOGGER.e(0, "cannot open [" + filename + "] for writing.");
 
+    auto write_bytes = [fd, &filename](const void* src, size_t nbytes) {
+        const char* ptr = static_cast<const char*>(src);
+        size_t total_written = 0;
+        while (total_written < nbytes) {
+            ssize_t res = write(fd, ptr + total_written, nbytes - total_written);
+            if (res <= 0) {
+                close(fd);
+                LOGGER.e(0, "write error on [" + filename + "] — disk full or I/O failure.");
+            }
+            total_written += static_cast<size_t>(res);
+        }
+    };
+
     if (ctx.Vi_use_woodbury_basis) {
+        // --- TUNA Branch Optimization ---
         struct Header {
             char    magic[4] = {'T', 'U', 'N', 'A'};
             int32_t n = 0, x_c = 0, num_varcmp = 0, num_r_indx = 0;
@@ -220,39 +284,44 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
         hdr.x_c = static_cast<int32_t>(ctx.X_c);
         hdr.num_varcmp = static_cast<int32_t>(ctx.varcmp.size());
         hdr.num_r_indx = static_cast<int32_t>(ctx.varcmp.size());
-        out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+        write_bytes(&hdr, sizeof(hdr));
 
         const int32_t k = static_cast<int32_t>(ctx.dk.size());
-        out.write(reinterpret_cast<const char*>(&k), sizeof(int32_t));
+        write_bytes(&k, sizeof(int32_t));
 
         const double lambda_tail = ctx.lambda_tail;
-        out.write(reinterpret_cast<const char*>(&lambda_tail), sizeof(double));
+        write_bytes(&lambda_tail, sizeof(double));
 
         if (ctx.Uk.rows() != ctx.n || ctx.Uk.cols() != k)
             LOGGER.e(0, "invalid Woodbury REML context dimensions before save.");
-        if (ctx.dk.size() != k)
-            LOGGER.e(0, "invalid Woodbury eigenvalue vector before save.");
 
-        Eigen::MatrixXf Uk_f = ctx.Uk.transpose().cast<float>();
-        out.write(reinterpret_cast<const char*>(Uk_f.data()),
-                  static_cast<std::streamsize>(static_cast<size_t>(ctx.n) * k * sizeof(float)));
+        // Uk_f must be written k×n (see mlma_woodbury.hpp layout convention),
+        // transposed relative to ctx.Uk's n×k storage -- readers place these
+        // bytes directly into a k×n matrix with no further transpose.
+        // Parallel manual transpose+cast (not ctx.Uk.transpose().cast<float>(),
+        // which Eigen evaluates single-threaded) so large Uk blocks use all cores.
+        Eigen::MatrixXf Uk_f(k, ctx.n);
+        #pragma omp parallel for schedule(static)
+        for (int32_t i = 0; i < ctx.n; ++i) {
+            for (int32_t j = 0; j < k; ++j)
+                Uk_f(j, i) = static_cast<float>(ctx.Uk(i, j));
+        }
+        write_bytes(Uk_f.data(), static_cast<size_t>(ctx.n) * k * sizeof(float));
+
         Eigen::VectorXf dk_f = ctx.dk.cast<float>();
-        out.write(reinterpret_cast<const char*>(dk_f.data()),
-                  static_cast<std::streamsize>(k * sizeof(float)));
+        write_bytes(dk_f.data(), static_cast<size_t>(k) * sizeof(float));
 
         if (!no_adj_covar) {
             Eigen::VectorXf b_f = ctx.b.cast<float>();
-            if (b_f.size() != ctx.X_c)
-                LOGGER.e(0, "invalid fixed-effect vector length before save.");
-            out.write(reinterpret_cast<const char*>(b_f.data()),
-                      static_cast<std::streamsize>(ctx.X_c * sizeof(float)));
+            write_bytes(b_f.data(), static_cast<size_t>(ctx.X_c) * sizeof(float));
         }
 
         Eigen::VectorXf varcmp_f = Eigen::Map<const Eigen::VectorXd>(ctx.varcmp.data(),
                                                                       static_cast<Eigen::Index>(ctx.varcmp.size())).cast<float>();
-        out.write(reinterpret_cast<const char*>(varcmp_f.data()),
-                  static_cast<std::streamsize>(hdr.num_varcmp * sizeof(float)));
+        write_bytes(varcmp_f.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float));
+
     } else {
+        // --- GOBY Branch Optimization ---
         struct Header {
             char    magic[4] = {'G', 'O', 'B', 'Y'};
             int32_t n = 0, x_c = 0, num_varcmp = 0, num_r_indx = 0;
@@ -261,88 +330,67 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
         hdr.x_c = static_cast<int32_t>(ctx.X_c);
         hdr.num_varcmp = static_cast<int32_t>(ctx.varcmp.size());
         hdr.num_r_indx = static_cast<int32_t>(ctx.varcmp.size());
-        out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+        write_bytes(&hdr, sizeof(hdr));
 
-        // 0 = packed buffer is L, where V = L L^T (the common case: ctx.Vi_L
-        //     already IS this, straight out of calcu_Vi's dpotrf-only path —
-        //     no inversion needed, ever, for this branch).
-        // 1 = packed buffer is Li, where V^{-1} = Li Li^T (reml_diagV_adj
-        //     fallback only: ctx.Vi is already the dense explicit inverse,
-        //     so we factor it here — once — instead of leaving every
-        //     downstream MLMA run to re-derive a usable factor from a dense
-        //     matrix itself).
         const int32_t factor_kind = ctx.Vi_use_llt ? 0 : 1;
-        out.write(reinterpret_cast<const char*>(&factor_kind), sizeof(int32_t));
+        write_bytes(&factor_kind, sizeof(int32_t));
 
-        // Buffered packer: streams the lower triangle of a resident n×n
-        // matrix out to disk without allocating a second n×n copy.
-        // Casts and appends one column-segment at a time (each segment is
-        // contiguous in mat's column-major storage) instead of a scalar
-        // per-element push_back loop -- the old loop ran O(n^2) scalar
-        // cast+push_back iterations (~5e9 at n=100k); this is O(n) vectorized
-        // Eigen casts plus bulk buffer inserts, same output byte order.
-        auto write_lower_triangle = [&](const Eigen::MatrixXd& mat) {
-            constexpr size_t io_chunk = 1 << 16;  // ~256KB of floats per flush
-            vector<float> io_buf;
-            io_buf.reserve(io_chunk);
-            vector<float> col_scratch(static_cast<size_t>(ctx.n));
-            for (int j = 0; j < ctx.n; ++j) {
-                const int len = ctx.n - j;
-                Eigen::Map<Eigen::VectorXf>(col_scratch.data(), len) =
-                    mat.col(j).tail(len).cast<float>();
-                size_t written = 0;
-                while (written < static_cast<size_t>(len)) {
-                    const size_t take = std::min(static_cast<size_t>(len) - written,
-                                                  io_chunk - io_buf.size());
-                    io_buf.insert(io_buf.end(),
-                                   col_scratch.data() + written,
-                                   col_scratch.data() + written + take);
-                    written += take;
-                    if (io_buf.size() == io_chunk) {
-                        out.write(reinterpret_cast<const char*>(io_buf.data()),
-                                  static_cast<std::streamsize>(io_buf.size() * sizeof(float)));
-                        io_buf.clear();
-                    }
-                }
-            }
-            if (!io_buf.empty())
-                out.write(reinterpret_cast<const char*>(io_buf.data()),
-                          static_cast<std::streamsize>(io_buf.size() * sizeof(float)));
-        };
+        // Prepare factorization matrix reference
+        const Eigen::MatrixXd* mat_ptr = &ctx.Vi_L;
+        Eigen::MatrixXd Vi_copy;
 
-        if (ctx.Vi_use_llt) {
-            if (ctx.Vi_L.rows() != ctx.n || ctx.Vi_L.cols() != ctx.n)
-                LOGGER.e(0, "invalid LLT REML context dimensions before save.");
-            // ctx.Vi_L already IS L — pack it directly. O(n²) instead of the
-            // O(n³) blocked triangular-solve inversion this used to do only
-            // to throw the factorization away again on the read side.
-            write_lower_triangle(ctx.Vi_L);
-        } else {
+        if (!ctx.Vi_use_llt) {
             if (ctx.Vi.rows() != ctx.n || ctx.Vi.cols() != ctx.n)
                 LOGGER.e(0, "invalid dense REML context dimensions before save.");
+            // Copy to preserve original ctx.Vi state
+            Vi_copy = ctx.Vi;
             gcta_blas_int blas_n = static_cast<gcta_blas_int>(ctx.n);
-            if (gcta_dpotrf(blas_n, ctx.Vi.data(), blas_n) != 0)
+            if (gcta_dpotrf(blas_n, Vi_copy.data(), blas_n) != 0)
                 LOGGER.e(0, "Vi is not positive definite when factorising for save.");
-            write_lower_triangle(ctx.Vi);
+            mat_ptr = &Vi_copy;
         }
+
+        const Eigen::MatrixXd& mat = *mat_ptr;
+        const size_t n_val = static_cast<size_t>(ctx.n);
+        const size_t tri_elements = n_val * (n_val + 1) / 2;
+
+        // Allocate packed single-precision output buffer once
+        std::vector<float> packed_buf(tri_elements);
+
+        // Pre-compute offsets per column to allow multi-threaded parallel packing
+        std::vector<size_t> col_offsets(n_val);
+        size_t current_idx = 0;
+        for (size_t j = 0; j < n_val; ++j) {
+            col_offsets[j] = current_idx;
+            current_idx += (n_val - j);
+        }
+
+        // Parallel float conversion & packing: zero lock contention across CPU cores
+        #pragma omp parallel for schedule(static)
+        for (int32_t j = 0; j < ctx.n; ++j) {
+            const int32_t len = ctx.n - j;
+            const double* col_src = mat.col(j).tail(len).data();
+            float* dst = packed_buf.data() + col_offsets[j];
+
+            for (int32_t i = 0; i < len; ++i) {
+                dst[i] = static_cast<float>(col_src[i]);
+            }
+        }
+
+        // Single contiguous bulk write (utilizes full disk IO bus speed)
+        write_bytes(packed_buf.data(), tri_elements * sizeof(float));
 
         if (!no_adj_covar) {
             Eigen::VectorXf b_f = ctx.b.cast<float>();
-            if (b_f.size() != ctx.X_c)
-                LOGGER.e(0, "invalid fixed-effect vector length before save.");
-            out.write(reinterpret_cast<const char*>(b_f.data()),
-                      static_cast<std::streamsize>(ctx.X_c * sizeof(float)));
+            write_bytes(b_f.data(), static_cast<size_t>(ctx.X_c) * sizeof(float));
         }
 
         Eigen::VectorXf varcmp_f = Eigen::Map<const Eigen::VectorXd>(ctx.varcmp.data(),
                                                                       static_cast<Eigen::Index>(ctx.varcmp.size())).cast<float>();
-        out.write(reinterpret_cast<const char*>(varcmp_f.data()),
-                  static_cast<std::streamsize>(hdr.num_varcmp * sizeof(float)));
+        write_bytes(varcmp_f.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float));
     }
 
-    out.flush();
-    if (!out)
-        LOGGER.e(0, "write error on [" + filename + "] — disk full or I/O failure.");
+    close(fd);
 }
 
 void write_hsq_from_ctx(const string& out_prefix, const RemlCtx& ctx)
@@ -861,7 +909,9 @@ void MLMA::processMain()
             // RemlState overload in MLMA_stream_common.hpp).
             const string load_reml_file = options.at("load_reml");
             LOGGER.i(0, "Loading REML state from [" + load_reml_file + "]...");
+            LOGGER.ts("load_reml");
             state = readRemlState(load_reml_file, no_adj_covar);
+            LOGGER.i(0, "REML state loaded in " + to_string(LOGGER.tp("load_reml")) + " seconds.");
 
             if (state.n != n)
                 LOGGER.e(0, "Sample size mismatch: REML state n=" + to_string(state.n) +
@@ -976,7 +1026,7 @@ void MLMA::processMain()
 
             vector<string> grm_ids;
             Eigen::MatrixXd G_n;      // left empty when svd_chunked
-            double m_all = 0.0;
+            double m_all = options_d["woodbury_basis_rank"] == -1 ? 0.0 : -1.0;  // only populated when !svd_chunked
             gcta_grm_io::ChunkedGrmHandle chunked_grm;  // only populated when svd_chunked
 
             if (svd_chunked) {
@@ -1119,7 +1169,9 @@ void MLMA::processMain()
             if (options.count("save_reml")) {
                 const string save_reml_file = out_prefix + ".reml";
                 LOGGER.i(0, "Saving REML state to [" + save_reml_file + "] ...");
+                LOGGER.ts("save_reml");
                 writeRemlStateFromCtx(save_reml_file, ctx, no_adj_covar);
+                LOGGER.i(0, "REML state saved in " + to_string(LOGGER.tp("save_reml")) + " seconds.");
                 LOGGER.i(0, "REML estimation completed. Use --load-reml " + save_reml_file +
                             " to perform association tests.");
                 delete geno;

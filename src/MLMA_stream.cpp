@@ -44,6 +44,7 @@
 #include <limits>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 
 using std::map;
 using std::string;
@@ -83,8 +84,32 @@ string to_text(T x)
 // RemlState is now defined in include/RemlState.hpp (shared with MLMA_loco).
 // The readRemlState() function below remains file-local (only MLMA_stream needs it).
 
+static void read_exact(int fd, void* dst, size_t nbytes, const std::string& path)
+{
+    char* ptr = static_cast<char*>(dst);
+    size_t total_read = 0;
+    while (total_read < nbytes) {
+        const ssize_t res = ::read(fd, ptr + total_read, nbytes - total_read);
+        if (res == 0) {
+            close(fd);
+            LOGGER.e(0, "Unexpected EOF while reading [" + path + "] (expected " +
+                        to_string(nbytes) + " bytes, got " + to_string(total_read) + ").");
+        }
+        if (res < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            LOGGER.e(0, "I/O error while reading [" + path + "] (errno=" +
+                        std::to_string(errno) + ").");
+        }
+        total_read += static_cast<size_t>(res);
+    }
+}
+
 // Read the binary REML state written by save_reml_state().
 // When !no_adj_covar the 'b' vector is loaded; otherwise it is skipped.
+// The file is read serially in one contiguous pass to avoid HPC/Lustre I/O
+// storms from many threads touching scattered offsets concurrently; only the
+// in-memory unpack/decode is parallelized afterwards.
 RemlState readRemlState(const std::string& filename, bool no_adj_covar)
 {
     int fd = open(filename.c_str(), O_RDONLY);
@@ -96,25 +121,19 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
         LOGGER.e(0, "Failed to stat file [" + filename + "].");
     }
     const size_t file_size = static_cast<size_t>(sb.st_size);
-
-    // 1. Standard POSIX PROT_READ + MAP_SHARED mapping (macOS & Linux compliant)
-    void* raw_mapped = mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd); // File descriptor can be closed immediately after mmap
-
-    if (raw_mapped == MAP_FAILED) {
-        LOGGER.e(0, "mmap failed for [" + filename + "].");
+    if (file_size == 0) {
+        close(fd);
+        LOGGER.e(0, "[" + filename + "] is empty.");
     }
 
-    const char* mapped = static_cast<const char*>(raw_mapped);
+    std::vector<char> file_buf(file_size);
+    read_exact(fd, file_buf.data(), file_size, filename);
+    close(fd);
 
-    // 2. POSIX madvise: Signal non-destructive asynchronous page-in
-    // Avoids MADV_SEQUENTIAL eviction storms when threads jump to different offsets
-    posix_madvise(raw_mapped, file_size, POSIX_MADV_WILLNEED);
-
+    const char* mapped = file_buf.data();
     size_t offset = 0;
     auto read_bytes = [&](void* dst, size_t nbytes) {
         if (offset + nbytes > file_size) {
-            munmap(raw_mapped, file_size);
             LOGGER.e(0, "Unexpected EOF in [" + filename + "].");
         }
         std::memcpy(dst, mapped + offset, nbytes);
@@ -126,7 +145,6 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
     read_bytes(&hdr, sizeof(Header));
 
     if (hdr.n <= 0 || hdr.x_c < 0 || hdr.num_varcmp <= 0) {
-        munmap(raw_mapped, file_size);
         LOGGER.e(0, "[" + filename + "] has invalid header dimensions.");
     }
 
@@ -143,12 +161,13 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
 
         st.Vi_L_f.resize(hdr.n, hdr.n);
 
-        // Compute element offset where the packed lower triangle starts
-        const float* packed_ptr = reinterpret_cast<const float*>(mapped + offset);
         const size_t tri = static_cast<size_t>(hdr.n) * (hdr.n + 1) / 2;
-        offset += tri * sizeof(float);
+        std::vector<float> packed_buf(tri);
+        read_bytes(packed_buf.data(), tri * sizeof(float));
 
-        // Pre-compute starting indices per column to avoid serial loop dependencies
+        // Pre-compute starting indices per column to avoid serial loop dependencies.
+        // The file bytes are already resident in memory; the parallel work here is only
+        // the unpack/decode step, not the disk-facing read path.
         std::vector<size_t> col_offsets(hdr.n);
         size_t current_idx = 0;
         for (int32_t j = 0; j < hdr.n; ++j) {
@@ -156,12 +175,11 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
             current_idx += static_cast<size_t>(hdr.n - j);
         }
 
-        // Parallel zero-copy unpack directly from mapped file space into Eigen
         #pragma omp parallel for schedule(static)
         for (int32_t j = 0; j < hdr.n; ++j) {
             const int32_t len = hdr.n - j;
             std::memcpy(st.Vi_L_f.col(j).tail(len).data(),
-                        packed_ptr + col_offsets[j],
+                        packed_buf.data() + col_offsets[j],
                         static_cast<size_t>(len) * sizeof(float));
         }
 
@@ -173,7 +191,6 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
         st.varcmp.resize(hdr.num_varcmp);
         read_bytes(st.varcmp.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float));
 
-        munmap(raw_mapped, file_size);
         return st;
     }
 
@@ -183,7 +200,6 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
         int32_t k = 0;
         read_bytes(&k, sizeof(int32_t));
         if (k <= 0) {
-            munmap(raw_mapped, file_size);
             LOGGER.e(0, "[" + filename + "] has invalid Woodbury rank k=" + to_string(k) + ".");
         }
 
@@ -191,25 +207,17 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
         read_bytes(&lambda_tail, sizeof(double));
         st.lambda_tail_f = static_cast<float>(lambda_tail);
 
-        // Uk is stored k×n (see mlma_woodbury.hpp layout convention), a single
-        // contiguous column-major block. Parallel per-column memcpy (rather
-        // than one big read_bytes() call) so large Uk blocks use all cores
-        // instead of a single-threaded copy, matching the GOBY branch above.
         Eigen::MatrixXf Uk(k, hdr.n);
         {
-            const size_t uk_bytes = static_cast<size_t>(k) * hdr.n * sizeof(float);
-            if (offset + uk_bytes > file_size) {
-                munmap(raw_mapped, file_size);
-                LOGGER.e(0, "Unexpected EOF in [" + filename + "].");
-            }
-            const float* uk_src = reinterpret_cast<const float*>(mapped + offset);
+            const size_t uk_elems = static_cast<size_t>(k) * hdr.n;
+            std::vector<float> uk_buf(uk_elems);
+            read_bytes(uk_buf.data(), uk_elems * sizeof(float));
             #pragma omp parallel for schedule(static)
             for (int32_t col = 0; col < hdr.n; ++col) {
                 std::memcpy(Uk.data() + static_cast<size_t>(col) * k,
-                            uk_src + static_cast<size_t>(col) * k,
+                            uk_buf.data() + static_cast<size_t>(col) * k,
                             static_cast<size_t>(k) * sizeof(float));
             }
-            offset += uk_bytes;
         }
 
         Eigen::VectorXf dk(k);
@@ -239,11 +247,9 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
         st.wb.sqrt_ck_f    = st.wb.ck_f.cwiseSqrt();
         st.wb.sigma2_eff_f = static_cast<float>(sig2e);
 
-        munmap(raw_mapped, file_size);
         return st;
     }
 
-    munmap(raw_mapped, file_size);
     LOGGER.e(0, "[" + filename + "] unsupported format.");
     return st;
 }

@@ -116,7 +116,7 @@ int main(int argc, char *argv[]){
         "--pca", "--pca-v1", "--pca-stream", "--pca-approx",
         "--svd-method", "--svd-chunked-budget",
         "--reml-trace-hutchpp", "--reml-trace-hutchpp-fixed-probes", "--reml-no-HE-start", "--reml-force-dense-V",
-        "--reml-woodbury-basis", "--reml-woodbury-basis-MP-margin", "--reml-woodbury-basis-MP-confirm", "--reml-woodbury-basis-EIG-mass", "--reml-woodbury-basis-EIG-k-buffer", "--reml-woodbury-basis-VAR-tail", "--reml-woodbury-basis-range", "--reml-woodbury-basis-posthoc-correction",
+        "--reml-woodbury-basis", "--reml-woodbury-basis-MP-margin", "--reml-woodbury-basis-MP-confirm", "--reml-woodbury-basis-EIG-mass", "--reml-woodbury-basis-EIG-k-buffer", "--reml-woodbury-basis-VAR-tail", "--reml-woodbury-basis-range", "--reml-woodbury-basis-posthoc-correction", "--reml-woodbury-basis-mem-budget",
         "--reml-no-constrain", "--reml-priors", "--reml-priors-var", "--reml-diagV-adj", "--reml-maxit",  "--reml-alg",
         "--reml-ai-robust", "--reml-ai-robust-tol", "--reml-ai-robust-risk",
         "--mlma-loco-stream", "--loco-manifest",

@@ -772,16 +772,13 @@ inline void merge_grms_streaming(
         // Pull this block from input files in parallel across all 2K input streams
         // (.grm.bin and .grm.N.bin for each input). Every stream has an independent
         // file descriptor and advances sequentially block by block.
-        #pragma omp parallel for schedule(dynamic, 1)
-        for (int s = 0; s < 2 * K; ++s) {
-            if (s < K) {
-                read_exact(val_files[s].fd, val_block_bufs[s].data(),
-                           bytes_this_chunk, val_files[s].path);
-            } else {
-                const int f = s - K;
-                read_exact(n_files[f].fd, n_block_bufs[f].data(),
-                           bytes_this_chunk, n_files[f].path);
-            }
+        const int max_io_threads = std::min(omp_get_max_threads(), 8);
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(max_io_threads)
+        for (int f = 0; f < K; ++f) {
+            read_exact(val_files[f].fd, val_block_bufs[f].data(),
+                    bytes_this_chunk, val_files[f].path);
+            read_exact(n_files[f].fd, n_block_bufs[f].data(),
+                    bytes_this_chunk, n_files[f].path);
         }
 
         // Compute the N-weighted average across all elements in this chunk.

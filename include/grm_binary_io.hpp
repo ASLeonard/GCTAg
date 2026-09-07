@@ -85,6 +85,21 @@ inline void read_exact(int fd, void* buf, size_t count, const std::string& path)
     }
 }
 
+// Blocking write of exactly `count` bytes from `buf`, retrying on EINTR and
+// on short writes. Errors out via LOGGER on a hard write error.
+inline void write_exact(int fd, const void* buf, size_t count, const std::string& path) {
+    const char* p = static_cast<const char*>(buf);
+    size_t done = 0;
+    while (done < count) {
+        const ssize_t w = ::write(fd, p + done, count - done);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            LOGGER.e(0, "write() failed on [" + path + "]: " + std::string(std::strerror(errno)));
+        }
+        done += static_cast<size_t>(w);
+    }
+}
+
 
 // Returns:
 //   ids      — "FID\tIID" strings in GRM file order
@@ -651,6 +666,7 @@ inline int solve_merge_chunk_rows(int n, int K, double budget_gb) {
 // prefixes.size() is available, and because a fixed row_block_rows chosen
 // without K in mind is exactly what caused this function's memory to scale
 // unboundedly with K (see solve_merge_chunk_rows's comment above).
+//TODO: note this could actually be just a fancy 1D merge across files
 inline void merge_grms_streaming(
     const std::vector<std::string>& prefixes,
     const std::string& out_prefix,
@@ -678,22 +694,35 @@ inline void merge_grms_streaming(
     const size_t tri      = static_cast<size_t>(n) * (n + 1) / 2;
     const size_t byte_len = tri * sizeof(float);
     const int    K        = static_cast<int>(prefixes.size());
-    int row_block_rows = 4096;
+    const size_t num_buffers = static_cast<size_t>(2 * K + 2);
+
+    // Sizing chunk_elems: the packed lower triangle has tri = n(n+1)/2 floats.
+    // Every element is independent in the N-weighted merge, so chunking by a
+    // fixed number of float elements (rather than a fixed number of rows)
+    // keeps memory strictly constant across iterations, avoids vector reallocations,
+    // and eliminates the quadratic growth of row-based buffers at large n.
+    size_t chunk_elems = 0;
     if (memory_budget_gb > 0.0) {
-        row_block_rows = solve_merge_chunk_rows(n, K, memory_budget_gb);
-        if (row_block_rows < 1) {
-            LOGGER.e(0, "merge_grms_streaming: memory_budget_gb=" + std::to_string(memory_budget_gb) +
-                        "GB cannot fit even a single row across K=" + std::to_string(K) +
-                        " inputs (n=" + std::to_string(n) + " -> " +
-                        std::to_string(4.0 * n * (2.0 * K + 2.0) / 1e9) +
-                        "GB/row worst-case); raise memory_budget_gb.");
-        } else  {
-            LOGGER.i(0, "merge_grms_streaming: using " + std::to_string(row_block_rows) +
-                        " rows per block (memory_budget_gb=" + std::to_string(memory_budget_gb) + ").");
-        }
-    }
-    else {
-        LOGGER.e(0, "merge_grms_streaming: defaulting to " + std::to_string(row_block_rows) + " rows. This may use more memory than expected for large K, and the memory budget should be set explicitly with `--merge-grm-streaming <budget in GB>`.");
+        const double budget_bytes = memory_budget_gb * 1e9;
+        chunk_elems = static_cast<size_t>(budget_bytes / (num_buffers * sizeof(float)));
+        chunk_elems = std::clamp<size_t>(chunk_elems, 65536, tri);
+        LOGGER.i(0, "merge_grms_streaming: using " +
+                    std::to_string((chunk_elems * sizeof(float)) >> 20) +
+                    " MB per stream buffer (" +
+                    std::to_string((num_buffers * chunk_elems * sizeof(float)) >> 20) +
+                    " MB total buffer memory, budget=" + std::to_string(memory_budget_gb) + "GB).");
+    } else {
+        // Default: 16 MiB (4M floats) per stream buffer, capped at 512 MiB total across all 2K+2 buffers.
+        constexpr size_t default_target_elems = 4 * 1024 * 1024;
+        constexpr size_t max_total_bytes = 512ull << 20;
+        const size_t max_elems_from_cap = max_total_bytes / (num_buffers * sizeof(float));
+        chunk_elems = std::min(default_target_elems, max_elems_from_cap);
+        chunk_elems = std::clamp<size_t>(chunk_elems, 65536, tri);
+        LOGGER.i(0, "merge_grms_streaming: using " +
+                    std::to_string((chunk_elems * sizeof(float)) >> 20) +
+                    " MB per stream buffer (" +
+                    std::to_string((num_buffers * chunk_elems * sizeof(float)) >> 20) +
+                    " MB total buffer memory). Set `--merge-grm-streaming <GB>` to customize.");
     }
 
     struct OpenGrmFile {
@@ -721,77 +750,76 @@ inline void merge_grms_streaming(
 
     const std::string out_bin_path = out_prefix + ".grm.bin";
     const std::string out_n_path   = out_prefix + ".grm.N.bin";
-    std::ofstream out_bin(out_bin_path, std::ios::binary);
-    std::ofstream out_n(out_n_path, std::ios::binary);
-    if (!out_bin) LOGGER.e(0, "cannot open [" + out_bin_path + "] for writing.");
-    if (!out_n)   LOGGER.e(0, "cannot open [" + out_n_path + "] for writing.");
+    const int out_bin_fd = ::open(out_bin_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out_bin_fd == -1) LOGGER.e(0, "cannot open [" + out_bin_path + "] for writing: " + std::string(std::strerror(errno)));
+    const int out_n_fd   = ::open(out_n_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out_n_fd == -1) {
+        ::close(out_bin_fd);
+        LOGGER.e(0, "cannot open [" + out_n_path + "] for writing: " + std::string(std::strerror(errno)));
+    }
 
-    std::vector<float> out_val_buf, out_n_buf;
+    // Allocate all stream buffers once up front. No reallocations occur in the streaming loop.
+    std::vector<float> out_val_buf(chunk_elems), out_n_buf(chunk_elems);
     std::vector<std::vector<float>> val_block_bufs(K), n_block_bufs(K);
+    for (int f = 0; f < K; ++f) {
+        val_block_bufs[f].resize(chunk_elems);
+        n_block_bufs[f].resize(chunk_elems);
+    }
 
-    for (int rs = 0; rs < n; rs += row_block_rows) {
-        const int re = std::min(rs + row_block_rows, n);
-        const size_t block_base = static_cast<size_t>(rs) * (rs + 1) / 2;
-        size_t block_elems = 0;
-        for (int i = rs; i < re; ++i) block_elems += static_cast<size_t>(i + 1);
-        out_val_buf.resize(block_elems);
-        out_n_buf.resize(block_elems);
+    for (size_t offset = 0; offset < tri; offset += chunk_elems) {
+        const size_t elems_this_chunk = std::min(chunk_elems, tri - offset);
+        const size_t bytes_this_chunk = elems_this_chunk * sizeof(float);
 
-        // Pull this block from every input file with one sequential read()
-        // per file -- single-threaded, strictly in row_block_rows order, so
-        // each file's own read position just advances block by block with
-        // no seeking needed. This is the only I/O in the loop; everything
-        // below reads from these in-RAM buffers.
+        // Pull this block from input files in parallel across K inputs.
+        // Each input file f is an independent file descriptor, and each
+        // file's offset advances sequentially block by block.
+        #pragma omp parallel for schedule(dynamic, 1)
         for (int f = 0; f < K; ++f) {
-            val_block_bufs[f].resize(block_elems);
-            n_block_bufs[f].resize(block_elems);
             read_exact(val_files[f].fd, val_block_bufs[f].data(),
-                       block_elems * sizeof(float), val_files[f].path);
+                       bytes_this_chunk, val_files[f].path);
             read_exact(n_files[f].fd, n_block_bufs[f].data(),
-                       block_elems * sizeof(float), n_files[f].path);
+                       bytes_this_chunk, n_files[f].path);
         }
 
-        // Rows are independent (each writes its own non-overlapping range
-        // of the block buffer, computed from the packed-triangular offset
-        // formula), so this parallelizes cleanly — each thread keeps its
-        // own reusable n-length scratch rather than reallocating per row.
-        // Safe to schedule(dynamic) here regardless of row order since all
-        // of this block's data is already resident (read above); this loop
-        // is pure in-RAM compute, not file access.
-        #pragma omp parallel
-        {
-            std::vector<double> wsum(n), wtN(n);
-            #pragma omp for schedule(dynamic, 64)
-            for (int i = rs; i < re; ++i) {
-                const int row_len = i + 1;
-                const size_t row_start = static_cast<size_t>(i) * (i + 1) / 2;
-                const size_t local_off = row_start - block_base;
-                std::fill_n(wsum.data(), row_len, 0.0);
-                std::fill_n(wtN.data(), row_len, 0.0);
-                for (int f = 0; f < K; ++f) {
-                    const float* v  = val_block_bufs[f].data() + local_off;
-                    const float* nn = n_block_bufs[f].data() + local_off;
-                    for (int j = 0; j < row_len; ++j) {
-                        wsum[j] += static_cast<double>(v[j]) * static_cast<double>(nn[j]);
-                        wtN[j]  += static_cast<double>(nn[j]);
-                    }
+        // Compute the N-weighted average across all elements in this chunk.
+        // Tiled in L1-cache-sized blocks (4096 floats = 32KB per stack tile)
+        // with static OpenMP scheduling for uniform load balancing.
+        constexpr size_t TILE_SIZE = 4096;
+        #pragma omp parallel for schedule(static)
+        for (size_t t_start = 0; t_start < elems_this_chunk; t_start += TILE_SIZE) {
+            const size_t t_end = std::min(t_start + TILE_SIZE, elems_this_chunk);
+            const size_t tile_len = t_end - t_start;
+
+            alignas(64) double tile_wsum[TILE_SIZE];
+            alignas(64) double tile_wtN[TILE_SIZE];
+            std::fill_n(tile_wsum, tile_len, 0.0);
+            std::fill_n(tile_wtN, tile_len, 0.0);
+
+            for (int f = 0; f < K; ++f) {
+                const float* __restrict__ v  = val_block_bufs[f].data() + t_start;
+                const float* __restrict__ nn = n_block_bufs[f].data() + t_start;
+                #pragma omp simd
+                for (size_t j = 0; j < tile_len; ++j) {
+                    tile_wsum[j] += static_cast<double>(v[j]) * static_cast<double>(nn[j]);
+                    tile_wtN[j]  += static_cast<double>(nn[j]);
                 }
-                const size_t out_offset = row_start - block_base;
-                for (int j = 0; j < row_len; ++j) {
-                    out_val_buf[out_offset + j] = static_cast<float>(wtN[j] > 0.0 ? wsum[j] / wtN[j] : 0.0);
-                    out_n_buf[out_offset + j]   = static_cast<float>(wtN[j]);
-                }
+            }
+
+            float* __restrict__ out_v = out_val_buf.data() + t_start;
+            float* __restrict__ out_n = out_n_buf.data() + t_start;
+            #pragma omp simd
+            for (size_t j = 0; j < tile_len; ++j) {
+                out_v[j] = static_cast<float>(tile_wtN[j] > 0.0 ? tile_wsum[j] / tile_wtN[j] : 0.0);
+                out_n[j] = static_cast<float>(tile_wtN[j]);
             }
         }
 
-        out_bin.write(reinterpret_cast<const char*>(out_val_buf.data()), block_elems * sizeof(float));
-        out_n.write(reinterpret_cast<const char*>(out_n_buf.data()), block_elems * sizeof(float));
-        if (!out_bin || !out_n)
-            LOGGER.e(0, "write failed while writing merged GRM to [" + out_prefix + "].");
+        write_exact(out_bin_fd, out_val_buf.data(), bytes_this_chunk, out_bin_path);
+        write_exact(out_n_fd, out_n_buf.data(), bytes_this_chunk, out_n_path);
     }
 
-    out_bin.close();
-    out_n.close();
+    ::close(out_bin_fd);
+    ::close(out_n_fd);
 
     for (auto& f : val_files) ::close(f.fd);
     for (auto& f : n_files)   ::close(f.fd);

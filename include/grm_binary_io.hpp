@@ -666,7 +666,6 @@ inline int solve_merge_chunk_rows(int n, int K, double budget_gb) {
 // prefixes.size() is available, and because a fixed row_block_rows chosen
 // without K in mind is exactly what caused this function's memory to scale
 // unboundedly with K (see solve_merge_chunk_rows's comment above).
-//TODO: note this could actually be just a fancy 1D merge across files
 inline void merge_grms_streaming(
     const std::vector<std::string>& prefixes,
     const std::string& out_prefix,
@@ -770,15 +769,19 @@ inline void merge_grms_streaming(
         const size_t elems_this_chunk = std::min(chunk_elems, tri - offset);
         const size_t bytes_this_chunk = elems_this_chunk * sizeof(float);
 
-        // Pull this block from input files in parallel across K inputs.
-        // Each input file f is an independent file descriptor, and each
-        // file's offset advances sequentially block by block.
+        // Pull this block from input files in parallel across all 2K input streams
+        // (.grm.bin and .grm.N.bin for each input). Every stream has an independent
+        // file descriptor and advances sequentially block by block.
         #pragma omp parallel for schedule(dynamic, 1)
-        for (int f = 0; f < K; ++f) {
-            read_exact(val_files[f].fd, val_block_bufs[f].data(),
-                       bytes_this_chunk, val_files[f].path);
-            read_exact(n_files[f].fd, n_block_bufs[f].data(),
-                       bytes_this_chunk, n_files[f].path);
+        for (int s = 0; s < 2 * K; ++s) {
+            if (s < K) {
+                read_exact(val_files[s].fd, val_block_bufs[s].data(),
+                           bytes_this_chunk, val_files[s].path);
+            } else {
+                const int f = s - K;
+                read_exact(n_files[f].fd, n_block_bufs[f].data(),
+                           bytes_this_chunk, n_files[f].path);
+            }
         }
 
         // Compute the N-weighted average across all elements in this chunk.
@@ -814,8 +817,18 @@ inline void merge_grms_streaming(
             }
         }
 
-        write_exact(out_bin_fd, out_val_buf.data(), bytes_this_chunk, out_bin_path);
-        write_exact(out_n_fd, out_n_buf.data(), bytes_this_chunk, out_n_path);
+        // Write the two independent output files in parallel.
+        #pragma omp parallel sections
+        {
+            #pragma omp section
+            {
+                write_exact(out_bin_fd, out_val_buf.data(), bytes_this_chunk, out_bin_path);
+            }
+            #pragma omp section
+            {
+                write_exact(out_n_fd, out_n_buf.data(), bytes_this_chunk, out_n_path);
+            }
+        }
     }
 
     ::close(out_bin_fd);
@@ -824,7 +837,6 @@ inline void merge_grms_streaming(
     for (auto& f : val_files) ::close(f.fd);
     for (auto& f : n_files)   ::close(f.fd);
 
-    //TODO: avoid if/ofstream
     // .grm.id is identical across inputs (already validated) — copy it once.
     // dst << src.rdbuf() has no built-in error signalling: an unopenable
     // source or a write failure (disk full, permissions) both produce a

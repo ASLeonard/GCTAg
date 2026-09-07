@@ -1009,7 +1009,7 @@ void MLMA::processMain()
 
             vector<string> grm_ids;
             Eigen::MatrixXd G_n;      // left empty when svd_chunked
-            double m_all = options_d["woodbury_basis_rank"] == -1 ? 0.0 : -1.0;  // only populated when !svd_chunked
+            double m_all = options_d["woodbury_basis_rank"] == -1 ? 0.0 : -1.0;  // only populated when dense GRM and Woodbury-MP mode is selected
             gcta_grm_io::ChunkedGrmHandle chunked_grm;  // only populated when svd_chunked
 
             if (svd_chunked) {

@@ -654,7 +654,6 @@ inline int solve_merge_chunk_rows(int n, int K, double budget_gb) {
 inline void merge_grms_streaming(
     const std::vector<std::string>& prefixes,
     const std::string& out_prefix,
-    int row_block_rows = 4000,
     double memory_budget_gb = 0.0)
 {
     if (prefixes.empty())
@@ -679,18 +678,23 @@ inline void merge_grms_streaming(
     const size_t tri      = static_cast<size_t>(n) * (n + 1) / 2;
     const size_t byte_len = tri * sizeof(float);
     const int    K        = static_cast<int>(prefixes.size());
-
+    int row_block_rows = 4096;
     if (memory_budget_gb > 0.0) {
         row_block_rows = solve_merge_chunk_rows(n, K, memory_budget_gb);
-        if (row_block_rows < 1)
+        if (row_block_rows < 1) {
             LOGGER.e(0, "merge_grms_streaming: memory_budget_gb=" + std::to_string(memory_budget_gb) +
                         "GB cannot fit even a single row across K=" + std::to_string(K) +
                         " inputs (n=" + std::to_string(n) + " -> " +
                         std::to_string(4.0 * n * (2.0 * K + 2.0) / 1e9) +
                         "GB/row worst-case); raise memory_budget_gb.");
+        } else  {
+            LOGGER.i(0, "merge_grms_streaming: using " + std::to_string(row_block_rows) +
+                        " rows per block (memory_budget_gb=" + std::to_string(memory_budget_gb) + ").");
+        }
     }
-    if (row_block_rows <= 0)
-        LOGGER.e(0, "merge_grms_streaming: row_block_rows must be positive.");
+    else {
+        LOGGER.e(0, "merge_grms_streaming: defaulting to " + std::to_string(row_block_rows) + " rows. This may use more memory than expected for large K, and the memory budget should be set explicitly with `--merge-grm-streaming <budget in GB>`.");
+    }
 
     struct OpenGrmFile {
         int fd = -1;

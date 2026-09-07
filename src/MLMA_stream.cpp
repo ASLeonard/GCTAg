@@ -989,37 +989,20 @@ void MLMA::processMain()
                             "the Woodbury basis provides an exact tr(PA) and takes precedence — "
                             "--reml-trace-hutchpp is ignored.");
 
-            // Row-chunk size for streaming GRM reads, resolved from
-            // --svd-chunked-budget the same way RemlEngine.cpp's
-            // compute_woodbury_basis sizes it (k_svd_budget_ceiling from
-            // --reml-woodbury-basis-mem-budget, defaulting to n-1 unbounded).
-            // Resolved here, before committing to the chunked reader below, so
-            // a budget that turns out to cover the whole matrix in one chunk
-            // can fall back to the dense load instead. Chunking then buys
-            // nothing (there's no second chunk to defer) but still pays the
-            // diagonal-tile mirror's transient 2x n x n duplication (see
-            // chunked_grm_matvec.hpp) across the entire GRM at once — strictly
-            // worse than dense in that case.
             int svd_chunk_rows = 0;
             if (svd_chunked) {
-                int k_svd_budget_ceiling = n - 1;
-                if (woodbury_basis_mem_budget_gb > 0.0) {
-                    const double budget_bytes = woodbury_basis_mem_budget_gb * 1e9;
-                    const int max_k_ext = static_cast<int>(budget_bytes / (5.0 * n * 8.0));
-                    k_svd_budget_ceiling = std::min(k_svd_budget_ceiling, std::max(20, max_k_ext - 200));
-                }
-                const int k_ext_hint = k_svd_budget_ceiling + gcta_eigh::recommended_oversample(k_svd_budget_ceiling);
-                svd_chunk_rows = gcta_chunked::solve_chunk_rows(n, svd_chunked_budget, k_ext_hint);
+                const double grm_packed_gb =
+                    static_cast<double>(gcta_grm_io::grm_packed_bytes(n)) / 1e9;
+                svd_chunk_rows = gcta_chunked::solve_chunk_rows(n, svd_chunked_budget, 0, grm_packed_gb);
                 if (svd_chunk_rows < 1)
                     LOGGER.e(0, "--svd-chunked-budget=" + to_string(svd_chunked_budget) +
-                                "GB cannot fit even a single GRM row (n=" + to_string(n) +
-                                ", k_ext=" + to_string(k_ext_hint) + " -> " +
-                                to_string(8.0 * (n + k_ext_hint) / 1e9) + "GB/row); raise the budget.");
+                                "GB is too small: the packed GRM itself needs " +
+                                to_string(grm_packed_gb) + "GB (n=" + to_string(n) + "); raise the budget.");
                 if (svd_chunk_rows >= n) {
                     LOGGER.w(0, "--svd-chunked-budget=" + to_string(svd_chunked_budget) +
-                                "GB covers the full GRM (n=" + to_string(n) + ", k_ext up to " +
-                                to_string(k_ext_hint) + ") in a single chunk. Falling back to "
-                                "dense loading instead of paying chunking overhead for no benefit.");
+                                "GB covers the full GRM (n=" + to_string(n) + ") in a single chunk. "
+                                "Falling back to dense loading instead of paying chunking overhead "
+                                "for no benefit.");
                     svd_chunked = false;
                 }
             }

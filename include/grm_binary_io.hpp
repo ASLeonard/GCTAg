@@ -2,7 +2,6 @@
 
 #include <Eigen/Dense>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -45,6 +44,16 @@ inline std::vector<int> triangular_row_partition(int n, int num_parts) {
     }
     bounds.push_back(n);
     return bounds;
+}
+
+// Size in bytes of a GCTA-format packed lower-triangle .grm.bin (or
+// .grm.N.bin) for n individuals: n(n+1)/2 float32 entries. Exposed so
+// callers sizing a memory budget that ChunkedGrmReader's fixed-size buffer
+// shares space with (see that class's constructor) can reserve this amount
+// up front, e.g. via solve_chunk_rows's reserved_gb parameter in
+// chunked_grm_matvec.hpp, rather than duplicating this formula themselves.
+inline size_t grm_packed_bytes(int n) {
+    return static_cast<size_t>(n) * (n + 1) / 2 * sizeof(float);
 }
 
 // Largest row index r > lo such that r*(r+1)/2 <= target_elems, clamped to
@@ -222,22 +231,10 @@ inline std::vector<int> match_ids_to_grm(const std::vector<std::string>& ref_ids
 }
 
 // Tile reader for --reml-svd-chunked: returns K in ANALYSIS sample order
-// (post-kp reindexing) directly from the mmap'd .grm.bin file, without ever
-// materializing a dense matrix — not even transiently, and not just the
-// n x n analysis-subsetted one, unlike read_grm_binary() above.
-//
-// Why mmap rather than manual pread(): kp (analysis index -> GRM-file row
-// index) is an arbitrary permutation in general — match_ids_to_grm doesn't
-// promise anything about ordering. When kp turns out to be monotonic
-// (identity, or an order-preserving subset — by far the common case, since
-// analysis sample order usually tracks the GRM's own .grm.id order),
-// read_tile below exploits that to bulk-read one contiguous run per output
-// row and the constructor advises the kernel to read ahead accordingly. A
-// genuinely scrambled kp degrades to one mmap touch per scalar entry —
-// still correct, but each touch can land on a different page of a
-// possibly huge file, which is real, unavoidable, and can dominate runtime;
-// the constructor warns loudly in that case.
-class ChunkedGrmMmap {
+// (post-kp reindexing), without ever materializing a dense matrix — not
+// even transiently, and not just the n x n analysis-subsetted one, unlike
+// read_grm_binary() above.
+class ChunkedGrmReader {
 public:
     // kp[i] = row index (in whatever file this wraps) for analysis
     // individual i (see match_ids_to_grm). Every entry must be >= 0 —
@@ -249,7 +246,7 @@ public:
     // share an identical packed-lower-triangular float32 layout, so this
     // class serves either; callers needing both (e.g. a weighted merge)
     // construct two instances against the same kp.
-    ChunkedGrmMmap(const std::string& path, std::vector<int> kp, int n_grm)
+    ChunkedGrmReader(const std::string& path, std::vector<int> kp, int n_grm)
         : kp_(std::move(kp))
     {
         const size_t tri = static_cast<size_t>(n_grm) * (n_grm + 1) / 2;
@@ -272,72 +269,54 @@ public:
             if (i > 0 && kp_[i] <= kp_[i - 1]) kp_is_monotonic_ = false;
         }
 
-        void* raw = ::mmap(nullptr, byte_len_, PROT_READ, MAP_PRIVATE, fd_, 0);
-        if (raw == MAP_FAILED) {
-            ::close(fd_);
-            LOGGER.e(0, "mmap failed for [" + path + "].");
-        }
-        // Identity/order-preserving-subset kp (the common case: analysis
-        // sample order tracks the GRM's .grm.id order, possibly with some
-        // individuals dropped) makes read_tile's per-row access a single
-        // increasing run of file offsets (see read_tile below) — tell the
-        // kernel to read ahead for that case. A genuinely scrambled kp
-        // (sample order shuffled relative to the GRM) has no such locality;
-        // keep the no-readahead hint there so we don't pollute the page
-        // cache with pages that won't be reused.
-        ::madvise(raw, byte_len_, kp_is_monotonic_ ? (MADV_SEQUENTIAL | MADV_WILLNEED) : MADV_RANDOM);
-
-        // Warm the WHOLE mapping into the page cache with one coherent,
-        // single-threaded sequential sweep before any read_tile() call,
-        // rather than letting first-touch page faults happen lazily during
-        // the actual Lanczos/power-iteration loop. Two things make this
-        // necessary beyond the madvise() hint above (a one-time, best-effort
-        // hint the kernel isn't obliged to honour under the access pattern
-        // below):
-        //  1. Even single-threaded, read_tile() is structurally scattered:
-        //     a tile spans up to block_size GRM rows, and consecutive rows'
-        //     file offsets are `row+1` elements apart (the packed lower-
-        //     triangle format), growing linearly with row index -- a tile
-        //     near the end of a 150k-individual GRM can have its 256 rows
-        //     spread across >100MB of file, each touched via a separate,
-        //     small, synchronous mmap fault.
-        //  2. chunked_symmetric_matvec's single-vector fast path (the one
-        //     Lanczos/power-iteration actually uses) runs multiple threads
-        //     concurrently through that same scattered pattern, once per
-        //     matvec call -- i.e. once per iteration, not once total.
-        // Paying for one sequential pass here, once per --svd-chunked run,
-        // is far cheaper than paying for (1) and (2) combined on every
-        // iteration for however many iterations Lanczos needs. Once every
-        // page is resident, subsequent read_tile() calls -- scattered or
-        // concurrent -- are RAM-bandwidth-bound, not filesystem-bound; see
-        // read_grm_binary's analogous fix in this same file for the
-        // background on why relying on the OS's own readahead here
-        // regressed badly on this project's Lustre-backed cluster storage.
-        // Deliberately a plain touch loop rather than a platform-specific
-        // bulk-prefetch call (e.g. Linux readahead(2)): portable, and the
-        // cost is dominated by the underlying I/O either way, not by the
-        // loop itself.
-        {
-            volatile char sink = 0;
-            const char* touch = static_cast<const char*>(raw);
-            for (size_t off = 0; off < byte_len_; off += 4096) sink ^= touch[off];
-            (void)sink;
-        }
-        fbuf_ = static_cast<const float*>(raw);
+        // Read the whole packed file with one portable, single-threaded
+        // sequential read_exact() call into an owned buffer, rather than
+        // mmap + madvise + a manual warm-up sweep (the prior version of
+        // this constructor). Two things motivated dropping mmap here, not
+        // just tuning it further:
+        //  1. Every mmap-based path in this file has needed a workaround
+        //     for the same underlying issue on this project's Lustre-backed
+        //     cluster storage -- read_grm_binary's original dense fill
+        //     (concurrent per-thread page faults), merge_grms_streaming's
+        //     schedule(dynamic) mixing loop, and this class's own read_tile
+        //     scatter, all independently regressed the same way. The dense
+        //     loader's read()-based chunked design has been robust in every
+        //     case it's been tried, including at the largest scales tested
+        //     so far; mmap's page-fault-driven access, even single-threaded
+        //     and even with an explicit warm-up sweep, has not been.
+        //  2. This makes the class's memory cost an explicit, fixed heap
+        //     allocation (byte_len_ bytes, known at construction) instead
+        //     of page-cache-resident-but-technically-reclaimable pages --
+        //     a plain heap buffer is simpler to reason about for memory
+        //     budgeting than "resident right now, but the kernel is free
+        //     to evict it under pressure and re-fault it later."
+        // read_exact already handles retrying on short reads (routine on
+        // network filesystems) and errors out via LOGGER on real failure,
+        // so this one call is the whole read -- no chunk loop needed here
+        // (unlike read_grm_binary's fill, there's no per-chunk float->double
+        // cast or scatter to interleave; this class stores the packed
+        // float32 data verbatim and defers the cast to read_tile/
+        // matvec_blocked, at tile/row granularity, same as before).
+        data_.resize(tri);
+        read_exact(fd_, data_.data(), byte_len_, path);
+        ::close(fd_);
+        fd_ = -1;
+        fbuf_ = data_.data();
 
         if (!kp_is_monotonic_)
             LOGGER.w(0, "--svd-chunked-budget: the analysis sample order does not match [" +
                         path + "]'s order (individuals were reordered, not just subsetted). "
-                        "GRM tile reads degrade to scattered per-entry access in this case and "
-                        "can be dramatically slower than the reported chunk count suggests.");
+                        "GRM tile reads degrade to scattered per-entry access in this case, "
+                        "which costs RAM/cache locality (not filesystem I/O, since the whole "
+                        "file is already loaded at this point) but can still be noticeably "
+                        "slower than the monotonic case.");
     }
 
-    ~ChunkedGrmMmap() {
-        if (fbuf_) ::munmap(const_cast<float*>(fbuf_), byte_len_);
+    ~ChunkedGrmReader() {
         if (fd_ != -1) ::close(fd_);
     }
-    ChunkedGrmMmap(const ChunkedGrmMmap&)            = delete;
-    ChunkedGrmMmap& operator=(const ChunkedGrmMmap&) = delete;
+    ChunkedGrmReader(const ChunkedGrmReader&)            = delete;
+    ChunkedGrmReader& operator=(const ChunkedGrmReader&) = delete;
 
     // K_analysis[rs:re, cs:ce]. Every consumer (chunked_symmetric_matvec,
     // chunked_diagonal, chunked_trace_K_squared) only ever reads a
@@ -431,7 +410,7 @@ public:
                                    int block_size) const {
         const int n = static_cast<int>(kp_.size());
         if (x.size() != n)
-            throw std::invalid_argument("ChunkedGrmMmap::matvec_blocked: x has wrong length.");
+            throw std::invalid_argument("ChunkedGrmReader::matvec_blocked: x has wrong length.");
 
 #ifdef _OPENMP
         const int num_threads = omp_get_max_threads();
@@ -522,7 +501,8 @@ private:
     std::vector<int> kp_;
     int fd_ = -1;
     size_t byte_len_ = 0;
-    const float* fbuf_ = nullptr;
+    std::vector<float> data_;      // owned storage for fbuf_ (see constructor)
+    const float* fbuf_ = nullptr;  // = data_.data(), cached for existing call sites
     bool kp_is_identity_ = false;
     bool kp_is_monotonic_ = false;
 };
@@ -533,7 +513,7 @@ private:
 // calls this directly rather than duplicating the extraction.
 //
 // Deliberately NOT the whole-file warm-up pattern used by read_grm_binary's
-// dense fill or ChunkedGrmMmap's constructor: those warm the whole file
+// dense fill or ChunkedGrmReader's constructor: those warm the whole file
 // because they go on to use (or may use) most or all of it, so paying for
 // one coherent sequential pass once is strictly better than letting a
 // scattered/concurrent access pattern re-derive that same data cold. Here,
@@ -595,7 +575,7 @@ inline double read_grm_N_mean(const std::string& prefix, int n_grm) {
 
 struct ChunkedGrmHandle {
     gcta_chunked::TileReader reader;
-    std::shared_ptr<const ChunkedGrmMmap> file;
+    std::shared_ptr<const ChunkedGrmReader> file;
     double m_snps = 0.0;
 };
 
@@ -621,7 +601,7 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
 
     ChunkedGrmHandle handle;
     handle.m_snps = read_grm_N_mean(prefix, n_grm);
-    auto file = std::make_shared<ChunkedGrmMmap>(prefix + ".grm.bin", std::move(kp), n_grm);
+    auto file = std::make_shared<ChunkedGrmReader>(prefix + ".grm.bin", std::move(kp), n_grm);
     handle.file = file;
     handle.reader = [file](int rs, int re, int cs, int ce) -> Eigen::MatrixXd {
         return file->read_tile(rs, re, cs, ce);
@@ -641,7 +621,7 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
 // offsets (threads grab row-chunks in whatever order they finish, not in
 // row order), the same failure mode diagnosed for read_grm_binary's
 // original dense fill (see that function's comment) and for
-// ChunkedGrmMmap's constructor. Reading each block into a plain buffer
+// ChunkedGrmReader's constructor. Reading each block into a plain buffer
 // first, single-threaded and strictly in order, then parallelizing only the
 // in-RAM mixing math, avoids that: the row_block_rows loop itself is
 // already the "coherent sequential stream" every filesystem's readahead is
@@ -654,17 +634,31 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
 // --reml-svd-chunk-size elsewhere, smaller for tighter RSS.
 //
 // If your GRMs might have different sample orderings, this isn't the right
-// tool — use ChunkedGrmMmap-based per-entry lookups instead (each source
+// tool — use ChunkedGrmReader-based per-entry lookups instead (each source
 // file gets its own kp).
+inline int solve_merge_chunk_rows(int n, int K, double budget_gb) {
+    const double budget_bytes = budget_gb * 1e9;
+    const double bytes_per_row = 4.0 * static_cast<double>(n) * (2.0 * K + 2.0);
+    const int chunk_rows = static_cast<int>(budget_bytes / bytes_per_row);
+    return std::min(std::max(chunk_rows, 0), n);
+}
+
+// row_block_rows: caller-chosen block size, unchanged default (4000) for
+// backward compatibility with existing callers. memory_budget_gb: if > 0,
+// OVERRIDES row_block_rows with solve_merge_chunk_rows(n, K, budget) --
+// prefer this over hand-picking row_block_rows, since the right block size
+// depends on K (number of inputs), which the caller may not know until
+// prefixes.size() is available, and because a fixed row_block_rows chosen
+// without K in mind is exactly what caused this function's memory to scale
+// unboundedly with K (see solve_merge_chunk_rows's comment above).
 inline void merge_grms_streaming(
     const std::vector<std::string>& prefixes,
     const std::string& out_prefix,
-    int row_block_rows = 4000)
+    int row_block_rows = 4000,
+    double memory_budget_gb = 0.0)
 {
     if (prefixes.empty())
         LOGGER.e(0, "merge_grms_streaming: no input GRM prefixes given.");
-    if (row_block_rows <= 0)
-        LOGGER.e(0, "merge_grms_streaming: row_block_rows must be positive.");
 
     const std::vector<std::string> ids = Pheno::read_sublist(prefixes[0] + ".grm.id");
     const int n = static_cast<int>(ids.size());
@@ -679,12 +673,24 @@ inline void merge_grms_streaming(
         if (other_ids != ids)
             LOGGER.e(0, "merge_grms_streaming: [" + prefixes[f] + ".grm.id] does not match "
                         "[" + prefixes[0] + ".grm.id] exactly (same sample order required). "
-                        "Use a kp-based merge (ChunkedGrmMmap) for mismatched orderings.");
+                        "Use a kp-based merge (ChunkedGrmReader) for mismatched orderings.");
     }
 
     const size_t tri      = static_cast<size_t>(n) * (n + 1) / 2;
     const size_t byte_len = tri * sizeof(float);
     const int    K        = static_cast<int>(prefixes.size());
+
+    if (memory_budget_gb > 0.0) {
+        row_block_rows = solve_merge_chunk_rows(n, K, memory_budget_gb);
+        if (row_block_rows < 1)
+            LOGGER.e(0, "merge_grms_streaming: memory_budget_gb=" + std::to_string(memory_budget_gb) +
+                        "GB cannot fit even a single row across K=" + std::to_string(K) +
+                        " inputs (n=" + std::to_string(n) + " -> " +
+                        std::to_string(4.0 * n * (2.0 * K + 2.0) / 1e9) +
+                        "GB/row worst-case); raise memory_budget_gb.");
+    }
+    if (row_block_rows <= 0)
+        LOGGER.e(0, "merge_grms_streaming: row_block_rows must be positive.");
 
     struct OpenGrmFile {
         int fd = -1;
@@ -788,10 +794,22 @@ inline void merge_grms_streaming(
 
     //TODO: avoid if/ofstream
     // .grm.id is identical across inputs (already validated) — copy it once.
+    // dst << src.rdbuf() has no built-in error signalling: an unopenable
+    // source or a write failure (disk full, permissions) both produce a
+    // silently truncated or empty output .grm.id with no exception and no
+    // nonzero exit -- exactly the "confidently wrong result with no
+    // symptom" failure mode this function already refuses to risk for the
+    // sample-order check above. Check explicitly rather than trust the
+    // stream state implicitly.
     {
-        std::ifstream src(prefixes[0] + ".grm.id", std::ios::binary);
-        std::ofstream dst(out_prefix + ".grm.id", std::ios::binary);
+        const std::string id_src_path = prefixes[0] + ".grm.id";
+        const std::string id_dst_path = out_prefix + ".grm.id";
+        std::ifstream src(id_src_path, std::ios::binary);
+        if (!src) LOGGER.e(0, "cannot open [" + id_src_path + "] to copy.");
+        std::ofstream dst(id_dst_path, std::ios::binary);
+        if (!dst) LOGGER.e(0, "cannot open [" + id_dst_path + "] for writing.");
         dst << src.rdbuf();
+        if (!dst) LOGGER.e(0, "failed while copying [" + id_src_path + "] to [" + id_dst_path + "].");
     }
 
     LOGGER.i(0, "Merged " + std::to_string(K) + " GRMs (" + std::to_string(n) +

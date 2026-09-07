@@ -80,13 +80,48 @@ struct BlockPartition {
 // plus oversample, not the live rank mid-way through an adaptive loop —
 // since the chunk size is typically solved once and held fixed thereafter.
 //
-// Returns 0 if the budget can't fit even a single row; callers are
-// expected to treat that as a hard error with their own message, since the
-// right phrasing (which flag, which units) is call-site-specific.
-inline int solve_chunk_rows(int n, double budget_gb, int k_ext) {
-    const double budget_bytes = budget_gb * 1e9;
-    const double bytes_per_row = 8.0 * (static_cast<double>(n) + static_cast<double>(k_ext));
-    const int chunk_rows = static_cast<int>(budget_bytes / bytes_per_row);
+// `reserved_gb`: bytes to subtract from budget_gb before sizing the chunk,
+// for memory this call's budget shares space with but that isn't part of
+// the chunk buffers themselves — e.g. ChunkedGrmMmap's own packed-file
+// buffer, which is a fixed allocation independent of chunk_size and was
+// previously not accounted for here at all, silently letting total memory
+// exceed budget_gb by however large that fixed allocation was. Defaults to
+// 0.0 (previous behaviour) for callers that don't share budget with such an
+// allocation, or that account for it separately themselves.
+//
+// Returns 0 if the (budget minus reservations) can't fit even a single row;
+// callers are expected to treat that as a hard error with their own
+// message, since the right phrasing (which flag, which units) is
+// call-site-specific.
+//
+// Two fixed costs reserved before sizing block_size:
+//  - reserved_gb: memory this call's budget shares space with but that
+//    isn't part of the chunk buffers themselves, e.g. ChunkedGrmMmap's own
+//    packed-file buffer (a fixed allocation independent of chunk_size).
+//  - Y = n x k_ext doubles: chunked_symmetric_matvec's output accumulator,
+//    `Y = Eigen::MatrixXd::Zero(n, X.cols())`, allocated once, in full,
+//    BEFORE the block loop starts -- not reduced by chunk_size at all.
+// Both default to 0 contribution when not applicable (reserved_gb via its
+// own default; Y via k_ext=0 for diagonal/trace-only callers).
+//
+// What's left sizes block_size against the read_tile materialization's
+// TRUE cost: block_size x block_size (both dimensions bounded by
+// block_size -- see BlockPartition), independent of n and k_ext entirely.
+// Every tile multiplication already uses the FULL k_ext width of X in one
+// GEMM call (tile * X.middleRows(...)); k_ext is never used to split a
+// tile. A formula that shrinks block_size as k_ext grows (as an earlier
+// version of this function did, treating the cost as if it scaled with
+// n+k_ext per row) has no basis in what the tile actually costs -- it was
+// needlessly conservative at low k_ext and, worse, still didn't correctly
+// account for Y's real (and separately reserved) cost at high k_ext. The
+// 2x factor below accounts for tile and tile_full briefly coexisting
+// during diagonal-block processing, before tile.resize(0,0) frees the
+// former.
+inline int solve_chunk_rows(int n, double budget_gb, int k_ext, double reserved_gb = 0.0) {
+    const double y_bytes = 8.0 * static_cast<double>(n) * static_cast<double>(k_ext);
+    const double budget_bytes = std::max(0.0, budget_gb * 1e9 - reserved_gb * 1e9 - y_bytes);
+    const double block_size_d = std::sqrt(budget_bytes / (2.0 * 8.0));
+    const int chunk_rows = static_cast<int>(block_size_d);
     return std::min(std::max(chunk_rows, 0), n);
 }
 

@@ -1762,7 +1762,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     const bool svd_chunked = ctx.svd_chunked_budget > 0.0;
 
     int k_svd_budget_ceiling = n - 1;
-    if (ctx.svd_mem_budget_gb > 0.0) {
+    if (svd_chunked && ctx.svd_mem_budget_gb > 0.0) {
         const double budget_bytes = ctx.svd_mem_budget_gb * 1e9;
         const int max_k_ext = static_cast<int>(budget_bytes / (5.0 * n * 8.0));
         k_svd_budget_ceiling = std::min(k_svd_budget_ceiling, std::max(20, max_k_ext - 200));
@@ -1770,32 +1770,24 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                << "GB -> k_svd capped at " << k_svd_budget_ceiling << std::endl;
     }
 
-    // Row-chunk size for streaming reads off ctx.grm_tile_reader (chunked_diagonal,
-    // chunked_trace_K_squared, chunked_symmetric_matvec). Budget-driven, same pattern
-    // as --GRM-tile-budget: solve for the number of rows that fit rather than guessing
-    // a fixed size. Sized against k_svd_budget_ceiling (the worst-case rank this call
-    // can reach) since the chunk size is fixed once here and reused across the whole
-    // adaptive-rank loop below, regardless of which k_ext is live at any given moment.
     int svd_chunk_rows = 0;
     if (svd_chunked) {
-        // k_svd_budget_ceiling feeds k_ext_hint below. Left at its n-1 default (no
-        // --reml-woodbury-basis-mem-budget), k_ext_hint is sized against the
-        // worst case the adaptive-rank loop could reach, not the rank it will
-        // actually settle on — so svd_chunk_rows may land smaller than strictly
-        // necessary. That's the intended tradeoff for a hard RSS cap on the
-        // GRM-streaming buffer regardless of k_svd, not a misconfiguration.
-        const int k_ext_hint = k_svd_budget_ceiling + gcta_eigh::recommended_oversample(k_svd_budget_ceiling);
-        svd_chunk_rows = gcta_chunked::solve_chunk_rows(n, ctx.svd_chunked_budget, k_ext_hint);
+        const double grm_packed_gb = static_cast<double>(n) * (n + 1) / 2 * sizeof(float) / 1e9;
+        svd_chunk_rows = gcta_chunked::solve_chunk_rows(n, ctx.svd_chunked_budget, 0, grm_packed_gb);
         if (svd_chunk_rows < 1)
             LOGGER.e(0, "--svd-chunked-budget=" + std::to_string(ctx.svd_chunked_budget)
-                        + "GB cannot fit even a single GRM row (n=" + std::to_string(n)
-                        + ", k_ext=" + std::to_string(k_ext_hint) + " -> "
-                        + std::to_string(8.0 * (n + k_ext_hint) / 1e9) + "GB/row); raise the budget"
-                        + " or add --reml-woodbury-basis-mem-budget <GB> to cap k_ext.");
+                        + "GB is too small: the packed GRM itself needs " + std::to_string(grm_packed_gb)
+                        + "GB (n=" + std::to_string(n) + "); raise the budget.");
+        // Y is not reserved above -- report its worst-case size (at the
+        // current k_svd ceiling) here so it's visible without being enforced.
+        const double y_worst_case_gb = 8.0 * n * static_cast<double>(k_svd_budget_ceiling) / 1e9;
         LOGGER << "--svd-chunked-budget=" << ctx.svd_chunked_budget
-               << "GB -> streaming " << svd_chunk_rows << " GRM row(s) per chunk (k_ext up to "
-               << k_ext_hint << ")" << std::endl;
+               << "GB (" << grm_packed_gb << "GB reserved for the packed GRM) -> streaming "
+               << svd_chunk_rows << " GRM row(s) per chunk. Separately, at the current k_svd "
+               << "ceiling of " << k_svd_budget_ceiling << ", the basis matrix (Y) may need up "
+               << "to ~" << y_worst_case_gb << "GB, not covered by this budget." << std::endl;
     }
+
 
     const bool k_max_is_hard_ceiling = (ctx.woodbury_basis_k_max > 0);
     const int k_svd_cap = woodbury_rank_cap(ctx, k_svd_budget_ceiling);

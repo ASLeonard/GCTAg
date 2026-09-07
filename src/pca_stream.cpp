@@ -208,7 +208,7 @@ void PCAStream::processMain()
 
         // ---- GRM access: chunked tile reader, or dense (fallback / comparison) ----
         gcta_chunked::TileReader chunked_reader;
-        std::shared_ptr<const gcta_grm_io::ChunkedGrmMmap> chunked_file;
+        std::shared_ptr<const gcta_grm_io::ChunkedGrmReader> chunked_file;
         Eigen::MatrixXd G_dense;  // left empty when svd_chunked
 
         if (svd_chunked) {

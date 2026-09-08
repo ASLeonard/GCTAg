@@ -721,7 +721,7 @@ inline void merge_grms(
                     std::to_string((chunk_elems * sizeof(float)) >> 20) +
                     " MB per stream buffer (" +
                     std::to_string((num_buffers * chunk_elems * sizeof(float)) >> 20) +
-                    " MB total buffer memory). Set `--merge-grm-streaming <GB>` to customize.");
+                    " MB total buffer memory). Set `--merge-grms <GB>` to customize.");
     }
 
     struct OpenGrmFile {

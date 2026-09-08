@@ -292,7 +292,7 @@ public:
         //  1. Every mmap-based path in this file has needed a workaround
         //     for the same underlying issue on this project's Lustre-backed
         //     cluster storage -- read_grm_binary's original dense fill
-        //     (concurrent per-thread page faults), merge_grms_streaming's
+        //     (concurrent per-thread page faults), merge_grms's
         //     schedule(dynamic) mixing loop, and this class's own read_tile
         //     scatter, all independently regressed the same way. The dense
         //     loader's read()-based chunked design has been robust in every
@@ -666,13 +666,13 @@ inline int solve_merge_chunk_rows(int n, int K, double budget_gb) {
 // prefixes.size() is available, and because a fixed row_block_rows chosen
 // without K in mind is exactly what caused this function's memory to scale
 // unboundedly with K (see solve_merge_chunk_rows's comment above).
-inline void merge_grms_streaming(
+inline void merge_grms(
     const std::vector<std::string>& prefixes,
     const std::string& out_prefix,
     double memory_budget_gb = 0.0)
 {
     if (prefixes.empty())
-        LOGGER.e(0, "merge_grms_streaming: no input GRM prefixes given.");
+        LOGGER.e(0, "merge_grms: no input GRM prefixes given.");
 
     const std::vector<std::string> ids = Pheno::read_sublist(prefixes[0] + ".grm.id");
     const int n = static_cast<int>(ids.size());
@@ -685,7 +685,7 @@ inline void merge_grms_streaming(
     for (size_t f = 1; f < prefixes.size(); ++f) {
         const std::vector<std::string> other_ids = Pheno::read_sublist(prefixes[f] + ".grm.id");
         if (other_ids != ids)
-            LOGGER.e(0, "merge_grms_streaming: [" + prefixes[f] + ".grm.id] does not match "
+            LOGGER.e(0, "merge_grms: [" + prefixes[f] + ".grm.id] does not match "
                         "[" + prefixes[0] + ".grm.id] exactly (same sample order required). "
                         "Use a kp-based merge (ChunkedGrmReader) for mismatched orderings.");
     }
@@ -705,7 +705,7 @@ inline void merge_grms_streaming(
         const double budget_bytes = memory_budget_gb * 1e9;
         chunk_elems = static_cast<size_t>(budget_bytes / (num_buffers * sizeof(float)));
         chunk_elems = std::clamp<size_t>(chunk_elems, 65536, tri);
-        LOGGER.i(0, "merge_grms_streaming: using " +
+        LOGGER.i(0, "merge_grms: using " +
                     std::to_string((chunk_elems * sizeof(float)) >> 20) +
                     " MB per stream buffer (" +
                     std::to_string((num_buffers * chunk_elems * sizeof(float)) >> 20) +
@@ -717,7 +717,7 @@ inline void merge_grms_streaming(
         const size_t max_elems_from_cap = max_total_bytes / (num_buffers * sizeof(float));
         chunk_elems = std::min(default_target_elems, max_elems_from_cap);
         chunk_elems = std::clamp<size_t>(chunk_elems, 65536, tri);
-        LOGGER.i(0, "merge_grms_streaming: using " +
+        LOGGER.i(0, "merge_grms: using " +
                     std::to_string((chunk_elems * sizeof(float)) >> 20) +
                     " MB per stream buffer (" +
                     std::to_string((num_buffers * chunk_elems * sizeof(float)) >> 20) +

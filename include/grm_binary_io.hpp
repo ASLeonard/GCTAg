@@ -115,10 +115,7 @@ inline void write_exact(int fd, const void* buf, size_t count, const std::string
 //     same mapping still presents the kernel/filesystem with N interleaved
 //     access offsets, which defeated page-cache readahead and, on this
 //     project's Lustre-backed cluster storage, fragmented reads across
-//     whichever OSTs happened to back each thread's current extent --
-//     regressions from ~2s to 900+s were observed at n=75000. A single
-//     sequential reader avoids this by construction, independent of
-//     filesystem/OS specifics -- no platform-specific calls needed.
+//     whichever OSTs happened to back each thread's current extent.
 //   - Only the read itself is single-threaded; float→double conversion
 //     and the scatter into G are parallelized per chunk, once that
 //     chunk's bytes are already in memory (see the loop below).

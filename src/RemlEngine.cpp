@@ -542,12 +542,6 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
         const bool is_I = (ctx.A[ctx.r_indx[ci]].size() == 0);
 
         auto applyPA_mat = [&](const RemlMat& Z) -> RemlMat {
-            if (ctx.Vi_use_woodbury_basis && ci == 0) {
-                RemlMat UkZ = ctx.Uk.transpose() * Z;
-                UkZ.array().colwise() *= (ctx.dk.array() - ctx.lambda_tail);
-                RemlMat KZ = ctx.lambda_tail * Z + ctx.Uk * UkZ;
-                return applyP_mat(ctx, KZ);
-            }
             return is_I ? applyP_mat(ctx, Z)
                         : applyP_mat(ctx, RemlMat(ctx.A[ctx.r_indx[ci]] * Z));
         };

@@ -1655,14 +1655,15 @@ static int finalize_and_log_woodbury_rank(
                    << " (margin=" << (ctx.woodbury_basis_edge_margin * 100.0) << "%, confirm="
                    << ctx.woodbury_basis_edge_confirm << " consecutive)"
                    << ", using k = " << k << std::endl;
-            if (k_edge >= k_svd && k_svd >= n - 1)
-                LOGGER.w(0, "Woodbury MP-k: edge band not confirmed even at k=n-1=" + std::to_string(n - 1)
-                         + "; this GRM has near-full effective rank and Woodbury may not offer a computational advantage here.");
-            else if (k_edge >= k_svd && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury MP-k: edge band not confirmed within the memory-budget-implied ceiling k="
-                         + std::to_string(k_svd) + " (--reml-woodbury-basis-mem-budget=" + std::to_string(ctx.svd_mem_budget_gb) + "GB).");
-            else if (k_edge >= k_svd)
-                LOGGER.w(0, "Woodbury MP-k: edge band not confirmed within k_max=" + std::to_string(k_svd) + "; clamped to k_max.");
+            if (!eval_res.satisfied && k_svd >= n - 1)
+                LOGGER.e(0, "Woodbury MP-k: edge band not confirmed even at k=n-1=" + std::to_string(n - 1)
+                         + "; this GRM has near-full effective rank and Woodbury may not offer a computational advantage here. Refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury MP-k: edge band not confirmed within the memory-budget-implied ceiling k="
+                         + std::to_string(k_svd) + " (--reml-woodbury-basis-mem-budget=" + std::to_string(ctx.svd_mem_budget_gb) + "GB). Raise the budget or lower --reml-woodbury-basis-edge-margin/-confirm; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied)
+                LOGGER.e(0, "Woodbury MP-k: edge band not confirmed within k_max=" + std::to_string(k_svd)
+                         + ". Raise --reml-woodbury-basis-range's k_max; refusing to proceed with an unresolved basis.");
             break;
         }
         case WoodburyMode::EIG: {
@@ -1671,18 +1672,29 @@ static int finalize_and_log_woodbury_rank(
             double cumulative = 0.0;
             for (int i = 0; i < k; ++i) cumulative += eval_full[i];
             const double rho = cumulative / trace_K_full;
-            LOGGER << "EIG-k: trace(K)=" << trace_K_full
-                   << ", raw " << ctx.woodbury_basis_eigen_mass * 100 << "% mass crossing at k=" << k_EIGMASS
-                   << ", using k=" << k << " (+" << ctx.woodbury_basis_EIG_k_buffer << " eigenvalue buffer)"
-                   << ", captured mass rho=" << rho << std::endl;
-            if (k_EIGMASS >= k_svd && k_svd >= n - 1)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached even at k=n-1=" + std::to_string(n - 1) + ".");
-            else if (k_EIGMASS >= k_svd && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached within memory budget ceiling k=" + std::to_string(k_svd) + ".");
-            else if (k_EIGMASS >= k_svd && k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached within k_max=" + std::to_string(k_cap) + ".");
-            else if (k_EIGMASS >= k_svd)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached within k=" + std::to_string(k_svd) + ".");
+            if (eval_res.satisfied) {
+                LOGGER << "EIG-k: trace(K)=" << trace_K_full
+                       << ", raw " << ctx.woodbury_basis_eigen_mass * 100 << "% mass crossing at k=" << k_EIGMASS
+                       << ", using k=" << k << " (+" << ctx.woodbury_basis_EIG_k_buffer << " eigenvalue buffer)"
+                       << ", captured mass rho=" << rho << std::endl;
+            } else {
+                LOGGER << "EIG-k: trace(K)=" << trace_K_full
+                       << ", target mass (" << ctx.woodbury_basis_eigen_mass * 100 << "%) NOT reached within k=" << k_svd
+                       << ", using fallback k=" << k
+                       << ", captured mass rho=" << rho << std::endl;
+            }
+            if (!eval_res.satisfied && k_svd >= n - 1)
+                LOGGER.e(0, "Woodbury EIG-k: mass target not reached even at k=n-1=" + std::to_string(n - 1)
+                         + " (captured rho=" + std::to_string(rho) + "). Refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury EIG-k: mass target not reached within memory budget ceiling k=" + std::to_string(k_svd)
+                         + " (captured rho=" + std::to_string(rho) + "). Raise --reml-woodbury-basis-mem-budget; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury EIG-k: mass target not reached within k_max=" + std::to_string(k_cap)
+                         + " (captured rho=" + std::to_string(rho) + "). Raise --reml-woodbury-basis-range's k_max; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied)
+                LOGGER.e(0, "Woodbury EIG-k: mass target not reached within k=" + std::to_string(k_svd)
+                         + " (captured rho=" + std::to_string(rho) + "). Refusing to proceed with an unresolved basis.");
             break;
         }
         case WoodburyMode::VAR: {
@@ -1707,14 +1719,18 @@ static int finalize_and_log_woodbury_rank(
                    << " (tail_d_var=" << tail_var
                    << ", tail non-isotropic energy=" << tail_nonisotropic_energy
                    << ", relative Frobenius error=" << relative_frobenius_error << ")" << std::endl;
-            if (k_VAR >= k_svd && k_svd >= n - 1)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached even at k=n-1=" + std::to_string(n - 1) + ".");
-            else if (k_VAR >= k_svd && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within memory budget ceiling k=" + std::to_string(k_svd) + ".");
-            else if (k_VAR >= k_svd && k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k_max=" + std::to_string(k_cap) + ".");
-            else if (k_VAR >= k_svd)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k=" + std::to_string(k_svd) + ".");
+            if (!eval_res.satisfied && k_svd >= n - 1)
+                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached even at k=n-1=" + std::to_string(n - 1)
+                         + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within memory budget ceiling k=" + std::to_string(k_svd)
+                         + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Raise --reml-woodbury-basis-mem-budget; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k_max=" + std::to_string(k_cap)
+                         + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Raise --reml-woodbury-basis-range's k_max; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied)
+                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k=" + std::to_string(k_svd)
+                         + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Refusing to proceed with an unresolved basis.");
             break;
         }
         case WoodburyMode::Fixed:
@@ -1903,7 +1919,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
 
         eval_res = evaluate_rank_criterion(mode, eval_full, k_svd, lambda_plus, target_mass, trace_K_full, trace_K2, ctx);
 
-        if (eval_res.satisfied || k_svd >= k_svd_cap || k_svd >= n / 2 || k_svd >= k_svd_budget_ceiling) break;
+        if (eval_res.satisfied || k_svd >= k_svd_cap || k_svd >= k_svd_budget_ceiling) break;
 
         int k_svd_next = std::min({k_svd * 2, n - 1, k_svd_cap});
         if (mode == WoodburyMode::EIG && ctx.woodbury_basis_eigen_adaptive) {

@@ -70,6 +70,14 @@ struct RemlCtx {
     double                      svd_chunked_budget = 0.0;  // GB budget for streaming chunk rows, off by default
     gcta_chunked::TileReader grm_tile_reader;               // caller-populated when chunked
 
+    // Set once, in reml::compute(), before the AI-REML/EM-REML loop begins,
+    // when --reml-trace-hutchpp is active with chunking. Consumed in three places:
+    // assemble_V_lower (streams the GRM's contribution to V instead of
+    // reading ctx.A -- ctx.A[GRM] is expected to stay EMPTY exactly as in
+    // the Woodbury-chunked case), and the ai_reml/em_reml/
+    // calcu_tr_PA_hutchpp A@vec sites.
+    int hutchpp_chunk_rows = 0;
+
     // Hard cap on rSVD sketch memory (Omega/Y/qr_scratch/Q, each ~n*k_ext*8
     // bytes, several live simultaneously during power iteration) as k_ext
     // escalates. Chunking K (svd_chunked) removes K's own O(n^2)

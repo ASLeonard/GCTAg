@@ -253,13 +253,53 @@ bool verbose=false;
 void assemble_V_lower(RemlCtx& ctx, const RemlVec& varcmp) {
     const int num_comp = static_cast<int>(ctx.r_indx.size());
     ctx.Vi.triangularView<Eigen::Lower>().setZero();
-    #pragma omp parallel for schedule(static)
-    for (int j = 0; j < ctx.n; j++) {
-        for (int ci = 0; ci < num_comp; ci++)
-            if (ctx.A[ctx.r_indx[ci]].size() > 0)
-                ctx.Vi.col(j).tail(ctx.n - j) +=
-                    varcmp[ci] * ctx.A[ctx.r_indx[ci]].col(j).tail(ctx.n - j);
+
+    if (ctx.hutchpp_chunk_rows > 0) {
+        // Single-GRM only (enforced where ctx.hutchpp_chunk_rows is set) --
+        // component 0 is the GRM, streamed tile-by-tile via the same
+        // TileReader/chunk_rows already proven correct by
+        // chunked_symmetric_matvec. Everything downstream of this function
+        // (dpotrf, Vi_L, applyP_mat) is completely unchanged: ctx.Vi still
+        // ends up fully dense -- this only changes how its lower triangle
+        // gets filled in, so ctx.A[GRM] never needs to be resident.
+        const double sg2 = varcmp[0];
+        const gcta_chunked::BlockPartition part(ctx.n, ctx.hutchpp_chunk_rows);
+        const int m = part.num_blocks();
+        for (int i = 0; i < m; ++i) {
+            const int rs = part.block_start(i), re = part.block_end(i);
+            for (int j = 0; j <= i; ++j) {
+                const int cs = part.block_start(j), ce = part.block_end(j);
+                const Eigen::MatrixXd tile = ctx.grm_tile_reader(rs, re, cs, ce);  // (re-rs) x (ce-cs)
+
+                if (i == j) {
+                    // Diagonal block: only the tile's own lower triangle is
+                    // valid data, in the same convention ctx.Vi already
+                    // uses -- copy it directly, column by column. (No
+                    // mirroring needed here, unlike chunked_symmetric_matvec,
+                    // which needs the tile's full symmetric form to do
+                    // tile_full * X; we're writing straight into ctx.Vi's
+                    // own lower triangle, same layout as the source.)
+                    for (int col = 0; col < re - rs; ++col)
+                        ctx.Vi.col(cs + col).segment(rs + col, re - rs - col) +=
+                            sg2 * tile.col(col).tail(re - rs - col);
+                } else {
+                    // Off-diagonal block (i > j): every row in block i
+                    // exceeds every column in block j, so this whole tile
+                    // sits inside the lower triangle -- write it in one shot.
+                    ctx.Vi.block(rs, cs, re - rs, ce - cs) += sg2 * tile;
+                }
+            }
+        }
+    } else {
+        #pragma omp parallel for schedule(static)
+        for (int j = 0; j < ctx.n; j++) {
+            for (int ci = 0; ci < num_comp; ci++)
+                if (ctx.A[ctx.r_indx[ci]].size() > 0)
+                    ctx.Vi.col(j).tail(ctx.n - j) +=
+                        varcmp[ci] * ctx.A[ctx.r_indx[ci]].col(j).tail(ctx.n - j);
+        }
     }
+
     for (int ci = 0; ci < num_comp; ci++)
         if (ctx.A[ctx.r_indx[ci]].size() == 0)
             ctx.Vi.diagonal().array() += varcmp[ci];
@@ -494,6 +534,30 @@ void calcu_tr_PA_woodbury(const RemlCtx& ctx, RemlVec& tr_PA, RemlVec* tr_PA_cor
     }
 }
 
+// Validates ctx.grm_tile_reader and derives a chunk-row count from the
+// memory budget. Called once, at setup, by whichever feature needs the GRM
+// stream (compute_woodbury_basis, or reml::compute() for chunked hutch++) —
+// never from inside the AI-REML/EM-REML loop. feature_flag is only used to
+// prefix the log/error message so the source is clear when both features
+// share this budget knob.
+int setup_chunked_grm_stream(const RemlCtx& ctx, const char* feature_flag) {
+    if (!ctx.grm_tile_reader)
+        LOGGER.e(0, std::string(feature_flag) + ": --svd-chunked-budget is set but "
+                    "ctx.grm_tile_reader is empty — the GRM component wasn't actually "
+                    "loaded either way.");
+    const int n = ctx.n;
+    const double grm_packed_gb = static_cast<double>(n) * (n + 1) / 2 * sizeof(float) / 1e9;
+    const int chunk_rows = gcta_chunked::solve_chunk_rows(n, ctx.svd_chunked_budget, 0, grm_packed_gb);
+    if (chunk_rows < 1)
+        LOGGER.e(0, std::string(feature_flag) + ": --svd-chunked-budget=" + std::to_string(ctx.svd_chunked_budget)
+                    + "GB is too small: the packed GRM itself needs " + std::to_string(grm_packed_gb)
+                    + "GB (n=" + std::to_string(n) + "); raise the budget.");
+    LOGGER << feature_flag << ": --svd-chunked-budget=" << ctx.svd_chunked_budget
+           << "GB (" << grm_packed_gb << "GB reserved for the packed GRM) -> streaming "
+           << chunk_rows << " GRM row(s) per chunk." << std::endl;
+    return chunk_rows;
+}
+
 // tr_PA_var receives, per component, the sampling variance of the Hutch++
 // residual-term mean estimator (i.e. Var(tr_PA(ci))). It is a free byproduct
 // of the existing colwise reduction below — used by ai_reml to build the
@@ -542,6 +606,16 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
         const bool is_I = (ctx.A[ctx.r_indx[ci]].size() == 0);
 
         auto applyPA_mat = [&](const RemlMat& Z) -> RemlMat {
+            if (ctx.hutchpp_chunk_rows > 0 && ci == 0) {
+                return applyP_mat(ctx, RemlMat(gcta_chunked::chunked_symmetric_matvec(
+                    ctx.grm_tile_reader, ctx.n, ctx.hutchpp_chunk_rows, Z)));
+            }
+            if (ctx.Vi_use_woodbury_basis && ci == 0) {
+                RemlMat UkZ = ctx.Uk.transpose() * Z;
+                UkZ.array().colwise() *= (ctx.dk.array() - ctx.lambda_tail);
+                RemlMat KZ = ctx.lambda_tail * Z + ctx.Uk * UkZ;
+                return applyP_mat(ctx, KZ);
+            }
             return is_I ? applyP_mat(ctx, Z)
                         : applyP_mat(ctx, RemlMat(ctx.A[ctx.r_indx[ci]] * Z));
         };
@@ -735,7 +809,10 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     const int m = static_cast<int>(ctx.r_indx.size());
     RemlMat APy(ctx.n, m);
     for (int i = 0; i < m; i++) {
-        if (woodbury_basis_active && i == 0)
+        if (ctx.hutchpp_chunk_rows > 0 && i == 0)
+            APy.col(i) = gcta_chunked::chunked_symmetric_matvec(
+                ctx.grm_tile_reader, ctx.n, ctx.hutchpp_chunk_rows, Py);
+        else if (woodbury_basis_active && i == 0)
             APy.col(i) = woodbury_basis_Kv(ctx, Py);
         else if (ctx.A[ctx.r_indx[i]].size() == 0)
             APy.col(i) = Py;
@@ -1100,7 +1177,11 @@ void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
     RemlVec R(m);
     if (ctx.reml_tmp_n.size() != ctx.n) ctx.reml_tmp_n.resize(ctx.n);
     for (int i = 0; i < m; i++) {
-        if (woodbury_basis_active && i == 0) {
+        if (ctx.hutchpp_chunk_rows > 0 && i == 0) {
+            ctx.reml_tmp_n = gcta_chunked::chunked_symmetric_matvec(
+                ctx.grm_tile_reader, ctx.n, ctx.hutchpp_chunk_rows, Py);
+            R(i) = Py.dot(ctx.reml_tmp_n);
+        } else if (woodbury_basis_active && i == 0) {
             ctx.reml_tmp_n = woodbury_basis_Kv(ctx, Py);
             R(i) = Py.dot(ctx.reml_tmp_n);
         } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
@@ -1782,20 +1863,13 @@ void compute_woodbury_basis(RemlCtx& ctx) {
 
     int svd_chunk_rows = 0;
     if (svd_chunked) {
-        const double grm_packed_gb = static_cast<double>(n) * (n + 1) / 2 * sizeof(float) / 1e9;
-        svd_chunk_rows = gcta_chunked::solve_chunk_rows(n, ctx.svd_chunked_budget, 0, grm_packed_gb);
-        if (svd_chunk_rows < 1)
-            LOGGER.e(0, "--svd-chunked-budget=" + std::to_string(ctx.svd_chunked_budget)
-                        + "GB is too small: the packed GRM itself needs " + std::to_string(grm_packed_gb)
-                        + "GB (n=" + std::to_string(n) + "); raise the budget.");
-        // Y is not reserved above -- report its worst-case size (at the
-        // current k_svd ceiling) here so it's visible without being enforced.
+        svd_chunk_rows = setup_chunked_grm_stream(ctx, "--reml-woodbury-basis");
+        // Y is not reserved by setup_chunked_grm_stream -- report its worst-case
+        // size (at the current k_svd ceiling) here so it's visible without being enforced.
         const double y_worst_case_gb = 8.0 * n * static_cast<double>(k_svd_budget_ceiling) / 1e9;
-        LOGGER << "--svd-chunked-budget=" << ctx.svd_chunked_budget
-               << "GB (" << grm_packed_gb << "GB reserved for the packed GRM) -> streaming "
-               << svd_chunk_rows << " GRM row(s) per chunk. Separately, at the current k_svd "
-               << "ceiling of " << k_svd_budget_ceiling << ", the basis matrix (Y) may need up "
-               << "to ~" << y_worst_case_gb << "GB, not covered by this budget." << std::endl;
+        LOGGER << "--reml-woodbury-basis: at the current k_svd ceiling of " << k_svd_budget_ceiling
+               << ", the basis matrix (Y) may need up to ~" << y_worst_case_gb
+               << "GB, not covered by --svd-chunked-budget." << std::endl;
     }
 
 
@@ -2012,6 +2086,11 @@ void compute(RemlCtx& ctx,
         compute_woodbury_basis(ctx);
         float duration = LOGGER.tp("main");
         LOGGER.i(0, "Woodbury basis computation took " + std::to_string(duration) + " seconds.");
+    } else if (ctx.reml_trace_hutchpp && ctx.svd_chunked_budget > 0.0) {
+        // Woodbury takes precedence when both are requested.
+        if ((int)ctx.r_indx.size() != 2)
+            LOGGER.e(0, "--svd-chunked-budget with --reml-trace-hutchpp supports only single-GRM models.");
+        ctx.hutchpp_chunk_rows = setup_chunked_grm_stream(ctx, "--reml-trace-hutchpp");
     }
 
     RemlMat Vi_X_out(ctx.n, ctx.X_c), Xt_Vi_X_i_out(ctx.X_c, ctx.X_c);
@@ -2168,6 +2247,7 @@ RemlState build_reml_state(RemlCtx& ctx) {
     ctx.hutchpp_QtG.resize(0, 0);
     ctx.hutchpp_R.resize(0, 0);
     ctx.hutchpp_MR.resize(0, 0);
+    ctx.hutchpp_chunk_rows = 0;
     ctx.reml_tmp_n.resize(0);
     ctx.P.resize(0, 0);
     ctx.varcmp.clear();

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -345,6 +346,7 @@ public:
         if (!kp_is_monotonic_) {
             // Genuinely scrambled kp: no exploitable locality, every entry
             // can live on a different page of a possibly huge file.
+            #pragma omp parallel for schedule(dynamic, 64)
             for (int lp = 0; lp < tile_rows; ++lp) {
                 const int gi = kp_[rs + lp];
                 for (int lq = 0; lq < tile_cols; ++lq) {
@@ -362,6 +364,7 @@ public:
             // and let Eigen vectorize the float->double widen as one cast
             // instead of a hand-rolled scalar gather loop.
             const bool diagonal_tile = (rs == cs);
+            #pragma omp parallel for schedule(dynamic, 64)
             for (int lp = 0; lp < tile_rows; ++lp) {
                 const int gi = rs + lp;
                 const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
@@ -379,17 +382,18 @@ public:
         // gj <= gi (true for off-diagonal tiles because the whole column
         // block precedes the row block; true for the diagonal tile's lower
         // triangle because lq <= lp there) — so file_row == gi is constant
-        // across the row and the needed file_col's form one increasing run.
-        // Bulk-read that run once instead of touching the mmap per entry;
-        // this is what turns a per-entry page-fault storm on a huge file
-        // into one sequential read per output row.
+        // across the row. Still a scalar per-entry gather (kp_ may have
+        // gaps within [cs, cs+lq_end), so the needed file columns aren't
+        // necessarily contiguous even though they're bounded and increasing)
+        // — bounded to one row's own span rather than the whole file is
+        // what matters for locality here, not a bulk vectorized read.
         const bool diagonal_tile = (rs == cs);
+        #pragma omp parallel for schedule(dynamic, 64)
         for (int lp = 0; lp < tile_rows; ++lp) {
             const int gi = kp_[rs + lp];
             const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;  // upper triangle unused for diagonal tiles
             if (lq_end == 0) continue;
             const int gj_lo = kp_[cs];
-            const int gj_hi = kp_[cs + lq_end - 1];
             const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2;
             const float* row_span = fbuf_ + row_base + gj_lo;
             for (int lq = 0; lq < lq_end; ++lq) {
@@ -769,14 +773,34 @@ inline void merge_grms(
         // Pull this block from input files in parallel across all 2K input streams
         // (.grm.bin and .grm.N.bin for each input). Every stream has an independent
         // file descriptor and advances sequentially block by block.
+#ifdef _OPENMP
         const int max_io_threads = std::min(omp_get_max_threads(), 8);
+#else
+        const int max_io_threads = 1;
+#endif
+        // read_exact throws (via LOGGER.e) on failure; letting that escape a
+        // parallel region is undefined behaviour (likely std::terminate()
+        // instead of the intended error message). Catch per-thread, defer
+        // to a single LOGGER.e() call after the region ends, same pattern
+        // as read_grm_N_mean's parallel diagonal read elsewhere in this file.
+        std::string io_error;
+        bool io_failed = false;
         #pragma omp parallel for schedule(dynamic, 1) num_threads(max_io_threads)
         for (int f = 0; f < K; ++f) {
-            read_exact(val_files[f].fd, val_block_bufs[f].data(),
-                    bytes_this_chunk, val_files[f].path);
-            read_exact(n_files[f].fd, n_block_bufs[f].data(),
-                    bytes_this_chunk, n_files[f].path);
+            try {
+                read_exact(val_files[f].fd, val_block_bufs[f].data(),
+                        bytes_this_chunk, val_files[f].path);
+                read_exact(n_files[f].fd, n_block_bufs[f].data(),
+                        bytes_this_chunk, n_files[f].path);
+            } catch (const std::exception& e) {
+                #pragma omp critical
+                {
+                    if (!io_failed) { io_failed = true; io_error = e.what(); }
+                }
+            }
         }
+        if (io_failed)
+            LOGGER.e(0, "merge_grms: " + io_error);
 
         // Compute the N-weighted average across all elements in this chunk.
         // Tiled in L1-cache-sized blocks (4096 floats = 32KB per stack tile)
@@ -812,17 +836,31 @@ inline void merge_grms(
         }
 
         // Write the two independent output files in parallel.
+        std::string write_error;
+        bool write_failed = false;
         #pragma omp parallel sections
         {
             #pragma omp section
             {
-                write_exact(out_bin_fd, out_val_buf.data(), bytes_this_chunk, out_bin_path);
+                try {
+                    write_exact(out_bin_fd, out_val_buf.data(), bytes_this_chunk, out_bin_path);
+                } catch (const std::exception& e) {
+                    #pragma omp critical
+                    { if (!write_failed) { write_failed = true; write_error = e.what(); } }
+                }
             }
             #pragma omp section
             {
-                write_exact(out_n_fd, out_n_buf.data(), bytes_this_chunk, out_n_path);
+                try {
+                    write_exact(out_n_fd, out_n_buf.data(), bytes_this_chunk, out_n_path);
+                } catch (const std::exception& e) {
+                    #pragma omp critical
+                    { if (!write_failed) { write_failed = true; write_error = e.what(); } }
+                }
             }
         }
+        if (write_failed)
+            LOGGER.e(0, "merge_grms: " + write_error);
     }
 
     ::close(out_bin_fd);

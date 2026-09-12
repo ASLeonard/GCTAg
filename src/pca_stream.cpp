@@ -208,7 +208,7 @@ void PCAStream::processMain()
 
         // ---- GRM access: chunked tile reader, or dense (fallback / comparison) ----
         gcta_chunked::TileReader chunked_reader;
-        std::shared_ptr<const gcta_grm_io::ChunkedGrmMmap> chunked_file;
+        std::shared_ptr<const gcta_grm_io::ChunkedGrmReader> chunked_file;
         Eigen::MatrixXd G_dense;  // left empty when svd_chunked
 
         if (svd_chunked) {
@@ -221,7 +221,7 @@ void PCAStream::processMain()
                         "), not loaded densely.");
         } else {
             vector<string> loaded_ids;
-            double m_snps_unused = 0.0;
+            double m_snps_unused = -1.0;
             Eigen::MatrixXd G_full;
             gcta_grm_io::read_grm_binary(grm_pfx, loaded_ids, G_full, m_snps_unused);
             const vector<int> kp = gcta_grm_io::match_ids_to_grm(analysis_ids, loaded_ids);

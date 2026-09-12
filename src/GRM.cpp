@@ -234,7 +234,7 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
     LOGGER.i(0, "The subtracted GRM has been written to [" + out_file + ".grm.bin, .grm.N.bin].");
 }
 
-void GRM::merge_grm_streaming(string mgrm_file, string out_file, int row_block_rows){
+void GRM::merge_grm(string mgrm_file, string out_file, int memory_budget_gb){
     std::ifstream mgrm(mgrm_file.c_str());
     if(!mgrm){
         LOGGER.e(0, "can't open " + mgrm_file + " to read.");
@@ -266,7 +266,7 @@ void GRM::merge_grm_streaming(string mgrm_file, string out_file, int row_block_r
         LOGGER.e(0, "streaming merge needs at least two GRMs in --mgrm.");
     }
 
-    gcta_grm_io::merge_grms_streaming(files, out_file, row_block_rows);
+    gcta_grm_io::merge_grms(files, out_file, memory_budget_gb);
 }
 
 
@@ -2108,30 +2108,19 @@ int GRM::registerOption(map<string, vector<string>>& options_in) {
         return_value++;
     }
 
-    string op_merge_grm_streaming = "--merge-grm-streaming";
-    if(options_in.find(op_merge_grm_streaming) != options_in.end()){
+    string op_merge_grm = "--merge-grms";
+    if(options_in.find(op_merge_grm) != options_in.end()){
         if(options.find("mgrm") == options.end() || options["mgrm"].empty())
-            LOGGER.e(0, "--merge-grm-streaming requires --mgrm <file>.");
-        processFunctions.push_back("merge_grm_streaming");
-        options_in.erase(op_merge_grm_streaming);
-        return_value++;
-    }
-
-    const string op_merge_block_rows = "--merge-grm-row-block";
-    options_d["merge_grm_row_block"] = 4000.0;
-    if(options_in.find(op_merge_block_rows) != options_in.end()){
-        if(options_in[op_merge_block_rows].size() != 1)
-            LOGGER.e(0, op_merge_block_rows + " requires exactly one integer value.");
-        int block_rows = 0;
-        try{
-            block_rows = std::stoi(options_in[op_merge_block_rows][0]);
-        }catch(std::invalid_argument&){
-            LOGGER.e(0, op_merge_block_rows + " must be an integer.");
+            LOGGER.e(0, "--merge-grms requires --mgrm <file>.");
+        if(options_in[op_merge_grm].size() == 1){
+            options_d["merge_grm"] = std::stod(options_in[op_merge_grm][0]);
         }
-        if(block_rows <= 0)
-            LOGGER.e(0, op_merge_block_rows + " must be > 0.");
-        options_d["merge_grm_row_block"] = static_cast<double>(block_rows);
-        options_in.erase(op_merge_block_rows);
+        else {
+            options_d["merge_grm"] = 0.0;
+        }
+        processFunctions.push_back("merge_grm");
+        options_in.erase(op_merge_grm);
+        return_value++;
     }
 
     if(options_in.find("--make-grm") != options_in.end()){
@@ -2575,10 +2564,10 @@ void GRM::processMain() {
             grm.subtract_grm(options["mgrm"], options["out"]);
         }
 
-        if(process_function == "merge_grm_streaming"){
+        if(process_function == "merge_grm"){
             GRM grm;
-            const int row_block_rows = static_cast<int>(options_d["merge_grm_row_block"]);
-            grm.merge_grm_streaming(options["mgrm"], options["out"], row_block_rows);
+            const int stream_budget = static_cast<int>(options_d["merge_grm"]);
+            grm.merge_grm(options["mgrm"], options["out"], stream_budget);
         }
     }
 

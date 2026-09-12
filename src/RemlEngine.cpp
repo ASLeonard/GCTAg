@@ -253,13 +253,53 @@ bool verbose=false;
 void assemble_V_lower(RemlCtx& ctx, const RemlVec& varcmp) {
     const int num_comp = static_cast<int>(ctx.r_indx.size());
     ctx.Vi.triangularView<Eigen::Lower>().setZero();
-    #pragma omp parallel for schedule(static)
-    for (int j = 0; j < ctx.n; j++) {
-        for (int ci = 0; ci < num_comp; ci++)
-            if (ctx.A[ctx.r_indx[ci]].size() > 0)
-                ctx.Vi.col(j).tail(ctx.n - j) +=
-                    varcmp[ci] * ctx.A[ctx.r_indx[ci]].col(j).tail(ctx.n - j);
+
+    if (ctx.hutchpp_chunk_rows > 0) {
+        // Single-GRM only (enforced where ctx.hutchpp_chunk_rows is set) --
+        // component 0 is the GRM, streamed tile-by-tile via the same
+        // TileReader/chunk_rows already proven correct by
+        // chunked_symmetric_matvec. Everything downstream of this function
+        // (dpotrf, Vi_L, applyP_mat) is completely unchanged: ctx.Vi still
+        // ends up fully dense -- this only changes how its lower triangle
+        // gets filled in, so ctx.A[GRM] never needs to be resident.
+        const double sg2 = varcmp[0];
+        const gcta_chunked::BlockPartition part(ctx.n, ctx.hutchpp_chunk_rows);
+        const int m = part.num_blocks();
+        for (int i = 0; i < m; ++i) {
+            const int rs = part.block_start(i), re = part.block_end(i);
+            for (int j = 0; j <= i; ++j) {
+                const int cs = part.block_start(j), ce = part.block_end(j);
+                const Eigen::MatrixXd tile = ctx.grm_tile_reader(rs, re, cs, ce);  // (re-rs) x (ce-cs)
+
+                if (i == j) {
+                    // Diagonal block: only the tile's own lower triangle is
+                    // valid data, in the same convention ctx.Vi already
+                    // uses -- copy it directly, column by column. (No
+                    // mirroring needed here, unlike chunked_symmetric_matvec,
+                    // which needs the tile's full symmetric form to do
+                    // tile_full * X; we're writing straight into ctx.Vi's
+                    // own lower triangle, same layout as the source.)
+                    for (int col = 0; col < re - rs; ++col)
+                        ctx.Vi.col(cs + col).segment(rs + col, re - rs - col) +=
+                            sg2 * tile.col(col).tail(re - rs - col);
+                } else {
+                    // Off-diagonal block (i > j): every row in block i
+                    // exceeds every column in block j, so this whole tile
+                    // sits inside the lower triangle -- write it in one shot.
+                    ctx.Vi.block(rs, cs, re - rs, ce - cs) += sg2 * tile;
+                }
+            }
+        }
+    } else {
+        #pragma omp parallel for schedule(static)
+        for (int j = 0; j < ctx.n; j++) {
+            for (int ci = 0; ci < num_comp; ci++)
+                if (ctx.A[ctx.r_indx[ci]].size() > 0)
+                    ctx.Vi.col(j).tail(ctx.n - j) +=
+                        varcmp[ci] * ctx.A[ctx.r_indx[ci]].col(j).tail(ctx.n - j);
+        }
     }
+
     for (int ci = 0; ci < num_comp; ci++)
         if (ctx.A[ctx.r_indx[ci]].size() == 0)
             ctx.Vi.diagonal().array() += varcmp[ci];
@@ -494,6 +534,30 @@ void calcu_tr_PA_woodbury(const RemlCtx& ctx, RemlVec& tr_PA, RemlVec* tr_PA_cor
     }
 }
 
+// Validates ctx.grm_tile_reader and derives a chunk-row count from the
+// memory budget. Called once, at setup, by whichever feature needs the GRM
+// stream (compute_woodbury_basis, or reml::compute() for chunked hutch++) —
+// never from inside the AI-REML/EM-REML loop. feature_flag is only used to
+// prefix the log/error message so the source is clear when both features
+// share this budget knob.
+int setup_chunked_grm_stream(const RemlCtx& ctx, const char* feature_flag) {
+    if (!ctx.grm_tile_reader)
+        LOGGER.e(0, std::string(feature_flag) + ": --svd-chunked-budget is set but "
+                    "ctx.grm_tile_reader is empty — the GRM component wasn't actually "
+                    "loaded either way.");
+    const int n = ctx.n;
+    const double grm_packed_gb = static_cast<double>(n) * (n + 1) / 2 * sizeof(float) / 1e9;
+    const int chunk_rows = gcta_chunked::solve_chunk_rows(n, ctx.svd_chunked_budget, 0, grm_packed_gb);
+    if (chunk_rows < 1)
+        LOGGER.e(0, std::string(feature_flag) + ": --svd-chunked-budget=" + std::to_string(ctx.svd_chunked_budget)
+                    + "GB is too small: the packed GRM itself needs " + std::to_string(grm_packed_gb)
+                    + "GB (n=" + std::to_string(n) + "); raise the budget.");
+    LOGGER << feature_flag << ": --svd-chunked-budget=" << ctx.svd_chunked_budget
+           << "GB (" << grm_packed_gb << "GB reserved for the packed GRM) -> streaming "
+           << chunk_rows << " GRM row(s) per chunk." << std::endl;
+    return chunk_rows;
+}
+
 // tr_PA_var receives, per component, the sampling variance of the Hutch++
 // residual-term mean estimator (i.e. Var(tr_PA(ci))). It is a free byproduct
 // of the existing colwise reduction below — used by ai_reml to build the
@@ -542,6 +606,10 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
         const bool is_I = (ctx.A[ctx.r_indx[ci]].size() == 0);
 
         auto applyPA_mat = [&](const RemlMat& Z) -> RemlMat {
+            if (ctx.hutchpp_chunk_rows > 0 && ci == 0) {
+                return applyP_mat(ctx, RemlMat(gcta_chunked::chunked_symmetric_matvec(
+                    ctx.grm_tile_reader, ctx.n, ctx.hutchpp_chunk_rows, Z)));
+            }
             if (ctx.Vi_use_woodbury_basis && ci == 0) {
                 RemlMat UkZ = ctx.Uk.transpose() * Z;
                 UkZ.array().colwise() *= (ctx.dk.array() - ctx.lambda_tail);
@@ -741,7 +809,10 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     const int m = static_cast<int>(ctx.r_indx.size());
     RemlMat APy(ctx.n, m);
     for (int i = 0; i < m; i++) {
-        if (woodbury_basis_active && i == 0)
+        if (ctx.hutchpp_chunk_rows > 0 && i == 0)
+            APy.col(i) = gcta_chunked::chunked_symmetric_matvec(
+                ctx.grm_tile_reader, ctx.n, ctx.hutchpp_chunk_rows, Py);
+        else if (woodbury_basis_active && i == 0)
             APy.col(i) = woodbury_basis_Kv(ctx, Py);
         else if (ctx.A[ctx.r_indx[i]].size() == 0)
             APy.col(i) = Py;
@@ -1106,7 +1177,11 @@ void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
     RemlVec R(m);
     if (ctx.reml_tmp_n.size() != ctx.n) ctx.reml_tmp_n.resize(ctx.n);
     for (int i = 0; i < m; i++) {
-        if (woodbury_basis_active && i == 0) {
+        if (ctx.hutchpp_chunk_rows > 0 && i == 0) {
+            ctx.reml_tmp_n = gcta_chunked::chunked_symmetric_matvec(
+                ctx.grm_tile_reader, ctx.n, ctx.hutchpp_chunk_rows, Py);
+            R(i) = Py.dot(ctx.reml_tmp_n);
+        } else if (woodbury_basis_active && i == 0) {
             ctx.reml_tmp_n = woodbury_basis_Kv(ctx, Py);
             R(i) = Py.dot(ctx.reml_tmp_n);
         } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
@@ -1661,14 +1736,15 @@ static int finalize_and_log_woodbury_rank(
                    << " (margin=" << (ctx.woodbury_basis_edge_margin * 100.0) << "%, confirm="
                    << ctx.woodbury_basis_edge_confirm << " consecutive)"
                    << ", using k = " << k << std::endl;
-            if (k_edge >= k_svd && k_svd >= n - 1)
-                LOGGER.w(0, "Woodbury MP-k: edge band not confirmed even at k=n-1=" + std::to_string(n - 1)
-                         + "; this GRM has near-full effective rank and Woodbury may not offer a computational advantage here.");
-            else if (k_edge >= k_svd && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury MP-k: edge band not confirmed within the memory-budget-implied ceiling k="
-                         + std::to_string(k_svd) + " (--reml-woodbury-basis-mem-budget=" + std::to_string(ctx.svd_mem_budget_gb) + "GB).");
-            else if (k_edge >= k_svd)
-                LOGGER.w(0, "Woodbury MP-k: edge band not confirmed within k_max=" + std::to_string(k_svd) + "; clamped to k_max.");
+            if (!eval_res.satisfied && k_svd >= n - 1)
+                LOGGER.e(0, "Woodbury MP-k: edge band not confirmed even at k=n-1=" + std::to_string(n - 1)
+                         + "; this GRM has near-full effective rank and Woodbury may not offer a computational advantage here. Refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury MP-k: edge band not confirmed within the memory-budget-implied ceiling k="
+                         + std::to_string(k_svd) + " (--reml-woodbury-basis-mem-budget=" + std::to_string(ctx.svd_mem_budget_gb) + "GB). Raise the budget or lower --reml-woodbury-basis-edge-margin/-confirm; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied)
+                LOGGER.e(0, "Woodbury MP-k: edge band not confirmed within k_max=" + std::to_string(k_svd)
+                         + ". Raise --reml-woodbury-basis-range's k_max; refusing to proceed with an unresolved basis.");
             break;
         }
         case WoodburyMode::EIG: {
@@ -1677,18 +1753,29 @@ static int finalize_and_log_woodbury_rank(
             double cumulative = 0.0;
             for (int i = 0; i < k; ++i) cumulative += eval_full[i];
             const double rho = cumulative / trace_K_full;
-            LOGGER << "EIG-k: trace(K)=" << trace_K_full
-                   << ", raw " << ctx.woodbury_basis_eigen_mass * 100 << "% mass crossing at k=" << k_EIGMASS
-                   << ", using k=" << k << " (+" << ctx.woodbury_basis_EIG_k_buffer << " eigenvalue buffer)"
-                   << ", captured mass rho=" << rho << std::endl;
-            if (k_EIGMASS >= k_svd && k_svd >= n - 1)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached even at k=n-1=" + std::to_string(n - 1) + ".");
-            else if (k_EIGMASS >= k_svd && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached within memory budget ceiling k=" + std::to_string(k_svd) + ".");
-            else if (k_EIGMASS >= k_svd && k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached within k_max=" + std::to_string(k_cap) + ".");
-            else if (k_EIGMASS >= k_svd)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached within k=" + std::to_string(k_svd) + ".");
+            if (eval_res.satisfied) {
+                LOGGER << "EIG-k: trace(K)=" << trace_K_full
+                       << ", raw " << ctx.woodbury_basis_eigen_mass * 100 << "% mass crossing at k=" << k_EIGMASS
+                       << ", using k=" << k << " (+" << ctx.woodbury_basis_EIG_k_buffer << " eigenvalue buffer)"
+                       << ", captured mass rho=" << rho << std::endl;
+            } else {
+                LOGGER << "EIG-k: trace(K)=" << trace_K_full
+                       << ", target mass (" << ctx.woodbury_basis_eigen_mass * 100 << "%) NOT reached within k=" << k_svd
+                       << ", using fallback k=" << k
+                       << ", captured mass rho=" << rho << std::endl;
+            }
+            if (!eval_res.satisfied && k_svd >= n - 1)
+                LOGGER.e(0, "Woodbury EIG-k: mass target not reached even at k=n-1=" + std::to_string(n - 1)
+                         + " (captured rho=" + std::to_string(rho) + "). Refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury EIG-k: mass target not reached within memory budget ceiling k=" + std::to_string(k_svd)
+                         + " (captured rho=" + std::to_string(rho) + "). Raise --reml-woodbury-basis-mem-budget; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury EIG-k: mass target not reached within k_max=" + std::to_string(k_cap)
+                         + " (captured rho=" + std::to_string(rho) + "). Raise --reml-woodbury-basis-range's k_max; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied)
+                LOGGER.e(0, "Woodbury EIG-k: mass target not reached within k=" + std::to_string(k_svd)
+                         + " (captured rho=" + std::to_string(rho) + "). Refusing to proceed with an unresolved basis.");
             break;
         }
         case WoodburyMode::VAR: {
@@ -1713,14 +1800,18 @@ static int finalize_and_log_woodbury_rank(
                    << " (tail_d_var=" << tail_var
                    << ", tail non-isotropic energy=" << tail_nonisotropic_energy
                    << ", relative Frobenius error=" << relative_frobenius_error << ")" << std::endl;
-            if (k_VAR >= k_svd && k_svd >= n - 1)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached even at k=n-1=" + std::to_string(n - 1) + ".");
-            else if (k_VAR >= k_svd && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within memory budget ceiling k=" + std::to_string(k_svd) + ".");
-            else if (k_VAR >= k_svd && k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k_max=" + std::to_string(k_cap) + ".");
-            else if (k_VAR >= k_svd)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k=" + std::to_string(k_svd) + ".");
+            if (!eval_res.satisfied && k_svd >= n - 1)
+                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached even at k=n-1=" + std::to_string(n - 1)
+                         + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within memory budget ceiling k=" + std::to_string(k_svd)
+                         + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Raise --reml-woodbury-basis-mem-budget; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k_max=" + std::to_string(k_cap)
+                         + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Raise --reml-woodbury-basis-range's k_max; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied)
+                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k=" + std::to_string(k_svd)
+                         + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Refusing to proceed with an unresolved basis.");
             break;
         }
         case WoodburyMode::Fixed:
@@ -1762,7 +1853,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     const bool svd_chunked = ctx.svd_chunked_budget > 0.0;
 
     int k_svd_budget_ceiling = n - 1;
-    if (ctx.svd_mem_budget_gb > 0.0) {
+    if (svd_chunked && ctx.svd_mem_budget_gb > 0.0) {
         const double budget_bytes = ctx.svd_mem_budget_gb * 1e9;
         const int max_k_ext = static_cast<int>(budget_bytes / (5.0 * n * 8.0));
         k_svd_budget_ceiling = std::min(k_svd_budget_ceiling, std::max(20, max_k_ext - 200));
@@ -1770,32 +1861,17 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                << "GB -> k_svd capped at " << k_svd_budget_ceiling << std::endl;
     }
 
-    // Row-chunk size for streaming reads off ctx.grm_tile_reader (chunked_diagonal,
-    // chunked_trace_K_squared, chunked_symmetric_matvec). Budget-driven, same pattern
-    // as --GRM-tile-budget: solve for the number of rows that fit rather than guessing
-    // a fixed size. Sized against k_svd_budget_ceiling (the worst-case rank this call
-    // can reach) since the chunk size is fixed once here and reused across the whole
-    // adaptive-rank loop below, regardless of which k_ext is live at any given moment.
     int svd_chunk_rows = 0;
     if (svd_chunked) {
-        // k_svd_budget_ceiling feeds k_ext_hint below. Left at its n-1 default (no
-        // --reml-woodbury-basis-mem-budget), k_ext_hint is sized against the
-        // worst case the adaptive-rank loop could reach, not the rank it will
-        // actually settle on — so svd_chunk_rows may land smaller than strictly
-        // necessary. That's the intended tradeoff for a hard RSS cap on the
-        // GRM-streaming buffer regardless of k_svd, not a misconfiguration.
-        const int k_ext_hint = k_svd_budget_ceiling + gcta_eigh::recommended_oversample(k_svd_budget_ceiling);
-        svd_chunk_rows = gcta_chunked::solve_chunk_rows(n, ctx.svd_chunked_budget, k_ext_hint);
-        if (svd_chunk_rows < 1)
-            LOGGER.e(0, "--svd-chunked-budget=" + std::to_string(ctx.svd_chunked_budget)
-                        + "GB cannot fit even a single GRM row (n=" + std::to_string(n)
-                        + ", k_ext=" + std::to_string(k_ext_hint) + " -> "
-                        + std::to_string(8.0 * (n + k_ext_hint) / 1e9) + "GB/row); raise the budget"
-                        + " or add --reml-woodbury-basis-mem-budget <GB> to cap k_ext.");
-        LOGGER << "--svd-chunked-budget=" << ctx.svd_chunked_budget
-               << "GB -> streaming " << svd_chunk_rows << " GRM row(s) per chunk (k_ext up to "
-               << k_ext_hint << ")" << std::endl;
+        svd_chunk_rows = setup_chunked_grm_stream(ctx, "--reml-woodbury-basis");
+        // Y is not reserved by setup_chunked_grm_stream -- report its worst-case
+        // size (at the current k_svd ceiling) here so it's visible without being enforced.
+        const double y_worst_case_gb = 8.0 * n * static_cast<double>(k_svd_budget_ceiling) / 1e9;
+        LOGGER << "--reml-woodbury-basis: at the current k_svd ceiling of " << k_svd_budget_ceiling
+               << ", the basis matrix (Y) may need up to ~" << y_worst_case_gb
+               << "GB, not covered by --svd-chunked-budget." << std::endl;
     }
+
 
     const bool k_max_is_hard_ceiling = (ctx.woodbury_basis_k_max > 0);
     const int k_svd_cap = woodbury_rank_cap(ctx, k_svd_budget_ceiling);
@@ -1917,7 +1993,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
 
         eval_res = evaluate_rank_criterion(mode, eval_full, k_svd, lambda_plus, target_mass, trace_K_full, trace_K2, ctx);
 
-        if (eval_res.satisfied || k_svd >= k_svd_cap || k_svd >= n / 2 || k_svd >= k_svd_budget_ceiling) break;
+        if (eval_res.satisfied || k_svd >= k_svd_cap || k_svd >= k_svd_budget_ceiling) break;
 
         int k_svd_next = std::min({k_svd * 2, n - 1, k_svd_cap});
         if (mode == WoodburyMode::EIG && ctx.woodbury_basis_eigen_adaptive) {
@@ -2010,6 +2086,11 @@ void compute(RemlCtx& ctx,
         compute_woodbury_basis(ctx);
         float duration = LOGGER.tp("main");
         LOGGER.i(0, "Woodbury basis computation took " + std::to_string(duration) + " seconds.");
+    } else if (ctx.reml_trace_hutchpp && ctx.svd_chunked_budget > 0.0) {
+        // Woodbury takes precedence when both are requested.
+        if ((int)ctx.r_indx.size() != 2)
+            LOGGER.e(0, "--svd-chunked-budget with --reml-trace-hutchpp supports only single-GRM models.");
+        ctx.hutchpp_chunk_rows = setup_chunked_grm_stream(ctx, "--reml-trace-hutchpp");
     }
 
     RemlMat Vi_X_out(ctx.n, ctx.X_c), Xt_Vi_X_i_out(ctx.X_c, ctx.X_c);
@@ -2166,6 +2247,7 @@ RemlState build_reml_state(RemlCtx& ctx) {
     ctx.hutchpp_QtG.resize(0, 0);
     ctx.hutchpp_R.resize(0, 0);
     ctx.hutchpp_MR.resize(0, 0);
+    ctx.hutchpp_chunk_rows = 0;
     ctx.reml_tmp_n.resize(0);
     ctx.P.resize(0, 0);
     ctx.varcmp.clear();

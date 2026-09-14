@@ -104,8 +104,27 @@ inline void write_exact(int fd, const void* buf, size_t count, const std::string
 
 // Returns:
 //   ids      — "FID\tIID" strings in GRM file order
-//   G        — full symmetric n×n matrix (double precision)
+//   G        — full symmetric n×n matrix (double precision), unless
+//              upper_only is set (see below), in which case only the upper
+//              triangle (row <= col) holds valid data -- the lower triangle
+//              is whatever the allocator handed back (kernel-zero pages for
+//              a fresh, sufficiently large Eigen::MatrixXd; not guaranteed
+//              zero in general -- see upper_only note).
 //   m_snps   — SNP count from element (0,0) of .grm.N.bin; 0 if N file missing
+//
+// upper_only (default false): skip the upper->lower mirror pass after the
+// triangle fill. Saves ~n^2/2 double writes and, for a freshly-constructed
+// G (resize() on an empty matrix, no prior .setZero()/full touch), avoids
+// physically faulting in the lower-triangle pages at all -- confirmed via
+// RSS sampling (~n^2/2 * 8 bytes reduction at n=150k on the REML load
+// path). This last part depends on G having received no prior full-matrix
+// touch; if G is reused across calls or zero-initialised by the caller
+// first, the memory saving does not apply (the mirror-pass write-bandwidth
+// saving still does). Only pass upper_only=true when every downstream
+// consumer of G has been updated to read it as upper-triangle-only (dense
+// products via selfadjointView<Eigen::Upper>(), symmetric reads via row
+// instead of column tail on the lower half). Default false preserves the
+// original full-matrix contract for any caller not yet audited.
 //
 // Implementation notes:
 //   - .grm.bin is read sequentially in row-aligned chunks (grm_read_chunk_
@@ -128,6 +147,7 @@ inline void read_grm_binary(const std::string& prefix,
                              std::vector<std::string>& ids,
                              Eigen::MatrixXd& G,
                              double& m_snps,
+                             bool upper_only = false,
                              size_t grm_read_chunk_bytes = (1ull << 30) /* 1GiB */)
 {
     LOGGER.ts("grm");
@@ -190,22 +210,28 @@ inline void read_grm_binary(const std::string& prefix,
     }
     ::close(fd);
     LOGGER.i(0, "The .grm.bin fill took " + std::to_string(LOGGER.tp("grm")) + " seconds.");
-    LOGGER.ts("grm_mirror");
-    // Mirror upper -> lower, column-contiguous on the write side (fixed
-    // column c, rows c+1..n-1) and scattered only on the read side (G(c,r)
-    // across row c). A blocked-transpose version of this (tiling into
-    // BSxBS blocks to make the read side contiguous too) was tried and
-    // hung/regressed badly at n=75000 -- root cause not yet identified
-    // (suspect concurrent first-touch page faults on the still-unwritten
-    // lower triangle across many threads, but not confirmed). Reverted to
-    // this simpler version, which is validated (ran cleanly across the
-    // K10-K25 Woodbury sweep). Do not reintroduce blocking without
-    // isolating and timing it separately first.
-    #pragma omp parallel for schedule(dynamic, 64)
-    for (int c = 0; c < n; ++c)
-        for (int r = c + 1; r < n; ++r)
-            G(r, c) = G(c, r);
-    LOGGER.i(0, "The .grm.bin mirror took " + std::to_string(LOGGER.tp("grm_mirror")) + " seconds.");
+    if (upper_only) {
+        LOGGER.i(0, "upper_only=true: skipping the upper->lower mirror pass. "
+                    "G is valid on its upper triangle (row <= col) only -- "
+                    "every consumer of this G must be audited to read it that way.");
+    } else {
+        LOGGER.ts("grm_mirror");
+        // Mirror upper -> lower, column-contiguous on the write side (fixed
+        // column c, rows c+1..n-1) and scattered only on the read side (G(c,r)
+        // across row c). A blocked-transpose version of this (tiling into
+        // BSxBS blocks to make the read side contiguous too) was tried and
+        // hung/regressed badly at n=75000 -- root cause not yet identified
+        // (suspect concurrent first-touch page faults on the still-unwritten
+        // lower triangle across many threads, but not confirmed). Reverted to
+        // this simpler version, which is validated (ran cleanly across the
+        // K10-K25 Woodbury sweep). Do not reintroduce blocking without
+        // isolating and timing it separately first.
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (int c = 0; c < n; ++c)
+            for (int r = c + 1; r < n; ++r)
+                G(r, c) = G(c, r);
+        LOGGER.i(0, "The .grm.bin mirror took " + std::to_string(LOGGER.tp("grm_mirror")) + " seconds.");
+    }
 
     if (m_snps < 0.0) {
         LOGGER.i(0,"Skipping SNP count read from .grm.N.bin.");

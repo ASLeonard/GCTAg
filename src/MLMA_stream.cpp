@@ -559,7 +559,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         options_in.erase("--reml-woodbury-basis-EIG-mass");
         options_in.erase("--reml-woodbury-basis-VAR-tail");
         options_in.erase("--reml-woodbury-basis-range");
-        options_in.erase("--svd-chunked-budget");
+        options_in.erase("--grm-chunked-budget");
         options_in.erase("--reml-ai-robust");
         options_in.erase("--reml-ai-robust-tol");
         options_in.erase("--reml-ai-robust-risk");
@@ -645,17 +645,17 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
             options["force_dense_V"] = "1";
             options_in.erase("--reml-force-dense-V");
         }
-        // --svd-chunked-budget: read K in lower-triangular tiles for the
+        // --grm-chunked-budget: read K in lower-triangular tiles for the
         // Woodbury basis rSVD instead of holding a dense n x n K resident —
         // see chunked_grm_matvec.hpp. Requires the caller (below, once
         // grm_binary_io.hpp's reader is wired up) to populate
         // ctx.grm_tile_reader; RemlEngine enforces this at runtime.
-        if (options_in.find("--svd-chunked-budget") != options_in.end()) {
-            const auto& vals = options_in["--svd-chunked-budget"];
+        if (options_in.find("--grm-chunked-budget") != options_in.end()) {
+            const auto& vals = options_in["--grm-chunked-budget"];
             if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--svd-chunked-budget requires a target memory in GB.");
-            options_d["svd_chunked_budget"] = std::stod(vals[0]);
-            options_in.erase("--svd-chunked-budget");
+                LOGGER.e(0, "--grm-chunked-budget requires a target memory in GB.");
+            options_d["grm_chunked_budget"] = std::stod(vals[0]);
+            options_in.erase("--grm-chunked-budget");
         }
         if (options_in.find("--reml-woodbury-basis-MP-margin") != options_in.end()) {
             const auto& vals = options_in["--reml-woodbury-basis-MP-margin"];
@@ -896,7 +896,7 @@ void MLMA::processMain()
         // the previous fixed BLOCK=10000 (which allocated the same
         // GenoBufItem::geno + X_block footprint regardless of n, reaching
         // multi-GB at large n). Opt-in, matching --GRM-tile-budget /
-        // --svd-chunked-budget elsewhere: omitting the flag reproduces the
+        // --grm-chunked-budget elsewhere: omitting the flag reproduces the
         // old fixed-10000 behavior exactly (see resolve_mlma_block_size).
         const double mlma_tile_budget_gb = options_d.count("mlma_tile_budget_gb")
             ? options_d.at("mlma_tile_budget_gb") : 0.0;
@@ -936,9 +936,9 @@ void MLMA::processMain()
             LOGGER.i(0, "Running inline REML using GRM [" + grm_pfx + "] ...");
 
             const vector<string> analysis_ids = pheno->get_id(0, n - 1, "\t");
-            bool svd_chunked = options_d.count("svd_chunked_budget") > 0.0;
-            const double svd_chunked_budget = options_d.count("svd_chunked_budget")
-                ? options_d.at("svd_chunked_budget") : 0.0;
+            bool grm_chunked = options_d.count("grm_chunked_budget") > 0.0;
+            const double grm_chunked_budget = options_d.count("grm_chunked_budget")
+                ? options_d.at("grm_chunked_budget") : 0.0;
 
             // REML tuning parameters. Parsed here (ahead of the GRM load below,
             // not after it as before) because woodbury_basis_mem_budget_gb feeds
@@ -989,42 +989,46 @@ void MLMA::processMain()
                             "the Woodbury basis provides an exact tr(PA) and takes precedence — "
                             "--reml-trace-hutchpp is ignored.");
 
-            int svd_chunk_rows = 0;
-            if (svd_chunked) {
+            int grm_chunk_rows = 0;
+            if (grm_chunked) {
                 const double grm_packed_gb =
                     static_cast<double>(gcta_grm_io::grm_packed_bytes(n)) / 1e9;
-                svd_chunk_rows = gcta_chunked::solve_chunk_rows(n, svd_chunked_budget, 0, grm_packed_gb);
-                if (svd_chunk_rows < 1)
-                    LOGGER.e(0, "--svd-chunked-budget=" + to_string(svd_chunked_budget) +
+                grm_chunk_rows = gcta_chunked::solve_chunk_rows(n, grm_chunked_budget, 0, grm_packed_gb);
+                if (grm_chunk_rows < 1)
+                    LOGGER.e(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
                                 "GB is too small: the packed GRM itself needs " +
                                 to_string(grm_packed_gb) + "GB (n=" + to_string(n) + "); raise the budget.");
-                if (svd_chunk_rows >= n) {
-                    LOGGER.w(0, "--svd-chunked-budget=" + to_string(svd_chunked_budget) +
+                if (grm_chunk_rows >= n) {
+                    LOGGER.w(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
                                 "GB covers the full GRM (n=" + to_string(n) + ") in a single chunk. "
                                 "Falling back to dense loading instead of paying chunking overhead "
                                 "for no benefit.");
-                    svd_chunked = false;
+                    grm_chunked = false;
                 }
             }
 
             vector<string> grm_ids;
-            Eigen::MatrixXd G_n;      // left empty when svd_chunked
+            Eigen::MatrixXd G_n;      // left empty when grm_chunked
             double m_all = options_d["woodbury_basis_rank"] == -1 ? 0.0 : -1.0;  // only populated when dense GRM and Woodbury-MP mode is selected
-            gcta_grm_io::ChunkedGrmHandle chunked_grm;  // only populated when svd_chunked
+            gcta_grm_io::ChunkedGrmHandle chunked_grm;  // only populated when grm_chunked
 
-            if (svd_chunked) {
+            if (grm_chunked) {
                 // Skip the dense O(n_grm^2) load entirely — the whole point
-                // of --svd-chunked. make_chunked_grm_reader does its
+                // of --grm-chunked. make_chunked_grm_reader does its
                 // own ID validation (same fail-loud contract as the dense
                 // path below) and reads m_snps from .grm.N.bin's diagonal
                 // without touching .grm.bin.
                 chunked_grm = gcta_grm_io::make_chunked_grm_reader(grm_pfx, analysis_ids);
                 m_all = chunked_grm.m_snps;
-                LOGGER.i(0, "--svd-chunked-budget=" + to_string(svd_chunked_budget) +
-                            "GB -> GRM will be read in " + to_string(svd_chunk_rows) +
+                LOGGER.i(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
+                            "GB -> GRM will be read in " + to_string(grm_chunk_rows) +
                             "-row chunks from [" + grm_pfx + "], not loaded densely.");
             } else {
-                read_grm_binary(grm_pfx, grm_ids, G_n, m_all);
+                // upper_only=true: G_n is valid on its upper triangle (row<=col)
+                // only. This is safe here because ctx.A[0] (fed by G_n below) is
+                // itself expected to be upper-triangle-only by RemlEngine -- see
+                // grm_binary_io.hpp's upper_only doc comment.
+                read_grm_binary(grm_pfx, grm_ids, G_n, m_all, /*upper_only=*/true);
 
                 // Get post-filter analysis IDs (FID\tIID) and match to GRM
                 const vector<int> kp = match_ids_to_grm(analysis_ids, grm_ids);
@@ -1043,18 +1047,26 @@ void MLMA::processMain()
 
                 if (!is_identity) {
                     Eigen::MatrixXd G_sub(n, n);
-                    // Column-first traversal for column-major Eigen storage.
-                    // Columns are independent (each writes its own G_sub
-                    // column, reads only from G_n), so this parallelizes
-                    // directly -- was single-threaded, O(n^2) scalar gather,
-                    // inconsistent with the OMP convention used for the same
-                    // shape of loop elsewhere (RemlEngine.cpp's
-                    // assemble_V_lower, trace_K2 computation).
-                    #pragma omp parallel for schedule(static)
+                    // G_n is upper-triangle-only (row<=col valid). The old
+                    // gather read G_n(kp[i], src_col) directly for every (i,j)
+                    // pair, which is only correct when kp[i] <= src_col --
+                    // otherwise it silently reads unfaulted/zero data now that
+                    // the mirror pass is gone. Fixed two ways at once:
+                    //   1. Only the upper triangle of G_sub is written
+                    //      (i <= j) -- that's all ctx.A[0] needs downstream,
+                    //      and it keeps G_sub's own lower-triangle pages
+                    //      unfaulted too, carrying the memory saving through
+                    //      this subsetting step.
+                    //   2. Each read uses min/max on (kp[i], src_col) so it
+                    //      always lands in G_n's valid upper triangle,
+                    //      regardless of how the permutation reorders things.
+                    #pragma omp parallel for schedule(dynamic, 64)
                     for (int j = 0; j < n; ++j) {
                         const int src_col = kp[j];
-                        for (int i = 0; i < n; ++i)
-                            G_sub(i, j) = G_n(kp[i], src_col);
+                        for (int i = 0; i <= j; ++i) {
+                            const int r = kp[i], c = src_col;
+                            G_sub(i, j) = (r <= c) ? G_n(r, c) : G_n(c, r);
+                        }
                     }
                     G_n = std::move(G_sub);
                 }
@@ -1079,7 +1091,7 @@ void MLMA::processMain()
                 ctx.y_Ssq = ctx.y.squaredNorm();
             }
             ctx.A.resize(2);
-            if (svd_chunked) {
+            if (grm_chunked) {
                 // ctx.A[0] stays empty (default RemlMat()); RemlEngine reads
                 // K through ctx.grm_tile_reader instead. See the guard in
                 // compute_woodbury_basis_basis that errors out if this flag is set
@@ -1102,12 +1114,6 @@ void MLMA::processMain()
             ctx.reml_diagV_adj           = reml_diagV_adj;
             ctx.reml_force_dense_vi     = options.count("force_dense_V") > 0;
             ctx.woodbury_basis_rank            = woodbury_basis_rank;
-            if (svd_chunked && woodbury_basis_rank == 0)
-                LOGGER.e(0, "--svd-chunked-budget requires --reml-woodbury. Every REML code path "
-                            "outside compute_woodbury_basis_basis (the trace/projection machinery, "
-                            "Hutch++, dense/exact REML) still reads ctx.A[...] directly and treats "
-                            "an empty component as \"identity\" — chunked mode leaves it empty for "
-                            "a different reason, and nothing else knows the difference yet.");
             ctx.woodbury_basis_edge_margin        = woodbury_basis_edge_margin;
             ctx.woodbury_basis_edge_confirm       = woodbury_basis_edge_confirm;
             ctx.woodbury_basis_EIG_k_buffer  = woodbury_basis_EIG_k_buffer;
@@ -1120,7 +1126,7 @@ void MLMA::processMain()
             ctx.woodbury_basis_posthoc_correction = options.count("woodbury_basis_posthoc_correction") > 0;
             ctx.svd_mem_budget_gb   = woodbury_basis_mem_budget_gb;
             ctx.svd_nystrom         = svd_nystrom;
-            ctx.svd_chunked_budget         = svd_chunked ? svd_chunked_budget : 0.0;
+            ctx.grm_chunked_budget         = grm_chunked ? grm_chunked_budget : 0.0;
             ctx.reml_trace_hutchpp        = trace_hutchpp;
             ctx.reml_trace_hutchpp_nprobes = trace_hutchpp_nprobes;
             ctx.reml_hutchpp_fixed_probes = options.count("trace_hutchpp_fixed_probes") > 0;

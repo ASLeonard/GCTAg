@@ -1,5 +1,17 @@
 cmake_minimum_required(VERSION 3.28...4.3)
 
+# CMake computes CMAKE_SYSTEM_FRAMEWORK_PATH (and other Apple SDK-derived paths)
+# at the FIRST project()/enable_language() call below, using whatever
+# CMAKE_OSX_SYSROOT resolves to at that moment. Must be resolved here, before 
+# project(), to take effect everywhere.
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin" AND NOT CMAKE_OSX_SYSROOT)
+    execute_process(
+        COMMAND xcrun --sdk macosx --show-sdk-path
+        OUTPUT_VARIABLE CMAKE_OSX_SYSROOT
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    set(CMAKE_OSX_SYSROOT "${CMAKE_OSX_SYSROOT}" CACHE PATH "macOS SDK sysroot")
+endif()
+
 if(GCTA_GCC_TOOLCHAIN AND DEFINED CMAKE_CXX_COMPILER)
     execute_process(
         COMMAND "${CMAKE_CXX_COMPILER}" --version
@@ -553,6 +565,7 @@ find_package(OpenMP REQUIRED)
 
 set(GCTA_BLAS_LIBS "")
 set(GCTA_BLAS_INCLUDE_DIRS "")
+set(GCTA_BLAS_COMPILE_OPTIONS "")
 set(GCTA_BLAS_DEFINES "")
 
 if(NOT GCTA_BLAS_BACKEND)
@@ -578,26 +591,22 @@ if(NOT APPLE AND _GCTA_BLAS STREQUAL "Accelerate")
 endif()
 
 if(_GCTA_BLAS STREQUAL "Accelerate")
+    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+        # 13.3 is the minimum for ACCELERATE_NEW_LAPACK.
+        set(CMAKE_OSX_DEPLOYMENT_TARGET "13.3" CACHE STRING "Minimum macOS deployment target")
+    endif()
+    message(STATUS "Accelerate SDK: ${CMAKE_OSX_SYSROOT}")
+
     # Accelerate is a macOS system framework — no user-supplied paths needed.
     set(BLA_VENDOR Apple)
     find_package(BLAS   REQUIRED)
     find_package(LAPACK REQUIRED)
 
-    # Default to 13.3 (minimum for ACCELERATE_NEW_LAPACK) if not already set.
-    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
-        set(CMAKE_OSX_DEPLOYMENT_TARGET "13.3" CACHE STRING "Minimum macOS deployment target")
-    endif()
-
-    if(NOT CMAKE_OSX_SYSROOT)
-        execute_process(
-            COMMAND xcrun --sdk macosx --show-sdk-path
-            OUTPUT_VARIABLE CMAKE_OSX_SYSROOT
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-    endif()
-    message(STATUS "Accelerate SDK: ${CMAKE_OSX_SYSROOT}")
-
-    # Framework headers (e.g. <vecLib/cblas_new.h>) are resolved via -F.
-    list(APPEND GCTA_BLAS_INCLUDE_DIRS "-F${CMAKE_OSX_SYSROOT}/System/Library/Frameworks")
+    # Framework headers (e.g. <vecLib/cblas_new.h>) are resolved via -F. This is a
+    # compiler FLAG, not an include directory, so it must go through
+    # target_compile_options — feeding it to target_include_directories (which
+    # always prefixes entries with -I) produces a malformed "-I-F..." argument.
+    list(APPEND GCTA_BLAS_COMPILE_OPTIONS "-F${CMAKE_OSX_SYSROOT}/System/Library/Frameworks")
     list(APPEND GCTA_BLAS_LIBS         ${BLAS_LIBRARIES} ${LAPACK_LIBRARIES})
     list(APPEND GCTA_BLAS_DEFINES      GCTA_USE_ACCELERATE ACCELERATE_NEW_LAPACK EIGEN_USE_BLAS)
     set(GCTA_BLAS_PROVIDER "Accelerate" CACHE INTERNAL "")
@@ -793,6 +802,8 @@ target_include_directories(GCTAg PRIVATE
     third_party/plink-ng/2.0/simde
     # module-mode FindBoost.cmake fallback (empty when using config-mode Boost targets)
     ${Boost_INCLUDE_DIRS})
+
+target_compile_options(GCTAg PRIVATE ${GCTA_BLAS_COMPILE_OPTIONS})
 
 # Boost: prefer modern config-mode targets; fall back to module-mode Boost_LIBRARIES.
 # $<TARGET_EXISTS:...> (3.27) avoids the imperative if(TARGET)/list(APPEND) pattern.

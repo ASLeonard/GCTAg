@@ -15,9 +15,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 #include "chunked_grm_matvec.hpp"
 
@@ -334,8 +331,8 @@ public:
         // so this one call is the whole read -- no chunk loop needed here
         // (unlike read_grm_binary's fill, there's no per-chunk float->double
         // cast or scatter to interleave; this class stores the packed
-        // float32 data verbatim and defers the cast to read_tile/
-        // matvec_blocked, at tile/row granularity, same as before).
+        // float32 data verbatim and defers the cast to read_tile, at tile
+        // granularity, same as before).
         data_.resize(tri);
         read_exact(fd_, data_.data(), byte_len_, path);
         ::close(fd_);
@@ -365,9 +362,13 @@ public:
     // leaves the upper triangle uninitialized for diagonal tiles. For a
     // genuinely scrambled (non-monotonic) kp there's no cheaper option, so
     // the fallback below still fills the whole tile per entry.
-    Eigen::MatrixXd read_tile(int rs, int re, int cs, int ce) const {
+    Eigen::Ref<const Eigen::MatrixXd> read_tile(int rs, int re, int cs, int ce) const {
         const int tile_rows = re - rs, tile_cols = ce - cs;
-        Eigen::MatrixXd tile(tile_rows, tile_cols);
+        if (tile_scratch_.rows() < tile_rows || tile_scratch_.cols() < tile_cols) {
+            tile_scratch_.resize(std::max<Eigen::Index>(tile_scratch_.rows(), tile_rows),
+                                  std::max<Eigen::Index>(tile_scratch_.cols(), tile_cols));
+         }
+        auto tile = tile_scratch_.topLeftCorner(tile_rows, tile_cols);
 
         if (!kp_is_monotonic_) {
             // Genuinely scrambled kp: no exploitable locality, every entry
@@ -430,107 +431,9 @@ public:
         return tile;
     }
 
-    // Single-entry accessor for scattered (not tile-shaped) access patterns
-    // — e.g. GRM merging, which looks up one (analysis_row, analysis_col)
-    // pair at a time rather than processing contiguous blocks. Same index
-    // math as read_tile, just without constructing an Eigen::MatrixXd for
-    // one value.
-    double read_entry(int analysis_row, int analysis_col) const {
-        return read_raw(kp_[analysis_row], kp_[analysis_col]);
-    }
-
-    // Fused y = Kx for the packed lower-triangular mmap, specialized for the
-    // single-vector case that dominates chunked Lanczos. This bypasses the
-    // tile -> MatrixXd materialization path entirely.
-    //
-    // partials_scratch_/y_scratch_ are mutable, lazily sized on first call,
-    // and reused across every subsequent call -- this runs once per Lanczos
-    // matvec (hundreds of times per eigendecomposition), and was previously
-    // a fresh n x num_threads allocation (+ a fresh per-thread n-length
-    // Zero() vector) on every single call.
-    Eigen::VectorXd matvec_blocked(const Eigen::Ref<const Eigen::VectorXd>& x,
-                                   int block_size) const {
-        const int n = static_cast<int>(kp_.size());
-        if (x.size() != n)
-            throw std::invalid_argument("ChunkedGrmReader::matvec_blocked: x has wrong length.");
-
-#ifdef _OPENMP
-        const int num_threads = omp_get_max_threads();
-        if (num_threads > 1) {
-            if (partials_scratch_.rows() != n || partials_scratch_.cols() != num_threads)
-                partials_scratch_.resize(n, num_threads);
-            partials_scratch_.setZero();
-            #pragma omp parallel
-            {
-                const int tid = omp_get_thread_num();
-                auto y_local = partials_scratch_.col(tid);  // view into scratch, not a fresh alloc
-                #pragma omp for schedule(static, block_size > 0 ? block_size : 1)
-                for (int r = 0; r < n; ++r) {
-                    const double xr = x[r];
-                    const int gi = kp_[r];
-                    double acc = 0.0;
-
-                    if (kp_is_identity_) {
-                        const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2;
-                        const float* row = fbuf_ + row_base;
-                        for (int c = 0; c < r; ++c) {
-                            const double a = static_cast<double>(row[c]);
-                            acc += a * x[c];
-                            y_local[c] += a * xr;
-                        }
-                        acc += static_cast<double>(row[r]) * xr;
-                    } else {
-                        for (int c = 0; c < r; ++c) {
-                            const double a = read_raw(gi, kp_[c]);
-                            acc += a * x[c];
-                            y_local[c] += a * xr;
-                        }
-                        acc += read_raw(gi, gi) * xr;
-                    }
-
-                    y_local[r] += acc;
-                }
-            }
-            return partials_scratch_.rowwise().sum();
-        }
-#endif
-
-        // Single-threaded fallback (rare in practice -- any real SLURM
-        // allocation runs with cpus-per-task > 1). Left as a plain local: it
-        // already gets RVO/guaranteed-move on return, so persistent scratch
-        // here would trade that for a mandatory copy on every call instead.
-        Eigen::VectorXd y = Eigen::VectorXd::Zero(n);
-        for (int r = 0; r < n; ++r) {
-            const double xr = x[r];
-            const int gi = kp_[r];
-            double acc = 0.0;
-
-            if (kp_is_identity_) {
-                const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2;
-                const float* row = fbuf_ + row_base;
-                for (int c = 0; c < r; ++c) {
-                    const double a = static_cast<double>(row[c]);
-                    acc += a * x[c];
-                    y[c] += a * xr;
-                }
-                acc += static_cast<double>(row[r]) * xr;
-            } else {
-                for (int c = 0; c < r; ++c) {
-                    const double a = read_raw(gi, kp_[c]);
-                    acc += a * x[c];
-                    y[c] += a * xr;
-                }
-                acc += read_raw(gi, gi) * xr;
-            }
-
-            y[r] += acc;
-        }
-
-        return y;
-    }
 
 private:
-    mutable Eigen::MatrixXd partials_scratch_;  // n x num_threads, reused across matvec_blocked calls
+    mutable Eigen::MatrixXd tile_scratch_;
 
     double read_raw(int gi, int gj) const {
         const int file_row = std::max(gi, gj);
@@ -645,7 +548,7 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
     handle.m_snps = read_grm_N_mean(prefix, n_grm);
     auto file = std::make_shared<ChunkedGrmReader>(prefix + ".grm.bin", std::move(kp), n_grm);
     handle.file = file;
-    handle.reader = [file](int rs, int re, int cs, int ce) -> Eigen::MatrixXd {
+    handle.reader = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXd> {
         return file->read_tile(rs, re, cs, ce);
     };
     return handle;
@@ -799,11 +702,7 @@ inline void merge_grms(
         // Pull this block from input files in parallel across all 2K input streams
         // (.grm.bin and .grm.N.bin for each input). Every stream has an independent
         // file descriptor and advances sequentially block by block.
-#ifdef _OPENMP
         const int max_io_threads = std::min(omp_get_max_threads(), 8);
-#else
-        const int max_io_threads = 1;
-#endif
         // read_exact throws (via LOGGER.e) on failure; letting that escape a
         // parallel region is undefined behaviour (likely std::terminate()
         // instead of the intended error message). Catch per-thread, defer
@@ -830,7 +729,6 @@ inline void merge_grms(
 
         // Compute the N-weighted average across all elements in this chunk.
         // Tiled in L1-cache-sized blocks (4096 floats = 32KB per stack tile)
-        // with static OpenMP scheduling for uniform load balancing.
         constexpr size_t TILE_SIZE = 4096;
         #pragma omp parallel for schedule(static)
         for (size_t t_start = 0; t_start < elems_this_chunk; t_start += TILE_SIZE) {

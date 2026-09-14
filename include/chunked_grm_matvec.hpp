@@ -26,28 +26,30 @@
  * lower-triangular-only I/O, applied to a matvec instead of a build.
  */
 #pragma once
-
 #include <Eigen/Dense>
 #include <algorithm>
 #include <functional>
 #include <vector>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 namespace gcta_chunked {
 
 // Reads K[rs:re, cs:ce] for a tile at or below the diagonal (cs_block <=
 // rs_block, so ce <= re always holds for j==i, and the whole tile is valid
-// lower-triangular data for j<i). Must return an (re-rs) x (ce-cs) matrix.
+// lower-triangular data for j<i). Must return an (re-rs) x (ce-cs) view.
 //
 // Implementation note for whoever wires this to grm_binary_io.hpp: the file
 // stores float32 (row-major packed lower triangle); read as float and
 // .cast<double>() once here, at the tile level, rather than widening the
-// whole file up front. Tiles are small and short-lived, so the widen is
-// cheap regardless of tile size, and this is the only place precision needs
-// to be decided — everything downstream of this callback is already double.
-using TileReader = std::function<Eigen::MatrixXd(int rs, int re, int cs, int ce)>;
+// whole file up front. This is the only place precision needs to be
+// decided — everything downstream of this callback is already double.
+//
+// Return type is a Ref, not a MatrixXd, deliberately: implementations are
+// expected to hand back a view into storage they own and reuse across
+// calls (e.g. ChunkedGrmReader::read_tile's per-thread scratch buffer)
+// rather than allocate a fresh block_size x block_size matrix per call —
+// at the memory budgets this is sized against.
+
+using TileReader = std::function<Eigen::Ref<const Eigen::MatrixXd>(int rs, int re, int cs, int ce)>;
 
 struct BlockPartition {
     std::vector<int> starts;  // starts[i]..starts[i+1) is block i; starts.back() == n
@@ -62,9 +64,9 @@ struct BlockPartition {
 };
 
 // Solve for the largest row-chunk size (the `block_size` passed to every
-// function below, and to matvec_blocked wherever that's defined) that fits
-// a given memory budget, rather than each call site guessing a fixed
-// constant or re-deriving this arithmetic independently.
+// function below) that fits a given memory budget, rather than each call
+// site guessing a fixed constant or re-deriving this arithmetic
+// independently.
 //
 // Every one of these streaming entry points holds at most two buffers live
 // per chunk: the `chunk_rows x n` tile-read slab (chunked_diagonal,
@@ -140,67 +142,30 @@ inline Eigen::MatrixXd chunked_symmetric_matvec(
 
     Eigen::MatrixXd Y = Eigen::MatrixXd::Zero(n, X.cols());
 
-    // Lanczos matvecs are single-vector (X.cols()==1), where BLAS GEMV often
-    // leaves many cores idle. Parallelise over source blocks in that case.
-    // For block multiplies (rSVD sketches/power iters), keep the original
-    // serial block traversal so each tile multiply remains a larger GEMM.
-#ifdef _OPENMP
-    const bool prefer_tile_parallel = (X.cols() == 1) && (omp_get_max_threads() > 1) && (m > 1);
-#else
-    const bool prefer_tile_parallel = false;
-#endif
-
     for (int i = 0; i < m; ++i) {
         const int rs = part.block_start(i), re = part.block_end(i);
         const int rows_i = re - rs;
 
-        if (!prefer_tile_parallel) {
-            for (int j = 0; j <= i; ++j) {
-                const int cs = part.block_start(j), ce = part.block_end(j);
-                Eigen::MatrixXd tile = read_tile(rs, re, cs, ce);  // (re-rs) x (ce-cs)
+        for (int j = 0; j <= i; ++j) {
+            const int cs = part.block_start(j), ce = part.block_end(j);
+            auto tile = read_tile(rs, re, cs, ce);  // (re-rs) x (ce-cs) view; consumed before next call
 
-                if (i == j) {
-                    // Diagonal block: only its own lower triangle is valid data
-                    // (mirrors how it was written); mirror locally before use.
-                    Eigen::MatrixXd tile_full = tile.selfadjointView<Eigen::Lower>();
-                    tile.resize(0, 0);  // fully absorbed into tile_full; not needed for the GEMM below
-                    Y.middleRows(rs, rows_i).noalias() += tile_full * X.middleRows(rs, rows_i);
-                } else {
-                    // Off-diagonal: tile = K[B_i, B_j]; reflect its transpose
-                    // into B_j's output row range to account for K[B_j, B_i]
-                    // without ever reading it from disk.
-                    Y.middleRows(rs, rows_i).noalias() += tile * X.middleRows(cs, ce - cs);
-                    Y.middleRows(cs, ce - cs).noalias() += tile.transpose() * X.middleRows(rs, rows_i);
-                }
+            if (i == j) {
+                // Diagonal block: only its own lower triangle is valid data
+                // (mirrors how it was written). selfadjointView<Lower>() is
+                // a lazy view — Eigen dispatches the product straight to a
+                // symmetric GEMM/GEMV without ever materializing the
+                // mirrored dense copy that used to sit here.
+                Y.middleRows(rs, rows_i).noalias() +=
+                    tile.selfadjointView<Eigen::Lower>() * X.middleRows(rs, rows_i);
+            } else {
+                // Off-diagonal: tile = K[B_i, B_j]; reflect its transpose
+                // into B_j's output row range to account for K[B_j, B_i]
+                // without ever reading it from disk.
+                Y.middleRows(rs, rows_i).noalias() += tile * X.middleRows(cs, ce - cs);
+                Y.middleRows(cs, ce - cs).noalias() += tile.transpose() * X.middleRows(rs, rows_i);
             }
-            continue;
         }
-
-        Eigen::MatrixXd y_rs = Eigen::MatrixXd::Zero(rows_i, X.cols());
-#ifdef _OPENMP
-        #pragma omp parallel
-        {
-            Eigen::MatrixXd y_rs_local = Eigen::MatrixXd::Zero(rows_i, X.cols());
-            #pragma omp for schedule(dynamic)
-            for (int j = 0; j <= i; ++j) {
-                const int cs = part.block_start(j), ce = part.block_end(j);
-                Eigen::MatrixXd tile = read_tile(rs, re, cs, ce);
-
-                if (i == j) {
-                    Eigen::MatrixXd tile_full = tile.selfadjointView<Eigen::Lower>();
-                    y_rs_local.noalias() += tile_full * X.middleRows(rs, rows_i);
-                } else {
-                    y_rs_local.noalias() += tile * X.middleRows(cs, ce - cs);
-                    // For fixed i, each j maps to a disjoint block [cs, ce), so
-                    // these writes have no overlap across threads.
-                    Y.middleRows(cs, ce - cs).noalias() += tile.transpose() * X.middleRows(rs, rows_i);
-                }
-            }
-            #pragma omp critical
-            y_rs.noalias() += y_rs_local;
-        }
-#endif
-        Y.middleRows(rs, rows_i).noalias() += y_rs;
     }
     return Y;
 }
@@ -214,7 +179,7 @@ inline Eigen::VectorXd chunked_diagonal(const TileReader& read_tile, int n, int 
     Eigen::VectorXd d(n);
     for (int i = 0; i < m; ++i) {
         const int rs = part.block_start(i), re = part.block_end(i);
-        const Eigen::MatrixXd tile = read_tile(rs, re, rs, re);  // diagonal block only
+        const auto tile = read_tile(rs, re, rs, re);
         d.segment(rs, re - rs) = tile.diagonal();
     }
     return d;
@@ -237,11 +202,14 @@ inline double chunked_trace_K_squared(const TileReader& read_tile, int n, int bl
         const int rs = part.block_start(i), re = part.block_end(i);
         for (int j = 0; j <= i; ++j) {
             const int cs = part.block_start(j), ce = part.block_end(j);
-            Eigen::MatrixXd tile = read_tile(rs, re, cs, ce);
+            auto tile = read_tile(rs, re, cs, ce);
             if (i == j) {
-                Eigen::MatrixXd tile_full = tile.selfadjointView<Eigen::Lower>();
-                tile.resize(0, 0);
-                total += tile_full.squaredNorm();
+                //   full_sq = 2*lower_incl_diag_sq - diag_sq
+                double lower_incl_diag_sq = 0.0;
+                for (int c = 0; c < tile.cols(); ++c)
+                    lower_incl_diag_sq += tile.col(c).tail(tile.rows() - c).squaredNorm();
+                const double diag_sq = tile.diagonal().squaredNorm();
+                total += 2.0 * lower_incl_diag_sq - diag_sq;
             } else {
                 total += 2.0 * tile.squaredNorm();
             }

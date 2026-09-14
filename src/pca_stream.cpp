@@ -170,14 +170,8 @@ void PCAStream::processMain()
             LOGGER.e(0, "--pca exact mode (dsyevr/dsyevd) requires dense GRM loading. "
                         "Remove --grm-chunked-budget, or set --pca-approx to Lanczos/rSVD.");
 
-        // Row-chunk size for streaming reads off the GRM (chunked_symmetric_matvec /
-        // matvec_blocked). Budget-driven rather than a guessed constant, same pattern
-        // as RemlEngine.cpp's compute_woodbury_basis: solve for the number of rows
-        // that fit chunk_rows x (n + k_ext) doubles in the budget. k_ext is sized for
-        // whichever approx method got selected above — rSVD/Nystrom multiply block-wise
-        // by out_pc_num + oversample columns at once; Lanczos is normally one vector at
-        // a time (cols=1) but ncv is used here anyway as a conservative upper bound in
-        // case the underlying implementation ever blocks its matvecs internally.
+        // Row-chunk size for streaming reads off the GRM (chunked_symmetric_matvec).
+        // Budget-driven rather than a guessed constant.
         int chunk_size = 0;
         int k_ext_hint = 0;
         if (grm_chunked) {
@@ -208,13 +202,11 @@ void PCAStream::processMain()
 
         // ---- GRM access: chunked tile reader, or dense (fallback / comparison) ----
         gcta_chunked::TileReader chunked_reader;
-        std::shared_ptr<const gcta_grm_io::ChunkedGrmReader> chunked_file;
         Eigen::MatrixXd G_dense;  // left empty when grm_chunked
 
         if (grm_chunked) {
             gcta_grm_io::ChunkedGrmHandle handle = gcta_grm_io::make_chunked_grm_reader(grm_pfx, analysis_ids);
             chunked_reader = std::move(handle.reader);
-            chunked_file = std::move(handle.file);
             LOGGER.i(0, "--pca: GRM will be read in " + to_string(chunk_size) +
                         "-row chunks from [" + grm_pfx + "] (--grm-chunked-budget=" +
                         to_string(grm_chunked_budget) + "GB, k_ext up to " + to_string(k_ext_hint) +
@@ -279,21 +271,10 @@ void PCAStream::processMain()
         }
 
         auto apply = [&](const auto& X) -> Eigen::MatrixXd {
-            const int cols = static_cast<int>(X.cols());
             if (grm_chunked)
-            {
-                Eigen::MatrixXd Y;
-                if (cols == 1 && chunked_file) {
-                    Y.resize(n, 1);
-                    Y.col(0) = chunked_file->matvec_blocked(X.col(0), chunk_size);
-                } else {
-                    Y = gcta_chunked::chunked_symmetric_matvec(chunked_reader, n, chunk_size, X);
-                }
-                return Y;
-            }
-
-            Eigen::MatrixXd Y = G_dense.selfadjointView<Eigen::Upper>() * X;
-            return Y;
+                return gcta_chunked::chunked_symmetric_matvec(chunked_reader, n, chunk_size, X);
+            else
+                return G_dense.selfadjointView<Eigen::Upper>() * X;
         };
 
         Eigen::VectorXd eval;

@@ -714,10 +714,9 @@ void calcu_tr_PA(const RemlCtx& ctx, const RemlMat& P, RemlVec& tr_PA) {
             double s = 0.0;
             #pragma omp parallel for reduction(+:s) schedule(guided)
             for (int col = 0; col < ctx.n; col++) {
-                const int tail = ctx.n - col - 1;
                 s += P(col, col) * Ai(col, col);
-                if (tail > 0)
-                    s += 2.0 * P.col(col).tail(tail).dot(Ai.row(col).tail(tail).transpose());
+                if (col > 0)
+                    s += 2.0 * P.col(col).head(col).dot(Ai.col(col).head(col));
             }
             tr_PA(i) = s;
         }

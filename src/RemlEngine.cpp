@@ -80,10 +80,10 @@ RemlVec applyP_vec(const RemlCtx& ctx, const RemlVec& v) {
         w = woodbury_basis_Viv(ctx, v);
     } else if (ctx.Vi_use_llt) {
         w = v;
-        ctx.Vi_L.triangularView<Eigen::Lower>().solveInPlace(w);
-        ctx.Vi_L.triangularView<Eigen::Lower>().adjoint().solveInPlace(w);
+        ctx.Vi_L.triangularView<Eigen::Upper>().adjoint().solveInPlace(w); // U^T z = v
+        ctx.Vi_L.triangularView<Eigen::Upper>().solveInPlace(w);          // U w = z
     } else {
-        w = RemlVec(ctx.Vi.selfadjointView<Eigen::Lower>() * v);
+        w = RemlVec(ctx.Vi.selfadjointView<Eigen::Upper>() * v);
     }
     RemlVec a = ctx.Vi_X.transpose() * v;
     RemlVec b = ctx.Xt_Vi_X_i.selfadjointView<Eigen::Lower>() * a;
@@ -97,10 +97,10 @@ RemlMat applyP_mat(const RemlCtx& ctx, const RemlMat& Z) {
         W = woodbury_basis_ViZ(ctx, Z);
     } else if (ctx.Vi_use_llt) {
         W = Z;
-        ctx.Vi_L.triangularView<Eigen::Lower>().solveInPlace(W);
-        ctx.Vi_L.triangularView<Eigen::Lower>().adjoint().solveInPlace(W);
+        ctx.Vi_L.triangularView<Eigen::Upper>().adjoint().solveInPlace(W); // U^T z = v
+        ctx.Vi_L.triangularView<Eigen::Upper>().solveInPlace(W);          // U w = z
     } else {
-        W = RemlMat(ctx.Vi.selfadjointView<Eigen::Lower>() * Z);
+        W = RemlMat(ctx.Vi.selfadjointView<Eigen::Upper>() * Z);
     }
     const RemlMat A = ctx.Vi_X.transpose() * Z;
     W.noalias() -= ctx.Vi_X * (ctx.Xt_Vi_X_i.selfadjointView<Eigen::Lower>() * A);
@@ -263,12 +263,12 @@ void init_varcomp(const RemlCtx& ctx,
 bool verbose=false;
 
 
-// Fill ctx.Vi (lower triangle + diagonal) with sum_ci varcmp[ci] * A[ci].
+// Fill ctx.Vi (upper triangle + diagonal) with sum_ci varcmp[ci] * A[ci].
 // Caller must have already called ctx.Vi.resize(n, n) and zeroed it.
 // Identity-components (A.size()==0) are added to the diagonal only.
-void assemble_V_lower(RemlCtx& ctx, const RemlVec& varcmp) {
+void assemble_V_upper(RemlCtx& ctx, const RemlVec& varcmp) {
     const int num_comp = static_cast<int>(ctx.r_indx.size());
-    ctx.Vi.triangularView<Eigen::Lower>().setZero();
+    ctx.Vi.triangularView<Eigen::Upper>().setZero();
 
     if (ctx.grm_chunk_rows > 0) {
         // Single-GRM only (enforced where ctx.grm_chunk_rows is set) --
@@ -276,7 +276,7 @@ void assemble_V_lower(RemlCtx& ctx, const RemlVec& varcmp) {
         // TileReader/chunk_rows already proven correct by
         // chunked_symmetric_matvec. Everything downstream of this function
         // (dpotrf, Vi_L, applyP_mat) is completely unchanged: ctx.Vi still
-        // ends up fully dense -- this only changes how its lower triangle
+        // ends up fully dense -- this only changes how its upper triangle
         // gets filled in, so ctx.A[GRM] never needs to be resident.
         const double sg2 = varcmp[0];
         const gcta_chunked::BlockPartition part(ctx.n, ctx.grm_chunk_rows);
@@ -285,43 +285,38 @@ void assemble_V_lower(RemlCtx& ctx, const RemlVec& varcmp) {
             const int rs = part.block_start(i), re = part.block_end(i);
             for (int j = 0; j <= i; ++j) {
                 const int cs = part.block_start(j), ce = part.block_end(j);
-                const Eigen::MatrixXd tile = ctx.grm_tile_reader(rs, re, cs, ce);  // (re-rs) x (ce-cs)
+                const auto tile = ctx.grm_tile_reader(rs, re, cs, ce);  // (re-rs) x (ce-cs) view
 
                 if (i == j) {
-                    // Diagonal block: only the tile's own lower triangle is
-                    // valid data, in the same convention ctx.Vi already
-                    // uses -- copy it directly, column by column. (No
-                    // mirroring needed here, unlike chunked_symmetric_matvec,
-                    // which needs the tile's full symmetric form to do
-                    // tile_full * X; we're writing straight into ctx.Vi's
-                    // own lower triangle, same layout as the source.)
+                    // Diagonal block: the tile's own LOWER triangle holds the
+                    // valid data (row >= col) -- fixed by how
+                    // ChunkedGrmReader/grm_binary_io.hpp read the GRM's
+                    // on-disk packed-lower-triangular format.
                     for (int col = 0; col < re - rs; ++col)
-                        ctx.Vi.col(cs + col).segment(rs + col, re - rs - col) +=
-                            sg2 * tile.col(col).tail(re - rs - col);
+                        ctx.Vi.col(cs + col).segment(rs, col + 1) +=
+                            sg2 * tile.row(col).head(col + 1).transpose();
+
                 } else {
-                    // Off-diagonal block (i > j): every row in block i
-                    // exceeds every column in block j, so this whole tile
-                    // sits inside the lower triangle -- write it in one shot.
-                    ctx.Vi.block(rs, cs, re - rs, ce - cs) += sg2 * tile;
+                    // Off-diagonal block (i > j): block rows rs..re sit
+                    // strictly below block cols cs..ce, i.e. this tile lives
+                    // in the lower triangle. By symmetry the mirror-image
+                    // block (rows cs..ce, cols rs..re) lives in the upper
+                    // triangle, so write the transposed tile there instead.
+                    ctx.Vi.block(cs, rs, ce - cs, re - rs) += sg2 * tile.transpose();
                 }
             }
         }
     } else {
-        // ctx.A is upper-triangle-only storage. The write side
-        // (ctx.Vi.col(j).tail(...)) must stay column-contiguous -- it's
-        // fixed by the surrounding accumulation. The corresponding read
-        // used to be ctx.A[...].col(j).tail(n-j), i.e. rows j..n-1 of
-        // column j -- the lower triangle, no longer valid. By symmetry
-        // A(j..n-1, j) == A(j, j..n-1), so read row j instead: strided
-        // (stride n) rather than contiguous. Correctness fix only for now;
-        // not yet perf-traced against a contiguous-copy alternative -- see
-        // plan.
+        // ctx.A is upper-triangle-only storage, so both the read
+        // (ctx.A[...].col(j).head(j+1)) and the write
+        // (ctx.Vi.col(j).head(j+1)) are now column-contiguous -- zero
+        // stride, directly vectorizable.
         #pragma omp parallel for schedule(static)
         for (int j = 0; j < ctx.n; j++) {
             for (int ci = 0; ci < num_comp; ci++)
                 if (ctx.A[ctx.r_indx[ci]].size() > 0)
-                    ctx.Vi.col(j).tail(ctx.n - j) +=
-                        varcmp[ci] * ctx.A[ctx.r_indx[ci]].row(j).tail(ctx.n - j).transpose();
+                    ctx.Vi.col(j).head(j + 1) +=
+                        varcmp[ci] * ctx.A[ctx.r_indx[ci]].col(j).head(j + 1);
         }
     }
 
@@ -362,22 +357,22 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
         return true;
     }
 
-    // Dense path: assemble V (lower triangle)
+    // Dense path: assemble V (upper triangle)
     if (factorize_only && static_cast<int>(ctx.r_indx.size()) > 1)
         ctx.Vi.swap(ctx.Vi_L);
     ctx.Vi.resize(ctx.n, ctx.n);
 
     if (ctx.r_indx.size() == 1) {
-        ctx.Vi.triangularView<Eigen::Lower>().setZero();
+        ctx.Vi.triangularView<Eigen::Upper>().setZero();
         ctx.Vi.diagonal() = RemlVec::Constant(ctx.n, 1.0 / prev_varcmp[0]);
         logdet = ctx.n * std::log(prev_varcmp[0]);
     } else {
-        assemble_V_lower(ctx, prev_varcmp);
+        assemble_V_upper(ctx, prev_varcmp);
 
         // LLT-only path (factorize_only, no diagV_adj)
         if (factorize_only && !ctx.reml_diagV_adj && !ctx.reml_force_dense_vi) {
             gcta_blas_int blas_n = static_cast<gcta_blas_int>(ctx.n);
-            if (gcta_dpotrf(blas_n, ctx.Vi.data(), blas_n) == 0) {
+            if (gcta_dpotrf(blas_n, ctx.Vi.data(), blas_n, 'U') == 0) {
                 logdet = 2.0 * ctx.Vi.diagonal().array().log().sum();
                 ctx.Vi_L.swap(ctx.Vi);
                 ctx.Vi.resize(0, 0);
@@ -386,7 +381,7 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
             }
             // dpotrf failed: reassemble from scratch (dpotrf may have partially overwritten Vi)
             ctx.Vi.resize(ctx.n, ctx.n);
-            assemble_V_lower(ctx, prev_varcmp);
+            assemble_V_upper(ctx, prev_varcmp);
             LOGGER.w(0, "REML: final LLT factorization of V failed at convergence; falling back to dense inverse.");
         }
 
@@ -396,21 +391,27 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
 
         if (method_try == INV_LLT && (!factorize_only || ctx.reml_force_dense_vi)) {
             gcta_blas_int blas_n_f = static_cast<gcta_blas_int>(ctx.n);
-            bool llt_ok = (gcta_dpotrf(blas_n_f, ctx.Vi.data(), blas_n_f) == 0);
+            bool llt_ok = (gcta_dpotrf(blas_n_f, ctx.Vi.data(), blas_n_f, 'U') == 0);
             if (llt_ok) {
                 logdet = ctx.Vi.diagonal().array().square().log().sum();
-                llt_ok = (gcta_dpotri(blas_n_f, ctx.Vi.data(), blas_n_f) == 0);
+                llt_ok = (gcta_dpotri(blas_n_f, ctx.Vi.data(), blas_n_f, 'U') == 0);
             }
             if (llt_ok) {
-                if (!factorize_only)
-                    ctx.Vi.triangularView<Eigen::Upper>() = ctx.Vi.transpose();
+                // No mirror here: every downstream consumer of a dense ctx.Vi
+                // (calcu_P_impl's Vi_X and its P construction) reads via
+                // selfadjointView<Eigen::Upper>()/triangularView<Eigen::Upper>(),
+                // exactly what dpotri('U') just populated -- mirroring the
+                // lower triangle here would be a redundant O(n^2/2) copy
+                // every REML iteration. The one consumer that genuinely
+                // needs a fully dense ctx.Vi (the rare X'V^{-1}X-not-PD
+                // fallback in calcu_P_impl) mirrors on demand there instead.
                 return true;
             }
             // dpotrf/dpotri failed: reassemble for LU fallback
             ctx.Vi.resize(ctx.n, ctx.n);
-            assemble_V_lower(ctx, prev_varcmp);
-            ctx.Vi.triangularView<Eigen::Upper>() =
-                ctx.Vi.triangularView<Eigen::Lower>().transpose();
+            assemble_V_upper(ctx, prev_varcmp);
+            ctx.Vi.triangularView<Eigen::Lower>() =
+                ctx.Vi.triangularView<Eigen::Upper>().transpose();
             method_try = INV_LU;
         }
 
@@ -449,10 +450,10 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
         ctx.Uk_Vi_X = (ctx.UkTX - ck_UkTX) / ctx.sigma2_eff;
     } else if (ctx.Vi_use_llt) {
         ctx.Vi_X = ctx.X;
-        ctx.Vi_L.triangularView<Eigen::Lower>().solveInPlace(ctx.Vi_X);
-        ctx.Vi_L.triangularView<Eigen::Lower>().adjoint().solveInPlace(ctx.Vi_X);
+        ctx.Vi_L.triangularView<Eigen::Upper>().adjoint().solveInPlace(ctx.Vi_X); // U^T z = X
+        ctx.Vi_L.triangularView<Eigen::Upper>().solveInPlace(ctx.Vi_X);          // U w = z
     } else {
-        ctx.Vi_X.noalias() = ctx.Vi.selfadjointView<Eigen::Lower>() * ctx.X;
+        ctx.Vi_X.noalias() = ctx.Vi.selfadjointView<Eigen::Upper>() * ctx.X;
     }
     ctx.Xt_Vi_X_i.noalias() = ctx.X.transpose() * ctx.Vi_X;
 
@@ -472,15 +473,15 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
         RemlMat Uk_scaled = ctx.Uk;
         for (int j = 0; j < ctx.woodbury_basis_rank_; ++j)
             Uk_scaled.col(j) *= std::sqrt(ctx.ck[j] / ctx.sigma2_eff);
-        ctx.Vi.selfadjointView<Eigen::Lower>().rankUpdate(Uk_scaled, -1.0);
-        ctx.Vi.triangularView<Eigen::Upper>() = ctx.Vi.transpose();
+        ctx.Vi.selfadjointView<Eigen::Upper>().rankUpdate(Uk_scaled, -1.0);
+        // No mirror: P's rank-update below only reads ctx.Vi's upper triangle.
     } else if (ctx.Vi_use_llt) {
         ctx.Vi.swap(ctx.Vi_L);
         gcta_blas_int blas_n_p = static_cast<gcta_blas_int>(ctx.n);
-        if (gcta_dpotri(blas_n_p, ctx.Vi.data(), blas_n_p) != 0)
+        if (gcta_dpotri(blas_n_p, ctx.Vi.data(), blas_n_p, 'U') != 0)
             LOGGER.e(0, "dpotri failed when materialising V^{-1} for P.");
-        ctx.Vi.triangularView<Eigen::Upper>() = ctx.Vi.transpose();
         ctx.Vi_use_llt = false;
+        // No mirror: P's rank-update below only reads ctx.Vi's upper triangle.
     }
 
     Eigen::LLT<RemlMat> llt(ctx.Xt_Vi_X_i);
@@ -488,9 +489,15 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
         RemlMat Z;
         Z.noalias() = ctx.Vi_X * llt.matrixL();
         P->swap(ctx.Vi);
-        P->selfadjointView<Eigen::Lower>().rankUpdate(Z, -1.0);
-        P->triangularView<Eigen::Upper>() = P->transpose();
+        P->selfadjointView<Eigen::Upper>().rankUpdate(Z, -1.0);
+        if (ctx.reml_mtd == 1)
+            P->triangularView<Eigen::Lower>() = P->transpose();
     } else {
+        // Rare path (X'V^{-1}X not positive definite): the subtraction below
+        // is a plain dense op, not a triangular rank-update, so unlike the
+        // common case above it needs a fully mirrored ctx.Vi. Mirror here,
+        // on demand, rather than paying for it on every iteration above.
+        ctx.Vi.triangularView<Eigen::Lower>() = ctx.Vi.transpose();
         RemlMat W;
         W.noalias() = ctx.Vi_X * ctx.Xt_Vi_X_i;
         P->swap(ctx.Vi);
@@ -708,8 +715,8 @@ void calcu_tr_PA(const RemlCtx& ctx, const RemlMat& P, RemlVec& tr_PA) {
             // rows col+1..n-1 of column col (lower triangle), no longer
             // valid. By symmetry Ai(col+1..n-1, col) == Ai(col, col+1..n-1)
             // -- read row col instead. Correctness fix only for now, same
-            // as assemble_V_lower -- not yet perf-traced against a
-            // contiguous-copy alternative.
+            // as assemble_V_upper's pre-upper-triangle-swap fix -- not yet
+            // perf-traced against a contiguous-copy alternative.
             const auto& Ai = ctx.A[ctx.r_indx[i]];
             double s = 0.0;
             #pragma omp parallel for reduction(+:s) schedule(guided)
@@ -724,7 +731,7 @@ void calcu_tr_PA(const RemlCtx& ctx, const RemlMat& P, RemlVec& tr_PA) {
 }
 
 void calcu_Hi(RemlCtx& ctx, RemlMat& P, RemlMat& Hi) {
-    P = (P + P.transpose()) * 0.5;
+    P.triangularView<Eigen::Lower>() = P.transpose();
     const int m = static_cast<int>(ctx.r_indx.size());
 
     std::vector<RemlMat> PA(m);
@@ -839,7 +846,7 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     if (use_approx || woodbury_basis_active)
         Py = applyP_vec(ctx, ctx.y);
     else
-        Py.noalias() = P.selfadjointView<Eigen::Lower>() * ctx.y;
+        Py.noalias() = P.selfadjointView<Eigen::Upper>() * ctx.y;
 
     const int m = static_cast<int>(ctx.r_indx.size());
     RemlMat APy(ctx.n, m);
@@ -869,10 +876,7 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     } else {
         R.noalias() = APy.transpose() * Py;
         RemlMat PAPy(ctx.n, m);
-        // P is fully symmetrised by calcu_P_impl before this call.
-        // Plain product dispatches to dgemm, which is faster than dsymm for
-        // rectangular APy (m is small) on AOCL/Zen4.
-        PAPy.noalias() = P * APy;
+        PAPy.noalias() = P.selfadjointView<Eigen::Upper>() * APy;
         Hi.noalias() = APy.transpose() * PAPy;
     }
     Hi = 0.5 * Hi;
@@ -1211,7 +1215,7 @@ void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
         Py = applyP_vec(ctx, ctx.y);
     } else {
         calcu_tr_PA(ctx, P, tr_PA);
-        Py.noalias() = P.selfadjointView<Eigen::Lower>() * ctx.y;
+        Py.noalias() = P.selfadjointView<Eigen::Upper>() * ctx.y;
     }
 
     const int m = static_cast<int>(ctx.r_indx.size());
@@ -2251,7 +2255,7 @@ RemlState build_reml_state(RemlCtx& ctx) {
 
         rs.lambda_tail_f = static_cast<float>(ctx.lambda_tail);
     } else if (ctx.Vi_use_llt) {
-        // Vi_L holds the lower Cholesky factor L of V (from dpotrf).
+        // Vi_L holds the upper Cholesky factor U of V (V = U^T U, from dpotrf).
         // Store it as float — the streaming code uses STRSV/STRSM directly,
         // avoiding dpotri (O(n³/3)) and a second Cholesky of V^{-1} (O(n³/3)).
         rs.is_llt = true;
@@ -2271,15 +2275,15 @@ RemlState build_reml_state(RemlCtx& ctx) {
         // operate in place on a caller-owned buffer -- that doubles peak
         // RSS transiently (ctx.Vi + LLT's internal copy, both n×n doubles,
         // alive simultaneously) for no reason, since ctx.Vi is read via
-        // selfadjointView<Lower> everywhere else in this file (only the
-        // lower triangle is guaranteed valid, matching dpotrf's contract)
+        // selfadjointView<Upper> everywhere else in this file (only the
+        // upper triangle is guaranteed valid, matching dpotrf('U')'s contract)
         // and is freed immediately below regardless.
         gcta_blas_int blas_n_bs = static_cast<gcta_blas_int>(ctx.n);
-        if (gcta_dpotrf(blas_n_bs, ctx.Vi.data(), blas_n_bs) != 0)
+        if (gcta_dpotrf(blas_n_bs, ctx.Vi.data(), blas_n_bs, 'U') != 0)
             LOGGER.e(0, "Vi is not positive definite when building REML state.");
         rs.is_llt = false;
         rs.Vi_L_f.resize(ctx.n, ctx.n);
-        rs.Vi_L_f.noalias() = ctx.Vi.cast<float>();   // lower triangle valid; upper is dpotrf
+        rs.Vi_L_f.noalias() = ctx.Vi.cast<float>();   // upper triangle valid; lower is dpotrf
                                                        // leftover and never read downstream --
                                                        // same convention as the Vi_use_llt branch above
         ctx.Vi.resize(0, 0);

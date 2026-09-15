@@ -167,18 +167,22 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
 
         // Pre-compute starting indices per column to avoid serial loop dependencies.
         // The file bytes are already resident in memory; the parallel work here is only
-        // the unpack/decode step, not the disk-facing read path.
+        // the unpack/decode step, not the disk-facing read path. Mirrors
+        // writeRemlStateFromCtx's packing: column j holds head(j+1) (rows 0..j),
+        // growing with j -- st.Vi_L_f is upper-triangle-valid on return, matching
+        // what run_mlma_stream_association's STRSV/STRSM/STRMM calls expect
+        // (CblasUpper / triangularView<Eigen::Upper>()).
         std::vector<size_t> col_offsets(hdr.n);
         size_t current_idx = 0;
         for (int32_t j = 0; j < hdr.n; ++j) {
             col_offsets[j] = current_idx;
-            current_idx += static_cast<size_t>(hdr.n - j);
+            current_idx += static_cast<size_t>(j + 1);
         }
 
         #pragma omp parallel for schedule(static)
         for (int32_t j = 0; j < hdr.n; ++j) {
-            const int32_t len = hdr.n - j;
-            std::memcpy(st.Vi_L_f.col(j).tail(len).data(),
+            const int32_t len = j + 1;
+            std::memcpy(st.Vi_L_f.col(j).head(len).data(),
                         packed_buf.data() + col_offsets[j],
                         static_cast<size_t>(len) * sizeof(float));
         }
@@ -345,7 +349,7 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
             // Copy to preserve original ctx.Vi state
             Vi_copy = ctx.Vi;
             gcta_blas_int blas_n = static_cast<gcta_blas_int>(ctx.n);
-            if (gcta_dpotrf(blas_n, Vi_copy.data(), blas_n) != 0)
+            if (gcta_dpotrf(blas_n, Vi_copy.data(), blas_n, 'U') != 0)
                 LOGGER.e(0, "Vi is not positive definite when factorising for save.");
             mat_ptr = &Vi_copy;
         }
@@ -357,19 +361,23 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
         // Allocate packed single-precision output buffer once
         std::vector<float> packed_buf(tri_elements);
 
-        // Pre-compute offsets per column to allow multi-threaded parallel packing
+        // Pre-compute offsets per column to allow multi-threaded parallel packing.
+        // mat is upper-triangle-valid (a Cholesky factor from dpotrf('U'), either
+        // ctx.Vi_L directly or the freshly-factorised Vi_copy above), so column j
+        // packs its own head(j+1) (rows 0..j) -- growing with j, the mirror image
+        // of the pre-upper-triangle-swap layout, which packed tail(n-j) instead.
         std::vector<size_t> col_offsets(n_val);
         size_t current_idx = 0;
         for (size_t j = 0; j < n_val; ++j) {
             col_offsets[j] = current_idx;
-            current_idx += (n_val - j);
+            current_idx += (j + 1);
         }
 
         // Parallel float conversion & packing: zero lock contention across CPU cores
         #pragma omp parallel for schedule(static)
         for (int32_t j = 0; j < ctx.n; ++j) {
-            const int32_t len = ctx.n - j;
-            const double* col_src = mat.col(j).tail(len).data();
+            const int32_t len = j + 1;
+            const double* col_src = mat.col(j).head(len).data();
             float* dst = packed_buf.data() + col_offsets[j];
 
             for (int32_t i = 0; i < len; ++i) {

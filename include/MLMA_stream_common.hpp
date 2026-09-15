@@ -220,24 +220,24 @@ inline void run_mlma_stream_association(RemlState& state,
             "(V^{-1} = D^{-1} - D^{-1} U_k C U_k^T D^{-1})." << std::endl;
         Vi_y = woodbury_apply_Vi_f(state.wb, y_adj);
     } else if (use_llt) {
-        // V^{-1} y = L^{-T}(L^{-1} y) via two float triangular solves
-        // against L, the Cholesky factor of V.
-        LOGGER << "MLMA streaming: applying V^{-1} via triangular solve against L, "
-            "where V = L L^T (STRSM/STRSV — forward/back substitution)." << std::endl;
+        // V^{-1} y = U^{-1}(U^{-T} y) via two float triangular solves
+        // against U, the (upper) Cholesky factor of V.
+        LOGGER << "MLMA streaming: applying V^{-1} via triangular solve against U, "
+            "where V = U^T U (STRSM/STRSV — forward/back substitution)." << std::endl;
         Vi_y = y_adj;
-        cblas_strsv(CblasColMajor, CblasLower, CblasNoTrans, CblasNonUnit,
+        cblas_strsv(CblasColMajor, CblasUpper, CblasTrans, CblasNonUnit,
                     n, state.Vi_L_f.data(), n, Vi_y.data(), 1);
-        cblas_strsv(CblasColMajor, CblasLower, CblasTrans, CblasNonUnit,
+        cblas_strsv(CblasColMajor, CblasUpper, CblasNoTrans, CblasNonUnit,
                     n, state.Vi_L_f.data(), n, Vi_y.data(), 1);
     } else {
-        // V^{-1} y = Li (Li^T y) via two float triangular products against
-        // Li, the Cholesky factor of V^{-1} itself. Li was already computed
-        // once at REML-exit/save time (see writeRemlStateFromCtx /
+        // V^{-1} y = Ui (Ui^T y) via two float triangular products against
+        // Ui, the (upper) Cholesky factor of V^{-1} itself. Ui was already
+        // computed once at REML-exit/save time (see writeRemlStateFromCtx /
         // build_reml_state) — no factorization happens here, ever.
-        LOGGER << "MLMA streaming: applying V^{-1} via triangular product against L_i, "
-            "where V^{-1} = L_i L_i^T (STRMM — no linear solve)." << std::endl;
-        Vi_y.noalias() = state.Vi_L_f.triangularView<Eigen::Lower>().transpose() * y_adj;
-        Vi_y = state.Vi_L_f.triangularView<Eigen::Lower>() * Vi_y;
+        LOGGER << "MLMA streaming: applying V^{-1} via triangular product against U_i, "
+            "where V^{-1} = U_i^T U_i (STRMM — no linear solve)." << std::endl;
+        Vi_y.noalias() = state.Vi_L_f.triangularView<Eigen::Upper>() * y_adj;
+        Vi_y = state.Vi_L_f.triangularView<Eigen::Upper>().transpose() * Vi_y;
     }
 
     Vi_y.array() *= w_sqrt.array();
@@ -251,7 +251,7 @@ inline void run_mlma_stream_association(RemlState& state,
         if (use_wb) {
             woodbury_xvx_diag_block(wb, X_block, bs, xvx_diag, UkX_scratch);
         } else if (use_llt) {
-            cblas_strsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasNonUnit,
+            cblas_strsm(CblasColMajor, CblasLeft, CblasUpper, CblasTrans, CblasNonUnit,
                         n, bs, 1.0f,
                         state.Vi_L_f.data(), n,
                         X_block.data(), n);
@@ -260,7 +260,7 @@ inline void run_mlma_stream_association(RemlState& state,
                 xvx_diag[j] = X_block.col(j).squaredNorm();
             }
         } else {
-            cblas_strmm(CblasColMajor, CblasLeft, CblasLower, CblasTrans, CblasNonUnit,
+            cblas_strmm(CblasColMajor, CblasLeft, CblasUpper, CblasNoTrans, CblasNonUnit,
                         n, bs, 1.0f,
                         state.Vi_L_f.data(), n,
                         X_block.data(), n);

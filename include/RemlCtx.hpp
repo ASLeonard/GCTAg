@@ -140,6 +140,7 @@ struct RemlCtx {
     bool   reml_fixed_var            = false;
     bool   reml_allow_constrain_run  = false;
     bool   reml_no_HE_start          = false; // Active by default
+    bool   he_warm_start_applied = false;
 
     bool   svd_nystrom          = false; // true → single-pass Nystrom basis
 

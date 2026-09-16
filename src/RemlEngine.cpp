@@ -165,13 +165,13 @@ int constrain_varcmp(const RemlCtx& ctx, RemlVec& varcmp) {
     return num;
 }
 
-void init_varcomp(RemlCtx& ctx,
+//Returns true if variance components successfully warm-started via HE, false if not (e.g. single-GRM but priors specified)
+bool init_varcomp(const RemlCtx& ctx,
                   const std::vector<double>& priors_var,
                   const std::vector<double>& priors,
                   RemlVec& varcmp) {
     const int m = static_cast<int>(ctx.r_indx.size());
     varcmp = RemlVec::Zero(m);
-    ctx.he_warm_start_applied = false;
 
     if (!priors_var.empty()) {
         for (int i = 0; i < m - 1; i++) varcmp[i] = priors_var[i];
@@ -203,7 +203,7 @@ void init_varcomp(RemlCtx& ctx,
         const RemlMat XtX = ctx.X.transpose() * ctx.X;
         Eigen::LDLT<RemlMat> XtX_ldlt(XtX);
         const int dof = n - ctx.X_c;
-        if (XtX_ldlt.info() != Eigen::Success || dof <= 0) return;
+        if (XtX_ldlt.info() != Eigen::Success || dof <= 0) return false;
         const RemlVec y_r = ctx.y - ctx.X * XtX_ldlt.solve(ctx.X.transpose() * ctx.y);
 
         if (ctx.Vi_use_woodbury_basis) {
@@ -264,12 +264,13 @@ void init_varcomp(RemlCtx& ctx,
                     && sg_he <= 100.0 * scale && se_he <= 100.0 * scale) {
                     varcmp(0) = std::max(sg_he, 0.01 * scale);
                     varcmp(1) = std::max(se_he, 0.01 * scale);
-                    ctx.he_warm_start_applied = true;
                     LOGGER << "REML: used single-GRM HE warm-start for variance components = " << varcmp.transpose() << std::endl;
+                    return true;
                 }
             }
         }
     }
+    return false;
 }
 bool verbose=false;
 
@@ -717,7 +718,46 @@ void calcu_tr_PA(const RemlCtx& ctx, const RemlMat& P, RemlVec& tr_PA) {
     const int m = static_cast<int>(ctx.r_indx.size());
     tr_PA.resize(m);
     for (int i = 0; i < m; i++) {
-        if (ctx.A[ctx.r_indx[i]].size() == 0) {
+        if (ctx.grm_chunk_rows > 0 && i == 0) {
+            // Exact GRM, streamed: tr(P*K) = <P,K>_F (both symmetric), computed
+            // from the same lower-triangular tiles assemble_V_upper reads, using
+            // the same diagonal/2*off-diagonal decomposition the dense branch
+            // below uses -- O(n^2), not a materialised O(n^3) K*P product.
+            // P is upper-triangle-only at this point (mirrors the dense branch).
+            const gcta_chunked::BlockPartition part(ctx.n, ctx.grm_chunk_rows);
+            const int nb = part.num_blocks();
+            double s = 0.0;
+            // Serial, deliberately: ctx.grm_tile_reader is called directly here
+            // (not via a gcta_chunked::* helper), and every other direct caller
+            // in this file (assemble_V_upper's chunked block loop) is serial too
+            // -- the raw reader is presumably a single stateful file/mmap
+            // cursor, not proven safe for concurrent invocation the way the
+            // gcta_chunked:: wrapper functions are.
+            for (int bi = 0; bi < nb; ++bi) {
+                const int rs = part.block_start(bi), re = part.block_end(bi);
+                for (int bj = 0; bj <= bi; ++bj) {
+                    const int cs = part.block_start(bj), ce = part.block_end(bj);
+                    const auto tile = ctx.grm_tile_reader(rs, re, cs, ce);
+                    if (bi == bj) {
+                        for (int col = 0; col < re - rs; ++col) {
+                            s += P(rs + col, rs + col) * tile(col, col);
+                            if (col > 0)
+                                s += 2.0 * P.col(rs + col).segment(rs, col)
+                                            .dot(tile.row(col).head(col).transpose());
+                        }
+                    } else {
+                        // Off-diagonal block: every (row,col) pair here is a
+                        // distinct i<j pair (block bj strictly precedes block
+                        // bi), visited exactly once across the (bi,bj) loop --
+                        // doubled per the symmetric decomposition, same as the
+                        // within-block off-diagonal term above.
+                        s += 2.0 * P.block(cs, rs, ce - cs, re - rs)
+                                    .cwiseProduct(tile.transpose()).sum();
+                    }
+                }
+            }
+            tr_PA(i) = s;
+        } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
             // Identity component: tr(PA) = tr(P). OMP parallel reduction over n
             // scalar loads has more overhead than gain; let Eigen vectorise it.
             tr_PA(i) = P.diagonal().sum();
@@ -755,6 +795,14 @@ void calcu_Hi(RemlCtx& ctx, RemlMat& P, RemlMat& Hi) {
             RemlVec delta_v = ctx.dk.array() - ctx.lambda_tail;
             PA[i] = ctx.lambda_tail * P;
             PA[i].noalias() += PUk * delta_v.asDiagonal() * ctx.Uk.transpose();
+        } else if (ctx.grm_chunk_rows > 0 && i == 0) {
+            // Exact GRM, streamed. P is already fully symmetrized above, so
+            // this is exactly the same chunked matvec used for APy/KX/Ky
+            // elsewhere, just against the whole (now dense) P instead of a
+            // handful of columns -- same O(n^3) cost class as the dense
+            // Ai.selfadjointView*P branch below, just streamed from disk.
+            PA[i] = gcta_chunked::chunked_symmetric_matvec(
+                ctx.grm_tile_reader, ctx.n, ctx.grm_chunk_rows, P);
         } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
             PA[i].resize(0, 0);
         } else {
@@ -2192,7 +2240,7 @@ void compute(RemlCtx& ctx,
     RemlMat Hi(ctx.r_indx.size(), ctx.r_indx.size());
     RemlVec Py(ctx.n);
     RemlVec varcmp;
-    init_varcomp(ctx, priors_var, priors, varcmp);
+    ctx.he_warm_start_applied = init_varcomp(ctx, priors_var, priors, varcmp);
 
     const double lgL = reml_iteration(ctx, Vi_X_out, Xt_Vi_X_i_out, Hi, Py, varcmp, priors_flag, no_constrain);
     ctx.logL = lgL;

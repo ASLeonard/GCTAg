@@ -998,14 +998,23 @@ void MLMA::processMain()
                             "--reml-trace-hutchpp is ignored.");
 
             int grm_chunk_rows = 0;
+            // Slice of grm_chunked_budget reserved for ChunkedGrmReader's own
+            // row-band cache. Previously this reserved the FULL packed-GRM
+            // size (grm_packed_bytes(n)) — correct back when the reader
+            // loaded the whole file into memory, but now that it only keeps
+            // a bounded band resident, that reservation was leaving almost
+            // none of the budget for grm_chunk_rows itself at any realistic
+            // n. chunked_reader_reserved_gb is the same split passed to
+            // make_chunked_grm_reader below, so the two can't drift apart.
+            double reader_reserved_gb = 0.0;
             if (grm_chunked) {
-                const double grm_packed_gb =
-                    static_cast<double>(gcta_grm_io::grm_packed_bytes(n)) / 1e9;
-                grm_chunk_rows = gcta_chunked::solve_chunk_rows(n, grm_chunked_budget, 0, grm_packed_gb);
+                reader_reserved_gb = gcta_grm_io::chunked_reader_reserved_gb(grm_chunked_budget);
+                grm_chunk_rows = gcta_chunked::solve_chunk_rows(n, grm_chunked_budget, 0, reader_reserved_gb);
                 if (grm_chunk_rows < 1)
                     LOGGER.e(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
-                                "GB is too small: the packed GRM itself needs " +
-                                to_string(grm_packed_gb) + "GB (n=" + to_string(n) + "); raise the budget.");
+                                "GB is too small: reserving " + to_string(reader_reserved_gb) +
+                                "GB for the reader's row-band cache leaves no room for a single "
+                                "row-chunk (n=" + to_string(n) + "); raise the budget.");
                 if (grm_chunk_rows >= n) {
                     LOGGER.w(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
                                 "GB covers the full GRM (n=" + to_string(n) + ") in a single chunk. "
@@ -1026,10 +1035,13 @@ void MLMA::processMain()
                 // own ID validation (same fail-loud contract as the dense
                 // path below) and reads m_snps from .grm.N.bin's diagonal
                 // without touching .grm.bin.
-                chunked_grm = gcta_grm_io::make_chunked_grm_reader(grm_pfx, analysis_ids);
+                chunked_grm = gcta_grm_io::make_chunked_grm_reader(
+                    grm_pfx, analysis_ids, static_cast<size_t>(reader_reserved_gb * 1e9));
                 m_all = chunked_grm.m_snps;
                 LOGGER.i(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
-                            "GB -> GRM will be read in " + to_string(grm_chunk_rows) +
+                            "GB (" + to_string(reader_reserved_gb) + "GB reader cache + " +
+                            to_string(grm_chunked_budget - reader_reserved_gb) +
+                            "GB tiles) -> GRM will be read in " + to_string(grm_chunk_rows) +
                             "-row chunks from [" + grm_pfx + "], not loaded densely.");
             } else {
                 // upper_only=true: G_n is valid on its upper triangle (row<=col)

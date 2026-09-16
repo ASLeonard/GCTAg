@@ -84,12 +84,17 @@ struct BlockPartition {
 //
 // `reserved_gb`: bytes to subtract from budget_gb before sizing the chunk,
 // for memory this call's budget shares space with but that isn't part of
-// the chunk buffers themselves — e.g. ChunkedGrmMmap's own packed-file
-// buffer, which is a fixed allocation independent of chunk_size and was
-// previously not accounted for here at all, silently letting total memory
-// exceed budget_gb by however large that fixed allocation was. Defaults to
-// 0.0 (previous behaviour) for callers that don't share budget with such an
-// allocation, or that account for it separately themselves.
+// the chunk buffers themselves — e.g. the band_byte_budget passed to
+// ChunkedGrmReader's row-band cache (see grm_binary_io.hpp), which is a
+// caller-chosen slice of the same --grm-chunked-budget, not the whole file:
+// callers MUST pass the identical number here and to make_chunked_grm_reader
+// (derive both from one variable), or the two silently drift and this
+// function under- or over-reserves relative to what the reader actually
+// holds. Previously this was 0.0 unconditionally with no way to reserve
+// anything, which silently let total memory exceed budget_gb by however
+// large the (then-fixed, whole-file) reader allocation was. Defaults to 0.0
+// for callers that don't share budget with such an allocation, or that
+// account for it separately themselves.
 //
 // Returns 0 if the (budget minus reservations) can't fit even a single row;
 // callers are expected to treat that as a hard error with their own
@@ -98,8 +103,9 @@ struct BlockPartition {
 //
 // Two fixed costs reserved before sizing block_size:
 //  - reserved_gb: memory this call's budget shares space with but that
-//    isn't part of the chunk buffers themselves, e.g. ChunkedGrmMmap's own
-//    packed-file buffer (a fixed allocation independent of chunk_size).
+//    isn't part of the chunk buffers themselves, e.g. ChunkedGrmReader's
+//    row-band cache (a caller-chosen slice of budget_gb, independent of
+//    chunk_size -- see the reserved_gb doc above).
 //  - Y = n x k_ext doubles: chunked_symmetric_matvec's output accumulator,
 //    `Y = Eigen::MatrixXd::Zero(n, X.cols())`, allocated once, in full,
 //    BEFORE the block loop starts -- not reduced by chunk_size at all.

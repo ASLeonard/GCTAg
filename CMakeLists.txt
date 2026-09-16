@@ -369,6 +369,8 @@ option(GCTA_UNITY_BUILD "Enable unity builds for faster compilation" ON)
 option(GCTA_ENABLE_IPO "Enable IPO/LTO in Release builds" ON)
 option(GCTA_VERBOSE_BLAS "Print verbose BLAS detection information during configure" OFF)
 option(BGEN_SUPPORT "Enable BGEN file format support (requires SQLite)" OFF)
+set(USE_JEMALLOC "" CACHE FILEPATH
+    "Path to libjemalloc.so. If set, links it and applies thp:never to avoid Linux THP over-allocation on large triangular-matrix allocations (e.g. the GRM).")
 
 
 # Initialize plink-ng submodule if needed
@@ -741,6 +743,27 @@ if(CMAKE_VERBOSE_MAKEFILE OR GCTA_VERBOSE_BLAS)
     message(STATUS "---- end BLAS detection details ----")
 endif()
 
+# jemalloc (optional): interposes malloc/free/new/delete via linking alone —
+# no header/API usage, so only the .so path is needed. thp:never is applied
+# via a malloc_conf symbol defined in src/mem.cpp, gated on GCTA_USE_JEMALLOC.
+set(GCTA_USE_JEMALLOC FALSE)
+if(USE_JEMALLOC)
+    if(NOT EXISTS "${USE_JEMALLOC}")
+        message(FATAL_ERROR "USE_JEMALLOC=${USE_JEMALLOC} does not exist")
+    endif()
+    if(IS_DIRECTORY "${USE_JEMALLOC}")
+        message(FATAL_ERROR
+            "USE_JEMALLOC=${USE_JEMALLOC} is a directory — pass the libjemalloc.so file itself, e.g. -DUSE_JEMALLOC=/opt/jemalloc/lib/libjemalloc.so")
+    endif()
+    get_filename_component(_jemalloc_realpath "${USE_JEMALLOC}" REALPATH)
+    if(NOT EXISTS "${_jemalloc_realpath}")
+        message(FATAL_ERROR "USE_JEMALLOC=${USE_JEMALLOC} resolves to ${_jemalloc_realpath}, which does not exist (broken symlink?)")
+    endif()
+    set(GCTA_JEMALLOC_LIB "${_jemalloc_realpath}")
+    set(GCTA_USE_JEMALLOC TRUE)
+    message(STATUS "jemalloc: ${GCTA_JEMALLOC_LIB} (thp:never)")
+endif()
+
 add_executable(GCTAg)
 
 target_sources(GCTAg PRIVATE
@@ -816,6 +839,22 @@ target_link_libraries(GCTAg PRIVATE
     Spectra
     STDEXEC::stdexec
     ${GCTA_ZSTD_LIBS})
+
+if(GCTA_USE_JEMALLOC)
+    target_compile_definitions(GCTAg PRIVATE GCTA_USE_JEMALLOC)
+    target_link_libraries(GCTAg PRIVATE ${GCTA_JEMALLOC_LIB})
+
+    if(LINUX)
+        # The runtime linker needs to find this exact .so again at load time,
+        # not just at link time. If it lives outside standard search paths
+        # (a Conda env, an HPC module tree, a scratch install), bake in an
+        # rpath so the binary works without relying on LD_LIBRARY_PATH.
+        get_filename_component(_jemalloc_dir "${GCTA_JEMALLOC_LIB}" DIRECTORY)
+        list(APPEND CMAKE_BUILD_RPATH   "${_jemalloc_dir}")
+        list(APPEND CMAKE_INSTALL_RPATH "${_jemalloc_dir}")
+        message(STATUS "jemalloc: added ${_jemalloc_dir} to build/install RPATH")
+    endif()
+endif()
 
 target_precompile_headers(GCTAg PRIVATE
     <Eigen/Dense>
@@ -1010,6 +1049,11 @@ message(STATUS "  IPO/LTO:           ${GCTA_IPO_ENABLED}")
 message(STATUS "  Install prefix:    ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "  OpenMP:            ${OpenMP_CXX_VERSION}")
 message(STATUS "  BGEN support:      ${BGEN_SUPPORT}")
+if(GCTA_USE_JEMALLOC)
+    message(STATUS "  jemalloc:          ${GCTA_JEMALLOC_LIB} (thp:never)")
+else()
+    message(STATUS "  jemalloc:          OFF (default allocator)")
+endif()
 if(LINUX)
     message(STATUS "  RPATH type:        DT_RPATH (--disable-new-dtags, all Linux)")
     message(STATUS "  Build RPATH:       ${CMAKE_BUILD_RPATH}")

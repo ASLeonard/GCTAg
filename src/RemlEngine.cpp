@@ -165,12 +165,13 @@ int constrain_varcmp(const RemlCtx& ctx, RemlVec& varcmp) {
     return num;
 }
 
-void init_varcomp(const RemlCtx& ctx,
+void init_varcomp(RemlCtx& ctx,
                   const std::vector<double>& priors_var,
                   const std::vector<double>& priors,
                   RemlVec& varcmp) {
     const int m = static_cast<int>(ctx.r_indx.size());
     varcmp = RemlVec::Zero(m);
+    ctx.he_warm_start_applied = false;
 
     if (!priors_var.empty()) {
         for (int i = 0; i < m - 1; i++) varcmp[i] = priors_var[i];
@@ -212,6 +213,15 @@ void init_varcomp(const RemlCtx& ctx,
                  + static_cast<double>(n - k) * (ctx.tail_d_var + ctx.lambda_tail * ctx.lambda_tail);
             KX   = woodbury_basis_KZ(ctx, ctx.X);
             Ky   = woodbury_basis_Kv(ctx, y_r);
+        } else if (ctx.grm_chunk_rows > 0) {
+            // Exact GRM, streamed from disk in chunks -- ctx.A is empty by
+            // design here, so this must come before (or instead of) the
+            // ctx.A-based branch below. Mirrors the trace/matvec machinery
+            // compute_woodbury_basis already uses for its chunked path.
+            trK  = gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, ctx.grm_chunk_rows).sum();
+            trK2 = gcta_chunked::chunked_trace_K_squared(ctx.grm_tile_reader, n, ctx.grm_chunk_rows);
+            KX   = gcta_chunked::chunked_symmetric_matvec(ctx.grm_tile_reader, n, ctx.grm_chunk_rows, ctx.X);
+            Ky   = gcta_chunked::chunked_symmetric_matvec(ctx.grm_tile_reader, n, ctx.grm_chunk_rows, y_r);
         } else if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
             // Full exact GRM K = ctx.A[r_indx[0]]; K is upper-triangle-only
             // storage (see grm_binary_io.hpp upper_only load path) -- no
@@ -254,6 +264,7 @@ void init_varcomp(const RemlCtx& ctx,
                     && sg_he <= 100.0 * scale && se_he <= 100.0 * scale) {
                     varcmp(0) = std::max(sg_he, 0.01 * scale);
                     varcmp(1) = std::max(se_he, 0.01 * scale);
+                    ctx.he_warm_start_applied = true;
                     LOGGER << "REML: used single-GRM HE warm-start for variance components = " << varcmp.transpose() << std::endl;
                 }
             }
@@ -1326,7 +1337,19 @@ double reml_iteration(RemlCtx& ctx,
 
             if (!prior_var_flag) {
                 LOGGER << "Round 0 iteration using ";
-                if(ctx.reml_no_HE_start) {
+                // Fall back to EM-REML for round 0 whenever the run did NOT
+                // actually start from an HE warm-start point -- either
+                // because the user asked to skip it (--reml-no-he-start) or
+                // because init_varcomp's warm-start preconditions weren't
+                // met (multi-component model, priors supplied, or the HE
+                // regression itself was ill-conditioned/degenerate and
+                // declined to set varcmp). ctx.reml_no_HE_start alone isn't
+                // enough here: it only reflects the user's request, not
+                // whether a warm start was actually applied, and AI-REML's
+                // Newton step from the naive equal-split starting point is
+                // not reliably informative -- EM-REML is robust from any
+                // starting point.
+                if (ctx.reml_no_HE_start || !ctx.he_warm_start_applied) {
                   ctx.reml_mtd = 2;
                   LOGGER << "EM-REML ..." << std::endl;
                 } else {
@@ -2152,6 +2175,17 @@ void compute(RemlCtx& ctx,
         if ((int)ctx.r_indx.size() != 2)
             LOGGER.e(0, "--grm-chunked-budget with --reml-trace-hutchpp supports only single-GRM models.");
         ctx.grm_chunk_rows = setup_chunked_grm_stream(ctx, "--reml-trace-hutchpp");
+    } else if (ctx.grm_chunked_budget > 0.0) {
+        // Plain exact (non-Hutch++, non-Woodbury) chunked GRM. Without this
+        // branch ctx.grm_chunk_rows is never set for this path, so every
+        // downstream "ctx.grm_chunk_rows > 0" gate (ai_reml, em_reml,
+        // calcu_tr_PA, applyP_mat, init_varcomp's HE warm-start, ...) falls
+        // through to the "ctx.A[...].size() == 0" branch instead -- which
+        // silently treats the (empty, because it's streamed, not loaded)
+        // GRM component as an identity/residual term for the entire run.
+        if ((int)ctx.r_indx.size() != 2)
+            LOGGER.e(0, "--grm-chunked-budget supports only single-GRM models.");
+        ctx.grm_chunk_rows = setup_chunked_grm_stream(ctx, "--grm-chunked-budget");
     }
 
     RemlMat Vi_X_out(ctx.n, ctx.X_c), Xt_Vi_X_i_out(ctx.X_c, ctx.X_c);
@@ -2309,6 +2343,7 @@ RemlState build_reml_state(RemlCtx& ctx) {
     ctx.hutchpp_R.resize(0, 0);
     ctx.hutchpp_MR.resize(0, 0);
     ctx.grm_chunk_rows = 0;
+    ctx.he_warm_start_applied = false;
     ctx.reml_tmp_n.resize(0);
     ctx.P.resize(0, 0);
     ctx.varcmp.clear();

@@ -82,16 +82,16 @@ int PCAStream::registerOption(map<string, vector<string>>& options_in)
         options_in.erase("--remove");
     }
 
-    // Same name and meaning as --svd-chunked-budget in MLMA_stream.cpp /
+    // Same name and meaning as --grm-chunked-budget in MLMA_stream.cpp /
     // RemlEngine.cpp — GB budget for streaming the GRM in row-chunks instead
     // of loading it densely — reused verbatim rather than introducing a
     // PCA-specific flag.
-    if (options_in.find("--svd-chunked-budget") != options_in.end()) {
-        const auto& vals = options_in["--svd-chunked-budget"];
+    if (options_in.find("--grm-chunked-budget") != options_in.end()) {
+        const auto& vals = options_in["--grm-chunked-budget"];
         if (vals.empty() || vals[0].empty())
-            LOGGER.e(0, "--svd-chunked-budget requires a GB argument (e.g. 20).");
-        options_d["svd_chunked_budget"] = std::stod(vals[0]);
-        options_in.erase("--svd-chunked-budget");
+            LOGGER.e(0, "--grm-chunked-budget requires a GB argument (e.g. 20).");
+        options_d["grm_chunked_budget"] = std::stod(vals[0]);
+        options_in.erase("--grm-chunked-budget");
     }
 
     if (options_in.find("--svd-method") != options_in.end()) {
@@ -162,31 +162,25 @@ void PCAStream::processMain()
             pca_approx.clear();
         }
 
-        const double svd_chunked_budget = options_d.count("svd_chunked_budget")
-            ? options_d.at("svd_chunked_budget") : 0.0;
-        bool svd_chunked = svd_chunked_budget > 0.0;
+        const double grm_chunked_budget = options_d.count("grm_chunked_budget")
+            ? options_d.at("grm_chunked_budget") : 0.0;
+        bool grm_chunked = grm_chunked_budget > 0.0;
 
-        if (pca_approx.empty() && svd_chunked)
+        if (pca_approx.empty() && grm_chunked)
             LOGGER.e(0, "--pca exact mode (dsyevr/dsyevd) requires dense GRM loading. "
-                        "Remove --svd-chunked-budget, or set --pca-approx to Lanczos/rSVD.");
+                        "Remove --grm-chunked-budget, or set --pca-approx to Lanczos/rSVD.");
 
-        // Row-chunk size for streaming reads off the GRM (chunked_symmetric_matvec /
-        // matvec_blocked). Budget-driven rather than a guessed constant, same pattern
-        // as RemlEngine.cpp's compute_woodbury_basis: solve for the number of rows
-        // that fit chunk_rows x (n + k_ext) doubles in the budget. k_ext is sized for
-        // whichever approx method got selected above — rSVD/Nystrom multiply block-wise
-        // by out_pc_num + oversample columns at once; Lanczos is normally one vector at
-        // a time (cols=1) but ncv is used here anyway as a conservative upper bound in
-        // case the underlying implementation ever blocks its matvecs internally.
+        // Row-chunk size for streaming reads off the GRM (chunked_symmetric_matvec).
+        // Budget-driven rather than a guessed constant.
         int chunk_size = 0;
         int k_ext_hint = 0;
-        if (svd_chunked) {
+        if (grm_chunked) {
             k_ext_hint = (pca_approx == "Lanczos")
                 ? std::min(n, std::max(3 * out_pc_num + 1, 30))
                 : out_pc_num + gcta_eigh::recommended_oversample(out_pc_num);
-            chunk_size = gcta_chunked::solve_chunk_rows(n, svd_chunked_budget, k_ext_hint);
+            chunk_size = gcta_chunked::solve_chunk_rows(n, grm_chunked_budget, k_ext_hint);
             if (chunk_size < 1)
-                LOGGER.e(0, "--svd-chunked-budget=" + to_string(svd_chunked_budget) +
+                LOGGER.e(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
                             "GB cannot fit even a single GRM row (n=" + to_string(n) +
                             ", k_ext=" + to_string(k_ext_hint) + " -> " +
                             to_string(8.0 * (n + k_ext_hint) / 1e9) + "GB/row); raise the budget.");
@@ -196,11 +190,11 @@ void PCAStream::processMain()
                 // diagonal-tile mirror's transient 2x n x n duplication (see
                 // chunked_grm_matvec.hpp) across the entire matrix at once, since
                 // that tile IS the whole matrix here. Strictly worse than dense.
-                LOGGER.w(0, "--svd-chunked-budget=" + to_string(svd_chunked_budget) +
+                LOGGER.w(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
                             "GB covers the full GRM (n=" + to_string(n) + ", k_ext=" +
                             to_string(k_ext_hint) + ") in a single chunk. Falling back to "
                             "dense loading instead of paying chunking overhead for no benefit.");
-                svd_chunked = false;
+                grm_chunked = false;
             }
         }
 
@@ -208,22 +202,30 @@ void PCAStream::processMain()
 
         // ---- GRM access: chunked tile reader, or dense (fallback / comparison) ----
         gcta_chunked::TileReader chunked_reader;
-        std::shared_ptr<const gcta_grm_io::ChunkedGrmMmap> chunked_file;
-        Eigen::MatrixXd G_dense;  // left empty when svd_chunked
+        Eigen::MatrixXd G_dense;  // left empty when grm_chunked
 
-        if (svd_chunked) {
+        if (grm_chunked) {
             gcta_grm_io::ChunkedGrmHandle handle = gcta_grm_io::make_chunked_grm_reader(grm_pfx, analysis_ids);
             chunked_reader = std::move(handle.reader);
-            chunked_file = std::move(handle.file);
             LOGGER.i(0, "--pca: GRM will be read in " + to_string(chunk_size) +
-                        "-row chunks from [" + grm_pfx + "] (--svd-chunked-budget=" +
-                        to_string(svd_chunked_budget) + "GB, k_ext up to " + to_string(k_ext_hint) +
+                        "-row chunks from [" + grm_pfx + "] (--grm-chunked-budget=" +
+                        to_string(grm_chunked_budget) + "GB, k_ext up to " + to_string(k_ext_hint) +
                         "), not loaded densely.");
         } else {
             vector<string> loaded_ids;
-            double m_snps_unused = 0.0;
+            double m_snps_unused = -1.0;
             Eigen::MatrixXd G_full;
-            gcta_grm_io::read_grm_binary(grm_pfx, loaded_ids, G_full, m_snps_unused);
+            // upper_only=true: confirmed safe via cpu.h -- gcta_dsyevd and
+            // gcta_dsyevr both hardcode uplo='U' (LAPACK dsyevd/dsyevr with
+            // uplo='U' only ever reads the upper triangle of the input on
+            // entry; on exit with jobz='V' they overwrite the whole buffer
+            // with dense eigenvectors regardless). So the exact-eigendecomp
+            // path below was already only reading the upper triangle even
+            // under the old fully-mirrored G_dense -- the mirror was pure
+            // waste for that path. The pca_approx (rSVD/Lanczos/Nystrom)
+            // branches go through the `apply` lambda below, which is updated
+            // to selfadjointView<Eigen::Upper>() to match.
+            gcta_grm_io::read_grm_binary(grm_pfx, loaded_ids, G_full, m_snps_unused, /*upper_only=*/true);
             const vector<int> kp = gcta_grm_io::match_ids_to_grm(analysis_ids, loaded_ids);
             for (int i = 0; i < n; ++i)
                 if (kp[i] < 0)
@@ -242,15 +244,23 @@ void PCAStream::processMain()
                 G_dense = std::move(G_full);
             } else {
                 G_dense.resize(n, n);
-                // Column-first traversal for column-major Eigen storage —
-                // same pattern as MLMA_stream.cpp's G_n subsetting: for fixed
-                // j, varying i reads down one column of G_full (contiguous
-                // range, even though kp[i] visits it out of order), rather
-                // than jumping across the whole matrix.
+                // G_full is upper-triangle-only (row<=col valid). Only write
+                // the upper triangle of G_dense (i <= j) -- that's all
+                // gcta_dsyevd/gcta_dsyevr (uplo='U') and the selfadjointView
+                // matvec below need -- and use a min/max lookup into G_full
+                // so every read lands in its valid region regardless of how
+                // the permutation reorders rows vs columns. Same fix as
+                // MLMA_stream.cpp's equivalent gather; see that file for the
+                // full rationale. Triangular workload -> dynamic scheduling,
+                // not static, to avoid imbalance across low-j vs high-j
+                // columns.
+                #pragma omp parallel for schedule(dynamic, 64)
                 for (int j = 0; j < n; ++j) {
                     const int src_col = kp[j];
-                    for (int i = 0; i < n; ++i)
-                        G_dense(i, j) = G_full(kp[i], src_col);
+                    for (int i = 0; i <= j; ++i) {
+                        const int r = kp[i], c = src_col;
+                        G_dense(i, j) = (r <= c) ? G_full(r, c) : G_full(c, r);
+                    }
                 }
                 // G_full (n_grm x n_grm, potentially much larger than G_dense
                 // when heavily filtered) goes out of scope at the end of this
@@ -261,21 +271,10 @@ void PCAStream::processMain()
         }
 
         auto apply = [&](const auto& X) -> Eigen::MatrixXd {
-            const int cols = static_cast<int>(X.cols());
-            if (svd_chunked)
-            {
-                Eigen::MatrixXd Y;
-                if (cols == 1 && chunked_file) {
-                    Y.resize(n, 1);
-                    Y.col(0) = chunked_file->matvec_blocked(X.col(0), chunk_size);
-                } else {
-                    Y = gcta_chunked::chunked_symmetric_matvec(chunked_reader, n, chunk_size, X);
-                }
-                return Y;
-            }
-
-            Eigen::MatrixXd Y = G_dense * X;
-            return Y;
+            if (grm_chunked)
+                return gcta_chunked::chunked_symmetric_matvec(chunked_reader, n, chunk_size, X);
+            else
+                return G_dense.selfadjointView<Eigen::Upper>() * X;
         };
 
         Eigen::VectorXd eval;
@@ -309,6 +308,13 @@ void PCAStream::processMain()
                     LOGGER.w(0, "--svd-method is ignored in exact mode (it only applies to --pca-approx rSVD).");
 
                 double* grm_ptr = G_dense.data();
+                // No selfadjointView/triangle change needed here: gcta_dsyevd
+                // and gcta_dsyevr (cpu.h) both hardcode uplo='U', so they
+                // only ever read the upper triangle of grm_ptr on entry --
+                // true before and after G_dense became upper-triangle-only.
+                // On exit (jobz='V') they overwrite the whole buffer with
+                // dense eigenvectors, which is why raw_evec = grm_ptr below
+                // is valid regardless of the input triangle convention.
                 if (out_pc_num == n) {
                     Eigen::VectorXd w(n);
                     const int info = gcta_dsyevd((gcta_blas_int)n, grm_ptr, (gcta_blas_int)n, w.data());
@@ -347,7 +353,7 @@ void PCAStream::processMain()
         // full sum of eigenvalues. For chunked execution we intentionally read only
         // the diagonal tiles, not the full matrix.
         const double trace_total = [&]() {
-            if (svd_chunked) return gcta_chunked::chunked_diagonal(chunked_reader, n, chunk_size).sum();
+            if (grm_chunked) return gcta_chunked::chunked_diagonal(chunked_reader, n, chunk_size).sum();
             if (G_dense.size() == 0) return 0.0;
             return G_dense.diagonal().sum();
         }();

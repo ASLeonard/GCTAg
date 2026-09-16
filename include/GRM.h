@@ -66,7 +66,7 @@ public:
     void prune_fam(float thresh, bool isSparse = true, float *val = NULL);
     void unify_grm(string mgrm_file, string out_file);
     void subtract_grm(string mgrm_file, string out_file);
-    void merge_grm_streaming(string mgrm_file, string out_file, int row_block_rows);
+    void merge_grm(string mgrm_file, string out_file, int row_block_rows);
 
     inline static int nMarkerBlock = 1024;
 

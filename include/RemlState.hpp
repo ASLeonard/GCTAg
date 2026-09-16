@@ -14,6 +14,14 @@
 #include <Eigen/Dense>
 #include <cstdint>
 
+struct Header {
+    char    magic[4];     // 4-byte magic signature ("TUNA" or "GOBY")
+    int32_t n;            // Matrix size (e.g., number of samples)
+    int32_t x_c;          // Number of covariates
+    int32_t num_varcmp;   // Number of variance components
+    int32_t num_r_indx;   // Index count metadata
+};
+
 struct RemlState {
     RemlState() = default;
     // Vi_L_f (and wb.Uk_f, for the Woodbury path) can be tens of GB at large

@@ -80,10 +80,10 @@ RemlVec applyP_vec(const RemlCtx& ctx, const RemlVec& v) {
         w = woodbury_basis_Viv(ctx, v);
     } else if (ctx.Vi_use_llt) {
         w = v;
-        ctx.Vi_L.triangularView<Eigen::Lower>().solveInPlace(w);
-        ctx.Vi_L.triangularView<Eigen::Lower>().adjoint().solveInPlace(w);
+        ctx.Vi_L.triangularView<Eigen::Upper>().adjoint().solveInPlace(w); // U^T z = v
+        ctx.Vi_L.triangularView<Eigen::Upper>().solveInPlace(w);          // U w = z
     } else {
-        w = RemlVec(ctx.Vi.selfadjointView<Eigen::Lower>() * v);
+        w = RemlVec(ctx.Vi.selfadjointView<Eigen::Upper>() * v);
     }
     RemlVec a = ctx.Vi_X.transpose() * v;
     RemlVec b = ctx.Xt_Vi_X_i.selfadjointView<Eigen::Lower>() * a;
@@ -97,10 +97,10 @@ RemlMat applyP_mat(const RemlCtx& ctx, const RemlMat& Z) {
         W = woodbury_basis_ViZ(ctx, Z);
     } else if (ctx.Vi_use_llt) {
         W = Z;
-        ctx.Vi_L.triangularView<Eigen::Lower>().solveInPlace(W);
-        ctx.Vi_L.triangularView<Eigen::Lower>().adjoint().solveInPlace(W);
+        ctx.Vi_L.triangularView<Eigen::Upper>().adjoint().solveInPlace(W); // U^T z = v
+        ctx.Vi_L.triangularView<Eigen::Upper>().solveInPlace(W);          // U w = z
     } else {
-        W = RemlMat(ctx.Vi.selfadjointView<Eigen::Lower>() * Z);
+        W = RemlMat(ctx.Vi.selfadjointView<Eigen::Upper>() * Z);
     }
     const RemlMat A = ctx.Vi_X.transpose() * Z;
     W.noalias() -= ctx.Vi_X * (ctx.Xt_Vi_X_i.selfadjointView<Eigen::Lower>() * A);
@@ -165,7 +165,8 @@ int constrain_varcmp(const RemlCtx& ctx, RemlVec& varcmp) {
     return num;
 }
 
-void init_varcomp(const RemlCtx& ctx,
+//Returns true if variance components successfully warm-started via HE, false if not (e.g. single-GRM but priors specified)
+bool init_varcomp(const RemlCtx& ctx,
                   const std::vector<double>& priors_var,
                   const std::vector<double>& priors,
                   RemlVec& varcmp) {
@@ -202,7 +203,7 @@ void init_varcomp(const RemlCtx& ctx,
         const RemlMat XtX = ctx.X.transpose() * ctx.X;
         Eigen::LDLT<RemlMat> XtX_ldlt(XtX);
         const int dof = n - ctx.X_c;
-        if (XtX_ldlt.info() != Eigen::Success || dof <= 0) return;
+        if (XtX_ldlt.info() != Eigen::Success || dof <= 0) return false;
         const RemlVec y_r = ctx.y - ctx.X * XtX_ldlt.solve(ctx.X.transpose() * ctx.y);
 
         if (ctx.Vi_use_woodbury_basis) {
@@ -212,13 +213,38 @@ void init_varcomp(const RemlCtx& ctx,
                  + static_cast<double>(n - k) * (ctx.tail_d_var + ctx.lambda_tail * ctx.lambda_tail);
             KX   = woodbury_basis_KZ(ctx, ctx.X);
             Ky   = woodbury_basis_Kv(ctx, y_r);
+        } else if (ctx.grm_chunk_rows > 0) {
+            // Exact GRM, streamed from disk in chunks -- ctx.A is empty by
+            // design here, so this must come before (or instead of) the
+            // ctx.A-based branch below. Mirrors the trace/matvec machinery
+            // compute_woodbury_basis already uses for its chunked path.
+            trK  = gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, ctx.grm_chunk_rows).sum();
+            trK2 = gcta_chunked::chunked_trace_K_squared(ctx.grm_tile_reader, n, ctx.grm_chunk_rows);
+            KX   = gcta_chunked::chunked_symmetric_matvec(ctx.grm_tile_reader, n, ctx.grm_chunk_rows, ctx.X);
+            Ky   = gcta_chunked::chunked_symmetric_matvec(ctx.grm_tile_reader, n, ctx.grm_chunk_rows, y_r);
         } else if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
-            // Full exact GRM K = ctx.A[r_indx[0]]
+            // Full exact GRM K = ctx.A[r_indx[0]]; K is upper-triangle-only
+            // storage (see grm_binary_io.hpp upper_only load path) -- no
+            // valid data below the diagonal.
             const auto& K = ctx.A[ctx.r_indx[0]];
             trK  = K.diagonal().sum();
-            trK2 = K.squaredNorm(); // Frobenius norm squared = tr(K^2)
-            KX   = K * ctx.X;
-            Ky   = K * y_r;
+            // K.squaredNorm() would undercount here: it sums whatever the
+            // full n^2 buffer holds, but only the upper triangle (row<=col)
+            // is valid -- the lower triangle is unfaulted/kernel-zero, not
+            // K's actual values. Reconstruct tr(K^2) = sum(diag^2) +
+            // 2*sum_{r<c} K(r,c)^2 explicitly. Column reads (col(j).head(j)
+            // = K(0..j-1, j), the upper part of column j) are fully
+            // contiguous -- strictly better than a row-based equivalent,
+            // and squaring is order-independent so there's no accuracy
+            // tradeoff either way.
+            double diag_sq = K.diagonal().squaredNorm();
+            double off_sq  = 0.0;
+            #pragma omp parallel for reduction(+:off_sq) schedule(static)
+            for (int j = 0; j < n; ++j)
+                off_sq += K.col(j).head(j).squaredNorm();
+            trK2 = diag_sq + 2.0 * off_sq;
+            KX.noalias() = K.selfadjointView<Eigen::Upper>() * ctx.X;
+            Ky.noalias() = K.selfadjointView<Eigen::Upper>() * y_r;
         }
         if (trK2 > 0.0) {
             const RemlMat XtKX = ctx.X.transpose() * KX;
@@ -239,30 +265,79 @@ void init_varcomp(const RemlCtx& ctx,
                     varcmp(0) = std::max(sg_he, 0.01 * scale);
                     varcmp(1) = std::max(se_he, 0.01 * scale);
                     LOGGER << "REML: used single-GRM HE warm-start for variance components = " << varcmp.transpose() << std::endl;
+                    return true;
                 }
             }
         }
     }
+    return false;
 }
 bool verbose=false;
 
 
-// Fill ctx.Vi (lower triangle + diagonal) with sum_ci varcmp[ci] * A[ci].
+// Fill ctx.Vi (upper triangle + diagonal) with sum_ci varcmp[ci] * A[ci].
 // Caller must have already called ctx.Vi.resize(n, n) and zeroed it.
 // Identity-components (A.size()==0) are added to the diagonal only.
-void assemble_V_lower(RemlCtx& ctx, const RemlVec& varcmp) {
+void assemble_V_upper(RemlCtx& ctx, const RemlVec& varcmp) {
     const int num_comp = static_cast<int>(ctx.r_indx.size());
-    ctx.Vi.triangularView<Eigen::Lower>().setZero();
-    #pragma omp parallel for schedule(static)
-    for (int j = 0; j < ctx.n; j++) {
-        for (int ci = 0; ci < num_comp; ci++)
-            if (ctx.A[ctx.r_indx[ci]].size() > 0)
-                ctx.Vi.col(j).tail(ctx.n - j) +=
-                    varcmp[ci] * ctx.A[ctx.r_indx[ci]].col(j).tail(ctx.n - j);
+    ctx.Vi.triangularView<Eigen::Upper>().setZero();
+
+    if (ctx.grm_chunk_rows > 0) {
+        // Single-GRM only (enforced where ctx.grm_chunk_rows is set) --
+        // component 0 is the GRM, streamed tile-by-tile via the same
+        // TileReader/chunk_rows already proven correct by
+        // chunked_symmetric_matvec. Everything downstream of this function
+        // (dpotrf, Vi_L, applyP_mat) is completely unchanged: ctx.Vi still
+        // ends up fully dense -- this only changes how its upper triangle
+        // gets filled in, so ctx.A[GRM] never needs to be resident.
+        const double sg2 = varcmp[0];
+        const gcta_chunked::BlockPartition part(ctx.n, ctx.grm_chunk_rows);
+        const int m = part.num_blocks();
+        for (int i = 0; i < m; ++i) {
+            const int rs = part.block_start(i), re = part.block_end(i);
+            for (int j = 0; j <= i; ++j) {
+                const int cs = part.block_start(j), ce = part.block_end(j);
+                const auto tile = ctx.grm_tile_reader(rs, re, cs, ce);  // (re-rs) x (ce-cs) view
+
+                if (i == j) {
+                    // Diagonal block: the tile's own LOWER triangle holds the
+                    // valid data (row >= col) -- fixed by how
+                    // ChunkedGrmReader/grm_binary_io.hpp read the GRM's
+                    // on-disk packed-lower-triangular format.
+                    for (int col = 0; col < re - rs; ++col)
+                        ctx.Vi.col(cs + col).segment(rs, col + 1) +=
+                            sg2 * tile.row(col).head(col + 1).transpose();
+
+                } else {
+                    // Off-diagonal block (i > j): block rows rs..re sit
+                    // strictly below block cols cs..ce, i.e. this tile lives
+                    // in the lower triangle. By symmetry the mirror-image
+                    // block (rows cs..ce, cols rs..re) lives in the upper
+                    // triangle, so write the transposed tile there instead.
+                    ctx.Vi.block(cs, rs, ce - cs, re - rs) += sg2 * tile.transpose();
+                }
+            }
+        }
+    } else {
+        // ctx.A is upper-triangle-only storage, so both the read
+        // (ctx.A[...].col(j).head(j+1)) and the write
+        // (ctx.Vi.col(j).head(j+1)) are now column-contiguous -- zero
+        // stride, directly vectorizable.
+        #pragma omp parallel for schedule(static)
+        for (int j = 0; j < ctx.n; j++) {
+            for (int ci = 0; ci < num_comp; ci++)
+                if (ctx.A[ctx.r_indx[ci]].size() > 0)
+                    ctx.Vi.col(j).head(j + 1) +=
+                        varcmp[ci] * ctx.A[ctx.r_indx[ci]].col(j).head(j + 1);
+        }
     }
-    for (int ci = 0; ci < num_comp; ci++)
+
+    for (int ci = 0; ci < num_comp; ci++) {
+        if (ctx.grm_chunk_rows > 0 && ci == 0)
+            continue;  // GRM diagonal already added by the streamed tile loop above
         if (ctx.A[ctx.r_indx[ci]].size() == 0)
             ctx.Vi.diagonal().array() += varcmp[ci];
+    }
 }
 
 // Returns false if V is not positive-definite and inversion failed.
@@ -294,22 +369,22 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
         return true;
     }
 
-    // Dense path: assemble V (lower triangle)
+    // Dense path: assemble V (upper triangle)
     if (factorize_only && static_cast<int>(ctx.r_indx.size()) > 1)
         ctx.Vi.swap(ctx.Vi_L);
     ctx.Vi.resize(ctx.n, ctx.n);
 
     if (ctx.r_indx.size() == 1) {
-        ctx.Vi.triangularView<Eigen::Lower>().setZero();
+        ctx.Vi.triangularView<Eigen::Upper>().setZero();
         ctx.Vi.diagonal() = RemlVec::Constant(ctx.n, 1.0 / prev_varcmp[0]);
         logdet = ctx.n * std::log(prev_varcmp[0]);
     } else {
-        assemble_V_lower(ctx, prev_varcmp);
+        assemble_V_upper(ctx, prev_varcmp);
 
         // LLT-only path (factorize_only, no diagV_adj)
         if (factorize_only && !ctx.reml_diagV_adj && !ctx.reml_force_dense_vi) {
             gcta_blas_int blas_n = static_cast<gcta_blas_int>(ctx.n);
-            if (gcta_dpotrf(blas_n, ctx.Vi.data(), blas_n) == 0) {
+            if (gcta_dpotrf(blas_n, ctx.Vi.data(), blas_n, 'U') == 0) {
                 logdet = 2.0 * ctx.Vi.diagonal().array().log().sum();
                 ctx.Vi_L.swap(ctx.Vi);
                 ctx.Vi.resize(0, 0);
@@ -318,7 +393,7 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
             }
             // dpotrf failed: reassemble from scratch (dpotrf may have partially overwritten Vi)
             ctx.Vi.resize(ctx.n, ctx.n);
-            assemble_V_lower(ctx, prev_varcmp);
+            assemble_V_upper(ctx, prev_varcmp);
             LOGGER.w(0, "REML: final LLT factorization of V failed at convergence; falling back to dense inverse.");
         }
 
@@ -328,21 +403,27 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
 
         if (method_try == INV_LLT && (!factorize_only || ctx.reml_force_dense_vi)) {
             gcta_blas_int blas_n_f = static_cast<gcta_blas_int>(ctx.n);
-            bool llt_ok = (gcta_dpotrf(blas_n_f, ctx.Vi.data(), blas_n_f) == 0);
+            bool llt_ok = (gcta_dpotrf(blas_n_f, ctx.Vi.data(), blas_n_f, 'U') == 0);
             if (llt_ok) {
                 logdet = ctx.Vi.diagonal().array().square().log().sum();
-                llt_ok = (gcta_dpotri(blas_n_f, ctx.Vi.data(), blas_n_f) == 0);
+                llt_ok = (gcta_dpotri(blas_n_f, ctx.Vi.data(), blas_n_f, 'U') == 0);
             }
             if (llt_ok) {
-                if (!factorize_only)
-                    ctx.Vi.triangularView<Eigen::Upper>() = ctx.Vi.transpose();
+                // No mirror here: every downstream consumer of a dense ctx.Vi
+                // (calcu_P_impl's Vi_X and its P construction) reads via
+                // selfadjointView<Eigen::Upper>()/triangularView<Eigen::Upper>(),
+                // exactly what dpotri('U') just populated -- mirroring the
+                // lower triangle here would be a redundant O(n^2/2) copy
+                // every REML iteration. The one consumer that genuinely
+                // needs a fully dense ctx.Vi (the rare X'V^{-1}X-not-PD
+                // fallback in calcu_P_impl) mirrors on demand there instead.
                 return true;
             }
             // dpotrf/dpotri failed: reassemble for LU fallback
             ctx.Vi.resize(ctx.n, ctx.n);
-            assemble_V_lower(ctx, prev_varcmp);
-            ctx.Vi.triangularView<Eigen::Upper>() =
-                ctx.Vi.triangularView<Eigen::Lower>().transpose();
+            assemble_V_upper(ctx, prev_varcmp);
+            ctx.Vi.triangularView<Eigen::Lower>() =
+                ctx.Vi.triangularView<Eigen::Upper>().transpose();
             method_try = INV_LU;
         }
 
@@ -381,10 +462,10 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
         ctx.Uk_Vi_X = (ctx.UkTX - ck_UkTX) / ctx.sigma2_eff;
     } else if (ctx.Vi_use_llt) {
         ctx.Vi_X = ctx.X;
-        ctx.Vi_L.triangularView<Eigen::Lower>().solveInPlace(ctx.Vi_X);
-        ctx.Vi_L.triangularView<Eigen::Lower>().adjoint().solveInPlace(ctx.Vi_X);
+        ctx.Vi_L.triangularView<Eigen::Upper>().adjoint().solveInPlace(ctx.Vi_X); // U^T z = X
+        ctx.Vi_L.triangularView<Eigen::Upper>().solveInPlace(ctx.Vi_X);          // U w = z
     } else {
-        ctx.Vi_X.noalias() = ctx.Vi.selfadjointView<Eigen::Lower>() * ctx.X;
+        ctx.Vi_X.noalias() = ctx.Vi.selfadjointView<Eigen::Upper>() * ctx.X;
     }
     ctx.Xt_Vi_X_i.noalias() = ctx.X.transpose() * ctx.Vi_X;
 
@@ -404,15 +485,15 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
         RemlMat Uk_scaled = ctx.Uk;
         for (int j = 0; j < ctx.woodbury_basis_rank_; ++j)
             Uk_scaled.col(j) *= std::sqrt(ctx.ck[j] / ctx.sigma2_eff);
-        ctx.Vi.selfadjointView<Eigen::Lower>().rankUpdate(Uk_scaled, -1.0);
-        ctx.Vi.triangularView<Eigen::Upper>() = ctx.Vi.transpose();
+        ctx.Vi.selfadjointView<Eigen::Upper>().rankUpdate(Uk_scaled, -1.0);
+        // No mirror: P's rank-update below only reads ctx.Vi's upper triangle.
     } else if (ctx.Vi_use_llt) {
         ctx.Vi.swap(ctx.Vi_L);
         gcta_blas_int blas_n_p = static_cast<gcta_blas_int>(ctx.n);
-        if (gcta_dpotri(blas_n_p, ctx.Vi.data(), blas_n_p) != 0)
+        if (gcta_dpotri(blas_n_p, ctx.Vi.data(), blas_n_p, 'U') != 0)
             LOGGER.e(0, "dpotri failed when materialising V^{-1} for P.");
-        ctx.Vi.triangularView<Eigen::Upper>() = ctx.Vi.transpose();
         ctx.Vi_use_llt = false;
+        // No mirror: P's rank-update below only reads ctx.Vi's upper triangle.
     }
 
     Eigen::LLT<RemlMat> llt(ctx.Xt_Vi_X_i);
@@ -420,9 +501,15 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
         RemlMat Z;
         Z.noalias() = ctx.Vi_X * llt.matrixL();
         P->swap(ctx.Vi);
-        P->selfadjointView<Eigen::Lower>().rankUpdate(Z, -1.0);
-        P->triangularView<Eigen::Upper>() = P->transpose();
+        P->selfadjointView<Eigen::Upper>().rankUpdate(Z, -1.0);
+        if (ctx.reml_mtd == 1)
+            P->triangularView<Eigen::Lower>() = P->transpose();
     } else {
+        // Rare path (X'V^{-1}X not positive definite): the subtraction below
+        // is a plain dense op, not a triangular rank-update, so unlike the
+        // common case above it needs a fully mirrored ctx.Vi. Mirror here,
+        // on demand, rather than paying for it on every iteration above.
+        ctx.Vi.triangularView<Eigen::Lower>() = ctx.Vi.transpose();
         RemlMat W;
         W.noalias() = ctx.Vi_X * ctx.Xt_Vi_X_i;
         P->swap(ctx.Vi);
@@ -494,6 +581,30 @@ void calcu_tr_PA_woodbury(const RemlCtx& ctx, RemlVec& tr_PA, RemlVec* tr_PA_cor
     }
 }
 
+// Validates ctx.grm_tile_reader and derives a chunk-row count from the
+// memory budget. Called once, at setup, by whichever feature needs the GRM
+// stream (compute_woodbury_basis, or reml::compute() for chunked hutch++) —
+// never from inside the AI-REML/EM-REML loop. feature_flag is only used to
+// prefix the log/error message so the source is clear when both features
+// share this budget knob.
+int setup_chunked_grm_stream(const RemlCtx& ctx, const char* feature_flag) {
+    if (!ctx.grm_tile_reader)
+        LOGGER.e(0, std::string(feature_flag) + ": --grm-chunked-budget is set but "
+                    "ctx.grm_tile_reader is empty — the GRM component wasn't actually "
+                    "loaded either way.");
+    const int n = ctx.n;
+    const double grm_packed_gb = static_cast<double>(n) * (n + 1) / 2 * sizeof(float) / 1e9;
+    const int chunk_rows = gcta_chunked::solve_chunk_rows(n, ctx.grm_chunked_budget, 0, grm_packed_gb);
+    if (chunk_rows < 1)
+        LOGGER.e(0, std::string(feature_flag) + ": --grm-chunked-budget=" + std::to_string(ctx.grm_chunked_budget)
+                    + "GB is too small: the packed GRM itself needs " + std::to_string(grm_packed_gb)
+                    + "GB (n=" + std::to_string(n) + "); raise the budget.");
+    LOGGER << feature_flag << ": --grm-chunked-budget=" << ctx.grm_chunked_budget
+           << "GB (" << grm_packed_gb << "GB reserved for the packed GRM) -> streaming "
+           << chunk_rows << " GRM row(s) per chunk." << std::endl;
+    return chunk_rows;
+}
+
 // tr_PA_var receives, per component, the sampling variance of the Hutch++
 // residual-term mean estimator (i.e. Var(tr_PA(ci))). It is a free byproduct
 // of the existing colwise reduction below — used by ai_reml to build the
@@ -542,6 +653,10 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
         const bool is_I = (ctx.A[ctx.r_indx[ci]].size() == 0);
 
         auto applyPA_mat = [&](const RemlMat& Z) -> RemlMat {
+            if (ctx.grm_chunk_rows > 0 && ci == 0) {
+                return applyP_mat(ctx, RemlMat(gcta_chunked::chunked_symmetric_matvec(
+                    ctx.grm_tile_reader, ctx.n, ctx.grm_chunk_rows, Z)));
+            }
             if (ctx.Vi_use_woodbury_basis && ci == 0) {
                 RemlMat UkZ = ctx.Uk.transpose() * Z;
                 UkZ.array().colwise() *= (ctx.dk.array() - ctx.lambda_tail);
@@ -549,7 +664,7 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
                 return applyP_mat(ctx, KZ);
             }
             return is_I ? applyP_mat(ctx, Z)
-                        : applyP_mat(ctx, RemlMat(ctx.A[ctx.r_indx[ci]] * Z));
+                        : applyP_mat(ctx, RemlMat(ctx.A[ctx.r_indx[ci]].selfadjointView<Eigen::Upper>() * Z));
         };
 
         ctx.hutchpp_K.noalias() = applyPA_mat(ctx.hutchpp_S);
@@ -603,19 +718,63 @@ void calcu_tr_PA(const RemlCtx& ctx, const RemlMat& P, RemlVec& tr_PA) {
     const int m = static_cast<int>(ctx.r_indx.size());
     tr_PA.resize(m);
     for (int i = 0; i < m; i++) {
-        if (ctx.A[ctx.r_indx[i]].size() == 0) {
+        if (ctx.grm_chunk_rows > 0 && i == 0) {
+            // Exact GRM, streamed: tr(P*K) = <P,K>_F (both symmetric), computed
+            // from the same lower-triangular tiles assemble_V_upper reads, using
+            // the same diagonal/2*off-diagonal decomposition the dense branch
+            // below uses -- O(n^2), not a materialised O(n^3) K*P product.
+            // P is upper-triangle-only at this point (mirrors the dense branch).
+            const gcta_chunked::BlockPartition part(ctx.n, ctx.grm_chunk_rows);
+            const int nb = part.num_blocks();
+            double s = 0.0;
+            // Serial, deliberately: ctx.grm_tile_reader is called directly here
+            // (not via a gcta_chunked::* helper), and every other direct caller
+            // in this file (assemble_V_upper's chunked block loop) is serial too
+            // -- the raw reader is presumably a single stateful file/mmap
+            // cursor, not proven safe for concurrent invocation the way the
+            // gcta_chunked:: wrapper functions are.
+            for (int bi = 0; bi < nb; ++bi) {
+                const int rs = part.block_start(bi), re = part.block_end(bi);
+                for (int bj = 0; bj <= bi; ++bj) {
+                    const int cs = part.block_start(bj), ce = part.block_end(bj);
+                    const auto tile = ctx.grm_tile_reader(rs, re, cs, ce);
+                    if (bi == bj) {
+                        for (int col = 0; col < re - rs; ++col) {
+                            s += P(rs + col, rs + col) * tile(col, col);
+                            if (col > 0)
+                                s += 2.0 * P.col(rs + col).segment(rs, col)
+                                            .dot(tile.row(col).head(col).transpose());
+                        }
+                    } else {
+                        // Off-diagonal block: every (row,col) pair here is a
+                        // distinct i<j pair (block bj strictly precedes block
+                        // bi), visited exactly once across the (bi,bj) loop --
+                        // doubled per the symmetric decomposition, same as the
+                        // within-block off-diagonal term above.
+                        s += 2.0 * P.block(cs, rs, ce - cs, re - rs)
+                                    .cwiseProduct(tile.transpose()).sum();
+                    }
+                }
+            }
+            tr_PA(i) = s;
+        } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
             // Identity component: tr(PA) = tr(P). OMP parallel reduction over n
             // scalar loads has more overhead than gain; let Eigen vectorise it.
             tr_PA(i) = P.diagonal().sum();
         } else {
+            // Ai is upper-triangle-only storage; Ai.col(col).tail(tail) read
+            // rows col+1..n-1 of column col (lower triangle), no longer
+            // valid. By symmetry Ai(col+1..n-1, col) == Ai(col, col+1..n-1)
+            // -- read row col instead. Correctness fix only for now, same
+            // as assemble_V_upper's pre-upper-triangle-swap fix -- not yet
+            // perf-traced against a contiguous-copy alternative.
             const auto& Ai = ctx.A[ctx.r_indx[i]];
             double s = 0.0;
             #pragma omp parallel for reduction(+:s) schedule(guided)
             for (int col = 0; col < ctx.n; col++) {
-                const int tail = ctx.n - col - 1;
                 s += P(col, col) * Ai(col, col);
-                if (tail > 0)
-                    s += 2.0 * P.col(col).tail(tail).dot(Ai.col(col).tail(tail));
+                if (col > 0)
+                    s += 2.0 * P.col(col).head(col).dot(Ai.col(col).head(col));
             }
             tr_PA(i) = s;
         }
@@ -623,7 +782,7 @@ void calcu_tr_PA(const RemlCtx& ctx, const RemlMat& P, RemlVec& tr_PA) {
 }
 
 void calcu_Hi(RemlCtx& ctx, RemlMat& P, RemlMat& Hi) {
-    P = (P + P.transpose()) * 0.5;
+    P.triangularView<Eigen::Lower>() = P.transpose();
     const int m = static_cast<int>(ctx.r_indx.size());
 
     std::vector<RemlMat> PA(m);
@@ -636,14 +795,24 @@ void calcu_Hi(RemlCtx& ctx, RemlMat& P, RemlMat& Hi) {
             RemlVec delta_v = ctx.dk.array() - ctx.lambda_tail;
             PA[i] = ctx.lambda_tail * P;
             PA[i].noalias() += PUk * delta_v.asDiagonal() * ctx.Uk.transpose();
+        } else if (ctx.grm_chunk_rows > 0 && i == 0) {
+            // Exact GRM, streamed. P is already fully symmetrized above, so
+            // this is exactly the same chunked matvec used for APy/KX/Ky
+            // elsewhere, just against the whole (now dense) P instead of a
+            // handful of columns -- same O(n^3) cost class as the dense
+            // Ai.selfadjointView*P branch below, just streamed from disk.
+            PA[i] = gcta_chunked::chunked_symmetric_matvec(
+                ctx.grm_tile_reader, ctx.n, ctx.grm_chunk_rows, P);
         } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
             PA[i].resize(0, 0);
         } else {
-            // ctx.A is lower-triangle only; use selfadjointView on A (not on the
-            // already-full P) to avoid reading uninitialised upper-triangle elements.
+            // ctx.A is upper-triangle only; use selfadjointView on A (not on the
+            // already-full P) to avoid reading uninitialised lower-triangle elements.
             // A is symmetric so A*P == P*A; pass P.transpose() (==P) as the dense
-            // RHS so dsymm fires with A as the symmetric operand.
-            PA[i].noalias() = ctx.A[ctx.r_indx[i]] * P;
+            // RHS so dsymm fires with A as the symmetric operand. PA[i] is a full
+            // (non-block) matrix, so this assignment is not subject to the
+            // selfadjointView-on-block-target scalar-fallback issue.
+            PA[i].noalias() = ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * P;
         }
     }
 
@@ -685,7 +854,7 @@ void reml_equation(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py, RemlVec& 
         if (ctx.A[ctx.r_indx[i]].size() == 0) {
             R(i) = Py.squaredNorm();
         } else {
-            ctx.reml_tmp_n.noalias() = ctx.A[ctx.r_indx[i]] * Py;
+            ctx.reml_tmp_n.noalias() = ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py;
             R(i) = Py.dot(ctx.reml_tmp_n);
         }
     }
@@ -736,17 +905,26 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     if (use_approx || woodbury_basis_active)
         Py = applyP_vec(ctx, ctx.y);
     else
-        Py.noalias() = P.selfadjointView<Eigen::Lower>() * ctx.y;
+        Py.noalias() = P.selfadjointView<Eigen::Upper>() * ctx.y;
 
     const int m = static_cast<int>(ctx.r_indx.size());
     RemlMat APy(ctx.n, m);
     for (int i = 0; i < m; i++) {
-        if (woodbury_basis_active && i == 0)
+        if (ctx.grm_chunk_rows > 0 && i == 0)
+            APy.col(i) = gcta_chunked::chunked_symmetric_matvec(
+                ctx.grm_tile_reader, ctx.n, ctx.grm_chunk_rows, Py);
+        else if (woodbury_basis_active && i == 0)
             APy.col(i) = woodbury_basis_Kv(ctx, Py);
         else if (ctx.A[ctx.r_indx[i]].size() == 0)
             APy.col(i) = Py;
         else
-            APy.col(i).noalias() = ctx.A[ctx.r_indx[i]] * Py;
+            // APy.col(i) is a block-expression target -- selfadjointView
+            // products assigned directly into a block silently fall back
+            // to a scalar (non-BLAS) path in Eigen. Evaluate into a plain
+            // RemlVec temporary first (forces the BLAS-dispatched product),
+            // then copy into the block -- same pattern already used
+            // elsewhere in this file (e.g. compute_woodbury_posthoc_delta).
+            APy.col(i) = RemlVec(ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py);
     }
 
     RemlVec R(m);
@@ -757,10 +935,7 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     } else {
         R.noalias() = APy.transpose() * Py;
         RemlMat PAPy(ctx.n, m);
-        // P is fully symmetrised by calcu_P_impl before this call.
-        // Plain product dispatches to dgemm, which is faster than dsymm for
-        // rectangular APy (m is small) on AOCL/Zen4.
-        PAPy.noalias() = P * APy;
+        PAPy.noalias() = P.selfadjointView<Eigen::Upper>() * APy;
         Hi.noalias() = APy.transpose() * PAPy;
     }
     Hi = 0.5 * Hi;
@@ -914,12 +1089,12 @@ RemlVec compute_woodbury_posthoc_delta(RemlCtx& ctx, const RemlMat& Hi, const Re
             else if (ctx.A[ctx.r_indx[i]].size() == 0)
                 R_raw_l(i) = Py_at.dot(Py_at);
             else
-                R_raw_l(i) = Py_at.dot(RemlVec(ctx.A[ctx.r_indx[i]] * Py_at));
+                R_raw_l(i) = Py_at.dot(RemlVec(ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py_at));
         }
 
         RemlVec R_for_correction_l = R_raw_l;
         if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
-            const RemlVec APy_exact_l = ctx.A[ctx.r_indx[0]] * Py_at;   // the O(n^2) pass
+            const RemlVec APy_exact_l = ctx.A[ctx.r_indx[0]].selfadjointView<Eigen::Upper>() * Py_at;   // the O(n^2) pass
             R_for_correction_l(0) = Py_at.dot(APy_exact_l);
         } else {
             LOGGER.w(0, "ctx.woodbury_basis_posthoc_correction is set but the exact GRM "
@@ -1024,7 +1199,7 @@ RemlVec compute_he_tail_corrected_varcmp(RemlCtx& ctx, bool use_exact_yKy) {
     // is available.
     double yKy;
     if (use_exact_yKy && !ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
-        yKy = ctx.y.dot(RemlVec(ctx.A[ctx.r_indx[0]] * ctx.y));   // one O(n^2) pass
+        yKy = ctx.y.dot(RemlVec(ctx.A[ctx.r_indx[0]].selfadjointView<Eigen::Upper>() * ctx.y));   // one O(n^2) pass
     } else {
         if (use_exact_yKy) {
             LOGGER.w(0, "compute_he_tail_corrected_varcmp: exact y'Ky requested but ctx.A "
@@ -1074,7 +1249,7 @@ RemlVec compute_woodbury_posthoc_delta_simple(RemlCtx& ctx, const RemlMat& Hi, c
     for (int i = 1; i < m; i++) {
         R_flat(i) = (ctx.A[ctx.r_indx[i]].size() == 0)
             ? Py.dot(Py)
-            : Py.dot(RemlVec(ctx.A[ctx.r_indx[i]] * Py));
+            : Py.dot(RemlVec(ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py));
     }
 
     const RemlVec U_partial = -0.5 * (tr_PA_corrected - R_flat);
@@ -1099,20 +1274,24 @@ void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
         Py = applyP_vec(ctx, ctx.y);
     } else {
         calcu_tr_PA(ctx, P, tr_PA);
-        Py.noalias() = P.selfadjointView<Eigen::Lower>() * ctx.y;
+        Py.noalias() = P.selfadjointView<Eigen::Upper>() * ctx.y;
     }
 
     const int m = static_cast<int>(ctx.r_indx.size());
     RemlVec R(m);
     if (ctx.reml_tmp_n.size() != ctx.n) ctx.reml_tmp_n.resize(ctx.n);
     for (int i = 0; i < m; i++) {
-        if (woodbury_basis_active && i == 0) {
+        if (ctx.grm_chunk_rows > 0 && i == 0) {
+            ctx.reml_tmp_n = gcta_chunked::chunked_symmetric_matvec(
+                ctx.grm_tile_reader, ctx.n, ctx.grm_chunk_rows, Py);
+            R(i) = Py.dot(ctx.reml_tmp_n);
+        } else if (woodbury_basis_active && i == 0) {
             ctx.reml_tmp_n = woodbury_basis_Kv(ctx, Py);
             R(i) = Py.dot(ctx.reml_tmp_n);
         } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
             R(i) = Py.squaredNorm();
         } else {
-            ctx.reml_tmp_n.noalias() = ctx.A[ctx.r_indx[i]] * Py;
+            ctx.reml_tmp_n.noalias() = ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py;
             R(i) = Py.dot(ctx.reml_tmp_n);
         }
         varcmp(i) = prev_varcmp(i) - prev_varcmp(i) * prev_varcmp(i) * (tr_PA(i) - R(i)) / ctx.n;
@@ -1206,7 +1385,19 @@ double reml_iteration(RemlCtx& ctx,
 
             if (!prior_var_flag) {
                 LOGGER << "Round 0 iteration using ";
-                if(ctx.reml_no_HE_start) {
+                // Fall back to EM-REML for round 0 whenever the run did NOT
+                // actually start from an HE warm-start point -- either
+                // because the user asked to skip it (--reml-no-he-start) or
+                // because init_varcomp's warm-start preconditions weren't
+                // met (multi-component model, priors supplied, or the HE
+                // regression itself was ill-conditioned/degenerate and
+                // declined to set varcmp). ctx.reml_no_HE_start alone isn't
+                // enough here: it only reflects the user's request, not
+                // whether a warm start was actually applied, and AI-REML's
+                // Newton step from the naive equal-split starting point is
+                // not reliably informative -- EM-REML is robust from any
+                // starting point.
+                if (ctx.reml_no_HE_start || !ctx.he_warm_start_applied) {
                   ctx.reml_mtd = 2;
                   LOGGER << "EM-REML ..." << std::endl;
                 } else {
@@ -1430,7 +1621,9 @@ double reml_iteration(RemlCtx& ctx,
                     else if (ctx.A[ctx.r_indx[i]].size() == 0)
                         APy_post.col(i) = Py;
                     else
-                        APy_post.col(i).noalias() = ctx.A[ctx.r_indx[i]] * Py;
+                        // Block-expression target (APy_post.col(i)) -- see ai_reml
+                        // for why this must evaluate into a temporary first.
+                        APy_post.col(i) = RemlVec(ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py);
                 }
                 const RemlMat PAPy_post = applyP_mat(ctx, APy_post);
                 Hi.noalias() = APy_post.transpose() * PAPy_post;
@@ -1661,14 +1854,15 @@ static int finalize_and_log_woodbury_rank(
                    << " (margin=" << (ctx.woodbury_basis_edge_margin * 100.0) << "%, confirm="
                    << ctx.woodbury_basis_edge_confirm << " consecutive)"
                    << ", using k = " << k << std::endl;
-            if (k_edge >= k_svd && k_svd >= n - 1)
-                LOGGER.w(0, "Woodbury MP-k: edge band not confirmed even at k=n-1=" + std::to_string(n - 1)
-                         + "; this GRM has near-full effective rank and Woodbury may not offer a computational advantage here.");
-            else if (k_edge >= k_svd && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury MP-k: edge band not confirmed within the memory-budget-implied ceiling k="
-                         + std::to_string(k_svd) + " (--reml-woodbury-basis-mem-budget=" + std::to_string(ctx.svd_mem_budget_gb) + "GB).");
-            else if (k_edge >= k_svd)
-                LOGGER.w(0, "Woodbury MP-k: edge band not confirmed within k_max=" + std::to_string(k_svd) + "; clamped to k_max.");
+            if (!eval_res.satisfied && k_svd >= n - 1)
+                LOGGER.e(0, "Woodbury MP-k: edge band not confirmed even at k=n-1=" + std::to_string(n - 1)
+                         + "; this GRM has near-full effective rank and Woodbury may not offer a computational advantage here. Refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury MP-k: edge band not confirmed within the memory-budget-implied ceiling k="
+                         + std::to_string(k_svd) + " (--reml-woodbury-basis-mem-budget=" + std::to_string(ctx.svd_mem_budget_gb) + "GB). Raise the budget or lower --reml-woodbury-basis-edge-margin/-confirm; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied)
+                LOGGER.e(0, "Woodbury MP-k: edge band not confirmed within k_max=" + std::to_string(k_svd)
+                         + ". Raise --reml-woodbury-basis-range's k_max; refusing to proceed with an unresolved basis.");
             break;
         }
         case WoodburyMode::EIG: {
@@ -1677,18 +1871,29 @@ static int finalize_and_log_woodbury_rank(
             double cumulative = 0.0;
             for (int i = 0; i < k; ++i) cumulative += eval_full[i];
             const double rho = cumulative / trace_K_full;
-            LOGGER << "EIG-k: trace(K)=" << trace_K_full
-                   << ", raw " << ctx.woodbury_basis_eigen_mass * 100 << "% mass crossing at k=" << k_EIGMASS
-                   << ", using k=" << k << " (+" << ctx.woodbury_basis_EIG_k_buffer << " eigenvalue buffer)"
-                   << ", captured mass rho=" << rho << std::endl;
-            if (k_EIGMASS >= k_svd && k_svd >= n - 1)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached even at k=n-1=" + std::to_string(n - 1) + ".");
-            else if (k_EIGMASS >= k_svd && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached within memory budget ceiling k=" + std::to_string(k_svd) + ".");
-            else if (k_EIGMASS >= k_svd && k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached within k_max=" + std::to_string(k_cap) + ".");
-            else if (k_EIGMASS >= k_svd)
-                LOGGER.w(0, "Woodbury EIG-k: mass target not reached within k=" + std::to_string(k_svd) + ".");
+            if (eval_res.satisfied) {
+                LOGGER << "EIG-k: trace(K)=" << trace_K_full
+                       << ", raw " << ctx.woodbury_basis_eigen_mass * 100 << "% mass crossing at k=" << k_EIGMASS
+                       << ", using k=" << k << " (+" << ctx.woodbury_basis_EIG_k_buffer << " eigenvalue buffer)"
+                       << ", captured mass rho=" << rho << std::endl;
+            } else {
+                LOGGER << "EIG-k: trace(K)=" << trace_K_full
+                       << ", target mass (" << ctx.woodbury_basis_eigen_mass * 100 << "%) NOT reached within k=" << k_svd
+                       << ", using fallback k=" << k
+                       << ", captured mass rho=" << rho << std::endl;
+            }
+            if (!eval_res.satisfied && k_svd >= n - 1)
+                LOGGER.e(0, "Woodbury EIG-k: mass target not reached even at k=n-1=" + std::to_string(n - 1)
+                         + " (captured rho=" + std::to_string(rho) + "). Refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury EIG-k: mass target not reached within memory budget ceiling k=" + std::to_string(k_svd)
+                         + " (captured rho=" + std::to_string(rho) + "). Raise --reml-woodbury-basis-mem-budget; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury EIG-k: mass target not reached within k_max=" + std::to_string(k_cap)
+                         + " (captured rho=" + std::to_string(rho) + "). Raise --reml-woodbury-basis-range's k_max; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied)
+                LOGGER.e(0, "Woodbury EIG-k: mass target not reached within k=" + std::to_string(k_svd)
+                         + " (captured rho=" + std::to_string(rho) + "). Refusing to proceed with an unresolved basis.");
             break;
         }
         case WoodburyMode::VAR: {
@@ -1713,14 +1918,18 @@ static int finalize_and_log_woodbury_rank(
                    << " (tail_d_var=" << tail_var
                    << ", tail non-isotropic energy=" << tail_nonisotropic_energy
                    << ", relative Frobenius error=" << relative_frobenius_error << ")" << std::endl;
-            if (k_VAR >= k_svd && k_svd >= n - 1)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached even at k=n-1=" + std::to_string(n - 1) + ".");
-            else if (k_VAR >= k_svd && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within memory budget ceiling k=" + std::to_string(k_svd) + ".");
-            else if (k_VAR >= k_svd && k_max_is_hard_ceiling)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k_max=" + std::to_string(k_cap) + ".");
-            else if (k_VAR >= k_svd)
-                LOGGER.w(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k=" + std::to_string(k_svd) + ".");
+            if (!eval_res.satisfied && k_svd >= n - 1)
+                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached even at k=n-1=" + std::to_string(n - 1)
+                         + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within memory budget ceiling k=" + std::to_string(k_svd)
+                         + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Raise --reml-woodbury-basis-mem-budget; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied && k_max_is_hard_ceiling)
+                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k_max=" + std::to_string(k_cap)
+                         + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Raise --reml-woodbury-basis-range's k_max; refusing to proceed with an unresolved basis.");
+            else if (!eval_res.satisfied)
+                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k=" + std::to_string(k_svd)
+                         + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Refusing to proceed with an unresolved basis.");
             break;
         }
         case WoodburyMode::Fixed:
@@ -1751,18 +1960,18 @@ void compute_woodbury_basis(RemlCtx& ctx) {
         LOGGER.e(0, "--reml-woodbury-basis is incompatible with Fisher-scoring REML.");
     if ((int)ctx.r_indx.size() != 2)
         LOGGER.e(0, "--reml-woodbury-basis supports only single-GRM models.");
-    if (ctx.A[ctx.r_indx[0]].size() == 0 && ctx.svd_chunked_budget <= 0.0)
+    if (ctx.A[ctx.r_indx[0]].size() == 0 && ctx.grm_chunked_budget <= 0.0)
         LOGGER.e(0, "--reml-woodbury: GRM component is identity; cannot compute basis.");
-    if (ctx.svd_chunked_budget > 0.0 && !ctx.grm_tile_reader)
-        LOGGER.e(0, "--reml-woodbury: --svd-chunked-budget is set but ctx.grm_tile_reader is empty "
+    if (ctx.grm_chunked_budget > 0.0 && !ctx.grm_tile_reader)
+        LOGGER.e(0, "--reml-woodbury: --grm-chunked-budget is set but ctx.grm_tile_reader is empty "
                     "— the GRM component wasn't actually loaded either way.");
 
     const WoodburyMode mode = ctx.woodbury_mode();
     const int  n = ctx.n;
-    const bool svd_chunked = ctx.svd_chunked_budget > 0.0;
+    const bool grm_chunked = ctx.grm_chunked_budget > 0.0;
 
     int k_svd_budget_ceiling = n - 1;
-    if (ctx.svd_mem_budget_gb > 0.0) {
+    if (grm_chunked && ctx.svd_mem_budget_gb > 0.0) {
         const double budget_bytes = ctx.svd_mem_budget_gb * 1e9;
         const int max_k_ext = static_cast<int>(budget_bytes / (5.0 * n * 8.0));
         k_svd_budget_ceiling = std::min(k_svd_budget_ceiling, std::max(20, max_k_ext - 200));
@@ -1770,32 +1979,17 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                << "GB -> k_svd capped at " << k_svd_budget_ceiling << std::endl;
     }
 
-    // Row-chunk size for streaming reads off ctx.grm_tile_reader (chunked_diagonal,
-    // chunked_trace_K_squared, chunked_symmetric_matvec). Budget-driven, same pattern
-    // as --GRM-tile-budget: solve for the number of rows that fit rather than guessing
-    // a fixed size. Sized against k_svd_budget_ceiling (the worst-case rank this call
-    // can reach) since the chunk size is fixed once here and reused across the whole
-    // adaptive-rank loop below, regardless of which k_ext is live at any given moment.
-    int svd_chunk_rows = 0;
-    if (svd_chunked) {
-        // k_svd_budget_ceiling feeds k_ext_hint below. Left at its n-1 default (no
-        // --reml-woodbury-basis-mem-budget), k_ext_hint is sized against the
-        // worst case the adaptive-rank loop could reach, not the rank it will
-        // actually settle on — so svd_chunk_rows may land smaller than strictly
-        // necessary. That's the intended tradeoff for a hard RSS cap on the
-        // GRM-streaming buffer regardless of k_svd, not a misconfiguration.
-        const int k_ext_hint = k_svd_budget_ceiling + gcta_eigh::recommended_oversample(k_svd_budget_ceiling);
-        svd_chunk_rows = gcta_chunked::solve_chunk_rows(n, ctx.svd_chunked_budget, k_ext_hint);
-        if (svd_chunk_rows < 1)
-            LOGGER.e(0, "--svd-chunked-budget=" + std::to_string(ctx.svd_chunked_budget)
-                        + "GB cannot fit even a single GRM row (n=" + std::to_string(n)
-                        + ", k_ext=" + std::to_string(k_ext_hint) + " -> "
-                        + std::to_string(8.0 * (n + k_ext_hint) / 1e9) + "GB/row); raise the budget"
-                        + " or add --reml-woodbury-basis-mem-budget <GB> to cap k_ext.");
-        LOGGER << "--svd-chunked-budget=" << ctx.svd_chunked_budget
-               << "GB -> streaming " << svd_chunk_rows << " GRM row(s) per chunk (k_ext up to "
-               << k_ext_hint << ")" << std::endl;
+    int grm_chunk_rows = 0;
+    if (grm_chunked) {
+        grm_chunk_rows = setup_chunked_grm_stream(ctx, "--reml-woodbury-basis");
+        // Y is not reserved by setup_chunked_grm_stream -- report its worst-case
+        // size (at the current k_svd ceiling) here so it's visible without being enforced.
+        const double y_worst_case_gb = 8.0 * n * static_cast<double>(k_svd_budget_ceiling) / 1e9;
+        LOGGER << "--reml-woodbury-basis: at the current k_svd ceiling of " << k_svd_budget_ceiling
+               << ", the basis matrix (Y) may need up to ~" << y_worst_case_gb
+               << "GB, not covered by --grm-chunked-budget." << std::endl;
     }
+
 
     const bool k_max_is_hard_ceiling = (ctx.woodbury_basis_k_max > 0);
     const int k_svd_cap = woodbury_rank_cap(ctx, k_svd_budget_ceiling);
@@ -1824,20 +2018,31 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     }
     if (k_svd >= n) LOGGER.e(0, "--reml-woodbury-basis rank must be < n.");
 
+    // K_dbl is upper-triangle-only storage (row <= col valid; see
+    // grm_binary_io.hpp upper_only load path). No valid data below the
+    // diagonal.
     const Eigen::MatrixXd& K_dbl = ctx.A[ctx.r_indx[0]];
-    const double trace_K_full = svd_chunked
-        ? gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, svd_chunk_rows).sum()
+    const double trace_K_full = grm_chunked
+        ? gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, grm_chunk_rows).sum()
         : K_dbl.diagonal().sum();
 
     double trace_K2 = 0.0;
-    if (svd_chunked) {
-        trace_K2 = gcta_chunked::chunked_trace_K_squared(ctx.grm_tile_reader, n, svd_chunk_rows);
+    if (grm_chunked) {
+        trace_K2 = gcta_chunked::chunked_trace_K_squared(ctx.grm_tile_reader, n, grm_chunk_rows);
     } else {
+        // Previously read K_dbl.col(j).tail(n-j-1) -- rows j+1..n-1 of
+        // column j, i.e. the LOWER triangle. That was a correctness bug
+        // waiting to happen under upper-only storage (it happened to be
+        // contiguous and correct only because the now-removed mirror pass
+        // kept the lower triangle populated). Fixed the same way as
+        // init_varcomp's trK2: col(j).head(j) reads rows 0..j-1 of column
+        // j -- the UPPER triangle -- and is equally contiguous, so this is
+        // a pure win, not a tradeoff.
         double diag_sq = K_dbl.diagonal().squaredNorm();
         double off_sq  = 0.0;
         #pragma omp parallel for reduction(+:off_sq) schedule(static)
         for (int j = 0; j < n; ++j)
-            off_sq += K_dbl.col(j).tail(n - j - 1).squaredNorm();
+            off_sq += K_dbl.col(j).head(j).squaredNorm();
         trace_K2 = diag_sq + 2.0 * off_sq;
     }
 
@@ -1845,8 +2050,8 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     if (mode == WoodburyMode::MP) {
         double M = 0.0;
         if (ctx.grm_N.rows() == n && ctx.grm_N.cols() == n) {
-            if (svd_chunked)
-                LOGGER.w(0, "--svd-chunked-budget: ctx.grm_N is a dense n x n matrix — this defeats "
+            if (grm_chunked)
+                LOGGER.w(0, "--grm-chunked-budget: ctx.grm_N is a dense n x n matrix — this defeats "
                             "the memory savings from chunking K. If your SNP-count-per-pair GRM_N "
                             "is roughly constant, pass it as a 1x1 scalar via ctx.grm_N instead.");
             M = ctx.grm_N.diagonal().mean();
@@ -1862,9 +2067,12 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     const bool allows_warm = woodbury_mode_allows_warm_start(mode);
 
     auto apply = [&](const auto& X) -> Eigen::MatrixXd {
-        if (svd_chunked)
-            return gcta_chunked::chunked_symmetric_matvec(ctx.grm_tile_reader, n, svd_chunk_rows, X);
-        return K_dbl * X;
+        if (grm_chunked)
+            return gcta_chunked::chunked_symmetric_matvec(ctx.grm_tile_reader, n, grm_chunk_rows, X);
+        // Return-by-value forces full evaluation into a fresh Eigen::MatrixXd
+        // temporary, not an in-place block write, so this is not subject to
+        // the selfadjointView-on-block-target scalar-fallback issue.
+        return K_dbl.selfadjointView<Eigen::Upper>() * X;
     };
 
     Eigen::VectorXd eval_full;
@@ -1917,7 +2125,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
 
         eval_res = evaluate_rank_criterion(mode, eval_full, k_svd, lambda_plus, target_mass, trace_K_full, trace_K2, ctx);
 
-        if (eval_res.satisfied || k_svd >= k_svd_cap || k_svd >= n / 2 || k_svd >= k_svd_budget_ceiling) break;
+        if (eval_res.satisfied || k_svd >= k_svd_cap || k_svd >= k_svd_budget_ceiling) break;
 
         int k_svd_next = std::min({k_svd * 2, n - 1, k_svd_cap});
         if (mode == WoodburyMode::EIG && ctx.woodbury_basis_eigen_adaptive) {
@@ -2010,13 +2218,29 @@ void compute(RemlCtx& ctx,
         compute_woodbury_basis(ctx);
         float duration = LOGGER.tp("main");
         LOGGER.i(0, "Woodbury basis computation took " + std::to_string(duration) + " seconds.");
+    } else if (ctx.reml_trace_hutchpp && ctx.grm_chunked_budget > 0.0) {
+        // Woodbury takes precedence when both are requested.
+        if ((int)ctx.r_indx.size() != 2)
+            LOGGER.e(0, "--grm-chunked-budget with --reml-trace-hutchpp supports only single-GRM models.");
+        ctx.grm_chunk_rows = setup_chunked_grm_stream(ctx, "--reml-trace-hutchpp");
+    } else if (ctx.grm_chunked_budget > 0.0) {
+        // Plain exact (non-Hutch++, non-Woodbury) chunked GRM. Without this
+        // branch ctx.grm_chunk_rows is never set for this path, so every
+        // downstream "ctx.grm_chunk_rows > 0" gate (ai_reml, em_reml,
+        // calcu_tr_PA, applyP_mat, init_varcomp's HE warm-start, ...) falls
+        // through to the "ctx.A[...].size() == 0" branch instead -- which
+        // silently treats the (empty, because it's streamed, not loaded)
+        // GRM component as an identity/residual term for the entire run.
+        if ((int)ctx.r_indx.size() != 2)
+            LOGGER.e(0, "--grm-chunked-budget supports only single-GRM models.");
+        ctx.grm_chunk_rows = setup_chunked_grm_stream(ctx, "--grm-chunked-budget");
     }
 
     RemlMat Vi_X_out(ctx.n, ctx.X_c), Xt_Vi_X_i_out(ctx.X_c, ctx.X_c);
     RemlMat Hi(ctx.r_indx.size(), ctx.r_indx.size());
     RemlVec Py(ctx.n);
     RemlVec varcmp;
-    init_varcomp(ctx, priors_var, priors, varcmp);
+    ctx.he_warm_start_applied = init_varcomp(ctx, priors_var, priors, varcmp);
 
     const double lgL = reml_iteration(ctx, Vi_X_out, Xt_Vi_X_i_out, Hi, Py, varcmp, priors_flag, no_constrain);
     ctx.logL = lgL;
@@ -2113,7 +2337,7 @@ RemlState build_reml_state(RemlCtx& ctx) {
 
         rs.lambda_tail_f = static_cast<float>(ctx.lambda_tail);
     } else if (ctx.Vi_use_llt) {
-        // Vi_L holds the lower Cholesky factor L of V (from dpotrf).
+        // Vi_L holds the upper Cholesky factor U of V (V = U^T U, from dpotrf).
         // Store it as float — the streaming code uses STRSV/STRSM directly,
         // avoiding dpotri (O(n³/3)) and a second Cholesky of V^{-1} (O(n³/3)).
         rs.is_llt = true;
@@ -2133,15 +2357,15 @@ RemlState build_reml_state(RemlCtx& ctx) {
         // operate in place on a caller-owned buffer -- that doubles peak
         // RSS transiently (ctx.Vi + LLT's internal copy, both n×n doubles,
         // alive simultaneously) for no reason, since ctx.Vi is read via
-        // selfadjointView<Lower> everywhere else in this file (only the
-        // lower triangle is guaranteed valid, matching dpotrf's contract)
+        // selfadjointView<Upper> everywhere else in this file (only the
+        // upper triangle is guaranteed valid, matching dpotrf('U')'s contract)
         // and is freed immediately below regardless.
         gcta_blas_int blas_n_bs = static_cast<gcta_blas_int>(ctx.n);
-        if (gcta_dpotrf(blas_n_bs, ctx.Vi.data(), blas_n_bs) != 0)
+        if (gcta_dpotrf(blas_n_bs, ctx.Vi.data(), blas_n_bs, 'U') != 0)
             LOGGER.e(0, "Vi is not positive definite when building REML state.");
         rs.is_llt = false;
         rs.Vi_L_f.resize(ctx.n, ctx.n);
-        rs.Vi_L_f.noalias() = ctx.Vi.cast<float>();   // lower triangle valid; upper is dpotrf
+        rs.Vi_L_f.noalias() = ctx.Vi.cast<float>();   // upper triangle valid; lower is dpotrf
                                                        // leftover and never read downstream --
                                                        // same convention as the Vi_use_llt branch above
         ctx.Vi.resize(0, 0);
@@ -2166,6 +2390,8 @@ RemlState build_reml_state(RemlCtx& ctx) {
     ctx.hutchpp_QtG.resize(0, 0);
     ctx.hutchpp_R.resize(0, 0);
     ctx.hutchpp_MR.resize(0, 0);
+    ctx.grm_chunk_rows = 0;
+    ctx.he_warm_start_applied = false;
     ctx.reml_tmp_n.resize(0);
     ctx.P.resize(0, 0);
     ctx.varcmp.clear();

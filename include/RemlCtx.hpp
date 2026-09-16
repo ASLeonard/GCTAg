@@ -60,19 +60,33 @@ struct RemlCtx {
     std::vector<int>     r_indx;  // typically {0, 1}
     RemlMat grm_N;   // from _grm_N — used only for Woodbury MP-k M estimation
 
-    // ── Chunked K@X (avoids a dense n x n K resident during basis construction) ──
-    // Only affects compute_woodbury_basis_basis's matvecs. When enabled, ctx.A[...]
-    // is expected to stay EMPTY (never densely loaded) and grm_tile_reader
-    // must be set by the caller before reml::compute() — see
-    // chunked_grm_matvec.hpp for the exact callback contract (reads a single
-    // lower-triangular tile; float32-on-disk should be widened to double at
-    // the tile level, not for the whole file up front).
-    double                      svd_chunked_budget = 0.0;  // GB budget for streaming chunk rows, off by default
+    // ── Chunked GRM access (avoids a dense n x n GRM resident) ────────────────
+    // Shared by three independent consumers: Woodbury basis construction
+    // (compute_woodbury_basis), the hutch++ trace estimator, and exact-mode
+    // REML (AI-REML/EM-REML only -- reml_mtd==1 is excluded, see
+    // grm_chunk_rows below). Whichever of these actually runs, ctx.A[...] is
+    // expected to stay EMPTY (never densely loaded) and grm_tile_reader must
+    // be set by the caller before reml::compute() — see chunked_grm_matvec.hpp
+    // for the exact callback contract (reads a single lower-triangular tile;
+    // float32-on-disk should be widened to double at the tile level, not for
+    // the whole file up front).
+    double                      grm_chunked_budget = 0.0;  // GB budget for streaming chunk rows, off by default
     gcta_chunked::TileReader grm_tile_reader;               // caller-populated when chunked
+
+    // Set once, in reml::compute(), before the AI-REML/EM-REML loop begins,
+    // whenever a chunked GRM budget is set and Woodbury is NOT active.
+    //Consumed by:
+    // assemble_V_lower (streams the GRM's contribution to V instead of
+    // reading ctx.A -- ctx.A[GRM] is expected to stay EMPTY exactly as in
+    // the Woodbury-chunked case), calcu_tr_PA (exact trace(PA)),
+    // calcu_tr_PA_hutchpp (hutch++ trace probes), calcu_Hi, and the
+    // ai_reml/em_reml A@vec sites. 0 = not streaming; all of the above
+    // fall back to the dense ctx.A path.
+    int grm_chunk_rows = 0;
 
     // Hard cap on rSVD sketch memory (Omega/Y/qr_scratch/Q, each ~n*k_ext*8
     // bytes, several live simultaneously during power iteration) as k_ext
-    // escalates. Chunking K (svd_chunked) removes K's own O(n^2)
+    // escalates. Chunking K (grm_chunked) removes K's own O(n^2)
     // footprint but does nothing to bound this — it scales with k_ext
     // identically whether K is chunked or dense, and unbounded escalation on
     // a pathological (near-full-rank) GRM can reach hundreds of GB before
@@ -126,6 +140,7 @@ struct RemlCtx {
     bool   reml_fixed_var            = false;
     bool   reml_allow_constrain_run  = false;
     bool   reml_no_HE_start          = false; // Active by default
+    bool   he_warm_start_applied = false;
 
     bool   svd_nystrom          = false; // true → single-pass Nystrom basis
 

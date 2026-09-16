@@ -40,30 +40,28 @@
 #endif
 
 // Portable dpotrf: Cholesky factorization of a symmetric positive-definite matrix
-// (lower triangle, column-major).  Returns 0 on success, non-zero on failure.
-inline int gcta_dpotrf(gcta_blas_int n, double* a, gcta_blas_int lda) {
+// (defaults to lower triangle, column-major). Returns 0 on success, non-zero on failure.
+inline int gcta_dpotrf(gcta_blas_int n, double* a, gcta_blas_int lda, char uplo = 'L') {
 #if defined(GCTA_USE_ACCELERATE)
-    char uplo = 'L';
     gcta_blas_int info = 0;
     dpotrf_(&uplo, &n, a, &lda, &info);
     return static_cast<int>(info);
 #else
-    return static_cast<int>(LAPACKE_dpotrf(LAPACK_COL_MAJOR, 'L', n, a, lda));
+    return static_cast<int>(LAPACKE_dpotrf(LAPACK_COL_MAJOR, uplo, n, a, lda));
 #endif
 }
 
 // Portable dpotri: in-place inversion of a Cholesky-factored symmetric positive-definite
-// matrix (lower triangle).  Returns 0 on success, non-zero on failure.
-inline int gcta_dpotri(gcta_blas_int n, double* a, gcta_blas_int lda) {
+// matrix. Returns 0 on success, non-zero on failure.
+inline int gcta_dpotri(gcta_blas_int n, double* a, gcta_blas_int lda, char uplo = 'L') {
 #if defined(GCTA_USE_ACCELERATE)
     // Accelerate exposes Fortran-ABI dpotri_ with pointer arguments.
-    char uplo = 'L';
     gcta_blas_int info = 0;
     dpotri_(&uplo, &n, a, &lda, &info);
     return static_cast<int>(info);
 #else
     // MKL, OpenBLAS, and AOCL all provide the LAPACKE C interface.
-    return static_cast<int>(LAPACKE_dpotri(LAPACK_COL_MAJOR, 'L', n, a, lda));
+    return static_cast<int>(LAPACKE_dpotri(LAPACK_COL_MAJOR, uplo, n, a, lda));
 #endif
 }
 

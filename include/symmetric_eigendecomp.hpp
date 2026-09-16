@@ -7,10 +7,12 @@
  *
  * Every entry point takes a matvec functor rather than a concrete matrix
  * type: `apply(X)` must return A * X for X either an n-vector or an n x m
- * block. This lets callers pass a plain MatrixXd, a selfadjointView<Upper>
- * or selfadjointView<Lower> (grm.cpp's GRM is fully populated; RemlEngine's
- * ctx.A GRM only has the lower triangle valid), or in future a tiled/
- * streaming matvec, without this header caring.
+ * block. This lets callers pass a plain MatrixXd, a selfadjointView<Upper>,
+ * or in future a tiled/streaming matvec, without this header caring.
+ * Both current callers (pca_stream.cpp's PCA path and RemlEngine.cpp's
+ * compute_woodbury_basis) now store their GRM upper-triangle-only and pass
+ * apply = [](X){ return G.selfadjointView<Eigen::Upper>() * X; } — see
+ * grm_binary_io.hpp's upper_only load option for why.
  *
  * Methods:
  *   - randomized_symmetric_eigh  : Halko/Martinsson/Tropp randomized range

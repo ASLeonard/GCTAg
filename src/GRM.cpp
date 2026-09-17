@@ -885,8 +885,21 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
         if(ret_grm){
             LOGGER.e(0, "can't allocate enough memory to store the (parted) GRM: " + to_string(fill_grm*sizeof(double) / 1024.0/1024/1024) + "GB required.");
         }
-        memset(grm, 0, fill_grm * sizeof(double));
+        if(bBLAS){
+            // grm here is a dense (grm_m x grm_n) buffer for cblas_dsyrk/dgemm, not the
+            // packed triangle fill_grm was sized for below (see the bBLAS override
+            // above) -- most of it is upper-triangle padding that's never read back.
+            // Skip zeroing it: calculate_GRM_blas's first call for this pass uses
+            // beta=0, which zero-initializes exactly the elements it writes (lower
+            // triangle for dsyrk, full rectangle for dgemm) without faulting in the
+            // untouched upper triangle. See grm_first_accum.
+            grm_first_accum = true;
+        } else {
+            memset(grm, 0, fill_grm * sizeof(double));
+        }
 
+        // N stays packed-triangular size even in bBLAS mode (fill_N was captured
+        // before the bBLAS override above), so this memset has no waste to fix.
         int ret_N = posix_memalign((void **)&N, 64, fill_N * sizeof(uint32_t));
         if(ret_N){
             LOGGER.e(0, "can't allocate enough memory to store (parted) N: " + to_string(fill_grm*sizeof(uint32_t) / 1024.0/1024/1024) + "GB required.");
@@ -1011,6 +1024,15 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     }
 
     static constexpr double alpha = 1.0;
+    // beta=0 on the *first* accumulation for this grm buffer (full pass or current
+    // tile) makes cblas_dsyrk/cblas_dgemm write straight into unzeroed memory instead
+    // of accumulating, so the very first touch of every page is confined to the
+    // elements that call actually writes: the lower triangle only for *syrk, the full
+    // rectangle for *gemm. beta=1 on every later block accumulates as before. This is
+    // what lets selfadjointView-style "lower triangle only" storage translate into
+    // actual reduced peak RSS -- a blanket memset before the loop would fault in the
+    // untouched upper triangle regardless of what BLAS does afterwards.
+    const double blas_beta = grm_first_accum ? 0.0 : 1.0;
     if(grm_tiling_enabled){
         // Block-tiled path: split into off-diagonal dgemm + diagonal dsyrk.
         //
@@ -1018,35 +1040,55 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         //   cols [0, tile_rs)    — off-diagonal, filled by dgemm
         //   cols [tile_rs, tile_re) — diagonal block (lower triangle), filled by dsyrk
         //
-        // A_tile = stdGeno[tile_rs : tile_re, :] — (tile_rows × k)
-        Eigen::Map<Eigen::MatrixXd, 0, Eigen::OuterStride<>> A_tile(
-            stdGeno + grm_tile_rs, grm_tile_rows, curNumValidMarkers,
-            Eigen::OuterStride<>(stdGenoLD));
+        // A_tile = stdGeno[tile_rs : tile_re, :] — (tile_rows × k), stored column-major
+        // with leading dimension stdGenoLD.
 
         // Off-diagonal block: only present when tile starts after column 0.
+        // C(tile_rows x tile_rs) := alpha * A_tile * A_top^T + beta * C
         if(grm_tile_rs > 0){
-            Eigen::Map<Eigen::MatrixXd, 0, Eigen::OuterStride<>> A_top(
-                stdGeno, grm_tile_rs, curNumValidMarkers,
-                Eigen::OuterStride<>(stdGenoLD));
-            Eigen::Map<Eigen::MatrixXd>(grm, grm_tile_rows, grm_tile_rs).noalias() +=
-                alpha * (A_tile * A_top.transpose());
+            cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans,
+                        grm_tile_rows, grm_tile_rs, curNumValidMarkers,
+                        alpha,
+                        stdGeno + grm_tile_rs, stdGenoLD,
+                        stdGeno, stdGenoLD,
+                        blas_beta,
+                        grm, grm_tile_rows);
         }
 
         // Diagonal block (dsyrk — ~2× fewer flops than equivalent dgemm).
         // Only the lower triangle is written; flush_grm_tile only reads pair2 <= pair1.
         double *grm_diag = grm + static_cast<size_t>(grm_tile_rs) * grm_tile_rows;
-        Eigen::Map<Eigen::MatrixXd>(grm_diag, grm_tile_rows, grm_tile_rows)
-            .selfadjointView<Eigen::Lower>().rankUpdate(A_tile, alpha);
+        cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans,
+                    grm_tile_rows, curNumValidMarkers,
+                    alpha,
+                    stdGeno + grm_tile_rs, stdGenoLD,
+                    blas_beta,
+                    grm_diag, grm_tile_rows);
     } else if(part_keep_indices.first == 0){
-        Eigen::Map<Eigen::MatrixXd, 0, Eigen::OuterStride<>> A(stdGeno, grm_n, curNumValidMarkers, Eigen::OuterStride<>(stdGenoLD));
-        Eigen::Map<Eigen::MatrixXd>(grm, grm_n, grm_n).selfadjointView<Eigen::Lower>().rankUpdate(A, alpha);
+        cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans,
+                    grm_n, curNumValidMarkers,
+                    alpha,
+                    stdGeno, stdGenoLD,
+                    blas_beta,
+                    grm, grm_n);
     }else{
-        Eigen::Map<Eigen::MatrixXd, 0, Eigen::OuterStride<>> A_top(stdGeno, grm_s_n, curNumValidMarkers, Eigen::OuterStride<>(stdGenoLD));
-        Eigen::Map<Eigen::MatrixXd, 0, Eigen::OuterStride<>> A_bot(stdGeno + part_keep_indices.first, grm_m, curNumValidMarkers, Eigen::OuterStride<>(stdGenoLD));
-        Eigen::Map<Eigen::MatrixXd>(grm, grm_m, grm_s_n).noalias() += alpha * (A_bot * A_top.transpose());
+        // C(grm_m x grm_s_n) := alpha * A_bot * A_top^T + beta * C
+        cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans,
+                    grm_m, grm_s_n, curNumValidMarkers,
+                    alpha,
+                    stdGeno + part_keep_indices.first, stdGenoLD,
+                    stdGeno, stdGenoLD,
+                    blas_beta,
+                    grm, grm_m);
         double *grm_start = grm + (uint64_t)grm_s_n * grm_m;
-        Eigen::Map<Eigen::MatrixXd>(grm_start, grm_m, grm_m).selfadjointView<Eigen::Lower>().rankUpdate(A_bot, alpha);
+        cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans,
+                    grm_m, curNumValidMarkers,
+                    alpha,
+                    stdGeno + part_keep_indices.first, stdGenoLD,
+                    blas_beta,
+                    grm_start, grm_m);
     }
+    grm_first_accum = false;  // every later marker block for this buffer accumulates (beta=1)
 
     const int markerPerN = sizeof(uintptr_t) * CHAR_BIT;
     const int numNblock = (curNumValidMarkers + markerPerN - 1) / markerPerN;
@@ -2404,8 +2446,25 @@ void GRM::processMakeGRM(){
             LOGGER.i(0, "  Tile rows " + to_string(tile_rs) + "-" + to_string(tile_re - 1)
                         + " (" + to_string(tile_gb).substr(0, 4) + " GB grm+N)");
 
-            memset(grm, 0, tile_elems * sizeof(double));
-            memset(N,   0, tile_elems * sizeof(uint32_t));
+            // grm: no memset needed. calculate_GRM_blas's first call for this tile
+            // uses beta=0 (see grm_first_accum), so cblas_dsyrk/dgemm zero-initialize
+            // exactly the elements they write -- lower triangle only for the diagonal
+            // block, full rectangle for the off-diagonal block -- instead of us
+            // blanket-zeroing the whole (grm_tile_rows x grm_tile_cols) rectangle and
+            // faulting in the diagonal block's never-read upper triangle.
+            grm_first_accum = true;
+
+            // N is populated by N_thread's popcount loop, not BLAS, so it still needs
+            // explicit zeroing. But N_thread only ever writes columns [0, pair1] for
+            // row pair1 (the lower-triangle footprint of this tile's rectangle, same
+            // shape grm's diagonal block uses) -- so only zero that footprint per row
+            // instead of the full grm_tile_cols-wide rectangle.
+            for(int r = 0; r < grm_tile_rows; r++){
+                const int pair1 = tile_rs + r;               // global row index
+                const int valid_cols = pair1 + 1;             // N_thread writes cols [0, pair1]
+                memset(N + static_cast<size_t>(r) * grm_tile_cols, 0,
+                       static_cast<size_t>(valid_cols) * sizeof(uint32_t));
+            }
 
             // Rebuild thread pair ranges for this tile's row range [tile_rs, tile_re).
             // N_thread and the grm accumulation buffer are both sized for this tile, so the

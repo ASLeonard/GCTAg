@@ -172,6 +172,7 @@ private:
     // quantities depend only on global genotype state, not on which tile row
     // range is being processed.
     bool grm_skip_global_state = false;
+    bool grm_first_accum = true;
 
     // Write the current tile's normalised rows to already-open output files.
     // w_grm/w_N/grm_block/sparse_buf are caller-owned scratch (sized once by

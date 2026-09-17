@@ -76,6 +76,10 @@ void out_ver(bool flag_outFile){
     log(0, "", "");
 }
 
+#ifdef GCTA_USE_JEMALLOC
+extern "C" const char* malloc_conf = "thp:never";
+#endif
+
 int main(int argc, char *argv[]){
     out_ver(false);
     LOGGER.ts("main");

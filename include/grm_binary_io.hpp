@@ -83,6 +83,29 @@ inline void read_exact(int fd, void* buf, size_t count, const std::string& path)
     }
 }
 
+// pread-based counterpart to read_exact above: reads exactly `count` bytes
+// starting at `offset`, retrying on EINTR and on short reads. pread takes
+// the offset as a call argument rather than mutating shared file-position
+// state, so unlike read()+lseek it's safe to call from any thread without
+// coordinating with others sharing the same fd -- ChunkedGrmReader only
+// ever calls this from one thread at a time regardless (see read_tile's
+// reentrancy note), but the safety property is what makes that fd share-
+// without-locking legitimate in the first place.
+inline void read_exact_at(int fd, void* buf, size_t count, off_t offset, const std::string& path) {
+    char* p = static_cast<char*>(buf);
+    size_t done = 0;
+    while (done < count) {
+        const ssize_t r = ::pread(fd, p + done, count - done, offset + static_cast<off_t>(done));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            LOGGER.e(0, "pread() failed on [" + path + "]: " + std::string(std::strerror(errno)));
+        }
+        if (r == 0)
+            LOGGER.e(0, "unexpected EOF reading [" + path + "].");
+        done += static_cast<size_t>(r);
+    }
+}
+
 // Blocking write of exactly `count` bytes from `buf`, retrying on EINTR and
 // on short writes. Errors out via LOGGER on a hard write error.
 inline void write_exact(int fd, const void* buf, size_t count, const std::string& path) {
@@ -267,9 +290,13 @@ inline std::vector<int> match_ids_to_grm(const std::vector<std::string>& ref_ids
 }
 
 // Tile reader for --reml-svd-chunked: returns K in ANALYSIS sample order
-// (post-kp reindexing), without ever materializing a dense matrix — not
-// even transiently, and not just the n x n analysis-subsetted one, unlike
-// read_grm_binary() above.
+// (post-kp reindexing), keeping only a bounded row-band resident at once
+// (see ensure_band below) rather than the whole file. Requires kp to be at
+// least an order-preserving subset of the file's row order (identity or
+// monotonic) -- see the constructor check for why scrambled kp isn't
+// supported: a row-band cache only pays off when each band's bytes are
+// read once and reused by every tile touching those rows, which needs
+// exactly the monotonicity this class requires.
 class ChunkedGrmReader {
 public:
     // kp[i] = row index (in whatever file this wraps) for analysis
@@ -282,8 +309,15 @@ public:
     // share an identical packed-lower-triangular float32 layout, so this
     // class serves either; callers needing both (e.g. a weighted merge)
     // construct two instances against the same kp.
-    ChunkedGrmReader(const std::string& path, std::vector<int> kp, int n_grm)
-        : kp_(std::move(kp))
+    //
+    // band_byte_budget caps how much of the file ensure_band() keeps
+    // resident at once (default 1GiB). Callers that size --grm-chunked-budget
+    // against a fixed reservation for this reader (see solve_chunk_rows's
+    // reserved_gb) must pass that same number here — the two are meant to
+    // be the same budget split two ways, not independently chosen.
+    ChunkedGrmReader(const std::string& path, std::vector<int> kp, int n_grm,
+                      size_t band_byte_budget = (1ull << 30) /* 1GiB */)
+        : kp_(std::move(kp)), path_(path), n_grm_(n_grm), band_byte_budget_(band_byte_budget)
     {
         const size_t tri = static_cast<size_t>(n_grm) * (n_grm + 1) / 2;
         byte_len_ = tri * sizeof(float);
@@ -299,53 +333,32 @@ public:
         }
 
         kp_is_identity_ = true;
-        kp_is_monotonic_ = true;
+        bool kp_is_monotonic = true;
         for (int i = 0; i < static_cast<int>(kp_.size()); ++i) {
             if (kp_[i] != i) kp_is_identity_ = false;
-            if (i > 0 && kp_[i] <= kp_[i - 1]) kp_is_monotonic_ = false;
+            if (i > 0 && kp_[i] <= kp_[i - 1]) kp_is_monotonic = false;
         }
 
-        // Read the whole packed file with one portable, single-threaded
-        // sequential read_exact() call into an owned buffer, rather than
-        // mmap + madvise + a manual warm-up sweep (the prior version of
-        // this constructor). Two things motivated dropping mmap here, not
-        // just tuning it further:
-        //  1. Every mmap-based path in this file has needed a workaround
-        //     for the same underlying issue on this project's Lustre-backed
-        //     cluster storage -- read_grm_binary's original dense fill
-        //     (concurrent per-thread page faults), merge_grms's
-        //     schedule(dynamic) mixing loop, and this class's own read_tile
-        //     scatter, all independently regressed the same way. The dense
-        //     loader's read()-based chunked design has been robust in every
-        //     case it's been tried, including at the largest scales tested
-        //     so far; mmap's page-fault-driven access, even single-threaded
-        //     and even with an explicit warm-up sweep, has not been.
-        //  2. This makes the class's memory cost an explicit, fixed heap
-        //     allocation (byte_len_ bytes, known at construction) instead
-        //     of page-cache-resident-but-technically-reclaimable pages --
-        //     a plain heap buffer is simpler to reason about for memory
-        //     budgeting than "resident right now, but the kernel is free
-        //     to evict it under pressure and re-fault it later."
-        // read_exact already handles retrying on short reads (routine on
-        // network filesystems) and errors out via LOGGER on real failure,
-        // so this one call is the whole read -- no chunk loop needed here
-        // (unlike read_grm_binary's fill, there's no per-chunk float->double
-        // cast or scatter to interleave; this class stores the packed
-        // float32 data verbatim and defers the cast to read_tile, at tile
-        // granularity, same as before).
-        data_.resize(tri);
-        read_exact(fd_, data_.data(), byte_len_, path);
-        ::close(fd_);
-        fd_ = -1;
-        fbuf_ = data_.data();
+        // A scrambled kp has no row-range locality: the band cache below
+        // only pays off because each row-band's full span is read once and
+        // reused by every tile touching those rows. Without monotonicity
+        // that reuse doesn't happen, and this degrades to a pread per
+        // output entry -- millions of syscalls for a single mid-size tile,
+        // far worse than the dense path. Rejected outright, no fallback
+        // (an earlier version of this class had a scrambled-kp fallback
+        // path; removed together with kp_is_monotonic_/read_raw once this
+        // became a hard error instead of a warning).
+        if (!kp_is_monotonic)
+            LOGGER.e(0, "--reml-svd-chunked requires the analysis sample order to match "
+                        "(or be an ordered subset of) [" + path + "]'s row order. Re-run "
+                        "with sample IDs sorted to match the GRM's native order, or drop "
+                        "--reml-svd-chunked to use the dense path.");
 
-        if (!kp_is_monotonic_)
-            LOGGER.w(0, "--svd-chunked-budget: the analysis sample order does not match [" +
-                        path + "]'s order (individuals were reordered, not just subsetted). "
-                        "GRM tile reads degrade to scattered per-entry access in this case, "
-                        "which costs RAM/cache locality (not filesystem I/O, since the whole "
-                        "file is already loaded at this point) but can still be noticeably "
-                        "slower than the monotonic case.");
+        // fd_ stays open for this object's lifetime; ensure_band() preads
+        // from it on demand, band by band. No whole-file buffer is
+        // allocated here (unlike the earlier version of this constructor,
+        // which read the entire file up front -- see chat history for why
+        // that was dropped in favor of a bounded band cache).
     }
 
     ~ChunkedGrmReader() {
@@ -357,32 +370,40 @@ public:
     // K_analysis[rs:re, cs:ce]. Every consumer (chunked_symmetric_matvec,
     // chunked_diagonal, chunked_trace_K_squared) only ever reads a
     // diagonal-block tile (rs==cs) through selfadjointView<Lower>() or
-    // .diagonal() — so only the tile's lower triangle (lq <= lp) needs to
-    // be valid there; the monotonic fast path below relies on that and
-    // leaves the upper triangle uninitialized for diagonal tiles. For a
-    // genuinely scrambled (non-monotonic) kp there's no cheaper option, so
-    // the fallback below still fills the whole tile per entry.
+    // .diagonal() -- so only the tile's lower triangle (lq <= lp) needs to
+    // be valid there; both paths below leave the upper triangle
+    // uninitialized for diagonal tiles.
+    //
+    // NOT reentrant: this call, and the ensure_band refill it may trigger,
+    // mutate band_buf_/band_lo_/band_hi_ and tile_scratch_ with no locking.
+    // Only the #pragma omp parallel for loop body inside one call may run
+    // concurrently. Two overlapping read_tile calls on the same reader --
+    // e.g. a caller that parallelizes the outer row-band loop instead of
+    // just the inner per-row loop -- will race on which band is resident
+    // and silently produce wrong numbers, not a crash.
+    //
+    // Also assumes rs is non-decreasing across a sweep (each call's row
+    // range starts at or after the previous call's, as chunked_grm_matvec's
+    // row-owner traversal does): ensure_band only grows the band forward,
+    // so a call requesting an earlier row than the current band's start
+    // pays a fresh read from that point -- still correct, just not the
+    // sequential-pass behavior this cache is for.
     Eigen::Ref<const Eigen::MatrixXd> read_tile(int rs, int re, int cs, int ce) const {
         const int tile_rows = re - rs, tile_cols = ce - cs;
         if (tile_scratch_.rows() < tile_rows || tile_scratch_.cols() < tile_cols) {
             tile_scratch_.resize(std::max<Eigen::Index>(tile_scratch_.rows(), tile_rows),
                                   std::max<Eigen::Index>(tile_scratch_.cols(), tile_cols));
-         }
-        auto tile = tile_scratch_.topLeftCorner(tile_rows, tile_cols);
-
-        if (!kp_is_monotonic_) {
-            // Genuinely scrambled kp: no exploitable locality, every entry
-            // can live on a different page of a possibly huge file.
-            #pragma omp parallel for schedule(dynamic, 64)
-            for (int lp = 0; lp < tile_rows; ++lp) {
-                const int gi = kp_[rs + lp];
-                for (int lq = 0; lq < tile_cols; ++lq) {
-                    const int gj = kp_[cs + lq];
-                    tile(lp, lq) = read_raw(gi, gj);
-                }
-            }
-            return tile;
         }
+        auto tile = tile_scratch_.topLeftCorner(tile_rows, tile_cols);
+        const bool diagonal_tile = (rs == cs);
+
+        // kp_ is strictly increasing (enforced at construction), so
+        // kp_[rs]/kp_[re-1] are this tile's min/max file row. Single-
+        // threaded pread, outside the parallel loop below.
+        ensure_band(kp_[rs], kp_[re - 1] + 1);
+
+        const float* buf = band_buf_.data();
+        const size_t band_elem_lo = static_cast<size_t>(band_lo_) * (band_lo_ + 1) / 2;
 
         if (kp_is_identity_) {
             // No reindexing at all: gj - gj_lo == lq exactly, so the source
@@ -390,14 +411,13 @@ public:
             // (and the per-entry gj/subtraction arithmetic below) entirely
             // and let Eigen vectorize the float->double widen as one cast
             // instead of a hand-rolled scalar gather loop.
-            const bool diagonal_tile = (rs == cs);
             #pragma omp parallel for schedule(dynamic, 64)
             for (int lp = 0; lp < tile_rows; ++lp) {
                 const int gi = rs + lp;
                 const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
                 if (lq_end == 0) continue;
-                const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2;
-                const float* row_span = fbuf_ + row_base + cs;
+                const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2 - band_elem_lo;
+                const float* row_span = buf + row_base + cs;
                 tile.row(lp).head(lq_end) =
                     Eigen::Map<const Eigen::RowVectorXf>(row_span, lq_end).cast<double>();
             }
@@ -412,17 +432,16 @@ public:
         // across the row. Still a scalar per-entry gather (kp_ may have
         // gaps within [cs, cs+lq_end), so the needed file columns aren't
         // necessarily contiguous even though they're bounded and increasing)
-        // — bounded to one row's own span rather than the whole file is
-        // what matters for locality here, not a bulk vectorized read.
-        const bool diagonal_tile = (rs == cs);
+        // — bounded to one row's own span (now within the resident band,
+        // not the whole file) rather than a filesystem read.
         #pragma omp parallel for schedule(dynamic, 64)
         for (int lp = 0; lp < tile_rows; ++lp) {
             const int gi = kp_[rs + lp];
             const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;  // upper triangle unused for diagonal tiles
             if (lq_end == 0) continue;
             const int gj_lo = kp_[cs];
-            const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2;
-            const float* row_span = fbuf_ + row_base + gj_lo;
+            const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2 - band_elem_lo;
+            const float* row_span = buf + row_base + gj_lo;
             for (int lq = 0; lq < lq_end; ++lq) {
                 const int gj = kp_[cs + lq];
                 tile(lp, lq) = static_cast<double>(row_span[gj - gj_lo]);
@@ -431,25 +450,49 @@ public:
         return tile;
     }
 
-
 private:
     mutable Eigen::MatrixXd tile_scratch_;
 
-    double read_raw(int gi, int gj) const {
-        const int file_row = std::max(gi, gj);
-        const int file_col = std::min(gi, gj);
-        const size_t idx = static_cast<size_t>(file_row) * (file_row + 1) / 2
-                          + static_cast<size_t>(file_col);
-        return static_cast<double>(fbuf_[idx]);
+    // [band_lo_, band_hi_) = file-row range currently resident in
+    // band_buf_. The packed layout has row_base(i+1) == row_base(i) + (i+1),
+    // so any contiguous run of file rows is one contiguous byte range,
+    // loadable with a single sequential pread.
+    //
+    // ensure_band grows band_hi_ past what the immediate tile needs, up to
+    // band_byte_budget_ total, via row_bound_for_cumulative -- the same
+    // closed-form triangular-row math read_grm_binary/merge_grms already
+    // use for their own chunk boundaries -- rather than a fixed row count,
+    // since a fixed row count is a very different byte size near the top
+    // of the matrix than the bottom. Growing past the immediate need also
+    // means later tiles sharing this row range (different column tiles,
+    // same row-band, as in chunked_symmetric_matvec's inner j loop) hit
+    // the resident buffer instead of re-reading.
+    mutable std::vector<float> band_buf_;
+    mutable int band_lo_ = 0, band_hi_ = 0;
+
+    void ensure_band(int file_lo, int file_hi) const {
+        if (file_lo >= band_lo_ && file_hi <= band_hi_) return;   // already resident
+
+        const size_t elem_lo = static_cast<size_t>(file_lo) * (file_lo + 1) / 2;
+        const size_t target_elems = elem_lo + band_byte_budget_ / sizeof(float);
+        const int grown_hi  = row_bound_for_cumulative(target_elems, file_lo, n_grm_);
+        const int actual_hi = std::max(file_hi, grown_hi);  // never smaller than this tile's own need
+
+        const size_t elem_hi = static_cast<size_t>(actual_hi) * (actual_hi + 1) / 2;
+        band_buf_.resize(elem_hi - elem_lo);
+        read_exact_at(fd_, band_buf_.data(), (elem_hi - elem_lo) * sizeof(float),
+                      static_cast<off_t>(elem_lo * sizeof(float)), path_);
+        band_lo_ = file_lo;
+        band_hi_ = actual_hi;
     }
 
     std::vector<int> kp_;
+    std::string path_;   // kept for ensure_band's read_exact_at error messages
     int fd_ = -1;
     size_t byte_len_ = 0;
-    std::vector<float> data_;      // owned storage for fbuf_ (see constructor)
-    const float* fbuf_ = nullptr;  // = data_.data(), cached for existing call sites
+    int n_grm_ = 0;
+    size_t band_byte_budget_ = 0;
     bool kp_is_identity_ = false;
-    bool kp_is_monotonic_ = false;
 };
 
 // .grm.N.bin diagonal only (mean SNP count) — same file, same packed layout,
@@ -518,10 +561,30 @@ inline double read_grm_N_mean(const std::string& prefix, int n_grm) {
 }
 
 
+// Splits a --grm-chunked-budget-style total (GB) into the slice reserved for
+// ChunkedGrmReader's row-band cache. Kept as one function, rather than each
+// call site independently picking a fraction, so the band_byte_budget passed
+// to make_chunked_grm_reader and the reserved_gb passed to
+// gcta_chunked::solve_chunk_rows can't silently drift apart -- see
+// chunked_grm_matvec.hpp's reserved_gb doc for why that drift matters
+// (previously reserved_gb was left at its 0.0 default at one call site and
+// set to the full packed-file size, a stale pre-band-cache assumption, at
+// the other -- both call sites should route through this instead).
+// Capped at 512MB so a large total budget doesn't hand the reader far more
+// than one row-band ever needs; 10% so a small budget still leaves the
+// reader a usable slice.
+inline double chunked_reader_reserved_gb(double total_budget_gb) {
+    return std::min(0.5, total_budget_gb * 0.10);
+}
+
 struct ChunkedGrmHandle {
     gcta_chunked::TileReader reader;
     std::shared_ptr<const ChunkedGrmReader> file;
     double m_snps = 0.0;
+    int chunk_rows = 0;   // block_size for chunked_symmetric_matvec/diagonal/trace_K_squared,
+                           // solved once here so every caller uses the same number instead of
+                           // each re-deriving it (and each independently reserving budget for
+                           // the row-band cache above) from scratch.
 };
 
 // Build the chunked reader (+ m_snps, read the same way read_grm_binary()
@@ -530,23 +593,57 @@ struct ChunkedGrmHandle {
 // as load_pca_warm_start's alignment in MLMA_stream.cpp. Fails loudly (not
 // a fallback) on any individual missing from the GRM: a silent misalignment
 // here corrupts every downstream REML result without any obvious symptom.
+//
+// budget_gb/k_ext/feature_flag drive the SAME chunk-sizing math previously
+// duplicated (and, in two of three copies, silently stale) across
+// pca_stream.cpp, MLMA_stream.cpp, and RemlEngine.cpp's
+// setup_chunked_grm_stream: the reader's own row-band cache reservation and
+// the resulting chunk_rows are now solved once, here, and returned on the
+// handle. feature_flag only affects wording in the error/log messages
+// below (which CLI flag to blame) — it does not change the arithmetic, so
+// callers whose downstream feature isn't known yet at construction time can
+// pass the generic default and the chunk_rows value is still correct for
+// whichever feature ends up consuming it, as long as that feature also
+// uses k_ext=0 (true of every current caller of this default).
 inline ChunkedGrmHandle make_chunked_grm_reader(
     const std::string& prefix,
-    const std::vector<std::string>& analysis_ids)
+    const std::vector<std::string>& analysis_ids,
+    double budget_gb,
+    int k_ext = 0,
+    const std::string& feature_flag = "--grm-chunked-budget")
 {
     const std::vector<std::string> grm_ids = Pheno::read_sublist(prefix + ".grm.id");
     const int n_grm = static_cast<int>(grm_ids.size());
+    const int n = static_cast<int>(analysis_ids.size());
 
     std::vector<int> kp = match_ids_to_grm(analysis_ids, grm_ids);
-    for (int i = 0; i < static_cast<int>(analysis_ids.size()); ++i) {
+    for (int i = 0; i < n; ++i) {
         if (kp[i] < 0)
-            LOGGER.e(0, "--reml-svd-chunked: individual [" + analysis_ids[i] +
+            LOGGER.e(0, feature_flag + ": individual [" + analysis_ids[i] +
                         "] not found in GRM [" + prefix + ".grm.id].");
     }
 
+    const double reader_reserved_gb = chunked_reader_reserved_gb(budget_gb);
+    const int chunk_rows = gcta_chunked::solve_chunk_rows(n, budget_gb, k_ext, reader_reserved_gb);
+    if (chunk_rows < 1)
+        LOGGER.e(0, feature_flag + ": budget=" + std::to_string(budget_gb) +
+                    "GB is too small: reserving " + std::to_string(reader_reserved_gb) +
+                    "GB for the reader's row-band cache leaves no room for a single row-chunk "
+                    "(n=" + std::to_string(n) +
+                    (k_ext > 0 ? ", k_ext=" + std::to_string(k_ext) : "") +
+                    "); raise the budget.");
+    LOGGER.i(0, feature_flag + ": budget=" + std::to_string(budget_gb) + "GB (" +
+                std::to_string(reader_reserved_gb) + "GB reader cache + " +
+                std::to_string(budget_gb - reader_reserved_gb) + "GB tiles" +
+                (k_ext > 0 ? ", k_ext up to " + std::to_string(k_ext) : "") +
+                ") -> " + std::to_string(chunk_rows) + "-row chunks from [" + prefix +
+                ".grm.bin], not loaded densely.");
+
     ChunkedGrmHandle handle;
+    handle.chunk_rows = chunk_rows;
     handle.m_snps = read_grm_N_mean(prefix, n_grm);
-    auto file = std::make_shared<ChunkedGrmReader>(prefix + ".grm.bin", std::move(kp), n_grm);
+    auto file = std::make_shared<ChunkedGrmReader>(prefix + ".grm.bin", std::move(kp), n_grm,
+                                                    static_cast<size_t>(reader_reserved_gb * 1e9));
     handle.file = file;
     handle.reader = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXd> {
         return file->read_tile(rs, re, cs, ce);

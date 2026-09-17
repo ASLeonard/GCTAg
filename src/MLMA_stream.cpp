@@ -998,23 +998,6 @@ void MLMA::processMain()
                             "--reml-trace-hutchpp is ignored.");
 
             int grm_chunk_rows = 0;
-            if (grm_chunked) {
-                const double grm_packed_gb =
-                    static_cast<double>(gcta_grm_io::grm_packed_bytes(n)) / 1e9;
-                grm_chunk_rows = gcta_chunked::solve_chunk_rows(n, grm_chunked_budget, 0, grm_packed_gb);
-                if (grm_chunk_rows < 1)
-                    LOGGER.e(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
-                                "GB is too small: the packed GRM itself needs " +
-                                to_string(grm_packed_gb) + "GB (n=" + to_string(n) + "); raise the budget.");
-                if (grm_chunk_rows >= n) {
-                    LOGGER.w(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
-                                "GB covers the full GRM (n=" + to_string(n) + ") in a single chunk. "
-                                "Falling back to dense loading instead of paying chunking overhead "
-                                "for no benefit.");
-                    grm_chunked = false;
-                }
-            }
-
             vector<string> grm_ids;
             Eigen::MatrixXd G_n;      // left empty when grm_chunked
             double m_all = options_d["woodbury_basis_rank"] == -1 ? 0.0 : -1.0;  // only populated when dense GRM and Woodbury-MP mode is selected
@@ -1022,15 +1005,36 @@ void MLMA::processMain()
 
             if (grm_chunked) {
                 // Skip the dense O(n_grm^2) load entirely — the whole point
-                // of --grm-chunked. make_chunked_grm_reader does its
-                // own ID validation (same fail-loud contract as the dense
-                // path below) and reads m_snps from .grm.N.bin's diagonal
-                // without touching .grm.bin.
-                chunked_grm = gcta_grm_io::make_chunked_grm_reader(grm_pfx, analysis_ids);
+                // of --grm-chunked. make_chunked_grm_reader does its own ID
+                // validation (same fail-loud contract as the dense path
+                // below), reads m_snps from .grm.N.bin's diagonal without
+                // touching .grm.bin, and now also solves grm_chunk_rows and
+                // its own row-band-cache reservation together (see
+                // grm_binary_io.hpp) instead of this file deriving them
+                // separately beforehand.
+                //
+                // NOTE: this now opens the file and ID-matches unconditionally
+                // whenever grm_chunked is true, even if the grm_chunk_rows >= n
+                // check below ends up falling back to dense -- previously that
+                // check ran first (via a standalone solve_chunk_rows call) and
+                // skipped opening the file entirely in that case. The extra
+                // work is cheap (ID matching + one N-mean read, no tile reads
+                // yet) but it's a real behavior change worth knowing about.
+                chunked_grm = gcta_grm_io::make_chunked_grm_reader(
+                    grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget");
+                grm_chunk_rows = chunked_grm.chunk_rows;
                 m_all = chunked_grm.m_snps;
-                LOGGER.i(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
-                            "GB -> GRM will be read in " + to_string(grm_chunk_rows) +
-                            "-row chunks from [" + grm_pfx + "], not loaded densely.");
+                if (grm_chunk_rows >= n) {
+                    LOGGER.w(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
+                                "GB covers the full GRM (n=" + to_string(n) + ") in a single chunk. "
+                                "Falling back to dense loading instead of paying chunking overhead "
+                                "for no benefit.");
+                    grm_chunked = false;
+                }
+                // make_chunked_grm_reader already logged the budget/chunk-size
+                // split; nothing further to log here. Note the dense fallback
+                // just above discards chunked_grm/its reader rather than using
+                // it, since the decision can only be made after construction now.
             } else {
                 // upper_only=true: G_n is valid on its upper triangle (row<=col)
                 // only. This is safe here because ctx.A[0] (fed by G_n below) is
@@ -1104,6 +1108,7 @@ void MLMA::processMain()
                 // K through ctx.grm_tile_reader instead. See the guard in
                 // compute_woodbury_basis_basis that errors out if this flag is set
                 // without a reader.
+                ctx.grm_chunk_rows_from_budget = chunked_grm.chunk_rows;
                 ctx.grm_tile_reader = std::move(chunked_grm.reader);
             } else {
                 ctx.A[0] = std::move(G_n);

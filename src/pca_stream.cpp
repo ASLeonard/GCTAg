@@ -170,28 +170,28 @@ void PCAStream::processMain()
             LOGGER.e(0, "--pca exact mode (dsyevr/dsyevd) requires dense GRM loading. "
                         "Remove --grm-chunked-budget, or set --pca-approx to Lanczos/rSVD.");
 
-        // Row-chunk size for streaming reads off the GRM (chunked_symmetric_matvec).
-        // Budget-driven rather than a guessed constant. A slice of the same
-        // budget is reserved for ChunkedGrmReader's own row-band cache
-        // (chunked_reader_reserved_gb) — previously that memory sat outside
-        // --grm-chunked-budget's accounting entirely (reserved_gb defaulted
-        // to 0.0 here), so actual peak RSS could exceed the stated budget by
-        // however large the reader's internal buffer was.
+        // Row-chunk size for streaming reads off the GRM (chunked_symmetric_matvec),
+        // and the reader's own row-band cache reservation, are now both solved
+        // inside make_chunked_grm_reader (see grm_binary_io.hpp) rather than
+        // computed here and passed in piecemeal -- this file never touches
+        // RemlCtx, so it has no other reason to duplicate that arithmetic.
         int chunk_size = 0;
         int k_ext_hint = 0;
-        double reader_reserved_gb = 0.0;
+        gcta_grm_io::ChunkedGrmHandle chunked_handle;  // only populated when grm_chunked
         if (grm_chunked) {
             k_ext_hint = (pca_approx == "Lanczos")
                 ? std::min(n, std::max(3 * out_pc_num + 1, 30))
                 : out_pc_num + gcta_eigh::recommended_oversample(out_pc_num);
-            reader_reserved_gb = gcta_grm_io::chunked_reader_reserved_gb(grm_chunked_budget);
-            chunk_size = gcta_chunked::solve_chunk_rows(n, grm_chunked_budget, k_ext_hint, reader_reserved_gb);
-            if (chunk_size < 1)
-                LOGGER.e(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
-                            "GB cannot fit even a single GRM row after reserving " +
-                            to_string(reader_reserved_gb) + "GB for the reader's row-band cache "
-                            "(n=" + to_string(n) + ", k_ext=" + to_string(k_ext_hint) + " -> " +
-                            to_string(8.0 * (n + k_ext_hint) / 1e9) + "GB/row); raise the budget.");
+            // NOTE: this now opens the file and ID-matches against
+            // .grm.id/.grm.N.bin unconditionally whenever grm_chunked is
+            // true, even if the chunk_size >= n check below ends up
+            // falling back to dense -- previously that check ran first and
+            // skipped opening the file entirely in that case. The extra
+            // work is cheap (ID matching + one N-mean read, no tile reads
+            // yet) but it's a real behavior change worth knowing about.
+            chunked_handle = gcta_grm_io::make_chunked_grm_reader(
+                grm_pfx, analysis_ids, grm_chunked_budget, k_ext_hint, "--pca");
+            chunk_size = chunked_handle.chunk_rows;
             if (chunk_size >= n) {
                 // The whole GRM fits in a single block: chunking then buys nothing
                 // (there's no second chunk to defer loading) but still pays the
@@ -213,15 +213,9 @@ void PCAStream::processMain()
         Eigen::MatrixXd G_dense;  // left empty when grm_chunked
 
         if (grm_chunked) {
-            gcta_grm_io::ChunkedGrmHandle handle = gcta_grm_io::make_chunked_grm_reader(
-                grm_pfx, analysis_ids, static_cast<size_t>(reader_reserved_gb * 1e9));
-            chunked_reader = std::move(handle.reader);
-            LOGGER.i(0, "--pca: GRM will be read in " + to_string(chunk_size) +
-                        "-row chunks from [" + grm_pfx + "] (--grm-chunked-budget=" +
-                        to_string(grm_chunked_budget) + "GB = " + to_string(reader_reserved_gb) +
-                        "GB reader cache + " + to_string(grm_chunked_budget - reader_reserved_gb) +
-                        "GB tiles, k_ext up to " + to_string(k_ext_hint) +
-                        "), not loaded densely.");
+            // make_chunked_grm_reader already logged the budget/chunk_size
+            // split above; nothing further to log here.
+            chunked_reader = std::move(chunked_handle.reader);
         } else {
             vector<string> loaded_ids;
             double m_snps_unused = -1.0;

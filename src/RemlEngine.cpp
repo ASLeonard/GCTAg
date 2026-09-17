@@ -592,17 +592,22 @@ int setup_chunked_grm_stream(const RemlCtx& ctx, const char* feature_flag) {
         LOGGER.e(0, std::string(feature_flag) + ": --grm-chunked-budget is set but "
                     "ctx.grm_tile_reader is empty — the GRM component wasn't actually "
                     "loaded either way.");
-    const int n = ctx.n;
-    const double grm_packed_gb = static_cast<double>(n) * (n + 1) / 2 * sizeof(float) / 1e9;
-    const int chunk_rows = gcta_chunked::solve_chunk_rows(n, ctx.grm_chunked_budget, 0, grm_packed_gb);
-    if (chunk_rows < 1)
-        LOGGER.e(0, std::string(feature_flag) + ": --grm-chunked-budget=" + std::to_string(ctx.grm_chunked_budget)
-                    + "GB is too small: the packed GRM itself needs " + std::to_string(grm_packed_gb)
-                    + "GB (n=" + std::to_string(n) + "); raise the budget.");
-    LOGGER << feature_flag << ": --grm-chunked-budget=" << ctx.grm_chunked_budget
-           << "GB (" << grm_packed_gb << "GB reserved for the packed GRM) -> streaming "
-           << chunk_rows << " GRM row(s) per chunk." << std::endl;
-    return chunk_rows;
+    // The row-chunk size and its row-band-cache reservation are solved once,
+    // when grm_tile_reader was built (gcta_grm_io::make_chunked_grm_reader),
+    // and cached on ctx as grm_chunk_rows_from_budget -- previously this
+    // function re-derived them independently per call site (Woodbury-basis,
+    // hutch++, plain exact), which is how a stale reservation assumption
+    // went unnoticed here even after being fixed at the reader's own
+    // construction site. A <1 value below should already have aborted the
+    // run when the reader was constructed, so this is a sanity check, not
+    // the primary validation.
+    if (ctx.grm_chunk_rows_from_budget < 1)
+        LOGGER.e(0, std::string(feature_flag) + ": --grm-chunked-budget=" +
+                    std::to_string(ctx.grm_chunked_budget) + "GB produced no usable row-chunk "
+                    "size (grm_chunk_rows_from_budget=" + std::to_string(ctx.grm_chunk_rows_from_budget) +
+                    ") -- this should have been caught when the reader was constructed; "
+                    "check the caller that built ctx.grm_tile_reader.");
+    return ctx.grm_chunk_rows_from_budget;
 }
 
 // tr_PA_var receives, per component, the sampling variance of the Hutch++

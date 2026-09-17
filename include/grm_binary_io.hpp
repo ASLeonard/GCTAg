@@ -581,6 +581,10 @@ struct ChunkedGrmHandle {
     gcta_chunked::TileReader reader;
     std::shared_ptr<const ChunkedGrmReader> file;
     double m_snps = 0.0;
+    int chunk_rows = 0;   // block_size for chunked_symmetric_matvec/diagonal/trace_K_squared,
+                           // solved once here so every caller uses the same number instead of
+                           // each re-deriving it (and each independently reserving budget for
+                           // the row-band cache above) from scratch.
 };
 
 // Build the chunked reader (+ m_snps, read the same way read_grm_binary()
@@ -589,29 +593,57 @@ struct ChunkedGrmHandle {
 // as load_pca_warm_start's alignment in MLMA_stream.cpp. Fails loudly (not
 // a fallback) on any individual missing from the GRM: a silent misalignment
 // here corrupts every downstream REML result without any obvious symptom.
+//
+// budget_gb/k_ext/feature_flag drive the SAME chunk-sizing math previously
+// duplicated (and, in two of three copies, silently stale) across
+// pca_stream.cpp, MLMA_stream.cpp, and RemlEngine.cpp's
+// setup_chunked_grm_stream: the reader's own row-band cache reservation and
+// the resulting chunk_rows are now solved once, here, and returned on the
+// handle. feature_flag only affects wording in the error/log messages
+// below (which CLI flag to blame) — it does not change the arithmetic, so
+// callers whose downstream feature isn't known yet at construction time can
+// pass the generic default and the chunk_rows value is still correct for
+// whichever feature ends up consuming it, as long as that feature also
+// uses k_ext=0 (true of every current caller of this default).
 inline ChunkedGrmHandle make_chunked_grm_reader(
     const std::string& prefix,
     const std::vector<std::string>& analysis_ids,
-    size_t band_byte_budget = (1ull << 30) /* 1GiB default; caller should pass its
-                                               actual reserved_gb slice of
-                                               --grm-chunked-budget instead of relying
-                                               on this default -- see chunked_grm_matvec.hpp's
-                                               solve_chunk_rows reserved_gb doc */)
+    double budget_gb,
+    int k_ext = 0,
+    const std::string& feature_flag = "--grm-chunked-budget")
 {
     const std::vector<std::string> grm_ids = Pheno::read_sublist(prefix + ".grm.id");
     const int n_grm = static_cast<int>(grm_ids.size());
+    const int n = static_cast<int>(analysis_ids.size());
 
     std::vector<int> kp = match_ids_to_grm(analysis_ids, grm_ids);
-    for (int i = 0; i < static_cast<int>(analysis_ids.size()); ++i) {
+    for (int i = 0; i < n; ++i) {
         if (kp[i] < 0)
-            LOGGER.e(0, "--reml-svd-chunked: individual [" + analysis_ids[i] +
+            LOGGER.e(0, feature_flag + ": individual [" + analysis_ids[i] +
                         "] not found in GRM [" + prefix + ".grm.id].");
     }
 
+    const double reader_reserved_gb = chunked_reader_reserved_gb(budget_gb);
+    const int chunk_rows = gcta_chunked::solve_chunk_rows(n, budget_gb, k_ext, reader_reserved_gb);
+    if (chunk_rows < 1)
+        LOGGER.e(0, feature_flag + ": budget=" + std::to_string(budget_gb) +
+                    "GB is too small: reserving " + std::to_string(reader_reserved_gb) +
+                    "GB for the reader's row-band cache leaves no room for a single row-chunk "
+                    "(n=" + std::to_string(n) +
+                    (k_ext > 0 ? ", k_ext=" + std::to_string(k_ext) : "") +
+                    "); raise the budget.");
+    LOGGER.i(0, feature_flag + ": budget=" + std::to_string(budget_gb) + "GB (" +
+                std::to_string(reader_reserved_gb) + "GB reader cache + " +
+                std::to_string(budget_gb - reader_reserved_gb) + "GB tiles" +
+                (k_ext > 0 ? ", k_ext up to " + std::to_string(k_ext) : "") +
+                ") -> " + std::to_string(chunk_rows) + "-row chunks from [" + prefix +
+                ".grm.bin], not loaded densely.");
+
     ChunkedGrmHandle handle;
+    handle.chunk_rows = chunk_rows;
     handle.m_snps = read_grm_N_mean(prefix, n_grm);
     auto file = std::make_shared<ChunkedGrmReader>(prefix + ".grm.bin", std::move(kp), n_grm,
-                                                    band_byte_budget);
+                                                    static_cast<size_t>(reader_reserved_gb * 1e9));
     handle.file = file;
     handle.reader = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXd> {
         return file->read_tile(rs, re, cs, ce);

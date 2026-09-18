@@ -23,6 +23,8 @@
 #include "gcta.h"
 #include "Logger.h"
 #include "constants.hpp"
+#include "utils.hpp"
+#include "../src/config.h"
 
 void option(int option_num, char* option_str[]);
 
@@ -30,6 +32,7 @@ int main_v1(int argc, char* argv[])
 {
     LOGGER << "*******************************************************************" << std::endl;
     LOGGER << "* Genome-wide Complex Trait Analysis -- Agricuture (GCTAg)" << std::endl;
+    LOGGER << "* " + std::string(GCTA_VERSION) + " (" + getOSName() + ")" << std::endl;
     LOGGER << "* v1.0.0 \"Braunvieh\"" << std::endl;
     LOGGER << "* GCTA: (C) 2010-2021, Westlake University" << std::endl;
     LOGGER << "* GCTAg: (C) 2026-present, Alexander S. Leonard, ETH Zurich" << std::endl;

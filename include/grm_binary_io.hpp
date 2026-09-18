@@ -230,22 +230,8 @@ inline void read_grm_binary(const std::string& prefix,
     }
     ::close(fd);
     LOGGER.i(0, "The .grm.bin fill took " + std::to_string(LOGGER.tp("grm")) + " seconds.");
-    if (upper_only) {
-        LOGGER.i(0, "upper_only=true: skipping the upper->lower mirror pass. "
-                    "G is valid on its upper triangle (row <= col) only -- "
-                    "every consumer of this G must be audited to read it that way.");
-    } else {
+    if (!upper_only) {
         LOGGER.ts("grm_mirror");
-        // Mirror upper -> lower, column-contiguous on the write side (fixed
-        // column c, rows c+1..n-1) and scattered only on the read side (G(c,r)
-        // across row c). A blocked-transpose version of this (tiling into
-        // BSxBS blocks to make the read side contiguous too) was tried and
-        // hung/regressed badly at n=75000 -- root cause not yet identified
-        // (suspect concurrent first-touch page faults on the still-unwritten
-        // lower triangle across many threads, but not confirmed). Reverted to
-        // this simpler version, which is validated (ran cleanly across the
-        // K10-K25 Woodbury sweep). Do not reintroduce blocking without
-        // isolating and timing it separately first.
         #pragma omp parallel for schedule(dynamic, 64)
         for (int c = 0; c < n; ++c)
             for (int r = c + 1; r < n; ++r)

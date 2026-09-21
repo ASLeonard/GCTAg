@@ -1,4 +1,4 @@
- logging properly/*
+/*
  * GCTA: a tool for Genome-wide Complex Trait Analysis
  *
  * RemlEngine — free-function REML engine for the v2 MLMALoco path.
@@ -267,7 +267,7 @@ bool init_varcomp(const RemlCtx& ctx,
                     varcmp(1) = std::max(se_he, 0.01 * scale);
                     LOGGER << "REML: used single-GRM HE warm-start for variance components = " << varcmp.transpose() << std::endl;
                     return true;
-                } else
+                } else {
                     LOGGER.w(0, "single-GRM HE warm-start produced implausible variance component(s) (sg=" + std::to_string(sg_he) + ", se=" + std::to_string(se_he) + ") -- ignoring.");
                 }
             }
@@ -1712,13 +1712,6 @@ static const char* woodbury_mode_name(WoodburyMode mode) {
     }
 }
 
-static bool woodbury_mode_allows_warm_start(WoodburyMode mode) {
-    // MP benefits from warm-starting across rSVD budget expansions.
-    // EIG and VAR require accurate tail/bulk summation each round,
-    // so fresh probes avoid carrying over warm-start bias.
-    return (mode == WoodburyMode::MP);
-}
-
 static int woodbury_rank_cap(const RemlCtx& ctx, int k_budget_ceiling) {
     const int n = ctx.n;
     const int user_cap = (ctx.woodbury_basis_k_max > 0) ? ctx.woodbury_basis_k_max : n - 1;
@@ -2072,7 +2065,6 @@ void compute_woodbury_basis(RemlCtx& ctx) {
         lambda_plus = std::pow(1.0 + std::sqrt(gamma), 2.0);
     }
     const double target_mass = (mode == WoodburyMode::EIG) ? (ctx.woodbury_basis_eigen_mass * trace_K_full) : 0.0;
-    const bool allows_warm = woodbury_mode_allows_warm_start(mode);
 
     auto apply = [&](const auto& X) -> Eigen::MatrixXd {
         if (grm_chunked)
@@ -2086,6 +2078,23 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     Eigen::VectorXd eval_full;
     Eigen::MatrixXd evec_full;
     RankEvalResult eval_res;
+
+    // Rank-expansion rounds lock the previous round's converged Ritz vectors and
+    // sketch only the new directions (gcta_eigh::expand_symmetric_eigh), so each
+    // column is touched once across rounds; that is what pays for q > 3.
+    const int q_pow = std::max(1, ctx.svd_power_iter);
+    // All k_ext Ritz pairs of a round are kept, not just the top k_svd: the oversample
+    // vectors are already converged-ish and locking them means no column is ever
+    // recomputed. The rank criterion only sees the leading k_svd values (eval_full).
+    Eigen::MatrixXd V0;        // previous round's Ritz vectors (n x k_ext_prev)
+    Eigen::VectorXd th0;       // matching Ritz values
+    Eigen::VectorXd eval_all;  // this round's k_ext Ritz values (non-Nystrom)
+    double prev_mass = 0.0;    // sum of the previous round's Ritz values
+    int    prev_k    = 0;
+    bool   round_expanded = false;
+    if (!ctx.svd_nystrom && mode != WoodburyMode::Fixed)
+        LOGGER << "Woodbury: rSVD power iterations = " << q_pow
+               << "; rank expansions reuse converged Ritz vectors." << std::endl;
 
     for (;;) {
         const int oversample = gcta_eigh::recommended_oversample(k_svd);
@@ -2113,20 +2122,59 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                     "Woodbury Nystrom: sum of estimated eigenvalues (" + std::to_string(eval_sum) +
                     ") exceeds trace(K) (" + std::to_string(trace_K_full) + ") — impossible for real eigenvalues.");
         } else {
-            const int k_prev = static_cast<int>(ctx.Uk.cols());
-            const bool has_warm = (allows_warm && k_prev > 0 && ctx.Uk.rows() == n);
-            auto [omega, Y] = gcta_eigh::build_randomized_sketch(
-                apply, n, k_ext, has_warm ? &ctx.Uk : nullptr);
-            omega.resize(0, 0);
-            constexpr int power_iter = 3;
-            try {
-                gcta_eigh::EighResult res =
-                    gcta_eigh::power_iterate_and_project(apply, std::move(Y), k_svd, power_iter);
-                eval_full = std::move(res.eigenvalues);
-                evec_full = std::move(res.eigenvectors);
-            } catch (const std::exception& e) {
-                LOGGER.e(0, std::string("Woodbury: ") + e.what());
+            round_expanded = false;
+            if (static_cast<int>(V0.cols()) == k_ext) {
+                // Near full rank (k_ext is capped at n-1): the locked basis already holds k_ext
+                // exact Ritz pairs of its own span; nothing to compute.
+                evec_full = std::move(V0);
+                eval_all  = std::move(th0);
+                round_expanded = true;
+            } else if (V0.cols() > 0 && k_ext > static_cast<int>(V0.cols())) {
+                try {
+                    gcta_eigh::EighResult res =
+                        gcta_eigh::expand_symmetric_eigh(apply, V0, th0, k_ext, k_ext, q_pow);
+                    eval_all  = std::move(res.eigenvalues);
+                    evec_full = std::move(res.eigenvectors);
+                    round_expanded = true;
+                } catch (const std::exception& e) {
+                    LOGGER.w(0, std::string("Woodbury: locked expansion failed (") + e.what() +
+                                "); recomputing this round from a fresh sketch.");
+                }
             }
+            if (!round_expanded) {
+                auto [omega, Y] = gcta_eigh::build_randomized_sketch(apply, n, k_ext, nullptr);
+                omega.resize(0, 0);
+                try {
+                    gcta_eigh::EighResult res =
+                        gcta_eigh::power_iterate_and_project(apply, std::move(Y), k_ext, q_pow);
+                    eval_all  = std::move(res.eigenvalues);
+                    evec_full = std::move(res.eigenvectors);
+                } catch (const std::exception& e) {
+                    LOGGER.e(0, std::string("Woodbury: ") + e.what());
+                }
+            }
+            V0.resize(0, 0);             // consumed (or moved from); free before the criterion runs
+            th0.resize(0);
+            eval_full = eval_all.head(k_svd);
+        }
+
+        if (mode != WoodburyMode::Fixed) {
+            // Per-round diagnostics. Captured mass at any fixed rank must be
+            // non-decreasing across locked-expansion rounds (Cauchy interlacing);
+            // a regression means numerical trouble, not a statistical fluke.
+            const double mass_now = eval_full.sum();
+            LOGGER << "Woodbury " << woodbury_mode_name(mode) << ": k_svd=" << k_svd
+                   << ", captured mass rho=" << (trace_K_full > 0.0 ? mass_now / trace_K_full : 0.0)
+                   << (round_expanded ? " (locked expansion)" : "") << std::endl;
+            if (round_expanded && prev_k > 0 && static_cast<int>(eval_full.size()) >= prev_k) {
+                const double mass_at_prev_rank = eval_full.head(prev_k).sum();
+                if (mass_at_prev_rank < prev_mass - 1e-9 * trace_K_full)
+                    LOGGER.w(0, "Woodbury: captured mass at rank " + std::to_string(prev_k) +
+                                " decreased across a locked expansion (" + std::to_string(prev_mass) + " -> " +
+                                std::to_string(mass_at_prev_rank) + "); please report this.");
+            }
+            prev_mass = mass_now;
+            prev_k    = static_cast<int>(eval_full.size());
         }
 
         if (mode == WoodburyMode::Fixed) break;
@@ -2143,16 +2191,21 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                         + " (bounded by " + std::to_string(k_svd_next) + ") to reach target mass (" + std::to_string(ctx.woodbury_basis_eigen_mass * 100.0) + "%)."
                         + "\n(Currently captured mass: " + std::to_string(eval_full.head(k_svd).sum()) + ")");
         }
-        const char* warm_status = ctx.svd_nystrom ? " (Nystrom: no warm start, full recompute)"
-                                 : !allows_warm              ? " (no warm start, fresh probe)"
-                                                             : " (warm-started)";
+        const char* warm_status = ctx.svd_nystrom ? " (Nystrom: full recompute)"
+                                                  : " (locked expansion: reusing converged Ritz vectors)";
         LOGGER << "Woodbury " << woodbury_mode_name(mode)
                << ": signal not resolved within k=" << k_svd
                << "; expanding budget to k=" << k_svd_next
                << warm_status << " ..." << std::endl;
-        if (!ctx.svd_nystrom && allows_warm) ctx.Uk = evec_full;
+        if (!ctx.svd_nystrom) {
+            V0  = std::move(evec_full);   // evec_full is reassigned next round
+            th0 = std::move(eval_all);
+        }
         k_svd = k_svd_next;
     }
+    V0.resize(0, 0);                      // release before the final basis copy
+    th0.resize(0);
+    eval_all.resize(0);
 
     int k = finalize_and_log_woodbury_rank(mode, ctx, eval_full, k_svd, k_svd_budget_ceiling, lambda_plus, trace_K_full, trace_K2, eval_res);
 
@@ -2222,7 +2275,20 @@ void compute(RemlCtx& ctx,
            << ctx.r_indx.size() << " variance component(s) (including residual)." << std::endl;
 
     // Woodbury basis (must be done before init_varcomp for HE warm-start)
-    if (ctx.woodbury_basis_rank != 0) {
+    if (ctx.woodbury_basis_preloaded) {
+        // Basis supplied by the caller (--reml-woodbury-reuse): Uk/dk/lambda_tail/
+        // woodbury_basis_rank_ are already set and ctx.A[GRM] is empty, i.e. the
+        // same state compute_woodbury_basis() leaves behind.
+        if (ctx.reml_mtd == 1)
+            LOGGER.e(0, "--reml-woodbury-reuse is incompatible with Fisher-scoring REML.");
+        if ((int)ctx.r_indx.size() != 2)
+            LOGGER.e(0, "--reml-woodbury-reuse supports only single-GRM models.");
+        if (ctx.Uk.rows() != ctx.n || ctx.Uk.cols() != ctx.woodbury_basis_rank_
+                || ctx.dk.size() != ctx.woodbury_basis_rank_)
+            LOGGER.e(0, "--reml-woodbury-reuse: preloaded basis has inconsistent dimensions.");
+        LOGGER << "Woodbury basis reused: k=" << ctx.woodbury_basis_rank_
+               << ", lambda_tail=" << ctx.lambda_tail << std::endl;
+    } else if (ctx.woodbury_basis_rank != 0) {
         LOGGER.ts("woodbury");
         compute_woodbury_basis(ctx);
         float duration = LOGGER.tp("main");

@@ -11,8 +11,23 @@
  *   --grm <prefix>        run REML inline against the given GRM. Combine
  *                         with --save-reml to only fit REML and write the
  *                         state to "<out>.reml" (no association test is run).
+ *   --reml-woodbury-reuse <file>
+ *                         like --grm, but no GRM is read: the Woodbury basis
+ *                         (Uk, dk, lambda_tail, tail_d_var) is taken from a Woodbury (TUNA)
+ *                         .reml saved earlier, and only the variance components
+ *                         and fixed effects are re-fitted for the current
+ *                         --pheno/--covar. The .reml must come from the same
+ *                         analysis samples in the same order: n and a hash of
+ *                         the ordered sample IDs are checked from the first
+ *                         28 bytes of the file, before anything else is read
+ *                         (--load-reml does the same). tail_d_var is stored in
+ *                         the file, so the fit matches a from-scratch run.
+ *                         .reml files from older builds (format v1) are
+ *                         rejected. Combine with --save-reml to write a new
+ *                         .reml for this phenotype.
  *
- * --save-reml is a boolean flag (no argument) valid only alongside --grm.
+ * --save-reml is a boolean flag (no argument) valid only alongside --grm or
+ * --reml-woodbury-reuse.
  */
 
 
@@ -105,12 +120,104 @@ static void read_exact(int fd, void* dst, size_t nbytes, const std::string& path
     }
 }
 
-// Read the binary REML state written by save_reml_state().
+// ---------------------------------------------------------------------------
+// .reml on-disk format (v2). Every file starts with a fixed 28-byte prefix
+//     [Header: magic[4], n, x_c, num_varcmp, num_r_indx][uint64 id_hash]
+// followed, depending on the magic, by
+//   "TUNA" (Woodbury):
+//     [int32 k][double lambda_tail][double tail_d_var]
+//     [Uk: k x n float][dk: k float][b: x_c float, omitted if no_adj_covar]
+//     [varcmp: num_varcmp float]
+//   "GOBY" (dense):
+//     [int32 factor_kind][packed upper-triangular Vi_L: n(n+1)/2 float]
+//     [b: x_c float, omitted if no_adj_covar][varcmp: num_varcmp float]
+// id_hash fingerprints the ordered analysis IDs ("FID\tIID"), i.e. the samples
+// the n x n GRM -- and hence the Woodbury basis / V -- was built for, not the
+// full .grm.id list. It sits in the prefix so a file made for other samples (or
+// the same samples in another order) is refused after reading 28 bytes, before
+// any bulk read. tail_d_var is stored so that a --reml-woodbury-reuse fit
+// reproduces the from-scratch logL and HE start.
+// ---------------------------------------------------------------------------
+constexpr std::string_view kMagicWoodbury = "TUNA";
+constexpr std::string_view kMagicDense    = "GOBY";
+constexpr size_t kRemlPrefixBytes = sizeof(Header) + sizeof(uint64_t);
+
+// FNV-1a (64-bit) over the ordered IDs, each terminated by '\n'. Deterministic
+// across builds/platforms (unlike std::hash). Never returns 0.
+uint64_t hash_sample_ids(const vector<string>& ids)
+{
+    constexpr uint64_t kPrime = 1099511628211ULL;
+    uint64_t h = 1469598103934665603ULL;
+    for (const string& s : ids) {
+        for (const unsigned char c : s) { h ^= c; h *= kPrime; }
+        h ^= static_cast<unsigned char>('\n');
+        h *= kPrime;
+    }
+    return h != 0 ? h : 1ULL;
+}
+
+string hash_hex(uint64_t h)
+{
+    char buf[17];
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+    return string(buf);
+}
+
+struct RemlPrefix {
+    Header   hdr{};
+    uint64_t id_hash  = 0;
+    bool     woodbury = false;   // true: TUNA, false: GOBY
+};
+
+// Read and validate the fixed prefix of a .reml from `fd` (positioned at 0).
+// Closes fd on any error.
+RemlPrefix read_reml_prefix(int fd, const std::string& filename)
+{
+    RemlPrefix p;
+    read_exact(fd, &p.hdr, sizeof(Header), filename);
+    read_exact(fd, &p.id_hash, sizeof(uint64_t), filename);
+
+    const std::string_view magic(p.hdr.magic, 4);
+    if (magic == kMagicWoodbury) {
+        p.woodbury = true;
+    } else if (magic != kMagicDense) {
+        close(fd);
+        if (magic != "TUNA" && magic != "GOBY")
+            LOGGER.e(0, "[" + filename + "] was written by an older build (format v1: no sample-ID hash) "
+                        "and can no longer be read; re-create it with --save-reml.");
+        LOGGER.e(0, "[" + filename + "] is not a REML state file (unrecognised magic).");
+    }
+    return p;
+}
+
+// Refuse a .reml made for different samples, using only its prefix.
+void check_reml_samples(int fd, const RemlPrefix& p, int expected_n, uint64_t expected_id_hash,
+                        const std::string& filename)
+{
+    if (p.hdr.n != expected_n) {
+        close(fd);
+        LOGGER.e(0, "Sample size mismatch: [" + filename + "] has n=" + to_string(p.hdr.n) +
+                    " vs dataset n=" + to_string(expected_n) +
+                    ". Use the same filters (--keep/--remove/--pheno) as the run that saved it.");
+    }
+    if (p.id_hash != expected_id_hash) {
+        close(fd);
+        LOGGER.e(0, "Sample ID mismatch: the ordered analysis IDs (hash " + hash_hex(expected_id_hash) +
+                    ") differ from those [" + filename + "] was saved with (hash " + hash_hex(p.id_hash) +
+                    "). Use the same samples in the same order (--keep/--remove and the row order of "
+                    "--pheno/--covar) as the run that saved it.");
+    }
+}
+
+// Read the binary REML state written by writeRemlStateFromCtx().
 // When !no_adj_covar the 'b' vector is loaded; otherwise it is skipped.
+// The prefix is checked first (format, n, sample-ID hash) so a file made for
+// other samples is refused before the bulk read.
 // The file is read serially in one contiguous pass to avoid HPC/Lustre I/O
 // storms from many threads touching scattered offsets concurrently; only the
 // in-memory unpack/decode is parallelized afterwards.
-RemlState readRemlState(const std::string& filename, bool no_adj_covar)
+RemlState readRemlState(const std::string& filename, bool no_adj_covar,
+                        int expected_n, uint64_t expected_id_hash)
 {
     int fd = open(filename.c_str(), O_RDONLY);
     if (fd == -1) LOGGER.e(0, "Cannot open file [" + filename + "].");
@@ -121,17 +228,22 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
         LOGGER.e(0, "Failed to stat file [" + filename + "].");
     }
     const size_t file_size = static_cast<size_t>(sb.st_size);
-    if (file_size == 0) {
+    if (file_size < kRemlPrefixBytes) {
         close(fd);
-        LOGGER.e(0, "[" + filename + "] is empty.");
+        LOGGER.e(0, "[" + filename + "] is empty or too short to be a REML state.");
     }
 
+    const RemlPrefix prefix = read_reml_prefix(fd, filename);
+    check_reml_samples(fd, prefix, expected_n, expected_id_hash, filename);
+
     std::vector<char> file_buf(file_size);
-    read_exact(fd, file_buf.data(), file_size, filename);
+    std::memcpy(file_buf.data(), &prefix.hdr, sizeof(Header));
+    std::memcpy(file_buf.data() + sizeof(Header), &prefix.id_hash, sizeof(uint64_t));
+    read_exact(fd, file_buf.data() + kRemlPrefixBytes, file_size - kRemlPrefixBytes, filename);
     close(fd);
 
     const char* mapped = file_buf.data();
-    size_t offset = 0;
+    size_t offset = kRemlPrefixBytes;
     auto read_bytes = [&](void* dst, size_t nbytes) {
         if (offset + nbytes > file_size) {
             LOGGER.e(0, "Unexpected EOF in [" + filename + "].");
@@ -140,9 +252,8 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
         offset += nbytes;
     };
 
-    // --- Read Header ---
-    Header hdr;
-    read_bytes(&hdr, sizeof(Header));
+    // --- Header (already read and validated above) ---
+    const Header& hdr = prefix.hdr;
 
     if (hdr.n <= 0 || hdr.x_c < 0 || hdr.num_varcmp <= 0) {
         LOGGER.e(0, "[" + filename + "] has invalid header dimensions.");
@@ -154,7 +265,7 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
     st.x_c = hdr.x_c;
 
     // ------------------------------------------------------------------ GOBY
-    if (magic == "GOBY") {
+    if (magic == kMagicDense) {
         int32_t factor_kind = 0;
         read_bytes(&factor_kind, sizeof(int32_t));
         st.is_llt = (factor_kind == 0);
@@ -199,7 +310,7 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
     }
 
     // ------------------------------------------------------------------ TUNA
-    if (magic == "TUNA") {
+    if (magic == kMagicWoodbury) {
         st.is_woodbury = true;
         int32_t k = 0;
         read_bytes(&k, sizeof(int32_t));
@@ -210,6 +321,11 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
         double lambda_tail = 0.0;
         read_bytes(&lambda_tail, sizeof(double));
         st.lambda_tail_f = static_cast<float>(lambda_tail);
+
+        // tail_d_var is stored for --reml-woodbury-reuse; association does not use it.
+        double tail_d_var = 0.0;
+        read_bytes(&tail_d_var, sizeof(double));
+        (void)tail_d_var;
 
         Eigen::MatrixXf Uk(k, hdr.n);
         {
@@ -258,7 +374,9 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar)
     return st;
 }
 
-void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_adj_covar)
+// Writes the v2 format described above. id_hash = hash_sample_ids(analysis IDs).
+void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_adj_covar,
+                           uint64_t id_hash)
 {
     // Use POSIX low-level I/O for direct control over OS write buffering
     int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -289,12 +407,16 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
         hdr.num_varcmp = static_cast<int32_t>(ctx.varcmp.size());
         hdr.num_r_indx = static_cast<int32_t>(ctx.varcmp.size());
         write_bytes(&hdr, sizeof(hdr));
+        write_bytes(&id_hash, sizeof(uint64_t));   // completes the 28-byte prefix
 
         const int32_t k = static_cast<int32_t>(ctx.dk.size());
         write_bytes(&k, sizeof(int32_t));
 
         const double lambda_tail = ctx.lambda_tail;
         write_bytes(&lambda_tail, sizeof(double));
+
+        const double tail_d_var = ctx.tail_d_var;
+        write_bytes(&tail_d_var, sizeof(double));
 
         if (ctx.Uk.rows() != ctx.n || ctx.Uk.cols() != k)
             LOGGER.e(0, "invalid Woodbury REML context dimensions before save.");
@@ -335,6 +457,7 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
         hdr.num_varcmp = static_cast<int32_t>(ctx.varcmp.size());
         hdr.num_r_indx = static_cast<int32_t>(ctx.varcmp.size());
         write_bytes(&hdr, sizeof(hdr));
+        write_bytes(&id_hash, sizeof(uint64_t));   // completes the 28-byte prefix
 
         const int32_t factor_kind = ctx.Vi_use_llt ? 0 : 1;
         write_bytes(&factor_kind, sizeof(int32_t));
@@ -399,6 +522,89 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
     }
 
     close(fd);
+}
+
+// --reml-woodbury-reuse: load the phenotype-independent part of a Woodbury
+// (TUNA) .reml -- Uk, dk, lambda_tail, tail_d_var -- straight into ctx,
+// replacing the GRM read and compute_woodbury_basis(). Only the leading bytes
+// are read:
+//   [Header][uint64 id_hash][int32 k][double lambda_tail][double tail_d_var]
+//   [Uk: k x n float][dk: k float]
+// A file made for other samples (n or ordered-ID hash) is refused after the
+// first 28 bytes. The trailing b / varcmp belong to the phenotype the file was
+// fitted on and are never touched, so whether the file was written with or
+// without b does not matter here.
+void load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ctx, uint64_t expected_id_hash)
+{
+    const int fd = open(filename.c_str(), O_RDONLY);
+    if (fd == -1) LOGGER.e(0, "Cannot open file [" + filename + "].");
+
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) {
+        close(fd);
+        LOGGER.e(0, "Failed to stat file [" + filename + "].");
+    }
+    const size_t file_size = static_cast<size_t>(sb.st_size);
+
+    const RemlPrefix prefix = read_reml_prefix(fd, filename);
+    if (!prefix.woodbury) {
+        close(fd);
+        LOGGER.e(0, "[" + filename + "] is a dense (GOBY) REML state; --reml-woodbury-reuse needs a "
+                    "Woodbury (TUNA) state saved from a --reml-woodbury-basis fit.");
+    }
+    check_reml_samples(fd, prefix, ctx.n, expected_id_hash, filename);
+
+    int32_t k           = 0;
+    double  lambda_tail = 0.0;
+    double  tail_d_var  = 0.0;
+    read_exact(fd, &k, sizeof(int32_t), filename);
+    read_exact(fd, &lambda_tail, sizeof(double), filename);
+    read_exact(fd, &tail_d_var, sizeof(double), filename);
+    if (k <= 0 || k >= ctx.n) {
+        close(fd);
+        LOGGER.e(0, "[" + filename + "] has invalid Woodbury rank k=" + to_string(k) + ".");
+    }
+    if (!std::isfinite(lambda_tail) || !std::isfinite(tail_d_var) || tail_d_var < 0.0) {
+        close(fd);
+        LOGGER.e(0, "[" + filename + "] has invalid Woodbury tail statistics.");
+    }
+
+    const size_t uk_bytes = static_cast<size_t>(k) * static_cast<size_t>(ctx.n) * sizeof(float);
+    const size_t dk_bytes = static_cast<size_t>(k) * sizeof(float);
+    const size_t need = kRemlPrefixBytes + sizeof(int32_t) + 2 * sizeof(double) + uk_bytes + dk_bytes;
+    if (file_size < need) {
+        close(fd);
+        LOGGER.e(0, "[" + filename + "] is too short for n=" + to_string(ctx.n) +
+                    ", k=" + to_string(k) + " (expected at least " + to_string(need) +
+                    " bytes, found " + to_string(file_size) + ").");
+    }
+
+    // Uk is stored k x n (column i = sample i, see writeRemlStateFromCtx).
+    Eigen::MatrixXf Uk_f(k, ctx.n);
+    read_exact(fd, Uk_f.data(), uk_bytes, filename);
+    Eigen::VectorXf dk_f(k);
+    read_exact(fd, dk_f.data(), dk_bytes, filename);
+    close(fd);
+
+    // k x n float -> n x k double; parallel over samples (contiguous reads).
+    ctx.Uk.resize(ctx.n, k);
+    #pragma omp parallel for schedule(static)
+    for (int32_t i = 0; i < ctx.n; ++i)
+        for (int32_t j = 0; j < k; ++j)
+            ctx.Uk(i, j) = static_cast<double>(Uk_f(j, i));
+    Uk_f.resize(0, 0);
+
+    ctx.dk                       = dk_f.cast<double>();
+    ctx.lambda_tail              = lambda_tail;
+    ctx.tail_d_var               = tail_d_var;
+    ctx.woodbury_basis_rank_     = k;
+    ctx.woodbury_basis_rank      = k;
+    ctx.Vi_use_woodbury_basis    = true;
+    ctx.woodbury_basis_preloaded = true;
+
+    LOGGER.i(0, "Woodbury basis loaded from [" + filename + "]: n=" + to_string(ctx.n) +
+                ", k=" + to_string(k) + ", lambda_tail=" + to_text(lambda_tail) +
+                ", tail_d_var=" + to_text(tail_d_var) + ".");
 }
 
 void write_hsq_from_ctx(const string& out_prefix, const RemlCtx& ctx)
@@ -512,6 +718,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
     // --save-reml is a boolean flag (no argument): the REML state is always
     // written to "<out>.reml". Any value accidentally supplied is ignored.
     const bool has_save_reml   = options_in.find("--save-reml")   != options_in.end();
+    const bool has_reuse       = options_in.find("--reml-woodbury-reuse") != options_in.end();
 
     auto capture_common_reml_flags = [&]() {
         if (options_in.find("--reml-alg") != options_in.end()
@@ -540,6 +747,12 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
 
     if (has_load_reml && has_save_reml)
         LOGGER.e(0, "--mlma-stream does not allow --load-reml with --save-reml.");
+    if (has_reuse && has_load_reml)
+        LOGGER.e(0, "--reml-woodbury-reuse re-fits REML for the current phenotype and cannot be "
+                    "combined with --load-reml (which uses a fitted state as-is).");
+    if (has_reuse && (options_in["--reml-woodbury-reuse"].empty()
+                      || options_in["--reml-woodbury-reuse"][0].empty()))
+        LOGGER.e(0, "--reml-woodbury-reuse requires a .reml file argument.");
 
     if (has_save_reml) {
         if (!options_in["--save-reml"].empty())
@@ -573,13 +786,25 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         options_in.erase("--reml-ai-robust-risk");
         options_in.erase("--reml-force-dense-V");
     } else {
-        // Inline REML path: --grm is required.
+        // Inline REML path: --grm is required, unless the Woodbury basis comes
+        // from a saved .reml (--reml-woodbury-reuse), in which case no GRM is read.
         const bool has_grm = options_in.find("--grm") != options_in.end()
                               && !options_in["--grm"].empty();
-        if (!has_grm)
-            LOGGER.e(0, "--mlma-stream requires either --load-reml <file> or --grm <prefix>.");
-        options["grm"] = options_in["--grm"][0];
-        options_in.erase("--grm");
+        if (has_reuse) {
+            if (has_grm)
+                LOGGER.e(0, "--reml-woodbury-reuse takes the basis from the .reml file and does not read a GRM; remove --grm.");
+            if (options_in.find("--reml-woodbury-basis") != options_in.end())
+                LOGGER.e(0, "--reml-woodbury-reuse cannot be combined with --reml-woodbury-basis (the rank comes from the .reml file).");
+            if (options_in.find("--reml-woodbury-basis-posthoc-correction") != options_in.end())
+                LOGGER.e(0, "--reml-woodbury-reuse is incompatible with --reml-woodbury-basis-posthoc-correction (no exact GRM is loaded).");
+            options["woodbury_reuse"] = options_in["--reml-woodbury-reuse"][0];
+            options_in.erase("--reml-woodbury-reuse");
+        } else {
+            if (!has_grm)
+                LOGGER.e(0, "--mlma-stream requires either --load-reml <file>, --reml-woodbury-reuse <file> or --grm <prefix>.");
+            options["grm"] = options_in["--grm"][0];
+            options_in.erase("--grm");
+        }
 
         // --reml-woodbury [k]  (k optional; -1 = MP-k, -2 = EIG, -3 = variance)
         if (options_in.find("--reml-woodbury-basis") != options_in.end()) {
@@ -628,6 +853,15 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
             if (vals.size() > 1)
                 LOGGER.w(0, "--svd-method expects exactly one value; using the first one.");
             options_in.erase("--svd-method");
+        }
+        if (options_in.find("--svd-power-iter") != options_in.end()) {
+            const auto& vals = options_in["--svd-power-iter"];
+            if (vals.empty() || vals[0].empty())
+                LOGGER.e(0, "--svd-power-iter requires one integer argument.");
+            options["svd_power_iter"] = vals[0];
+            if (vals.size() > 1)
+                LOGGER.w(0, "--svd-power-iter expects exactly one value; using the first one.");
+            options_in.erase("--svd-power-iter");
         }
         // --reml-woodbury-basis-warm-start <prefix>: seed the Woodbury rSVD sketch
         // with eigenvectors from a prior "<prefix>.eigenvec" (e.g. written by
@@ -918,7 +1152,8 @@ void MLMA::processMain()
             const string load_reml_file = options.at("load_reml");
             LOGGER.i(0, "Loading REML state from [" + load_reml_file + "]...");
             LOGGER.ts("load_reml");
-            state = readRemlState(load_reml_file, no_adj_covar);
+            state = readRemlState(load_reml_file, no_adj_covar, n,
+                                  hash_sample_ids(pheno->get_id(0, n - 1, "\t")));
             LOGGER.i(0, "REML state loaded in " + to_string(LOGGER.tp("load_reml")) + " seconds.");
 
             if (state.n != n)
@@ -940,11 +1175,17 @@ void MLMA::processMain()
             // run reml::compute() to populate its V^{-1} / Woodbury state, and then
             // pass that RemlCtx through run_mlma_stream_association(RemlCtx&) below.
             // This is distinct from the --load-reml serialized RemlState path above.
-            const string grm_pfx = options.at("grm");
-            LOGGER.i(0, "Running inline REML using GRM [" + grm_pfx + "] ...");
+            const bool   reuse_basis = options.count("woodbury_reuse") > 0;
+            const string grm_pfx     = reuse_basis ? string() : options.at("grm");
+            if (reuse_basis)
+                LOGGER.i(0, "Running inline REML with the Woodbury basis reused from [" +
+                            options.at("woodbury_reuse") + "] (no GRM is read) ...");
+            else
+                LOGGER.i(0, "Running inline REML using GRM [" + grm_pfx + "] ...");
 
             const vector<string> analysis_ids = pheno->get_id(0, n - 1, "\t");
-            bool grm_chunked = options_d.count("grm_chunked_budget") > 0.0;
+            const uint64_t id_hash = hash_sample_ids(analysis_ids);
+            bool grm_chunked = !reuse_basis && options_d.count("grm_chunked_budget") > 0.0;
             const double grm_chunked_budget = options_d.count("grm_chunked_budget")
                 ? options_d.at("grm_chunked_budget") : 0.0;
 
@@ -967,6 +1208,8 @@ void MLMA::processMain()
                 ? static_cast<int>(options_d.at("reml_diagV_adj")) : 0;
             const bool no_constrain   = options.count("no_constrain") > 0;
             const bool svd_nystrom = options.count("svd_nystrom") > 0;
+            const int svd_power_iter = options_d.count("svd_power_iter")
+                ? static_cast<int>(options_d.at("svd_power_iter")) : 3;
             const float  woodbury_basis_eigen_mass  = options_d.count("woodbury_basis_eigen_mass")
                 ? static_cast<float>(options_d.at("woodbury_basis_eigen_mass")) : 0.99f;
             const double woodbury_basis_edge_margin = options_d.count("woodbury_basis_edge_margin")
@@ -988,12 +1231,12 @@ void MLMA::processMain()
                 LOGGER.e(0, "--reml-alg should be 0, 1 or 2.");
             if (reml_diagV_adj < 0 || reml_diagV_adj > 2)
                 LOGGER.e(0, "--reml-diagV-adj should be 0, 1, or 2.");
-            if (woodbury_basis_rank != 0 && reml_alg == 1)
+            if ((woodbury_basis_rank != 0 || reuse_basis) && reml_alg == 1)
                 LOGGER.e(0, "--reml-woodbury is incompatible with Fisher-scoring REML (--reml-alg 1). Use AI-REML (default) or EM-REML (--reml-alg 2).");
             if (svd_nystrom && woodbury_basis_rank == 0)
                 LOGGER.e(0, "--svd-method nystrom requires --reml-woodbury <k|MP|EIG|VAR>.");
-            if (woodbury_basis_rank != 0 && trace_hutchpp)
-                LOGGER.w(0, "--reml-woodbury-basis and --reml-trace-hutchpp both given; "
+            if ((woodbury_basis_rank != 0 || reuse_basis) && trace_hutchpp)
+                LOGGER.w(0, "--reml-woodbury-basis/--reml-woodbury-reuse and --reml-trace-hutchpp both given; "
                             "the Woodbury basis provides an exact tr(PA) and takes precedence — "
                             "--reml-trace-hutchpp is ignored.");
 
@@ -1035,7 +1278,7 @@ void MLMA::processMain()
                 // split; nothing further to log here. Note the dense fallback
                 // just above discards chunked_grm/its reader rather than using
                 // it, since the decision can only be made after construction now.
-            } else {
+            } else if (!reuse_basis) {
                 // upper_only=true: G_n is valid on its upper triangle (row<=col)
                 // only. This is safe here because ctx.A[0] (fed by G_n below) is
                 // itself expected to be upper-triangle-only by RemlEngine -- see
@@ -1139,6 +1382,7 @@ void MLMA::processMain()
             ctx.woodbury_basis_posthoc_correction = options.count("woodbury_basis_posthoc_correction") > 0;
             ctx.svd_mem_budget_gb   = woodbury_basis_mem_budget_gb;
             ctx.svd_nystrom         = svd_nystrom;
+            ctx.svd_power_iter       = svd_power_iter;
             ctx.grm_chunked_budget         = grm_chunked ? grm_chunked_budget : 0.0;
             ctx.reml_trace_hutchpp        = trace_hutchpp;
             ctx.reml_trace_hutchpp_nprobes = trace_hutchpp_nprobes;
@@ -1159,6 +1403,12 @@ void MLMA::processMain()
                     ctx.Uk = load_pca_warm_start(options.at("woodbury_basis_warm_start"), analysis_ids);
             }
 
+            // Fill ctx.Uk/dk/lambda_tail from the saved basis (after the warm-start
+            // block above, which it supersedes); reml::compute() then skips the
+            // basis construction (ctx.woodbury_basis_preloaded).
+            if (reuse_basis)
+                load_woodbury_basis_into_ctx(options.at("woodbury_reuse"), ctx, id_hash);
+
             reml::compute(ctx, priors, priors_var, no_constrain);
 
             LOGGER.i(0, "Inline REML complete. Variance components:");
@@ -1172,7 +1422,7 @@ void MLMA::processMain()
                 const string save_reml_file = out_prefix + ".reml";
                 LOGGER.i(0, "Saving REML state to [" + save_reml_file + "] ...");
                 LOGGER.ts("save_reml");
-                writeRemlStateFromCtx(save_reml_file, ctx, no_adj_covar);
+                writeRemlStateFromCtx(save_reml_file, ctx, no_adj_covar, id_hash);
                 LOGGER.i(0, "REML state saved in " + to_string(LOGGER.tp("save_reml")) + " seconds.");
                 LOGGER.i(0, "REML estimation completed. Use --load-reml " + save_reml_file +
                             " to perform association tests.");

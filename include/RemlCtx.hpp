@@ -144,6 +144,7 @@ struct RemlCtx {
     bool   he_warm_start_applied = false;
 
     bool   svd_nystrom          = false; // true → single-pass Nystrom basis
+    int    svd_power_iter = 3; // power-iter for Woodbury basis formation
 
     // Output naming (for .hsq file and LOGGER lines)
     std::string out;                       // output file prefix
@@ -152,6 +153,10 @@ struct RemlCtx {
 
     // ── Woodbury basis (set by reml::compute_woodbury_basis_basis()) ───────────────
     bool    Vi_use_woodbury_basis = false;
+    // true -> the caller already filled Uk/dk/lambda_tail/woodbury_basis_rank_ from a
+    // saved basis (--reml-woodbury-reuse; tail_d_var included), so reml::compute()
+    // skips compute_woodbury_basis().
+    bool    woodbury_basis_preloaded = false;
     int     woodbury_basis_rank_  = 0;     // actual rank used (<= woodbury_basis_rank or MP)
     float woodbury_basis_eigen_mass = 0.99f;    // fraction of eigenvalue mass captured by Uk
     bool woodbury_basis_eigen_adaptive = true; // true → adaptively raise k until mass target is reached rather than doubling

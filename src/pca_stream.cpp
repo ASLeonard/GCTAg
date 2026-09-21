@@ -110,6 +110,15 @@ int PCAStream::registerOption(map<string, vector<string>>& options_in)
             LOGGER.w(0, "--svd-method expects exactly one value; using the first one.");
         options_in.erase("--svd-method");
     }
+    if (options_in.find("--svd-power-iter") != options_in.end()) {
+        const auto& vals = options_in["--svd-power-iter"];
+        if (vals.empty() || vals[0].empty())
+            LOGGER.e(0, "--svd-power-iter requires one integer argument.");
+        options["svd_power_iter"] = vals[0];
+        if (vals.size() > 1)
+            LOGGER.w(0, "--svd-power-iter expects exactly one value; using the first one.");
+        options_in.erase("--svd-power-iter");
+    }
 
     processFunctions.push_back("PCAStream");
     options_in.erase("--pca");
@@ -165,6 +174,8 @@ void PCAStream::processMain()
         const double grm_chunked_budget = options_d.count("grm_chunked_budget")
             ? options_d.at("grm_chunked_budget") : 0.0;
         bool grm_chunked = grm_chunked_budget > 0.0;
+        int svd_power_iter = options.count("svd_power_iter")
+            ? std::stoi(options.at("svd_power_iter")) : 3;
 
         if (pca_approx.empty() && grm_chunked)
             LOGGER.e(0, "--pca exact mode (dsyevr/dsyevd) requires dense GRM loading. "
@@ -176,12 +187,8 @@ void PCAStream::processMain()
         // computed here and passed in piecemeal -- this file never touches
         // RemlCtx, so it has no other reason to duplicate that arithmetic.
         int chunk_size = 0;
-        int k_ext_hint = 0;
         gcta_grm_io::ChunkedGrmHandle chunked_handle;  // only populated when grm_chunked
         if (grm_chunked) {
-            k_ext_hint = (pca_approx == "Lanczos")
-                ? std::min(n, std::max(3 * out_pc_num + 1, 30))
-                : out_pc_num + gcta_eigh::recommended_oversample(out_pc_num);
             // NOTE: this now opens the file and ID-matches against
             // .grm.id/.grm.N.bin unconditionally whenever grm_chunked is
             // true, even if the chunk_size >= n check below ends up
@@ -190,7 +197,7 @@ void PCAStream::processMain()
             // work is cheap (ID matching + one N-mean read, no tile reads
             // yet) but it's a real behavior change worth knowing about.
             chunked_handle = gcta_grm_io::make_chunked_grm_reader(
-                grm_pfx, analysis_ids, grm_chunked_budget, k_ext_hint, "--pca");
+                grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--pca");
             chunk_size = chunked_handle.chunk_rows;
             if (chunk_size >= n) {
                 // The whole GRM fits in a single block: chunking then buys nothing
@@ -199,9 +206,9 @@ void PCAStream::processMain()
                 // chunked_grm_matvec.hpp) across the entire matrix at once, since
                 // that tile IS the whole matrix here. Strictly worse than dense.
                 LOGGER.w(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
-                            "GB covers the full GRM (n=" + to_string(n) + ", k_ext=" +
-                            to_string(k_ext_hint) + ") in a single chunk. Falling back to "
-                            "dense loading instead of paying chunking overhead for no benefit.");
+                            "GB covers the full GRM (n=" + to_string(n) + ") in a single chunk. "
+                            "Falling back to dense loading instead of paying chunking overhead "
+                            "for no benefit.");
                 grm_chunked = false;
             }
         }
@@ -310,7 +317,7 @@ void PCAStream::processMain()
                                     std::to_string(out_pc_num) + " may be lower than power-iteration rSVD.");
                         res = gcta_eigh::nystrom_symmetric_eigh(apply, n, out_pc_num, oversample);
                     } else {
-                        res = gcta_eigh::randomized_symmetric_eigh(apply, n, out_pc_num, oversample, 3);
+                        res = gcta_eigh::randomized_symmetric_eigh(apply, n, out_pc_num, oversample, svd_power_iter);
                     }
                 } else if (pca_approx == "Lanczos") {
                     const int ncv = std::min(n, std::max(3 * out_pc_num + 1, 30));

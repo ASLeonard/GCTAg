@@ -1199,7 +1199,7 @@ void MLMA::processMain()
                 ? static_cast<int>(options_d.at("woodbury_basis_rank")) : 0;
             const bool trace_hutchpp   = options.count("trace_hutchpp") > 0;
             const int  trace_hutchpp_nprobes  = options_d.count("trace_hutchpp_nprobes")
-                ? static_cast<int>(options_d.at("trace_hutchpp_nprobes")) : 200;
+                ? static_cast<int>(options_d.at("trace_hutchpp_nprobes")) : 100;
             const int  reml_maxit     = options_d.count("reml_maxit")
                 ? static_cast<int>(options_d.at("reml_maxit")) : 100;
             const int  reml_alg       = options_d.count("reml_alg")

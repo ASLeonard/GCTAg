@@ -913,7 +913,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
             options_d["woodbury_basis_edge_confirm"] = std::stod(vals[0]);
             options_in.erase("--reml-woodbury-basis-MP-confirm");
         }
-        if (options_in.find("--reml-woodbury-basis-EIGM-k-buffer") != options_in.end()) {
+        if (options_in.find("--reml-woodbury-basis-EIG-k-buffer") != options_in.end()) {
             const auto& vals = options_in["--reml-woodbury-basis-EIG-k-buffer"];
             if (vals.empty() || vals[0].empty())
                 LOGGER.e(0, "--reml-woodbury-basis-EIG-k-buffer requires an integer argument.");

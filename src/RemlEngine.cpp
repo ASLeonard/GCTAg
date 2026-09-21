@@ -1950,8 +1950,8 @@ static int eigmass_min_k_next(const Eigen::VectorXd& eval_full, int k_svd, doubl
     if (!(lambda_k > 0.0)) return k_svd;  // degenerate: no positive tail mass left to exploit
     const double mass_to_remove = target_mass - S1_k;
     if (!(mass_to_remove > 0.0)) return k_svd;  // already satisfied or overshot; shouldn't reach here
-    const int m_needed = static_cast<int>(std::ceil(mass_to_remove / lambda_k));
-    return k_svd + std::max(1, m_needed);
+    const double m_needed = std::ceil(mass_to_remove / lambda_k);   // may be huge if lambda_k is tiny
+    return k_svd + static_cast<int>(std::max(1.0, std::min(m_needed, 1.0e9)));
 }
 
 } // anonymous namespace
@@ -2185,11 +2185,22 @@ void compute_woodbury_basis(RemlCtx& ctx) {
 
         int k_svd_next = std::min({k_svd * 2, n - 1, k_svd_cap});
         if (mode == WoodburyMode::EIG && ctx.woodbury_basis_eigen_adaptive) {
-            int k_svd_jump = eigmass_min_k_next(eval_full, k_svd, eval_full.head(k_svd).sum(), target_mass);
+            const double captured = eval_full.head(k_svd).sum();
+            int k_svd_jump = eigmass_min_k_next(eval_full, k_svd, captured, target_mass);
             k_svd_next = std::min(std::max(k_svd_jump, k_svd_next), k_svd_cap);
+            // Locked expansion recomputes nothing, so doubling can overshoot once the target is close.
+            // Sufficient bound: the m largest of the n-k uncaptured eigenvalues average at least their mean
+            // R/(n-k), so m = deficit*(n-k)/R more eigenvalues reach the target (+5% of k for Ritz lag).
+            // It only binds near the target; far away it is larger than the doubling and changes nothing.
+            const double deficit = target_mass - captured, remain = trace_K_full - captured;
+            if (!ctx.svd_nystrom && deficit > 0.0 && remain > 0.0) {
+                const double k_suff = std::max<double>(k_svd_jump, k_svd + std::ceil(deficit * (n - k_svd) / remain))
+                                      + 0.05 * k_svd;
+                k_svd_next = std::min(k_svd_next, static_cast<int>(std::min(k_suff, static_cast<double>(n))));
+            }
             LOGGER.i(0, "Woodbury EIG-k: adaptive jump from k=" + std::to_string(k_svd) + " to k=" + std::to_string(k_svd_jump)
                         + " (bounded by " + std::to_string(k_svd_next) + ") to reach target mass (" + std::to_string(ctx.woodbury_basis_eigen_mass * 100.0) + "%)."
-                        + "\n(Currently captured mass: " + std::to_string(eval_full.head(k_svd).sum()) + ")");
+                        + "\n(Currently captured mass: " + std::to_string(captured) + ")");
         }
         const char* warm_status = ctx.svd_nystrom ? " (Nystrom: full recompute)"
                                                   : " (locked expansion: reusing converged Ritz vectors)";

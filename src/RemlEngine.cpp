@@ -1,4 +1,4 @@
-/*
+ logging properly/*
  * GCTA: a tool for Genome-wide Complex Trait Analysis
  *
  * RemlEngine — free-function REML engine for the v2 MLMALoco path.
@@ -261,11 +261,14 @@ bool init_varcomp(const RemlCtx& ctx,
                 const double sg_he = (static_cast<double>(dof) * yKy - trQK * yy) / denom;
                 const double se_he = (trQKQK * yy - trQK * yKy) / denom;
                 if (std::isfinite(sg_he) && std::isfinite(se_he)
+                    && sg_he > 0.0 && se_he > 0.0
                     && sg_he <= 100.0 * scale && se_he <= 100.0 * scale) {
                     varcmp(0) = std::max(sg_he, 0.01 * scale);
                     varcmp(1) = std::max(se_he, 0.01 * scale);
                     LOGGER << "REML: used single-GRM HE warm-start for variance components = " << varcmp.transpose() << std::endl;
                     return true;
+                } else
+                    LOGGER.w(0, "single-GRM HE warm-start produced implausible variance component(s) (sg=" + std::to_string(sg_he) + ", se=" + std::to_string(se_he) + ") -- ignoring.");
                 }
             }
         }
@@ -2137,7 +2140,8 @@ void compute_woodbury_basis(RemlCtx& ctx) {
             int k_svd_jump = eigmass_min_k_next(eval_full, k_svd, eval_full.head(k_svd).sum(), target_mass);
             k_svd_next = std::min(std::max(k_svd_jump, k_svd_next), k_svd_cap);
             LOGGER.i(0, "Woodbury EIG-k: adaptive jump from k=" + std::to_string(k_svd) + " to k=" + std::to_string(k_svd_jump)
-                        + " (bounded by " + std::to_string(k_svd_next) + ") to reach target mass (" + std::to_string(ctx.woodbury_basis_eigen_mass * 100.0) + "%).");
+                        + " (bounded by " + std::to_string(k_svd_next) + ") to reach target mass (" + std::to_string(ctx.woodbury_basis_eigen_mass * 100.0) + "%)."
+                        + "\n(Currently captured mass: " + std::to_string(eval_full.head(k_svd).sum()) + ")");
         }
         const char* warm_status = ctx.svd_nystrom ? " (Nystrom: no warm start, full recompute)"
                                  : !allows_warm              ? " (no warm start, fresh probe)"

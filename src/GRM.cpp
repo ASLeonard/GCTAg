@@ -46,15 +46,15 @@ using std::to_string;
 namespace {
 
 // Finds the largest `re` in (rs, full_re] such that a GRM tile spanning rows
-// [rs, re) with column width `re` (lower-triangle layout: row i needs columns
-// [0, i]) fits within budget_elems combined grm+N elements, i.e.
-//   (re - rs) * re <= budget_elems
-// Solved as the positive root of re^2 - rs*re - budget_elems = 0 in 
-// floating-point arithmetic, then floored and clamped to an integer full_re.
+// [rs, re) fits within budget_elems *actually touched* grm+N elements.
+// This may overcommit if the virtual square allocation becomes resident.
+//
+// Solved as the positive root of re^2 + re - (2*budget_elems + rs*(rs+1)) = 0
+// in floating-point arithmetic, then floored and clamped to full_re.
 int solve_tile_budget_end(int rs, int full_re, double budget_elems) {
     const double drs = rs;
-    const double disc = drs * drs + 4.0 * budget_elems;
-    int re = static_cast<int>(std::floor((drs + std::sqrt(disc)) / 2.0));
+    const double disc = 1.0 + 4.0 * (2.0 * budget_elems + drs * (drs + 1.0));
+    int re = static_cast<int>(std::floor((-1.0 + std::sqrt(disc)) / 2.0));
     return std::min(re, full_re);
 }
 
@@ -2441,7 +2441,13 @@ void GRM::processMakeGRM(){
             grm_tile_rows = tile_re - tile_rs;
             grm_tile_cols = tile_re;   // lower-triangle: widest row needs cols [0, tile_re-1]
 
-            const size_t tile_elems = static_cast<size_t>(grm_tile_rows) * grm_tile_cols;
+            // Trapezoid element count actually touched by this tile (see
+            // solve_tile_budget_end): [re*(re+1) - rs*(rs+1)] / 2. Reported
+            // instead of the full rows*cols rectangle so the logged size
+            // matches the RSS the budget solver now targets, not the
+            // (larger) addressable buffer footprint.
+            const double drs = tile_rs, dre = tile_re;
+            const size_t tile_elems = static_cast<size_t>((dre * (dre + 1.0) - drs * (drs + 1.0)) / 2.0);
             const double tile_gb    = tile_elems * 12.0 / (1024.0 * 1024.0 * 1024.0);
             LOGGER.i(0, "  Tile rows " + to_string(tile_rs) + "-" + to_string(tile_re - 1)
                         + " (" + to_string(tile_gb).substr(0, 4) + " GB grm+N)");

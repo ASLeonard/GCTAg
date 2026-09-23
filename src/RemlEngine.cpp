@@ -267,7 +267,7 @@ bool init_varcomp(const RemlCtx& ctx,
                     varcmp(1) = std::max(se_he, 0.01 * scale);
                     LOGGER << "REML: used single-GRM HE warm-start for variance components = " << varcmp.transpose() << std::endl;
                     return true;
-                } else
+                } else {
                     LOGGER.w(0, "single-GRM HE warm-start produced implausible variance component(s) (sg=" + std::to_string(sg_he) + ", se=" + std::to_string(se_he) + ") -- ignoring.");
                 }
             }

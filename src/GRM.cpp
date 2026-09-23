@@ -58,6 +58,21 @@ int solve_tile_budget_end(int rs, int full_re, double budget_elems) {
     return std::min(re, full_re);
 }
 
+// True when a single tile spanning the whole GRM [full_rs, full_re) already
+// fits within budget_elems -- i.e. tiling would produce exactly one tile, so
+// the dense (non-tiled) path should be used instead of the tiling machinery.
+// Shared by the constructor (decides whether to allocate the member grm/N
+// buffers up front) and processMakeGRM (decides which path actually runs)
+// so the two decisions can't drift apart: if the constructor thinks tiling
+// is active and leaves grm/N null, but processMakeGRM then takes the dense
+// path expecting them allocated, every dense-path write goes through a null
+// pointer.
+bool grm_tile_budget_covers_whole(int full_rs, int full_re, double budget_elems) {
+    const double drs = full_rs, dre = full_re;
+    const double whole_elems = (dre * (dre + 1.0) - drs * (drs + 1.0)) / 2.0;
+    return whole_elems <= budget_elems;
+}
+
 } // namespace
 
 map<string, string> GRM::options;
@@ -877,9 +892,18 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
     }
 
     // In bBLAS mode grm and N are managed per-tile in processMakeGRM; allocate
-    // them here only when not using tiling (no --GRM-tile-budget active).
-    const bool ctor_tiling_enabled = options_d.count("grm_tile_budget_bytes") > 0
-                                    && options_d.at("grm_tile_budget_bytes") > 0;
+    // them here only when not using tiling (no --GRM-tile-budget active, or
+    // the budget is large enough that processMakeGRM will fall back to the
+    // dense path itself -- see grm_tile_budget_covers_whole, used both here
+    // and there so this can't disagree with that).
+    bool ctor_tiling_enabled = options_d.count("grm_tile_budget_bytes") > 0
+                              && options_d.at("grm_tile_budget_bytes") > 0;
+    if(ctor_tiling_enabled && grm_tile_budget_covers_whole(
+            static_cast<int>(part_keep_indices.first),
+            static_cast<int>(part_keep_indices.second) + 1,
+            options_d.at("grm_tile_budget_bytes") / 12.0)){
+        ctor_tiling_enabled = false;
+    }
     if(!bBLAS || !ctor_tiling_enabled){
         int ret_grm = posix_memalign((void **)&grm, 32, fill_grm * sizeof(double));
         if(ret_grm){
@@ -2338,9 +2362,7 @@ void GRM::processMakeGRM(){
         const int full_rs = static_cast<int>(part_keep_indices.first);
         const int full_re = static_cast<int>(part_keep_indices.second) + 1;
         const double budget_elems = grm_tile_budget_bytes / 12.0;
-        const double drs = full_rs, dre = full_re;
-        const double whole_elems = (dre * (dre + 1.0) - drs * (drs + 1.0)) / 2.0;
-        if(whole_elems <= budget_elems){
+        if(grm_tile_budget_covers_whole(full_rs, full_re, budget_elems)){
             LOGGER.i(0, "--GRM-tile-budget ("
                         + to_string(grm_tile_budget_bytes / (1024.0*1024.0*1024.0)).substr(0, 6)
                         + " GB) covers the whole GRM in one tile; using the dense path instead.");
@@ -2534,7 +2556,7 @@ void GRM::processMakeGRM(){
         }
     } else {
         // Non-tiled path (!grm_tiling_enabled): single pass, original behaviour.
-        LOGGER << "Computing GRM..." << std::endl;
+        LOGGER << "Computing dense GRM..." << std::endl;
         geno->loopDouble(processIndex, nMarkerBlock, true, true, isSTD, true, callBacks);
         LOGGER << "  Used " << numValidMarkers << " valid SNPs." << std::endl;
         deduce_GRM();

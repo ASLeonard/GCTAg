@@ -2332,6 +2332,22 @@ void GRM::processMakeGRM(){
 
     grm_tiling_enabled = grm_tile_budget_bytes > 0;
 
+    if(grm_tiling_enabled){
+        // If the budget covers the *whole* GRM's triangular
+        // footprint in a single tile, fall back to dense.
+        const int full_rs = static_cast<int>(part_keep_indices.first);
+        const int full_re = static_cast<int>(part_keep_indices.second) + 1;
+        const double budget_elems = grm_tile_budget_bytes / 12.0;
+        const double drs = full_rs, dre = full_re;
+        const double whole_elems = (dre * (dre + 1.0) - drs * (drs + 1.0)) / 2.0;
+        if(whole_elems <= budget_elems){
+            LOGGER.i(0, "--GRM-tile-budget ("
+                        + to_string(grm_tile_budget_bytes / (1024.0*1024.0*1024.0)).substr(0, 6)
+                        + " GB) covers the whole GRM in one tile; using the dense path instead.");
+            grm_tiling_enabled = false;
+        }
+    }
+
     if(bBLAS && grm_tiling_enabled){
         // ── Block-tiled GRM: cap the grm+N tile buffer to --GRM-tile-budget
         // bytes, auto-sizing rows per tile since the lower-triangle column
@@ -2343,9 +2359,9 @@ void GRM::processMakeGRM(){
         if(options_d.find("sparse_cutoff") != options_d.end()){
             thresh   = static_cast<float>(options_d["sparse_cutoff"]);
             isSparse = true;
-            LOGGER.i(0, "Saving sparse GRM with a cutoff " + to_string(thresh) + "...");
+            LOGGER.i(0, "Computing sparse GRM with a cutoff " + to_string(thresh) + "...");
         } else {
-            LOGGER.i(0, "Saving GRM...");
+            LOGGER.i(0, "Computing tiled GRM...");
         }
 
         FILE *grm_out = nullptr, *N_out = nullptr;

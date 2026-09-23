@@ -1,4 +1,4 @@
- logging properly/*
+ /*
  * GCTA: a tool for Genome-wide Complex Trait Analysis
  *
  * RemlEngine — free-function REML engine for the v2 MLMALoco path.

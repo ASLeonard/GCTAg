@@ -268,11 +268,18 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
     auto write_bytes = [fd, &filename](const void* src, size_t nbytes) {
         const char* ptr = static_cast<const char*>(src);
         size_t total_written = 0;
+        constexpr size_t kMaxChunk = 1u << 30; // 1 GiB per syscall, safely under INT_MAX, which is a hard constraint on e.g. macOS.
         while (total_written < nbytes) {
-            ssize_t res = write(fd, ptr + total_written, nbytes - total_written);
-            if (res <= 0) {
+            size_t chunk = std::min(kMaxChunk, nbytes - total_written);
+            ssize_t res = write(fd, ptr + total_written, chunk);
+            if (res < 0) {
+                if (errno == EINTR) continue; // interrupted, retry
                 close(fd);
-                LOGGER.e(0, "write error on [" + filename + "] — disk full or I/O failure.");
+                LOGGER.e(0, "write error on [" + filename + "]: " + std::string(strerror(errno)));
+            }
+            if (res == 0) {
+                close(fd);
+                LOGGER.e(0, "write error on [" + filename + "]: write() returned 0 unexpectedly.");
             }
             total_written += static_cast<size_t>(res);
         }

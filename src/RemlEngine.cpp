@@ -1,4 +1,4 @@
- logging properly/*
+ /*
  * GCTA: a tool for Genome-wide Complex Trait Analysis
  *
  * RemlEngine — free-function REML engine for the v2 MLMALoco path.
@@ -267,7 +267,7 @@ bool init_varcomp(const RemlCtx& ctx,
                     varcmp(1) = std::max(se_he, 0.01 * scale);
                     LOGGER << "REML: used single-GRM HE warm-start for variance components = " << varcmp.transpose() << std::endl;
                     return true;
-                } else
+                } else {
                     LOGGER.w(0, "single-GRM HE warm-start produced implausible variance component(s) (sg=" + std::to_string(sg_he) + ", se=" + std::to_string(se_he) + ") -- ignoring.");
                 }
             }
@@ -1359,7 +1359,7 @@ double reml_iteration(RemlCtx& ctx,
 
     if (ctx.reml_trace_hutchpp && !ctx.Vi_use_woodbury_basis) {
         LOGGER << "Using Hutch++ stochastic trace estimator with "
-               << ctx.reml_trace_hutchpp_nprobes << (ctx.reml_hutchpp_fixed_probes ? "fixed" : "fresh")  << " probes." << std::endl;
+               << ctx.reml_trace_hutchpp_nprobes << " " << (ctx.reml_hutchpp_fixed_probes ? "fixed" : "fresh")  << " probes." << std::endl;
     }
     if (ctx.reml_mtd == 0 && ctx.reml_ai_robust) {
         LOGGER << "Using Newton-decrement convergence criterion (--reml-ai-robust, "

@@ -34,11 +34,13 @@
 #include <Eigen/Dense>
 #include <Spectra/SymEigsSolver.h>
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <random>
 #include <stdexcept>
 #include <utility>
-#include "cpu.h"  // gcta_dsyevd
+#include <vector>
+#include "cpu.h"  // gcta_dsyevr
 
 namespace gcta_eigh {
 
@@ -125,6 +127,40 @@ inline int recommended_oversample(int k_target, int floor = 8, int cap = 128) {
     return std::clamp(k_target / 8, std::min(floor, soft_target), cap);
 }
 
+// Full eigendecomposition of the symmetric k x k matrix whose UPPER triangle is
+// stored in B (via gcta_dsyevr, il=1, iu=k: LAPACK's all-eigenpairs MRRR path).
+// B is destroyed. On return w (k) and Z (k x k) hold the eigenpairs in DESCENDING
+// order; the leading columns of Z are contiguous, so Z.leftCols(k_top) is a plain
+// column block for the caller's GEMM (no reversed copy).
+//
+// Only the upper triangle of B is read, so a raw product Q' (A Q) needs no B + B'
+// symmetrisation, and every Rayleigh-Ritz call site sees the same triangle.
+//
+// Why dsyevr and not dsyevd: dsyevd (jobz='V') overwrites all of B with eigenvectors
+// and needs a further ~2*k^2 workspace, so the never-written lower triangle would be
+// faulted in anyway (peak ~3*k^2). dsyevr references only the upper triangle, returns
+// vectors in a separate Z and needs O(k) workspace: peak ~ k^2/2 (touched upper
+// triangle) + k^2 (Z). It also avoids gcta_dsyevd's k >= 32766 workspace guard.
+inline void eigh_upper_desc(Eigen::MatrixXd& B, Eigen::VectorXd& w, Eigen::MatrixXd& Z)
+{
+    const int k = static_cast<int>(B.rows());
+    if (B.cols() != k || k < 1)
+        throw std::invalid_argument("eigh_upper_desc: B must be square and non-empty.");
+    w.resize(k);
+    Z.resize(k, k);
+    std::vector<gcta_blas_int> isuppz(2 * static_cast<size_t>(k));
+    gcta_blas_int m_found = 0;
+    const int info = gcta_dsyevr((gcta_blas_int)k, B.data(), (gcta_blas_int)k,
+                                 (gcta_blas_int)1, (gcta_blas_int)k, &m_found,
+                                 w.data(), Z.data(), (gcta_blas_int)k, isuppz.data());
+    if (info != 0 || m_found != k)
+        throw std::runtime_error("eigh_upper_desc: dsyevr failed (info=" + std::to_string(info) + ").");
+    for (int i = 0; i < k / 2; ++i) {     // ascending -> descending, in place (no copy)
+        Z.col(i).swap(Z.col(k - 1 - i));
+        std::swap(w[i], w[k - 1 - i]);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Randomized range finder + power iteration + Rayleigh-Ritz (rSVD)
 // ─────────────────────────────────────────────────────────────────────────
@@ -202,27 +238,152 @@ EighResult power_iterate_and_project(
     Eigen::MatrixXd AQ = apply(Q);
     Eigen::MatrixXd B  = Q.transpose() * AQ;   // k_ext x k_ext, symmetric in exact arithmetic
     AQ.resize(0, 0);
-    // Match rayleigh_ritz_refine: dsyevd only reads one triangle, so without
-    // this, which triangle's rounding error gets discarded is arbitrary and
-    // the two Rayleigh-Ritz call sites silently disagree. Matters here more
-    // than most places — Woodbury's EIG99/MP-edge logic reads tail
-    // eigenvalues straight out of this call.
-    B = 0.5 * (B + B.transpose());
-    Eigen::VectorXd w(k_ext);
-    const int info = gcta_dsyevd((gcta_blas_int)k_ext, B.data(), (gcta_blas_int)k_ext, w.data());
-    if (info != 0)
-        throw std::runtime_error("power_iterate_and_project: dsyevd failed (info=" +
-                                  std::to_string(info) + "). For k_ext > 32766, this is likely why.");
+    // eigh_upper_desc reads only the upper triangle, so no B + B' symmetrisation is
+    // needed; rayleigh_ritz_refine does the same, so the two Rayleigh-Ritz call sites
+    // still agree on which triangle's rounding error is used. Matters here more than
+    // most places: Woodbury's EIG99/MP-edge logic reads tail eigenvalues straight out
+    // of this call.
+    Eigen::VectorXd w;
+    Eigen::MatrixXd Z;
+    eigh_upper_desc(B, w, Z);
+    B.resize(0, 0);
 
     EighResult result;
-    // w is ascending; tail(k_target).reverse() -> descending top-k.
-    result.eigenvalues = w.tail(k_target).reverse();
-    // Materialise the reversed block into a plain contiguous matrix before the
-    // n x k_target DGEMM — rowwise().reverse() on a block expression forces
-    // column-by-column scatter during DGEMM, defeating tiling.
-    const Eigen::MatrixXd evecs_sorted =
-        B.rightCols(k_target).rowwise().reverse().eval();
-    result.eigenvectors = Q * evecs_sorted;
+    result.eigenvalues  = w.head(k_target);
+    result.eigenvectors = Q * Z.leftCols(k_target);
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Locked expansion: grow a converged Ritz basis without recomputing it
+// ─────────────────────────────────────────────────────────────────────────
+//
+// (V0, theta0) are the top-k0 Ritz pairs of a previous Rayleigh-Ritz step on
+// `apply`: V0 orthonormal and V0' A V0 = diag(theta0) (an identity of RR, exact up
+// to rounding). Instead of a fresh k_ext-wide sketch, only m = k_ext - k0 NEW
+// directions are sketched and power-iterated in the orthogonal complement of V0
+// (iterating (I-P0) A (I-P0), P0 = V0 V0'), and ONE Rayleigh-Ritz is done on the
+// orthonormal union W = [V0, Q1]:
+//
+//     W' A W = [ diag(theta0)   V0' A Q1 ]     A symmetric => Q1' A V0 = (V0' A Q1)',
+//              [ Q1' A V0       Q1' A Q1 ]     and V0' A Q1 = V0' * (A Q1): A*V0 is never needed.
+//
+// What is guaranteed (exact arithmetic, A symmetric, not necessarily PSD):
+//   * Exactness: this is the exact Rayleigh-Ritz of A on span(W), not an approximation.
+//   * Monotone mass: span(W) contains span(V0), so by Cauchy interlacing every Ritz
+//     value is >= its counterpart from the previous round; the captured trace
+//     sum_{i<=j} theta_i can only grow at any fixed rank j <= k0. Ritz values stay
+//     lower bounds of the true eigenvalues, so the mass lag is >= 0.
+// What is not: how small the lag is. That depends on the spectral decay and on
+// power_iter (fresh-block convergence factor ~ (lambda_{k_ext+1}/lambda_j)^(power_iter+1)).
+//
+// k_target is the number of Ritz pairs returned (descending). Callers that keep expanding
+// should pass k_target = k_ext and lock ALL pairs: the oversample vectors are then
+// refined by the next round instead of being discarded and recomputed.
+//
+// Cost: (power_iter + 2) block products on m columns (the first also carries a probe
+// column), plus (power_iter + 2) deflation GEMM pairs costing ~2*k0/n of a block
+// product each. Across a doubling schedule each column is touched once.
+//
+// Safety (any failure throws; callers should fall back to a cold sketch):
+//   * A probe z = V0 g rides the first product for free; V0'(A z) must equal
+//     theta0 .* g. This validates the operator, V0's orthonormality and theta0.
+//   * After orthonormalisation, ||V0' Q1||_F must be ~0. gcta_cholesky_qr_thin_Q
+//     silently falls back to Householder QR when a Gram matrix is not positive
+//     definite; on a numerically rank-deficient block dorgqr completes Q with
+//     directions that need not be orthogonal to V0, which would invalidate the
+//     block form above.
+template <typename MatVecApply>
+EighResult expand_symmetric_eigh(
+    MatVecApply&& apply,
+    const Eigen::MatrixXd& V0,
+    const Eigen::VectorXd& theta0,
+    int k_ext,
+    int k_target,
+    int power_iter = 3)
+{
+    const int n  = static_cast<int>(V0.rows());
+    const int k0 = static_cast<int>(V0.cols());
+    const int m  = k_ext - k0;
+    if (theta0.size() != k0)
+        throw std::invalid_argument("expand_symmetric_eigh: theta0 size does not match V0 columns.");
+    if (m <= 0)
+        throw std::invalid_argument("expand_symmetric_eigh: k_ext must exceed the locked basis width.");
+    if (k_target > k_ext)
+        throw std::invalid_argument("expand_symmetric_eigh: k_target exceeds k_ext.");
+    if (k_ext > n)
+        throw std::invalid_argument("expand_symmetric_eigh: k_ext exceeds n.");
+
+    // Y <- (I - V0 V0') Y, `reps` times. One rep between power passes only has to
+    // keep the next Cholesky-QR Gram matrix well conditioned; two reps ("twice is
+    // enough") before the final orthogonalization give full orthogonality to V0.
+    auto deflate = [&](Eigen::MatrixXd& Y, int reps) {
+        for (int rep = 0; rep < reps; ++rep) {
+            const Eigen::MatrixXd C = V0.transpose() * Y;   // k0 x m
+            Y.noalias() -= V0 * C;
+        }
+    };
+    auto orthonormalize = [&](Eigen::MatrixXd& Y) {
+        const int info = gcta_cholesky_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)m, Y.data(), (gcta_blas_int)n);
+        if (info != 0)
+            throw std::runtime_error("expand_symmetric_eigh: orthogonalization failed (info=" +
+                                      std::to_string(info) + ").");
+    };
+
+    // First product: m random columns plus one probe column z = V0 g.
+    Eigen::MatrixXd Y(n, m + 1);
+    fill_standard_normal(Y.leftCols(m));
+    Eigen::VectorXd g(k0);
+    {
+        Eigen::MatrixXd gm(k0, 1);
+        fill_standard_normal(gm);
+        g = gm.col(0);
+    }
+    Y.col(m).noalias() = V0 * g;
+    Y = apply(Y);
+    const Eigen::VectorXd Kz = Y.col(m);
+    Y.conservativeResize(Eigen::NoChange, m);
+    {
+        const Eigen::VectorXd expect = theta0.cwiseProduct(g);
+        const double scale = expect.norm();
+        const Eigen::VectorXd got  = V0.transpose() * Kz;
+        if (scale > 0.0 && (got - expect).norm() > 1e-8 * scale)
+            throw std::runtime_error("expand_symmetric_eigh: locked basis fails the Ritz invariance "
+                                      "check (V0' A V0 != diag(theta0)).");
+    }
+
+    for (int pi = 0; pi < power_iter; ++pi) {
+        deflate(Y, 1);
+        orthonormalize(Y);
+        Y = apply(Y);
+    }
+    deflate(Y, 2);
+    orthonormalize(Y);                       // Y is now Q1
+    if ((V0.transpose() * Y).norm() > 1e-8)
+        throw std::runtime_error("expand_symmetric_eigh: fresh block is not orthogonal to the locked basis.");
+
+    Eigen::MatrixXd KQ1 = apply(Y);          // n x m
+
+    // eigh_upper_desc reads only the upper triangle: the strict lower triangle of the
+    // leading k0 x k0 block and the whole lower-left block are never written or read,
+    // so those pages stay unfaulted.
+    Eigen::MatrixXd B(k_ext, k_ext);
+    B.topLeftCorner(k0, k0).triangularView<Eigen::StrictlyUpper>().setZero();
+    B.topLeftCorner(k0, k0).diagonal() = theta0;
+    B.topRightCorner(k0, m).noalias() = V0.transpose() * KQ1;        // V0' A Q1
+    B.bottomRightCorner(m, m).noalias() = Y.transpose() * KQ1;       // Q1' A Q1
+    KQ1.resize(0, 0);
+
+    Eigen::VectorXd w;
+    Eigen::MatrixXd Z;                       // k_ext x k_ext, descending
+    eigh_upper_desc(B, w, Z);
+    B.resize(0, 0);
+
+    EighResult result;
+    result.eigenvalues = w.head(k_target);
+    result.eigenvectors.resize(n, k_target);
+    result.eigenvectors.noalias()  = V0 * Z.topLeftCorner(k0, k_target);
+    result.eigenvectors.noalias() += Y * Z.bottomLeftCorner(m, k_target);
     return result;
 }
 
@@ -258,19 +419,15 @@ EighResult rayleigh_ritz_refine(
     Eigen::MatrixXd A_basis = apply(basis);
     Eigen::MatrixXd B = basis.transpose() * A_basis;
     A_basis.resize(0, 0);
-    B = 0.5 * (B + B.transpose());
 
-    Eigen::VectorXd w(k_ext);
-    const int info = gcta_dsyevd((gcta_blas_int)k_ext, B.data(), (gcta_blas_int)k_ext, w.data());
-    if (info != 0)
-        throw std::runtime_error("rayleigh_ritz_refine: dsyevd failed (info=" +
-                                  std::to_string(info) + "). For k_ext > 32766, this is likely why.");
+    Eigen::VectorXd w;
+    Eigen::MatrixXd Z;
+    eigh_upper_desc(B, w, Z);   // reads only the upper triangle; see power_iterate_and_project
+    B.resize(0, 0);
 
     EighResult result;
-    result.eigenvalues = w.tail(k_target).reverse();
-    const Eigen::MatrixXd evecs_sorted =
-        B.rightCols(k_target).rowwise().reverse().eval();
-    result.eigenvectors = basis * evecs_sorted;
+    result.eigenvalues  = w.head(k_target);
+    result.eigenvectors = basis * Z.leftCols(k_target);
     return result;
 }
 
@@ -391,8 +548,8 @@ EighResult nystrom_symmetric_eigh(
     // C = omega^T * Y  (k_ext × k_ext)
     // Symmetric in exact arithmetic for PSD K; indefinite when K has
     // negative eigenvalues (e.g. GRM with missing genotypes).
+    // Only the upper triangle is read by eigh_upper_desc, so no symmetrisation.
     Eigen::MatrixXd C = omega.transpose() * Y;
-    C = 0.5 * (C + C.transpose());
 
     // Bound the accumulated dot-product error in C = Omega^T Y. This is a
     // numerical-rank criterion, not a spectral regularizer: nonzero
@@ -403,13 +560,10 @@ EighResult nystrom_symmetric_eigh(
     const double eps_C = gamma_n * omega.norm() * Y.norm();
     omega.resize(0, 0);
 
-    Eigen::VectorXd w_C(k_ext);
-    const int info_C = gcta_dsyevd((gcta_blas_int)k_ext, C.data(), (gcta_blas_int)k_ext, w_C.data());
-    if (info_C != 0)
-        throw std::runtime_error("nystrom_symmetric_eigh: dsyevd on sketch C failed (info=" +
-                                  std::to_string(info_C) + "). For k_ext > 32766, this is likely why.");
-
-    const Eigen::VectorXd& lam_C = w_C;
+    Eigen::VectorXd lam_C;
+    Eigen::MatrixXd V_C;                 // eigenvectors of C (order matches lam_C)
+    eigh_upper_desc(C, lam_C, V_C);
+    C.resize(0, 0);
     const Eigen::VectorXd lam_sqrt_abs_inv = lam_C.unaryExpr(
         [eps_C](double lam) { return (std::abs(lam) > eps_C) ? 1.0 / std::sqrt(std::abs(lam)) : 0.0; });
     const Eigen::VectorXd signs = lam_C.unaryExpr(
@@ -418,9 +572,9 @@ EighResult nystrom_symmetric_eigh(
     // K_nys = Z sign(Lambda) Z^T, where
     // Z = Y V |Lambda|^{-1/2}. This retains the signed spectrum of an
     // indefinite GRM without an additional K matvec.
-    Eigen::MatrixXd Z = Y * (C * lam_sqrt_abs_inv.asDiagonal());
+    Eigen::MatrixXd Z = Y * (V_C * lam_sqrt_abs_inv.asDiagonal());
     Y.resize(0, 0);
-    C.resize(0, 0);
+    V_C.resize(0, 0);
 
     // Z is owned and mutable here (unlike tall_skinny_thin_svd's const&), so
     // this needs zero extra n x k_ext buffers: gcta_cholesky_qr_thin_QR
@@ -435,19 +589,15 @@ EighResult nystrom_symmetric_eigh(
         throw std::runtime_error("nystrom_symmetric_eigh: orthogonalization failed (info=" + std::to_string(info_qr) + ").");
     const Eigen::MatrixXd& Q = Z;   // Z now holds explicit Q; alias, not a copy
 
-    Eigen::MatrixXd T = R * signs.asDiagonal() * R.transpose();
-    T = 0.5 * (T + T.transpose());
-    Eigen::VectorXd w_T(k_ext);
-    const int info_T = gcta_dsyevd((gcta_blas_int)k_ext, T.data(), (gcta_blas_int)k_ext, w_T.data());
-    if (info_T != 0)
-        throw std::runtime_error("nystrom_symmetric_eigh: dsyevd on signed core T failed (info=" +
-                                  std::to_string(info_T) + "). For k_ext > 32766, this is likely why.");
+    Eigen::MatrixXd T = R * signs.asDiagonal() * R.transpose();   // upper triangle is read below
+    Eigen::VectorXd w_T;
+    Eigen::MatrixXd U_T;
+    eigh_upper_desc(T, w_T, U_T);
+    T.resize(0, 0);
 
     EighResult result;
-    result.eigenvalues = w_T.tail(k_target).reverse();
-    const Eigen::MatrixXd evecs_sorted =
-        T.rightCols(k_target).rowwise().reverse().eval();
-    result.eigenvectors = Q * evecs_sorted;
+    result.eigenvalues  = w_T.head(k_target);
+    result.eigenvectors = Q * U_T.leftCols(k_target);
     return result;
 }
 

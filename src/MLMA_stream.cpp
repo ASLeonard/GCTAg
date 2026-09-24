@@ -84,12 +84,14 @@ string to_text(T x)
 // RemlState is now defined in include/RemlState.hpp (shared with MLMA_loco).
 // The readRemlState() function below remains file-local (only MLMA_stream needs it).
 
+constexpr size_t kMaxChunk = 1u << 30; // 1 GiB per syscall, safely under INT_MAX, which is a hard constraint on e.g. macOS.
 static void read_exact(int fd, void* dst, size_t nbytes, const std::string& path)
 {
     char* ptr = static_cast<char*>(dst);
     size_t total_read = 0;
     while (total_read < nbytes) {
-        const ssize_t res = ::read(fd, ptr + total_read, nbytes - total_read);
+        size_t chunk = std::min(kMaxChunk, nbytes - total_read);
+        const ssize_t res = ::read(fd, ptr + total_read, chunk);
         if (res == 0) {
             close(fd);
             LOGGER.e(0, "Unexpected EOF while reading [" + path + "] (expected " +
@@ -268,7 +270,6 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
     auto write_bytes = [fd, &filename](const void* src, size_t nbytes) {
         const char* ptr = static_cast<const char*>(src);
         size_t total_written = 0;
-        constexpr size_t kMaxChunk = 1u << 30; // 1 GiB per syscall, safely under INT_MAX, which is a hard constraint on e.g. macOS.
         while (total_written < nbytes) {
             size_t chunk = std::min(kMaxChunk, nbytes - total_written);
             ssize_t res = write(fd, ptr + total_written, chunk);

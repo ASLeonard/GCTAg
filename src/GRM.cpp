@@ -46,16 +46,31 @@ using std::to_string;
 namespace {
 
 // Finds the largest `re` in (rs, full_re] such that a GRM tile spanning rows
-// [rs, re) with column width `re` (lower-triangle layout: row i needs columns
-// [0, i]) fits within budget_elems combined grm+N elements, i.e.
-//   (re - rs) * re <= budget_elems
-// Solved as the positive root of re^2 - rs*re - budget_elems = 0 in 
-// floating-point arithmetic, then floored and clamped to an integer full_re.
+// [rs, re) fits within budget_elems *actually touched* grm+N elements.
+// This may overcommit if the virtual square allocation becomes resident.
+//
+// Solved as the positive root of re^2 + re - (2*budget_elems + rs*(rs+1)) = 0
+// in floating-point arithmetic, then floored and clamped to full_re.
 int solve_tile_budget_end(int rs, int full_re, double budget_elems) {
     const double drs = rs;
-    const double disc = drs * drs + 4.0 * budget_elems;
-    int re = static_cast<int>(std::floor((drs + std::sqrt(disc)) / 2.0));
+    const double disc = 1.0 + 4.0 * (2.0 * budget_elems + drs * (drs + 1.0));
+    int re = static_cast<int>(std::floor((-1.0 + std::sqrt(disc)) / 2.0));
     return std::min(re, full_re);
+}
+
+// True when a single tile spanning the whole GRM [full_rs, full_re) already
+// fits within budget_elems -- i.e. tiling would produce exactly one tile, so
+// the dense (non-tiled) path should be used instead of the tiling machinery.
+// Shared by the constructor (decides whether to allocate the member grm/N
+// buffers up front) and processMakeGRM (decides which path actually runs)
+// so the two decisions can't drift apart: if the constructor thinks tiling
+// is active and leaves grm/N null, but processMakeGRM then takes the dense
+// path expecting them allocated, every dense-path write goes through a null
+// pointer.
+bool grm_tile_budget_covers_whole(int full_rs, int full_re, double budget_elems) {
+    const double drs = full_rs, dre = full_re;
+    const double whole_elems = (dre * (dre + 1.0) - drs * (drs + 1.0)) / 2.0;
+    return whole_elems <= budget_elems;
 }
 
 } // namespace
@@ -877,9 +892,18 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
     }
 
     // In bBLAS mode grm and N are managed per-tile in processMakeGRM; allocate
-    // them here only when not using tiling (no --GRM-tile-budget active).
-    const bool ctor_tiling_enabled = options_d.count("grm_tile_budget_bytes") > 0
-                                    && options_d.at("grm_tile_budget_bytes") > 0;
+    // them here only when not using tiling (no --GRM-tile-budget active, or
+    // the budget is large enough that processMakeGRM will fall back to the
+    // dense path itself -- see grm_tile_budget_covers_whole, used both here
+    // and there so this can't disagree with that).
+    bool ctor_tiling_enabled = options_d.count("grm_tile_budget_bytes") > 0
+                              && options_d.at("grm_tile_budget_bytes") > 0;
+    if(ctor_tiling_enabled && grm_tile_budget_covers_whole(
+            static_cast<int>(part_keep_indices.first),
+            static_cast<int>(part_keep_indices.second) + 1,
+            options_d.at("grm_tile_budget_bytes") / 12.0)){
+        ctor_tiling_enabled = false;
+    }
     if(!bBLAS || !ctor_tiling_enabled){
         int ret_grm = posix_memalign((void **)&grm, 32, fill_grm * sizeof(double));
         if(ret_grm){
@@ -1532,8 +1556,7 @@ void GRM::deduce_GRM(){
         // Writing row by row requires stride-m reads (one cache miss per column step).
         // To keep memory low we process the output in blocks of BLAS_OUT_BLOCK rows:
         // each block allocates a row-major float slab of at most
-        // BLAS_OUT_BLOCK × grm_n_write floats (~300 MB for n=74193, BLOCK=1024),
-        // rather than a single grm_m × grm_n_write slab (~22 GB for the full matrix).
+        // BLAS_OUT_BLOCK × grm_n_write floats rather than a single grm_m × grm_n_write.
         const int grm_n_write = static_cast<int>(part_keep_indices.second + 1);
         constexpr int BLAS_OUT_BLOCK = 1024;
 
@@ -2332,6 +2355,20 @@ void GRM::processMakeGRM(){
 
     grm_tiling_enabled = grm_tile_budget_bytes > 0;
 
+    if(grm_tiling_enabled){
+        // If the budget covers the *whole* GRM's triangular
+        // footprint in a single tile, fall back to dense.
+        const int full_rs = static_cast<int>(part_keep_indices.first);
+        const int full_re = static_cast<int>(part_keep_indices.second) + 1;
+        const double budget_elems = grm_tile_budget_bytes / 12.0;
+        if(grm_tile_budget_covers_whole(full_rs, full_re, budget_elems)){
+            LOGGER.i(0, "--GRM-tile-budget ("
+                        + to_string(grm_tile_budget_bytes / (1024.0*1024.0*1024.0)).substr(0, 6)
+                        + " GB) covers the whole GRM in one tile; using the dense path instead.");
+            grm_tiling_enabled = false;
+        }
+    }
+
     if(bBLAS && grm_tiling_enabled){
         // ── Block-tiled GRM: cap the grm+N tile buffer to --GRM-tile-budget
         // bytes, auto-sizing rows per tile since the lower-triangle column
@@ -2343,9 +2380,9 @@ void GRM::processMakeGRM(){
         if(options_d.find("sparse_cutoff") != options_d.end()){
             thresh   = static_cast<float>(options_d["sparse_cutoff"]);
             isSparse = true;
-            LOGGER.i(0, "Saving sparse GRM with a cutoff " + to_string(thresh) + "...");
+            LOGGER.i(0, "Computing sparse GRM with a cutoff " + to_string(thresh) + "...");
         } else {
-            LOGGER.i(0, "Saving GRM...");
+            LOGGER.i(0, "Computing tiled GRM...");
         }
 
         FILE *grm_out = nullptr, *N_out = nullptr;
@@ -2393,26 +2430,12 @@ void GRM::processMakeGRM(){
                     + to_string(tile_ranges.front().second - tile_ranges.front().first) + "-"
                     + to_string(tile_ranges.back().second - tile_ranges.back().first) + ".");
 
-        // Allocate for the worst-case tile once and reuse — avoids repeated mmap/munmap
-        // and the associated page-fault storms that dominate sys time. Every tile is
-        // constructed to fit within budget_elems, so this scan is just a safety net
-        // against any boundary-solver rounding.
-        size_t max_tile_elems = 0;
-        for(const auto &range : tile_ranges){
-            max_tile_elems = std::max(max_tile_elems,
-                                      static_cast<size_t>(range.second - range.first) * range.second);
-        }
-        if(posix_memalign((void**)&grm, 64, max_tile_elems * sizeof(double)) != 0)
-            LOGGER.e(0, "Can't allocate GRM tile buffer.");
-        if(posix_memalign((void**)&N, 64, max_tile_elems * sizeof(uint32_t)) != 0)
-            LOGGER.e(0, "Can't allocate N tile buffer.");
-
         // flush_grm_tile's output-formatting scratch, sized once to the final
-        // (widest) tile -- tile_ranges is monotonically widening, so
-        // tile_ranges.back() is always the worst case. Reused across every
-        // flush_grm_tile call below via resize-if-needed, same rationale as
-        // the grm/N allocation just above (avoid malloc/page-fault churn
-        // repeated once per tile).
+        // (widest) tile -- tile_ranges is monotonically widening in `re`, so
+        // tile_ranges.back() is always the widest-column case. This buffer's
+        // shape (BLAS_OUT_BLOCK rows x tile_cols) doesn't depend on tile_rows,
+        // so it doesn't have the grm/N reuse problem above and can stay
+        // allocated once and reused across every flush_grm_tile call below.
         constexpr int BLAS_OUT_BLOCK = 1024;
         const int widest_tile_cols = tile_ranges.back().second;
         std::vector<float> flush_w_grm(widest_tile_cols);
@@ -2441,7 +2464,20 @@ void GRM::processMakeGRM(){
             grm_tile_rows = tile_re - tile_rs;
             grm_tile_cols = tile_re;   // lower-triangle: widest row needs cols [0, tile_re-1]
 
-            const size_t tile_elems = static_cast<size_t>(grm_tile_rows) * grm_tile_cols;
+            // Fresh, exactly-sized allocation for this tile only
+            const size_t tile_rect_elems = static_cast<size_t>(grm_tile_rows) * grm_tile_cols;
+            if(posix_memalign((void**)&grm, 64, tile_rect_elems * sizeof(double)) != 0)
+                LOGGER.e(0, "Can't allocate GRM tile buffer.");
+            if(posix_memalign((void**)&N, 64, tile_rect_elems * sizeof(uint32_t)) != 0)
+                LOGGER.e(0, "Can't allocate N tile buffer.");
+
+            // Trapezoid element count actually touched by this tile (see
+            // solve_tile_budget_end): [re*(re+1) - rs*(rs+1)] / 2. Reported
+            // instead of the full rows*cols rectangle so the logged size
+            // matches the RSS the budget solver now targets, not the
+            // (larger) addressable buffer footprint.
+            const double drs = tile_rs, dre = tile_re;
+            const size_t tile_elems = static_cast<size_t>((dre * (dre + 1.0) - drs * (drs + 1.0)) / 2.0);
             const double tile_gb    = tile_elems * 12.0 / (1024.0 * 1024.0 * 1024.0);
             LOGGER.i(0, "  Tile rows " + to_string(tile_rs) + "-" + to_string(tile_re - 1)
                         + " (" + to_string(tile_gb).substr(0, 4) + " GB grm+N)");
@@ -2496,10 +2532,12 @@ void GRM::processMakeGRM(){
 
             flush_grm_tile(grm_out, N_out, thresh, isSparse, mtd_weight,
                           flush_w_grm, flush_w_N, flush_grm_block, flush_sparse_buf);
-        }
 
-        posix_mem_free(grm); grm = nullptr;
-        posix_mem_free(N);   N   = nullptr;
+            // Free this tile's buffers now rather than reusing them for the
+            // next tile, to keep allocation shape correct.
+            posix_mem_free(grm); grm = nullptr;
+            posix_mem_free(N);   N   = nullptr;
+        }
 
         if(grm_out) fclose(grm_out);
         if(N_out)   fclose(N_out);
@@ -2512,7 +2550,7 @@ void GRM::processMakeGRM(){
         }
     } else {
         // Non-tiled path (!grm_tiling_enabled): single pass, original behaviour.
-        LOGGER << "Computing GRM..." << std::endl;
+        LOGGER << "Computing dense GRM..." << std::endl;
         geno->loopDouble(processIndex, nMarkerBlock, true, true, isSTD, true, callBacks);
         LOGGER << "  Used " << numValidMarkers << " valid SNPs." << std::endl;
         deduce_GRM();

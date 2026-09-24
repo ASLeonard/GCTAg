@@ -1359,7 +1359,7 @@ double reml_iteration(RemlCtx& ctx,
 
     if (ctx.reml_trace_hutchpp && !ctx.Vi_use_woodbury_basis) {
         LOGGER << "Using Hutch++ stochastic trace estimator with "
-               << ctx.reml_trace_hutchpp_nprobes << (ctx.reml_hutchpp_fixed_probes ? "fixed" : "fresh")  << " probes." << std::endl;
+               << ctx.reml_trace_hutchpp_nprobes << " " << (ctx.reml_hutchpp_fixed_probes ? "fixed" : "fresh")  << " probes." << std::endl;
     }
     if (ctx.reml_mtd == 0 && ctx.reml_ai_robust) {
         LOGGER << "Using Newton-decrement convergence criterion (--reml-ai-robust, "

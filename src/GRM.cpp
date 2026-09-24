@@ -1556,8 +1556,7 @@ void GRM::deduce_GRM(){
         // Writing row by row requires stride-m reads (one cache miss per column step).
         // To keep memory low we process the output in blocks of BLAS_OUT_BLOCK rows:
         // each block allocates a row-major float slab of at most
-        // BLAS_OUT_BLOCK × grm_n_write floats (~300 MB for n=74193, BLOCK=1024),
-        // rather than a single grm_m × grm_n_write slab (~22 GB for the full matrix).
+        // BLAS_OUT_BLOCK × grm_n_write floats rather than a single grm_m × grm_n_write.
         const int grm_n_write = static_cast<int>(part_keep_indices.second + 1);
         constexpr int BLAS_OUT_BLOCK = 1024;
 
@@ -2431,26 +2430,12 @@ void GRM::processMakeGRM(){
                     + to_string(tile_ranges.front().second - tile_ranges.front().first) + "-"
                     + to_string(tile_ranges.back().second - tile_ranges.back().first) + ".");
 
-        // Allocate for the worst-case tile once and reuse — avoids repeated mmap/munmap
-        // and the associated page-fault storms that dominate sys time. Every tile is
-        // constructed to fit within budget_elems, so this scan is just a safety net
-        // against any boundary-solver rounding.
-        size_t max_tile_elems = 0;
-        for(const auto &range : tile_ranges){
-            max_tile_elems = std::max(max_tile_elems,
-                                      static_cast<size_t>(range.second - range.first) * range.second);
-        }
-        if(posix_memalign((void**)&grm, 64, max_tile_elems * sizeof(double)) != 0)
-            LOGGER.e(0, "Can't allocate GRM tile buffer.");
-        if(posix_memalign((void**)&N, 64, max_tile_elems * sizeof(uint32_t)) != 0)
-            LOGGER.e(0, "Can't allocate N tile buffer.");
-
         // flush_grm_tile's output-formatting scratch, sized once to the final
-        // (widest) tile -- tile_ranges is monotonically widening, so
-        // tile_ranges.back() is always the worst case. Reused across every
-        // flush_grm_tile call below via resize-if-needed, same rationale as
-        // the grm/N allocation just above (avoid malloc/page-fault churn
-        // repeated once per tile).
+        // (widest) tile -- tile_ranges is monotonically widening in `re`, so
+        // tile_ranges.back() is always the widest-column case. This buffer's
+        // shape (BLAS_OUT_BLOCK rows x tile_cols) doesn't depend on tile_rows,
+        // so it doesn't have the grm/N reuse problem above and can stay
+        // allocated once and reused across every flush_grm_tile call below.
         constexpr int BLAS_OUT_BLOCK = 1024;
         const int widest_tile_cols = tile_ranges.back().second;
         std::vector<float> flush_w_grm(widest_tile_cols);
@@ -2478,6 +2463,13 @@ void GRM::processMakeGRM(){
             grm_tile_re   = tile_re;
             grm_tile_rows = tile_re - tile_rs;
             grm_tile_cols = tile_re;   // lower-triangle: widest row needs cols [0, tile_re-1]
+
+            // Fresh, exactly-sized allocation for this tile only
+            const size_t tile_rect_elems = static_cast<size_t>(grm_tile_rows) * grm_tile_cols;
+            if(posix_memalign((void**)&grm, 64, tile_rect_elems * sizeof(double)) != 0)
+                LOGGER.e(0, "Can't allocate GRM tile buffer.");
+            if(posix_memalign((void**)&N, 64, tile_rect_elems * sizeof(uint32_t)) != 0)
+                LOGGER.e(0, "Can't allocate N tile buffer.");
 
             // Trapezoid element count actually touched by this tile (see
             // solve_tile_budget_end): [re*(re+1) - rs*(rs+1)] / 2. Reported
@@ -2540,10 +2532,12 @@ void GRM::processMakeGRM(){
 
             flush_grm_tile(grm_out, N_out, thresh, isSparse, mtd_weight,
                           flush_w_grm, flush_w_N, flush_grm_block, flush_sparse_buf);
-        }
 
-        posix_mem_free(grm); grm = nullptr;
-        posix_mem_free(N);   N   = nullptr;
+            // Free this tile's buffers now rather than reusing them for the
+            // next tile, to keep allocation shape correct.
+            posix_mem_free(grm); grm = nullptr;
+            posix_mem_free(N);   N   = nullptr;
+        }
 
         if(grm_out) fclose(grm_out);
         if(N_out)   fclose(N_out);

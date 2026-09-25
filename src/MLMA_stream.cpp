@@ -275,16 +275,16 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
         st.Vi_L_f.resize(hdr.n, hdr.n);
 
         const size_t tri = static_cast<size_t>(hdr.n) * (hdr.n + 1) / 2;
-        std::vector<float> packed_buf(tri);
-        read_bytes(packed_buf.data(), tri * sizeof(float));
+        const size_t tri_bytes = tri * sizeof(float);
+        if (offset + tri_bytes > file_size) {
+            LOGGER.e(0, "Unexpected EOF in [" + filename + "].");
+        }
+        // Unpack straight out of fully resident file_buf -- no filesystem risk.
+        const char* packed = mapped + offset;
 
         // Pre-compute starting indices per column to avoid serial loop dependencies.
-        // The file bytes are already resident in memory; the parallel work here is only
-        // the unpack/decode step, not the disk-facing read path. Mirrors
-        // writeRemlStateFromCtx's packing: column j holds head(j+1) (rows 0..j),
-        // growing with j -- st.Vi_L_f is upper-triangle-valid on return, matching
-        // what run_mlma_stream_association's STRSV/STRSM/STRMM calls expect
-        // (CblasUpper / triangularView<Eigen::Upper>()).
+        // Mirrors what run_mlma_stream_association's STRSV/STRSM/STRMM
+        // calls expect (CblasUpper / triangularView<Eigen::Upper>()).
         std::vector<size_t> col_offsets(hdr.n);
         size_t current_idx = 0;
         for (int32_t j = 0; j < hdr.n; ++j) {
@@ -296,9 +296,10 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
         for (int32_t j = 0; j < hdr.n; ++j) {
             const int32_t len = j + 1;
             std::memcpy(st.Vi_L_f.col(j).head(len).data(),
-                        packed_buf.data() + col_offsets[j],
+                        packed + col_offsets[j] * sizeof(float),
                         static_cast<size_t>(len) * sizeof(float));
         }
+        offset += tri_bytes;
 
         if (!no_adj_covar) {
             st.b.resize(hdr.x_c);

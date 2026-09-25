@@ -1738,7 +1738,12 @@ static int woodbury_initial_k_svd(const RemlCtx& ctx, WoodburyMode mode, int k_b
 struct RankEvalResult {
     bool satisfied = false;
     int k_target   = 0;
-    int k_extra    = 0;
+    int k_extra    = 0;    // MP: k_signal, count of eigenvalues above lambda+
+    int run_len    = 0;    // MP: consecutive sub-threshold eigenvalues confirmed so far this round
+    double metric  = 0.0;  // The actual tested convergence quantity for this mode:
+                            //   EIG: captured mass (absolute, i.e. rho * trace_K_full)
+                            //   VAR: relative Frobenius tail error (last value computed)
+                            //   MP:  unused — MP's test is the discrete edge-band state (k_extra/run_len), not a scalar
 };
 
 static RankEvalResult evaluate_rank_criterion(
@@ -1773,6 +1778,7 @@ static RankEvalResult evaluate_rank_criterion(
             res.satisfied = (run_len >= ctx.woodbury_basis_edge_confirm);
             res.k_target  = res.satisfied ? run_start : k_svd;
             res.k_extra   = k_signal;
+            res.run_len   = run_len;
             break;
         }
         case WoodburyMode::EIG: {
@@ -1789,6 +1795,10 @@ static RankEvalResult evaluate_rank_criterion(
             }
             res.satisfied = crossed_target
                          && (res.k_target + ctx.woodbury_basis_EIG_k_buffer <= k_svd);
+            // cumulative is the mass captured up to the crossing point when satisfied,
+            // or the full eval_full sum (mass at the current k_svd) otherwise — exactly
+            // the "how close are we" quantity the per-round log needs.
+            res.metric = cumulative;
             break;
         }
         case WoodburyMode::VAR: {
@@ -1796,6 +1806,7 @@ static RankEvalResult evaluate_rank_criterion(
             res.k_target = k_svd;
             double cum_sum = 0.0;
             double cum_sq  = 0.0;
+            double last_rel_err = 0.0;
             for (int i = 0; i < static_cast<int>(eval_full.size()); ++i) {
                 cum_sum += eval_full[i];
                 cum_sq  += eval_full[i] * eval_full[i];
@@ -1807,6 +1818,7 @@ static RankEvalResult evaluate_rank_criterion(
                 const double tail_nonisotropic_energy = static_cast<double>(rem_n) * tail_var;
                 const double relative_frobenius_error = (trace_K2 > 0.0)
                     ? std::sqrt(tail_nonisotropic_energy / trace_K2) : 0.0;
+                last_rel_err = relative_frobenius_error;
                 if (relative_frobenius_error < ctx.woodbury_basis_var_thresh) {
                     res.k_target = i + 1;
                     crossed_target = true;
@@ -1814,6 +1826,9 @@ static RankEvalResult evaluate_rank_criterion(
                 }
             }
             res.satisfied = crossed_target;
+            // last_rel_err is the error at the crossing point when satisfied, or the
+            // smallest value reached so far (at the current k_svd) otherwise.
+            res.metric = last_rel_err;
             break;
         }
         case WoodburyMode::Fixed:
@@ -1847,13 +1862,13 @@ static int finalize_and_log_woodbury_rank(
             const int k_signal = eval_res.k_extra;
             k = std::max(20, std::min(k_svd, k_edge));
             const int band = std::max(0, k_edge - k_signal);
-            LOGGER << "MP bulk edge lambda+ = " << lambda_plus
+            LOGGER << "Woodbury MP-k: bulk edge lambda+=" << lambda_plus
                    << " (n=" << n << ")"
-                   << ", eigenvalues above lambda+ = " << k_signal
+                   << ", eigenvalues above lambda+=" << k_signal
                    << ", edge band confirmed after " << band << " additional eigenvalue(s)"
                    << " (margin=" << (ctx.woodbury_basis_edge_margin * 100.0) << "%, confirm="
                    << ctx.woodbury_basis_edge_confirm << " consecutive)"
-                   << ", using k = " << k << std::endl;
+                   << ", using k=" << k << std::endl;
             if (!eval_res.satisfied && k_svd >= n - 1)
                 LOGGER.e(0, "Woodbury MP-k: edge band not confirmed even at k=n-1=" + std::to_string(n - 1)
                          + "; this GRM has near-full effective rank and Woodbury may not offer a computational advantage here. Refusing to proceed with an unresolved basis.");
@@ -1872,12 +1887,12 @@ static int finalize_and_log_woodbury_rank(
             for (int i = 0; i < k; ++i) cumulative += eval_full[i];
             const double rho = cumulative / trace_K_full;
             if (eval_res.satisfied) {
-                LOGGER << "EIG-k: trace(K)=" << trace_K_full
+                LOGGER << "Woodbury EIG-k: trace(K)=" << trace_K_full
                        << ", raw " << ctx.woodbury_basis_eigen_mass * 100 << "% mass crossing at k=" << k_EIGMASS
                        << ", using k=" << k << " (+" << ctx.woodbury_basis_EIG_k_buffer << " eigenvalue buffer)"
                        << ", captured mass rho=" << rho << std::endl;
             } else {
-                LOGGER << "EIG-k: trace(K)=" << trace_K_full
+                LOGGER << "Woodbury EIG-k: trace(K)=" << trace_K_full
                        << ", target mass (" << ctx.woodbury_basis_eigen_mass * 100 << "%) NOT reached within k=" << k_svd
                        << ", using fallback k=" << k
                        << ", captured mass rho=" << rho << std::endl;
@@ -1912,23 +1927,23 @@ static int finalize_and_log_woodbury_rank(
             const double tail_nonisotropic_energy = static_cast<double>(rem_n) * tail_var;
             const double relative_frobenius_error = (trace_K2 > 0.0)
                 ? std::sqrt(tail_nonisotropic_energy / trace_K2) : 0.0;
-            LOGGER << "VARIANCE: trace(K)=" << trace_K_full
+            LOGGER << "Woodbury VAR-k: trace(K)=" << trace_K_full
                    << ", target relative Frobenius tail error < " << ctx.woodbury_basis_var_thresh
                    << " crossed at k=" << k_VAR << ", using k=" << k
                    << " (tail_d_var=" << tail_var
                    << ", tail non-isotropic energy=" << tail_nonisotropic_energy
                    << ", relative Frobenius error=" << relative_frobenius_error << ")" << std::endl;
             if (!eval_res.satisfied && k_svd >= n - 1)
-                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached even at k=n-1=" + std::to_string(n - 1)
+                LOGGER.e(0, "Woodbury VAR-k: target relative Frobenius tail error not reached even at k=n-1=" + std::to_string(n - 1)
                          + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Refusing to proceed with an unresolved basis.");
             else if (!eval_res.satisfied && k_svd >= k_svd_budget_ceiling && !k_max_is_hard_ceiling)
-                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within memory budget ceiling k=" + std::to_string(k_svd)
+                LOGGER.e(0, "Woodbury VAR-k: target relative Frobenius tail error not reached within memory budget ceiling k=" + std::to_string(k_svd)
                          + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Raise --reml-woodbury-basis-mem-budget; refusing to proceed with an unresolved basis.");
             else if (!eval_res.satisfied && k_max_is_hard_ceiling)
-                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k_max=" + std::to_string(k_cap)
+                LOGGER.e(0, "Woodbury VAR-k: target relative Frobenius tail error not reached within k_max=" + std::to_string(k_cap)
                          + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Raise --reml-woodbury-basis-range's k_max; refusing to proceed with an unresolved basis.");
             else if (!eval_res.satisfied)
-                LOGGER.e(0, "Woodbury VARIANCE: target relative Frobenius tail error not reached within k=" + std::to_string(k_svd)
+                LOGGER.e(0, "Woodbury VAR-k: target relative Frobenius tail error not reached within k=" + std::to_string(k_svd)
                          + " (relative Frobenius error=" + std::to_string(relative_frobenius_error) + "). Refusing to proceed with an unresolved basis.");
             break;
         }
@@ -2158,13 +2173,46 @@ void compute_woodbury_basis(RemlCtx& ctx) {
         }
 
         if (mode != WoodburyMode::Fixed) {
-            // Per-round diagnostics. Captured mass at any fixed rank must be
-            // non-decreasing across locked-expansion rounds (Cauchy interlacing);
-            // a regression means numerical trouble, not a statistical fluke.
+            // Evaluate the rank criterion up front so the per-round log can report
+            // each mode's actual tested quantity, not a generic proxy shared across
+            // modes. Captured mass at any fixed rank must be non-decreasing across
+            // locked-expansion rounds (Cauchy interlacing); a regression means
+            // numerical trouble, not a statistical fluke.
+            eval_res = evaluate_rank_criterion(mode, eval_full, k_svd, lambda_plus, target_mass, trace_K_full, trace_K2, ctx);
             const double mass_now = eval_full.sum();
-            LOGGER << "Woodbury " << woodbury_mode_name(mode) << ": k_svd=" << k_svd
-                   << ", captured mass rho=" << (trace_K_full > 0.0 ? mass_now / trace_K_full : 0.0)
-                   << (round_expanded ? " (locked expansion)" : "") << std::endl;
+            const char* expansion_tag = round_expanded ? " (locked expansion)" : "";
+
+            switch (mode) {
+                case WoodburyMode::MP:
+                    // MP's test is the discrete bulk-edge band, not a smooth scalar:
+                    // report the count above lambda+ and how far the confirmation
+                    // run has gotten toward woodbury_basis_edge_confirm.
+                    LOGGER << "Woodbury MP-k: k_svd=" << k_svd
+                           << ", lambda+=" << lambda_plus
+                           << ", eigenvalues above lambda+=" << eval_res.k_extra
+                           << ", edge-band run=" << eval_res.run_len << "/" << ctx.woodbury_basis_edge_confirm
+                           << (eval_res.satisfied ? " (confirmed)" : "")
+                           << expansion_tag << std::endl;
+                    break;
+                case WoodburyMode::EIG:
+                    LOGGER << "Woodbury EIG-k: k_svd=" << k_svd
+                           << ", captured mass rho=" << (trace_K_full > 0.0 ? eval_res.metric / trace_K_full : 0.0)
+                           << " (target " << ctx.woodbury_basis_eigen_mass * 100.0 << "%)"
+                           << expansion_tag << std::endl;
+                    break;
+                case WoodburyMode::VAR:
+                    // VAR's actual convergence test is the relative Frobenius tail
+                    // error against woodbury_basis_var_thresh, not captured mass.
+                    LOGGER << "Woodbury VAR-k: k_svd=" << k_svd
+                           << ", relative Frobenius tail error=" << eval_res.metric
+                           << " (target < " << ctx.woodbury_basis_var_thresh << ")"
+                           << (eval_res.satisfied ? " (confirmed)" : "")
+                           << expansion_tag << std::endl;
+                    break;
+                default:
+                    break;
+            }
+
             if (round_expanded && prev_k > 0 && static_cast<int>(eval_full.size()) >= prev_k) {
                 const double mass_at_prev_rank = eval_full.head(prev_k).sum();
                 if (mass_at_prev_rank < prev_mass - 1e-9 * trace_K_full)
@@ -2178,11 +2226,11 @@ void compute_woodbury_basis(RemlCtx& ctx) {
 
         if (mode == WoodburyMode::Fixed) break;
 
-        eval_res = evaluate_rank_criterion(mode, eval_full, k_svd, lambda_plus, target_mass, trace_K_full, trace_K2, ctx);
-
         if (eval_res.satisfied || k_svd >= k_svd_cap || k_svd >= k_svd_budget_ceiling) break;
 
+        // This is the actual expansion rank for the next round, not a ceiling or cap on anything computed here
         int k_svd_next = std::min({k_svd * 2, n - 1, k_svd_cap});
+        std::string expand_note;
         if (mode == WoodburyMode::EIG && ctx.woodbury_basis_eigen_adaptive) {
             const double captured = eval_full.head(k_svd).sum();
             int k_svd_jump = eigmass_min_k_next(eval_full, k_svd, captured, target_mass);
@@ -2197,16 +2245,13 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                                       + 0.05 * k_svd;
                 k_svd_next = std::min(k_svd_next, static_cast<int>(std::min(k_suff, static_cast<double>(n))));
             }
-            LOGGER.i(0, "Woodbury EIG-k: adaptive jump from k=" + std::to_string(k_svd) + " to k=" + std::to_string(k_svd_jump)
-                        + " (bounded by " + std::to_string(k_svd_next) + ") to reach target mass (" + std::to_string(ctx.woodbury_basis_eigen_mass * 100.0) + "%)."
-                        + "\n(Currently captured mass: " + std::to_string(captured) + ")");
+            // mass-sufficient estimate vs. what's actually used next round (see note above).
+            expand_note = ", mass-sufficient estimate k_svd=" + std::to_string(k_svd_jump);
         }
-        const char* warm_status = ctx.svd_nystrom ? " (Nystrom: full recompute)"
-                                                  : " (locked expansion: reusing converged Ritz vectors)";
+        const char* warm_status = ctx.svd_nystrom ? "full recompute" : "locked expansion, reusing converged Ritz vectors";
         LOGGER << "Woodbury " << woodbury_mode_name(mode)
-               << ": signal not resolved within k=" << k_svd
-               << "; expanding budget to k=" << k_svd_next
-               << warm_status << " ..." << std::endl;
+               << ": k_svd=" << k_svd << " not sufficient; expanding to k_svd=" << k_svd_next
+               << expand_note << " (" << warm_status << ") ..." << std::endl;
         if (!ctx.svd_nystrom) {
             V0  = std::move(evec_full);   // evec_full is reassigned next round
             th0 = std::move(eval_all);

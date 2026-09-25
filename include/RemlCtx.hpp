@@ -142,6 +142,7 @@ struct RemlCtx {
     bool   reml_allow_constrain_run  = false;
     bool   reml_no_HE_start          = false; // Active by default
     bool   he_warm_start_applied = false;
+    bool   reml_print_trajectory = false; // true → print lambda_sq and delta at every iteration
 
     bool   svd_nystrom          = false; // true → single-pass Nystrom basis
     int    svd_power_iter = 3; // power-iter for Woodbury basis formation

@@ -12,7 +12,7 @@ Notes on `GCTAg`, a performance-oriented fork of `GCTA`.
 
 ### GRM Building
 
-- `--GRM-tile-budget <G>` — Process at most `G` gigabytes of GRM tiling at a time, similar to `--make-grm-part N n` but within a single call and more intuitive.
+- `--GRM-tile-budget <G>` — Process at most `G` gigabytes of GRM tiling at a time, similar to `--make-grm-part N n` but within a single call and more intuitive. The budget is not strict due to other matrices and buffers co-existing, but is a soft-constraint.
 - `--nMarkers <N=1024>` - Process N SNPs per block in GRM building. Raised the hardcoded value from 128 to now default at 1024. Higher values use more memory and eventually become cache bottlenecks, so higher is not always faster.
 - `--merge-grms <G=0.5>` - Merge GRMs (given by the `--mgrm` file) using a streaming chunk approach. By default, uses a 0.5 GB budget, but takes an optional value to change that budget. 
 
@@ -27,7 +27,7 @@ Note: `--pca` now dispatches to the V2 paths; use `--pca-v1` for the legacy PC s
 
 ### REML
 
-- `--reml-trace-hutchpp [N=200]` — Use the Hutch++ stochastic approximator for matrix traces. Lowers memory (and consequently can improve runtime). Optional `N` sets the number of probes.
+- `--reml-trace-hutchpp [N=100]` — Use the Hutch++ stochastic approximator for matrix traces. Lowers memory (and consequently can improve runtime). Optional `N` sets the number of probes.
 - `--reml-trace-hutchpp-fixed-probes` — By default, fresh probes are used at every REML iteration with a stochastic stopping condition. This flag reuses fixed probes instead, converging to a biased estimator but deterministically (better for an unstable matrix).
 - `--reml-woodbury-basis [MP|EIG|VAR|k]` — Use a Woodbury basis to exploit the low effective rank of the GRM. MP uses Marchenko–Pastur theory to detect the effective rank from the GRM; `EIG` uses the eigenmass approach from Jiang 2026; VAR limits the variance remaining in the truncated tail;`k` manually sets the effective rank to that value.
     - `--reml-woodbury-basis-MP-margin <M>` - Calculate the Woodbury basis using MP theory and extend beyond with margin `M`.
@@ -40,7 +40,9 @@ Note: `--pca` now dispatches to the V2 paths; use `--pca-v1` for the legacy PC s
 - `--reml-no-HE-start` - By default, REML now uses a (cheap) HE estimator rather than assuming equal parition of V(g) and V(e). This restores the previous default behaviour.
 - `--reml-force-dense-V` - By default, REML can store the solve of V rather than V itself. This affects MLMA using a different BLAS operation. In theory, the dense-V MLMA step can be faster, but at a greater cost during REML. Not recommended.
 
-The `--svd-method` and `--grm-chunked-budge` flags from the PCA section above can also be used here.
+The `--svd-method` and `--grm-chunked-budget` flags from the PCA section above can also be used here.
+
+If the non-missing samples are identical across different phenotypes, we can use `--reml-woodbury-reuse <.reml>` to use the same Woodbury basis as calculated from a previous REML run and then estimate variance components for a new phenotype.
 
 ### MLMA
 

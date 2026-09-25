@@ -793,6 +793,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         options_in.erase("--reml-ai-robust-tol");
         options_in.erase("--reml-ai-robust-risk");
         options_in.erase("--reml-force-dense-V");
+        options_in.erase("--reml-print-trajectory");
     } else {
         // Inline REML path: --grm is required, unless the Woodbury basis comes
         // from a saved .reml (--reml-woodbury-reuse), in which case no GRM is read.
@@ -997,6 +998,10 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
                 && !options_in["--reml-ai-robust-risk"].empty()) {
             options_d["reml_ai_robust_risk"] = std::stod(options_in["--reml-ai-robust-risk"][0]);
         }   
+        if (options_in.find("--reml-print-trajectory") != options_in.end()) {
+            options["reml_print_trajectory"] = "1";
+            options_in.erase("--reml-print-trajectory");
+        }
     }
 
     if (options_in.find("--mlma-no-preadj-covar") != options_in.end()) {
@@ -1400,6 +1405,7 @@ void MLMA::processMain()
             ctx.reml_ai_robust      = reml_ai_robust;
             ctx.reml_ai_robust_tol  = reml_ai_robust_tol;
             ctx.reml_ai_robust_risk = reml_ai_robust_risk;
+            ctx.reml_print_trajectory = options.count("reml_print_trajectory") > 0;
 
             if (options.count("woodbury_basis_warm_start")) {
                 if (woodbury_basis_rank == 0)

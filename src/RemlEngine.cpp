@@ -275,7 +275,6 @@ bool init_varcomp(const RemlCtx& ctx,
     }
     return false;
 }
-bool verbose=false;
 
 
 // Fill ctx.Vi (upper triangle + diagonal) with sum_ci varcmp[ci] * A[ci].
@@ -1048,7 +1047,7 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     // null-distribution weight matrix, not just its trace.
     var_U = 0.25 * tr_PA_var;
     varcmp = prev_varcmp + step_scale * delta;
-    if (verbose)
+    if (ctx.reml_print_trajectory)
         LOGGER << "REML iteration: lambda_sq = " << std::to_string(lambda_sq) << ", step scale = " << std::to_string(step_scale) << ", delta = " << delta.transpose() << std::endl;
 }
 
@@ -1304,7 +1303,7 @@ void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
         }
         varcmp(i) = prev_varcmp(i) - prev_varcmp(i) * prev_varcmp(i) * (tr_PA(i) - R(i)) / ctx.n;
     }
-    if (verbose)
+    if (ctx.reml_print_trajectory)
         LOGGER << "REML iteration: step scale = 1.000000, delta = " << (varcmp - prev_varcmp).transpose() << std::endl;
 }
 
@@ -1505,7 +1504,7 @@ double reml_iteration(RemlCtx& ctx,
         if (ai_robust_active_step && iter > 0 && have_predicted && predicted_dlogL > 1e-12) {
             const double rho = dlogL / predicted_dlogL;
             last_step_trustworthy = (rho > rho_threshold);
-            if (verbose) {
+            if (ctx.reml_print_trajectory) {
                 LOGGER << "  [ai-robust: predicted dlogL = " << std::fixed << LOGGER.setprecision(4)
                     << predicted_dlogL << ", actual dlogL = " << dlogL
                     << ", rho = " << LOGGER.setprecision(3) << rho

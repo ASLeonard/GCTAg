@@ -238,26 +238,11 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
     const RemlPrefix prefix = read_reml_prefix(fd, filename);
     check_reml_samples(fd, prefix, expected_n, expected_id_hash, filename);
 
-    std::vector<char> file_buf(file_size);
-    std::memcpy(file_buf.data(), &prefix.hdr, sizeof(Header));
-    std::memcpy(file_buf.data() + sizeof(Header), &prefix.id_hash, sizeof(uint64_t));
-    read_exact(fd, file_buf.data() + kRemlPrefixBytes, file_size - kRemlPrefixBytes, filename);
-    close(fd);
-
-    const char* mapped = file_buf.data();
-    size_t offset = kRemlPrefixBytes;
-    auto read_bytes = [&](void* dst, size_t nbytes) {
-        if (offset + nbytes > file_size) {
-            LOGGER.e(0, "Unexpected EOF in [" + filename + "].");
-        }
-        std::memcpy(dst, mapped + offset, nbytes);
-        offset += nbytes;
-    };
-
     // --- Header (already read and validated above) ---
     const Header& hdr = prefix.hdr;
 
     if (hdr.n <= 0 || hdr.x_c < 0 || hdr.num_varcmp <= 0) {
+        close(fd);
         LOGGER.e(0, "[" + filename + "] has invalid header dimensions.");
     }
 
@@ -269,45 +254,72 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
     // ------------------------------------------------------------------ GOBY
     if (magic == kMagicDense) {
         int32_t factor_kind = 0;
-        read_bytes(&factor_kind, sizeof(int32_t));
+        read_exact(fd, &factor_kind, sizeof(int32_t), filename);
         st.is_llt = (factor_kind == 0);
 
         st.Vi_L_f.resize(hdr.n, hdr.n);
 
         const size_t tri = static_cast<size_t>(hdr.n) * (hdr.n + 1) / 2;
-        std::vector<float> packed_buf(tri);
-        read_bytes(packed_buf.data(), tri * sizeof(float));
 
         // Pre-compute starting indices per column to avoid serial loop dependencies.
-        // The file bytes are already resident in memory; the parallel work here is only
-        // the unpack/decode step, not the disk-facing read path. Mirrors
-        // writeRemlStateFromCtx's packing: column j holds head(j+1) (rows 0..j),
-        // growing with j -- st.Vi_L_f is upper-triangle-valid on return, matching
-        // what run_mlma_stream_association's STRSV/STRSM/STRMM calls expect
-        // (CblasUpper / triangularView<Eigen::Upper>()).
-        std::vector<size_t> col_offsets(hdr.n);
+        // Mirrors what run_mlma_stream_association's STRSV/STRSM/STRMM
+        // calls expect (CblasUpper / triangularView<Eigen::Upper>()).
+        std::vector<size_t> col_offsets(hdr.n);   // element offsets into the packed stream
         size_t current_idx = 0;
         for (int32_t j = 0; j < hdr.n; ++j) {
             col_offsets[j] = current_idx;
             current_idx += static_cast<size_t>(j + 1);
         }
 
-        #pragma omp parallel for schedule(static)
-        for (int32_t j = 0; j < hdr.n; ++j) {
-            const int32_t len = j + 1;
-            std::memcpy(st.Vi_L_f.col(j).head(len).data(),
-                        packed_buf.data() + col_offsets[j],
-                        static_cast<size_t>(len) * sizeof(float));
+        // Stream the packed Vi_L block in bounded windows instead of reading
+        // the whole tri*4-byte block into RAM at once: read one batch of
+        // whole columns (a single large sequential read_exact -- still one
+        // contiguous forward pass through the file, just chunked at column
+        // boundaries rather than in one shot), unpack that batch into Vi_L_f
+        // in parallel, repeat. Bounds the extra buffer to ~kUnpackWindowBytes
+        // regardless of n instead of the full tri bytes.
+        constexpr size_t kUnpackWindowBytes = 1ULL << 29; // 512 MiB
+        LOGGER.i(0, "Reading [" + filename + "]'s packed Vi_L block in " +
+                    to_string(kUnpackWindowBytes >> 20) + " MiB windows.");
+        std::vector<char> chunk_buf;
+        chunk_buf.reserve(std::min(kUnpackWindowBytes, tri * sizeof(float)));
+
+        int32_t j = 0;
+        while (j < hdr.n) {
+            int32_t j_end = j;
+            size_t chunk_bytes = 0;
+            while (j_end < hdr.n) {
+                const size_t col_bytes = static_cast<size_t>(j_end + 1) * sizeof(float);
+                if (chunk_bytes > 0 && chunk_bytes + col_bytes > kUnpackWindowBytes) break;
+                chunk_bytes += col_bytes;
+                ++j_end;
+            }
+
+            chunk_buf.resize(chunk_bytes);
+            read_exact(fd, chunk_buf.data(), chunk_bytes, filename);
+
+            const size_t chunk_start_elem = col_offsets[j];
+            #pragma omp parallel for schedule(static)
+            for (int32_t jj = j; jj < j_end; ++jj) {
+                const int32_t len = jj + 1;
+                const size_t local_off = (col_offsets[jj] - chunk_start_elem) * sizeof(float);
+                std::memcpy(st.Vi_L_f.col(jj).head(len).data(),
+                            chunk_buf.data() + local_off,
+                            static_cast<size_t>(len) * sizeof(float));
+            }
+
+            j = j_end;
         }
 
         if (!no_adj_covar) {
             st.b.resize(hdr.x_c);
-            read_bytes(st.b.data(), static_cast<size_t>(hdr.x_c) * sizeof(float));
+            read_exact(fd, st.b.data(), static_cast<size_t>(hdr.x_c) * sizeof(float), filename);
         }
 
         st.varcmp.resize(hdr.num_varcmp);
-        read_bytes(st.varcmp.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float));
+        read_exact(fd, st.varcmp.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float), filename);
 
+        close(fd);
         return st;
     }
 
@@ -315,45 +327,43 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
     if (magic == kMagicWoodbury) {
         st.is_woodbury = true;
         int32_t k = 0;
-        read_bytes(&k, sizeof(int32_t));
+        read_exact(fd, &k, sizeof(int32_t), filename);
         if (k <= 0) {
+            close(fd);
             LOGGER.e(0, "[" + filename + "] has invalid Woodbury rank k=" + to_string(k) + ".");
         }
 
         double lambda_tail = 0.0;
-        read_bytes(&lambda_tail, sizeof(double));
+        read_exact(fd, &lambda_tail, sizeof(double), filename);
         st.lambda_tail_f = static_cast<float>(lambda_tail);
 
         // tail_d_var is stored for --reml-woodbury-reuse; association does not use it.
         double tail_d_var = 0.0;
-        read_bytes(&tail_d_var, sizeof(double));
+        read_exact(fd, &tail_d_var, sizeof(double), filename);
         (void)tail_d_var;
 
+        // Uk is stored k x n, column-major -- byte-identical to Eigen::MatrixXf(k, n)'s
+        // own packed layout (unlike the GOBY block above, no reshape/repack is
+        // needed here: the write side's transpose+cast from ctx.Uk's n x k layout
+        // already produced this exact k x n on-disk shape). Read straight into
+        // Uk.data(); no staging buffer, at any k or n.
         Eigen::MatrixXf Uk(k, hdr.n);
-        {
-            const size_t uk_elems = static_cast<size_t>(k) * hdr.n;
-            std::vector<float> uk_buf(uk_elems);
-            read_bytes(uk_buf.data(), uk_elems * sizeof(float));
-            #pragma omp parallel for schedule(static)
-            for (int32_t col = 0; col < hdr.n; ++col) {
-                std::memcpy(Uk.data() + static_cast<size_t>(col) * k,
-                            uk_buf.data() + static_cast<size_t>(col) * k,
-                            static_cast<size_t>(k) * sizeof(float));
-            }
-        }
+        read_exact(fd, Uk.data(), static_cast<size_t>(k) * hdr.n * sizeof(float), filename);
 
         Eigen::VectorXf dk(k);
-        read_bytes(dk.data(), static_cast<size_t>(k) * sizeof(float));
+        read_exact(fd, dk.data(), static_cast<size_t>(k) * sizeof(float), filename);
         st.dk_f = dk;
 
         if (!no_adj_covar) {
             st.b.resize(hdr.x_c);
-            read_bytes(st.b.data(), static_cast<size_t>(hdr.x_c) * sizeof(float));
+            read_exact(fd, st.b.data(), static_cast<size_t>(hdr.x_c) * sizeof(float), filename);
         }
 
         Eigen::VectorXf vc(hdr.num_varcmp);
-        read_bytes(vc.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float));
+        read_exact(fd, vc.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float), filename);
         st.varcmp = vc;
+
+        close(fd);
 
         const double sg2   = static_cast<double>(vc[0]);
         const double se2   = static_cast<double>(vc[hdr.num_varcmp - 1]);
@@ -372,6 +382,7 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
         return st;
     }
 
+    close(fd);
     LOGGER.e(0, "[" + filename + "] unsupported format.");
     return st;
 }

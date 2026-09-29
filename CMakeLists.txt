@@ -423,7 +423,7 @@ FetchContent_Declare(
     EXCLUDE_FROM_ALL)
 FetchContent_Declare(
     Boost
-    URL https://github.com/boostorg/boost/releases/download/boost-1.91.0/boost-1.91.0-cmake.tar.xz
+    URL https://github.com/boostorg/boost/releases/download/boost-1.92.0/boost-1.92.0-cmake.tar.xz
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     EXCLUDE_FROM_ALL)
 if(BGEN_SUPPORT)
@@ -1012,17 +1012,6 @@ if(LINUX OR APPLE)
         RUNTIME DESTINATION bin
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)
-endif()
-
-if(LINUX)
-    install(FILES ${CMAKE_SOURCE_DIR}/resources/GCTAg.desktop
-        DESTINATION share/applications)
-    install(FILES
-        ${CMAKE_SOURCE_DIR}/resources/GCTAg.png
-        DESTINATION share/icons/hicolor/256x256/apps)
-    install(FILES
-        ${CMAKE_SOURCE_DIR}/resources/GCTAg.svg
-        DESTINATION share/icons/hicolor/scalable/apps)
 endif()
 
 # Build configuration summary

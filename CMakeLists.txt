@@ -1014,17 +1014,6 @@ if(LINUX OR APPLE)
         ARCHIVE DESTINATION lib)
 endif()
 
-if(LINUX)
-    install(FILES ${CMAKE_SOURCE_DIR}/resources/GCTAg.desktop
-        DESTINATION share/applications)
-    install(FILES
-        ${CMAKE_SOURCE_DIR}/resources/GCTAg.png
-        DESTINATION share/icons/hicolor/256x256/apps)
-    install(FILES
-        ${CMAKE_SOURCE_DIR}/resources/GCTAg.svg
-        DESTINATION share/icons/hicolor/scalable/apps)
-endif()
-
 # Build configuration summary
 if(GCTA_COMPILER_IS_AOCC)
     set(GCTA_COMPILER_IS_AOCC_STR " (AOCC)")

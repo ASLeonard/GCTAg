@@ -27,7 +27,7 @@ x86\_64 and ARM (including Apple Silicon) CPUs are supported on Linux and macOS.
 | Requirement | Notes |
 |---|---|
 | C++23 compiler | GCC >= 13 or Clang >= 17 (AppleClang must report version >= 17; Homebrew LLVM also works). AMD's AOCC is supported, see [AOCC](#aocc-amd-compiler). |
-| CMake >= 3.28 | [Ninja](https://ninja-build.org/) is recommended but optional. |
+| CMake >= 3.28 |  |
 | Git | Needed to fetch the `plink-ng` submodule. |
 | OpenMP | libgomp with GCC; libomp with Clang (on macOS: `brew install libomp`). |
 | zlib | The system shared zlib is always used; it is not downloaded. |
@@ -41,7 +41,7 @@ x86\_64 and ARM (including Apple Silicon) CPUs are supported on Linux and macOS.
 | [Eigen](https://gitlab.com/libeigen/eigen) | 5.0.1 |
 | [Spectra](https://spectralib.org/) | 1.2.0 |
 | [zstd](https://github.com/facebook/zstd) | 1.5.7 (built as a static library) |
-| [Boost](https://www.boost.org/) | 1.91.0 (`algorithm`, `math`, `crc`, `iostreams`) |
+| [Boost](https://www.boost.org/) | 1.92.0 (`algorithm`, `math`, `crc`, `iostreams`) |
 | [stdexec](https://github.com/NVIDIA/stdexec) | `nvhpc-26.05` |
 | [SQLite](https://www.sqlite.org/) | 3.51.2 amalgamation (only with `-DBGEN_SUPPORT=ON`) |
 
@@ -52,7 +52,7 @@ To use an existing Boost (>= 1.90, with the `iostreams` component) instead of do
 Clone with submodules (GitHub source archives do **not** include them):
 
 ```sh
-git clone --recurse-submodules <GCTAg repository URL>
+git clone --recurse-submodules https://github.com/ASLeonard/GCTAg.git
 cd GCTAg
 ```
 
@@ -84,7 +84,7 @@ cmake -DCMAKE_BUILD_TYPE=Release \
       -DGCTA_BLAS_BACKEND=AOCL \
       -DGCTA_BLAS_LIBRARY=/path/to/aocl/lib/libblis-mt.so \
       -DGCTA_BLAS_INCLUDE_DIR=/path/to/aocl/include \
-      -G Ninja -B build/Release -S .
+      -B build/Release -S .
 ```
 
 **Linux, MKL:**
@@ -94,7 +94,7 @@ cmake -DCMAKE_BUILD_TYPE=Release \
       -DGCTA_BLAS_BACKEND=MKL \
       -DGCTA_BLAS_LIBRARY=/path/to/mkl/lib/libmkl_rt.so \
       -DGCTA_BLAS_INCLUDE_DIR=/path/to/mkl/include \
-      -G Ninja -B build/Release -S .
+      -B build/Release -S .
 ```
 
 At run time, tell `libmkl_rt` which OpenMP layer to use: `export MKL_THREADING_LAYER=GNU` for GCC builds, or `IOMP5` for AOCC builds.
@@ -107,7 +107,7 @@ cmake -DCMAKE_BUILD_TYPE=Release \
       -DGCTA_BLAS_LIBRARY=/path/to/libopenblas.so \
       -DGCTA_LAPACKE_LIBRARY=/path/to/liblapacke.so \
       -DGCTA_BLAS_INCLUDE_DIR=/path/to/openblas/include \
-      -G Ninja -B build/Release -S .
+      -B build/Release -S .
 ```
 
 **macOS, Accelerate:**
@@ -115,7 +115,7 @@ cmake -DCMAKE_BUILD_TYPE=Release \
 ```sh
 cmake -DCMAKE_BUILD_TYPE=Release \
       -DGCTA_BLAS_BACKEND=Accelerate \
-      -G Ninja -B build/Release -S .
+      -B build/Release -S .
 ```
 
 ### Compile
@@ -161,7 +161,7 @@ cmake -DCMAKE_BUILD_TYPE=Release \
       -DGCTA_BLAS_BACKEND=AOCL \
       -DGCTA_BLAS_LIBRARY=/path/to/aocl/lib/libblis-mt.so \
       -DGCTA_BLAS_INCLUDE_DIR=/path/to/aocl/include \
-      -G Ninja -B build/Release -S .
+      -B build/Release -S .
 ```
 
 - AOCC is Clang 17 based and cannot parse the headers of GCC 15 or newer. If your default GCC is that new, set `GCTA_GCC_TOOLCHAIN` to the prefix (the directory containing `bin/gcc`) of a GCC 12-14 installation. CMake rejects anything outside that range.
@@ -231,6 +231,6 @@ GPLv3. Some parts of the code are released under LGPL, as detailed in the indivi
 
 ## Questions and help requests
 
-For bug reports, questions and feature requests about `GCTAg`, please open an issue at <GCTAg issue tracker URL>.
+For bug reports, questions and feature requests about `GCTAg`, please open an [issue](https://github.com/ASLeonard/GCTAg/issues).
 
 For questions about the original GCTA software, contact Jian Yang at <jian.yang@westlake.edu.cn>.

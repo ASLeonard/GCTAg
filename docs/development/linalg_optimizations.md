@@ -465,7 +465,7 @@ Boost.Math uses Lanczos-approximated special functions with guaranteed relative 
 - Halko, N., Martinsson, P.-G., & Tropp, J. A. (2011). *Finding structure with randomness: Probabilistic algorithms for constructing approximate matrix decompositions*. SIAM Review.
 - Marchenko, V. A., & Pastur, L. A. (1967). Distribution of eigenvalues for some sets of random matrices. *Mathematics of the USSR-Sbornik* 1, 457–483.
 - Nocedal, J., & Wright, S. J. *Numerical Optimization* (Ch. 19); Wächter, A., & Biegler, L. T. (2006). On the implementation of an interior-point filter line-search algorithm for large-scale nonlinear programming. *Mathematical Programming* 106, 25–57.
-<!-- TODO: add the full citation for the eigenvalue-mass rank criterion (Jiang 2026) referenced in GCTAg.md. -->
+- Jiang, J. (2026). *Genomic Dimensionality Bounds Mixed-Model Association Power, Fine-Mapping Resolution, and Genomic Prediction Reliability*. bioRxiv.
 - Eigen documentation: `selfadjointView`, `rankUpdate`, `triangularView`, `LLT`.
 - Boost.Math documentation: *Statistical distributions and special functions*.
 - Spectra documentation: `SymEigsSolver` (implicitly restarted Lanczos).

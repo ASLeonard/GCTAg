@@ -4,7 +4,7 @@
 
 - A summary of the new flags: [docs/changes/GCTAg.md](docs/changes/GCTAg.md)
 - Notes on the linear algebra optimisations (incomplete): [docs/development/linalg_optimizations.md](docs/development/linalg_optimizations.md)
-- A manuscript describing this work is in preparation.
+- A manuscript describing this work is availble [here](https://arxiv.org/abs/2610.03815).
 
 ## Contents
 
@@ -191,7 +191,10 @@ cmake -DCMAKE_BUILD_TYPE=Release \
 
 ## Citation
 
-A manuscript describing GCTAg is in preparation. Until it is published, please cite the repository together with the upstream GCTA paper:
+The manuscript describing GCTAg is 
+> [Leonard AS, He Q, Watson N, Kadri NK, Pausch H. GCTAg: scalable mixed-model analysis for biobank-scale agricultural cohorts. *arXiv* (2026).](https://arxiv.org/abs/2610.03815)
+
+Please also cite the upstream GCTA paper upon which this work is based:
 
 > Yang J, Lee SH, Goddard ME, Visscher PM. GCTA: a tool for genome-wide complex trait analysis. *Am J Hum Genet* 88, 76-82 (2011).
 

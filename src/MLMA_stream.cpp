@@ -1033,6 +1033,10 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         options["log_pval"] = "1";
         options_in.erase("--log-pval");
     }
+    if (options_in.find("--weighted-phenotypes") != options_in.end()) {
+        options["weighted_phenotypes"] = "1";
+        options_in.erase("--weighted-phenotypes");
+    }
     if (options_in.find("--model") != options_in.end()) {
         const auto& vals = options_in["--model"];
         if (vals.size() != 1 || vals[0].empty())
@@ -1064,6 +1068,7 @@ void MLMA::processMain()
         const string out_prefix     = options.at("out");
         const bool   no_adj_covar   = options.count("no_adj_covar") > 0;
         const bool   log_pval       = options.count("log_pval") > 0;
+        const bool   weighted_pheno = options.count("weighted_phenotypes") > 0;
         // --save-reml only fits/saves the REML state and never streams SNPs,
         // so the bim (Marker) and genotype (Geno) data are never touched.
         const bool   reml_only      = options.count("save_reml") > 0;
@@ -1472,7 +1477,9 @@ void MLMA::processMain()
             ofile << "Chr\tSNP\tbp\tA1\tA2\tFreq\tb\tse\t"
                   << (log_pval ? "log_p" : "p") << "\n";
 
-            Eigen::VectorXf w_sqrt = pheno->get_sqrt_weight_keep();
+            Eigen::VectorXf w_sqrt = weighted_pheno
+                ? pheno->get_sqrt_weight_keep()
+                : Eigen::VectorXf::Ones(n);
             run_mlma_stream_association(ctx, y_vec, w_sqrt, geno, marker, n, log_pval, ofile,
                                         mlma_tile_budget_gb);
             LOGGER << "\nAssociation results saved to [" << out_file << "]." << std::endl;
@@ -1494,7 +1501,9 @@ void MLMA::processMain()
               << (log_pval ? "log_p" : "p") << "\n";
 
         // ---- Stream SNPs ----
-        Eigen::VectorXf w_sqrt = pheno->get_sqrt_weight_keep();
+        Eigen::VectorXf w_sqrt = weighted_pheno
+            ? pheno->get_sqrt_weight_keep()
+            : Eigen::VectorXf::Ones(n);
         run_mlma_stream_association(state, y_vec, w_sqrt, geno, marker, n, log_pval, ofile,
                                     mlma_tile_budget_gb);
         LOGGER << "\nAssociation results saved to [" << out_file << "]." << std::endl;

@@ -81,8 +81,11 @@ vector<string>       MLMA::processFunctions;
 namespace {
 
 // Shared GRM I/O helpers from include/grm_binary_io.hpp.
+using gcta_grm_io::read_exact;
+using gcta_grm_io::write_exact;
 using gcta_grm_io::read_grm_binary;
 using gcta_grm_io::match_ids_to_grm;
+using gcta_grm_io::load_and_subset_grm_upper;
 
 template <typename T>
 string to_text(T x)
@@ -96,31 +99,8 @@ string to_text(T x)
     return to_string(x);
 }
 
-// RemlState is now defined in include/RemlState.hpp (shared with MLMA_loco).
+// RemlState is defined in include/RemlState.hpp.
 // The readRemlState() function below remains file-local (only MLMA_stream needs it).
-
-constexpr size_t kMaxChunk = 1u << 30; // 1 GiB per syscall, safely under INT_MAX, which is a hard constraint on e.g. macOS.
-static void read_exact(int fd, void* dst, size_t nbytes, const std::string& path)
-{
-    char* ptr = static_cast<char*>(dst);
-    size_t total_read = 0;
-    while (total_read < nbytes) {
-        size_t chunk = std::min(kMaxChunk, nbytes - total_read);
-        const ssize_t res = ::read(fd, ptr + total_read, chunk);
-        if (res == 0) {
-            close(fd);
-            LOGGER.e(0, "Unexpected EOF while reading [" + path + "] (expected " +
-                        to_string(nbytes) + " bytes, got " + to_string(total_read) + ").");
-        }
-        if (res < 0) {
-            if (errno == EINTR) continue;
-            close(fd);
-            LOGGER.e(0, "I/O error while reading [" + path + "] (errno=" +
-                        std::to_string(errno) + ").");
-        }
-        total_read += static_cast<size_t>(res);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // .reml on-disk format (v2). Every file starts with a fixed 28-byte prefix
@@ -261,16 +241,6 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
 
         const size_t tri = static_cast<size_t>(hdr.n) * (hdr.n + 1) / 2;
 
-        // Pre-compute starting indices per column to avoid serial loop dependencies.
-        // Mirrors what run_mlma_stream_association's STRSV/STRSM/STRMM
-        // calls expect (CblasUpper / triangularView<Eigen::Upper>()).
-        std::vector<size_t> col_offsets(hdr.n);   // element offsets into the packed stream
-        size_t current_idx = 0;
-        for (int32_t j = 0; j < hdr.n; ++j) {
-            col_offsets[j] = current_idx;
-            current_idx += static_cast<size_t>(j + 1);
-        }
-
         // Stream the packed Vi_L block in bounded windows instead of reading
         // the whole tri*4-byte block into RAM at once: read one batch of
         // whole columns (a single large sequential read_exact -- still one
@@ -298,11 +268,12 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
             chunk_buf.resize(chunk_bytes);
             read_exact(fd, chunk_buf.data(), chunk_bytes, filename);
 
-            const size_t chunk_start_elem = col_offsets[j];
+            const size_t chunk_start_elem = static_cast<size_t>(j) * (j + 1) / 2;
             #pragma omp parallel for schedule(static)
             for (int32_t jj = j; jj < j_end; ++jj) {
                 const int32_t len = jj + 1;
-                const size_t local_off = (col_offsets[jj] - chunk_start_elem) * sizeof(float);
+                const size_t col_elem = static_cast<size_t>(jj) * (jj + 1) / 2;
+                const size_t local_off = (col_elem - chunk_start_elem) * sizeof(float);
                 std::memcpy(st.Vi_L_f.col(jj).head(len).data(),
                             chunk_buf.data() + local_off,
                             static_cast<size_t>(len) * sizeof(float));
@@ -388,6 +359,8 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
 }
 
 // Writes the v2 format described above. id_hash = hash_sample_ids(analysis IDs).
+// Note: writeRemlStateFromCtx is only invoked on the --save-reml path, which
+// exits immediately after saving; it may therefore factorize ctx.Vi in-place.
 void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_adj_covar,
                            uint64_t id_hash)
 {
@@ -395,25 +368,6 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
     int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd == -1)
         LOGGER.e(0, "cannot open [" + filename + "] for writing.");
-
-    auto write_bytes = [fd, &filename](const void* src, size_t nbytes) {
-        const char* ptr = static_cast<const char*>(src);
-        size_t total_written = 0;
-        while (total_written < nbytes) {
-            size_t chunk = std::min(kMaxChunk, nbytes - total_written);
-            ssize_t res = write(fd, ptr + total_written, chunk);
-            if (res < 0) {
-                if (errno == EINTR) continue; // interrupted, retry
-                close(fd);
-                LOGGER.e(0, "write error on [" + filename + "]: " + std::string(strerror(errno)));
-            }
-            if (res == 0) {
-                close(fd);
-                LOGGER.e(0, "write error on [" + filename + "]: write() returned 0 unexpectedly.");
-            }
-            total_written += static_cast<size_t>(res);
-        }
-    };
 
     if (ctx.Vi_use_woodbury_basis) {
         // --- TUNA Branch Optimization ---
@@ -425,17 +379,17 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
         hdr.x_c = static_cast<int32_t>(ctx.X_c);
         hdr.num_varcmp = static_cast<int32_t>(ctx.varcmp.size());
         hdr.num_r_indx = static_cast<int32_t>(ctx.varcmp.size());
-        write_bytes(&hdr, sizeof(hdr));
-        write_bytes(&id_hash, sizeof(uint64_t));   // completes the 28-byte prefix
+        write_exact(fd, &hdr, sizeof(hdr), filename);
+        write_exact(fd, &id_hash, sizeof(uint64_t), filename);   // completes the 28-byte prefix
 
         const int32_t k = static_cast<int32_t>(ctx.dk.size());
-        write_bytes(&k, sizeof(int32_t));
+        write_exact(fd, &k, sizeof(int32_t), filename);
 
         const double lambda_tail = ctx.lambda_tail;
-        write_bytes(&lambda_tail, sizeof(double));
+        write_exact(fd, &lambda_tail, sizeof(double), filename);
 
         const double tail_d_var = ctx.tail_d_var;
-        write_bytes(&tail_d_var, sizeof(double));
+        write_exact(fd, &tail_d_var, sizeof(double), filename);
 
         if (ctx.Uk.rows() != ctx.n || ctx.Uk.cols() != k)
             LOGGER.e(0, "invalid Woodbury REML context dimensions before save.");
@@ -451,19 +405,21 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
             for (int32_t j = 0; j < k; ++j)
                 Uk_f(j, i) = static_cast<float>(ctx.Uk(i, j));
         }
-        write_bytes(Uk_f.data(), static_cast<size_t>(ctx.n) * k * sizeof(float));
+        ctx.Uk.resize(0, 0);
+        write_exact(fd, Uk_f.data(), static_cast<size_t>(ctx.n) * k * sizeof(float), filename);
+        Uk_f.resize(0, 0);
 
         Eigen::VectorXf dk_f = ctx.dk.cast<float>();
-        write_bytes(dk_f.data(), static_cast<size_t>(k) * sizeof(float));
+        write_exact(fd, dk_f.data(), static_cast<size_t>(k) * sizeof(float), filename);
 
         if (!no_adj_covar) {
             Eigen::VectorXf b_f = ctx.b.cast<float>();
-            write_bytes(b_f.data(), static_cast<size_t>(ctx.X_c) * sizeof(float));
+            write_exact(fd, b_f.data(), static_cast<size_t>(ctx.X_c) * sizeof(float), filename);
         }
 
         Eigen::VectorXf varcmp_f = Eigen::Map<const Eigen::VectorXd>(ctx.varcmp.data(),
                                                                       static_cast<Eigen::Index>(ctx.varcmp.size())).cast<float>();
-        write_bytes(varcmp_f.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float));
+        write_exact(fd, varcmp_f.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float), filename);
 
     } else {
         // --- GOBY Branch Optimization ---
@@ -475,69 +431,74 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
         hdr.x_c = static_cast<int32_t>(ctx.X_c);
         hdr.num_varcmp = static_cast<int32_t>(ctx.varcmp.size());
         hdr.num_r_indx = static_cast<int32_t>(ctx.varcmp.size());
-        write_bytes(&hdr, sizeof(hdr));
-        write_bytes(&id_hash, sizeof(uint64_t));   // completes the 28-byte prefix
+        write_exact(fd, &hdr, sizeof(hdr), filename);
+        write_exact(fd, &id_hash, sizeof(uint64_t), filename);   // completes the 28-byte prefix
 
         const int32_t factor_kind = ctx.Vi_use_llt ? 0 : 1;
-        write_bytes(&factor_kind, sizeof(int32_t));
+        write_exact(fd, &factor_kind, sizeof(int32_t), filename);
 
-        // Prepare factorization matrix reference
+        // Prepare factorization matrix reference. Since --save-reml exits immediately
+        // after writing, factorize ctx.Vi in-place when !ctx.Vi_use_llt to avoid an
+        // 8*n^2-byte copy.
         const Eigen::MatrixXd* mat_ptr = &ctx.Vi_L;
-        Eigen::MatrixXd Vi_copy;
 
         if (!ctx.Vi_use_llt) {
             if (ctx.Vi.rows() != ctx.n || ctx.Vi.cols() != ctx.n)
                 LOGGER.e(0, "invalid dense REML context dimensions before save.");
-            // Copy to preserve original ctx.Vi state
-            Vi_copy = ctx.Vi;
             gcta_blas_int blas_n = static_cast<gcta_blas_int>(ctx.n);
-            if (gcta_dpotrf(blas_n, Vi_copy.data(), blas_n, 'U') != 0)
+            if (gcta_dpotrf(blas_n, ctx.Vi.data(), blas_n, 'U') != 0)
                 LOGGER.e(0, "Vi is not positive definite when factorising for save.");
-            mat_ptr = &Vi_copy;
+            mat_ptr = &ctx.Vi;
         }
 
         const Eigen::MatrixXd& mat = *mat_ptr;
         const size_t n_val = static_cast<size_t>(ctx.n);
         const size_t tri_elements = n_val * (n_val + 1) / 2;
 
-        // Allocate packed single-precision output buffer once
-        std::vector<float> packed_buf(tri_elements);
+        // Stream the packed upper-triangular Vi_L block in bounded 512 MiB column
+        // windows (matching readRemlState) instead of allocating a full
+        // tri_elements * 4-byte buffer at once.
+        constexpr size_t kPackWindowBytes = 1ULL << 29; // 512 MiB
+        std::vector<float> chunk_buf;
+        chunk_buf.reserve(std::min(kPackWindowBytes / sizeof(float), tri_elements));
 
-        // Pre-compute offsets per column to allow multi-threaded parallel packing.
-        // mat is upper-triangle-valid (a Cholesky factor from dpotrf('U'), either
-        // ctx.Vi_L directly or the freshly-factorised Vi_copy above), so column j
-        // packs its own head(j+1) (rows 0..j) -- growing with j, the mirror image
-        // of the pre-upper-triangle-swap layout, which packed tail(n-j) instead.
-        std::vector<size_t> col_offsets(n_val);
-        size_t current_idx = 0;
-        for (size_t j = 0; j < n_val; ++j) {
-            col_offsets[j] = current_idx;
-            current_idx += (j + 1);
-        }
-
-        // Parallel float conversion & packing: zero lock contention across CPU cores
-        #pragma omp parallel for schedule(static)
-        for (int32_t j = 0; j < ctx.n; ++j) {
-            const int32_t len = j + 1;
-            const double* col_src = mat.col(j).head(len).data();
-            float* dst = packed_buf.data() + col_offsets[j];
-
-            for (int32_t i = 0; i < len; ++i) {
-                dst[i] = static_cast<float>(col_src[i]);
+        int32_t j = 0;
+        while (j < ctx.n) {
+            int32_t j_end = j;
+            size_t chunk_elems = 0;
+            const size_t max_window_elems = kPackWindowBytes / sizeof(float);
+            while (j_end < ctx.n) {
+                const size_t col_elems = static_cast<size_t>(j_end + 1);
+                if (chunk_elems > 0 && chunk_elems + col_elems > max_window_elems) break;
+                chunk_elems += col_elems;
+                ++j_end;
             }
-        }
 
-        // Single contiguous bulk write (utilizes full disk IO bus speed)
-        write_bytes(packed_buf.data(), tri_elements * sizeof(float));
+            chunk_buf.resize(chunk_elems);
+            const size_t chunk_start_elem = static_cast<size_t>(j) * (j + 1) / 2;
+
+            #pragma omp parallel for schedule(static)
+            for (int32_t jj = j; jj < j_end; ++jj) {
+                const int32_t len = jj + 1;
+                const double* col_src = mat.col(jj).head(len).data();
+                const size_t col_elem = static_cast<size_t>(jj) * (jj + 1) / 2;
+                float* dst = chunk_buf.data() + (col_elem - chunk_start_elem);
+                for (int32_t i = 0; i < len; ++i)
+                    dst[i] = static_cast<float>(col_src[i]);
+            }
+
+            write_exact(fd, chunk_buf.data(), chunk_elems * sizeof(float), filename);
+            j = j_end;
+        }
 
         if (!no_adj_covar) {
             Eigen::VectorXf b_f = ctx.b.cast<float>();
-            write_bytes(b_f.data(), static_cast<size_t>(ctx.X_c) * sizeof(float));
+            write_exact(fd, b_f.data(), static_cast<size_t>(ctx.X_c) * sizeof(float), filename);
         }
 
         Eigen::VectorXf varcmp_f = Eigen::Map<const Eigen::VectorXd>(ctx.varcmp.data(),
                                                                       static_cast<Eigen::Index>(ctx.varcmp.size())).cast<float>();
-        write_bytes(varcmp_f.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float));
+        write_exact(fd, varcmp_f.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float), filename);
     }
 
     close(fd);
@@ -853,7 +814,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
             const auto& vals = options_in["--reml-woodbury-basis-VAR-tail"];
             if (vals.empty() || vals[0].empty())
                 LOGGER.e(0, "--reml-woodbury-basis-VAR-tail requires a relative Frobenius error argument (e.g. 0.001).");
-            options_d["woodbury_basis_var_tail"] = std::stod(vals[0]);
+            options_d["woodbury_basis_var_thresh"] = std::stod(vals[0]);
             options_in.erase("--reml-woodbury-basis-VAR-tail");
         }
         // --svd-method <power|nystrom>: select the Woodbury basis sketch.
@@ -878,7 +839,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
             const auto& vals = options_in["--svd-power-iter"];
             if (vals.empty() || vals[0].empty())
                 LOGGER.e(0, "--svd-power-iter requires one integer argument.");
-            options["svd_power_iter"] = vals[0];
+            options_d["svd_power_iter"] = std::stod(vals[0]);
             if (vals.size() > 1)
                 LOGGER.w(0, "--svd-power-iter expects exactly one value; using the first one.");
             options_in.erase("--svd-power-iter");
@@ -898,7 +859,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         if (options_in.find("--reml-no-HE-start") != options_in.end()) {
             if (!options_in["--reml-no-HE-start"].empty())
                 LOGGER.w(0, "--reml-no-HE-start takes no argument; ignoring the supplied value.");
-            options["no_HE_start"] = false;
+            options["no_HE_start"] = "1";
             options_in.erase("--reml-no-HE-start");
         }
         if (options_in.find("--reml-force-dense-V") != options_in.end()) {
@@ -1000,15 +961,18 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         }
         if (options_in.find("--reml-ai-robust") != options_in.end()) {
             options["reml_ai_robust"] = "1";
+            options_in.erase("--reml-ai-robust");
         }
         if (options_in.find("--reml-ai-robust-tol") != options_in.end()
                 && !options_in["--reml-ai-robust-tol"].empty()) {
             options_d["reml_ai_robust_tol"] = std::stod(options_in["--reml-ai-robust-tol"][0]);
+            options_in.erase("--reml-ai-robust-tol");
         }
         if (options_in.find("--reml-ai-robust-risk") != options_in.end()
                 && !options_in["--reml-ai-robust-risk"].empty()) {
             options_d["reml_ai_robust_risk"] = std::stod(options_in["--reml-ai-robust-risk"][0]);
-        }   
+            options_in.erase("--reml-ai-robust-risk");
+        }
         if (options_in.find("--reml-print-trajectory") != options_in.end()) {
             options["reml_print_trajectory"] = "1";
             options_in.erase("--reml-print-trajectory");
@@ -1265,28 +1229,11 @@ void MLMA::processMain()
                             "--reml-trace-hutchpp is ignored.");
 
             int grm_chunk_rows = 0;
-            vector<string> grm_ids;
             Eigen::MatrixXd G_n;      // left empty when grm_chunked
             double m_all = options_d["woodbury_basis_rank"] == -1 ? 0.0 : -1.0;  // only populated when dense GRM and Woodbury-MP mode is selected
             gcta_grm_io::ChunkedGrmHandle chunked_grm;  // only populated when grm_chunked
 
             if (grm_chunked) {
-                // Skip the dense O(n_grm^2) load entirely — the whole point
-                // of --grm-chunked. make_chunked_grm_reader does its own ID
-                // validation (same fail-loud contract as the dense path
-                // below), reads m_snps from .grm.N.bin's diagonal without
-                // touching .grm.bin, and now also solves grm_chunk_rows and
-                // its own row-band-cache reservation together (see
-                // grm_binary_io.hpp) instead of this file deriving them
-                // separately beforehand.
-                //
-                // NOTE: this now opens the file and ID-matches unconditionally
-                // whenever grm_chunked is true, even if the grm_chunk_rows >= n
-                // check below ends up falling back to dense -- previously that
-                // check ran first (via a standalone solve_chunk_rows call) and
-                // skipped opening the file entirely in that case. The extra
-                // work is cheap (ID matching + one N-mean read, no tile reads
-                // yet) but it's a real behavior change worth knowing about.
                 chunked_grm = gcta_grm_io::make_chunked_grm_reader(
                     grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget");
                 grm_chunk_rows = chunked_grm.chunk_rows;
@@ -1298,58 +1245,9 @@ void MLMA::processMain()
                                 "for no benefit.");
                     grm_chunked = false;
                 }
-                // make_chunked_grm_reader already logged the budget/chunk-size
-                // split; nothing further to log here. Note the dense fallback
-                // just above discards chunked_grm/its reader rather than using
-                // it, since the decision can only be made after construction now.
-            } else if (!reuse_basis) {
-                // upper_only=true: G_n is valid on its upper triangle (row<=col)
-                // only. This is safe here because ctx.A[0] (fed by G_n below) is
-                // itself expected to be upper-triangle-only by RemlEngine -- see
-                // grm_binary_io.hpp's upper_only doc comment.
-                read_grm_binary(grm_pfx, grm_ids, G_n, m_all, /*upper_only=*/true);
-
-                // Get post-filter analysis IDs (FID\tIID) and match to GRM
-                const vector<int> kp = match_ids_to_grm(analysis_ids, grm_ids);
-                for (int i = 0; i < n; ++i)
-                    if (kp[i] < 0)
-                        LOGGER.e(0, "Individual [" + analysis_ids[i] +
-                                    "] not found in GRM [" + grm_pfx + "]. "
-                                    "Re-build the GRM from the same sample set.");
-
-                // Subset GRM to the n analysis individuals.
-                // Fast path: if GRM sample == analysis sample (in order), no copy needed.
-                const int  n_grm        = static_cast<int>(grm_ids.size());
-                bool       is_identity  = (n_grm == n);
-                for (int i = 0; i < n && is_identity; ++i)
-                    if (kp[i] != i) is_identity = false;
-
-                if (!is_identity) {
-                    Eigen::MatrixXd G_sub(n, n);
-                    // G_n is upper-triangle-only (row<=col valid). The old
-                    // gather read G_n(kp[i], src_col) directly for every (i,j)
-                    // pair, which is only correct when kp[i] <= src_col --
-                    // otherwise it silently reads unfaulted/zero data now that
-                    // the mirror pass is gone. Fixed two ways at once:
-                    //   1. Only the upper triangle of G_sub is written
-                    //      (i <= j) -- that's all ctx.A[0] needs downstream,
-                    //      and it keeps G_sub's own lower-triangle pages
-                    //      unfaulted too, carrying the memory saving through
-                    //      this subsetting step.
-                    //   2. Each read uses min/max on (kp[i], src_col) so it
-                    //      always lands in G_n's valid upper triangle,
-                    //      regardless of how the permutation reorders things.
-                    #pragma omp parallel for schedule(dynamic, 64)
-                    for (int j = 0; j < n; ++j) {
-                        const int src_col = kp[j];
-                        for (int i = 0; i <= j; ++i) {
-                            const int r = kp[i], c = src_col;
-                            G_sub(i, j) = (r <= c) ? G_n(r, c) : G_n(c, r);
-                        }
-                    }
-                    G_n = std::move(G_sub);
-                }
-                // else: G_n already contains the right n×n block
+            }
+            if (!grm_chunked && !reuse_basis) {
+                load_and_subset_grm_upper(grm_pfx, analysis_ids, G_n, m_all, "--mlma");
             }
 
 

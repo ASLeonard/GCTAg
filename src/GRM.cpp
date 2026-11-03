@@ -849,37 +849,7 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
         }
     }
 
-    // init the geno buffers
-    /*
-    if(!bBLAS){
-        // use byte style coding
-        this->num_byte_geno = sizeof(uint16_t) * Constants::NUM_MARKER_READ / num_marker_block * index_keep.size();
-        lookup_GRM_table = new double[Constants::NUM_MARKER_READ / num_marker_block][num_lookup_table];
-
-        int ret1 = posix_memalign((void **) &geno_buf, 32, num_byte_geno);
-        int ret2 = posix_memalign((void **) &mask_buf, 32, num_byte_geno);
-        if(ret1 != 0 | ret2 != 0){
-            LOGGER.e(0, "can't allocate enough memory for genotype buffer.");
-        }
-
-   }else{
-   }
-   */
-
-    reg_bit_width = 64;
-    this->num_grm_handle = reg_bit_width / 64;
-    this->num_count_handle = reg_bit_width / 32;
-    this->num_block_handle = reg_bit_width / 16;
-    this->num_marker_process_block = this->num_marker_block * this->num_block_handle;
-
-    // init the count mask buffer;
-    /*
-    this->num_byte_cmask = sizeof(uint64_t) * Constants::NUM_MARKER_READ * index_keep.size() / num_cmask_block;
-    int ret3 = posix_memalign((void **) &cmask_buf, 32, num_byte_cmask); 
-    if(ret3 != 0){
-        LOGGER.e(0, "can't allocate enough memory to store the mask.");
-    }
-    */
+    this->num_count_handle = 2;
 
     // init the grm and N buffer
     num_individual = part_keep_indices.second - part_keep_indices.first + 1;
@@ -992,11 +962,6 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
     }
 
     output_id();
-
-#ifndef NDEBUG
-    o_geno0 = fopen("./test.bin", "wb");
-    o_mask0 = fopen("./test_mask.bin", "wb");
-#endif
 }
 
 
@@ -1020,6 +985,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     for(int i = 0; i < num_marker; i++){
         GenoBufItem &item = gbufitems[i];
         item.extractedMarkerIndex = markerIndex[i];
+        item.geno_ptr = stdGeno + static_cast<size_t>(i) * stdGenoLD;
         geno->getGenoDouble(buf, i, &item);
     }
 
@@ -1032,13 +998,17 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
 
     int curNumValidMarkers = static_cast<int>(validIndexBuf.size());
 
-    #pragma omp parallel for schedule(static)
-    for(int i = 0; i < curNumValidMarkers; i++){
-        const double *src = gbufitems[validIndexBuf[i]].geno.data();
-        double *dst = stdGeno + i * stdGenoLD;
-        #pragma omp simd
-        for (int j = 0; j < grm_n; ++j) {
-            dst[j] = src[j];
+    // When all markers in the block pass filters (curNumValidMarkers == num_marker),
+    // every column is already decoded in-place at stdGeno + i * stdGenoLD.
+    // Otherwise, compact valid columns forward in-place (validIndexBuf[k] >= k).
+    if (curNumValidMarkers < num_marker) {
+        for (int k = 0; k < curNumValidMarkers; ++k) {
+            const int src_idx = validIndexBuf[k];
+            if (src_idx != k) {
+                std::memcpy(stdGeno + static_cast<size_t>(k) * stdGenoLD,
+                            stdGeno + static_cast<size_t>(src_idx) * stdGenoLD,
+                            static_cast<size_t>(grm_bytes_std_geno));
+            }
         }
     }
     if(!grm_skip_global_state){
@@ -1118,53 +1088,59 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     const int numNblock = (curNumValidMarkers + markerPerN - 1) / markerPerN;
     const int numNSampleBlock = (grm_n + markerPerN - 1) / markerPerN;
     const int blockStride = numNSampleBlock * markerPerN;
-    std::array<uintptr_t, 64> transposeInput{};
-    std::vector<plink2::VecW> transposeScratch(plink2::kPglBitTransposeBufvecs);
-    for(int i = 0; i < numNblock; i++){
-        const int baseMarkerIndex = markerPerN * i;
-        const int lastValidIndex  = std::min(markerPerN * (i + 1), curNumValidMarkers);
-        uintptr_t *block_buf = sampleMissBuf.data() + i * blockStride;
+
+    // Each sample block j owns disjoint 64-element slices in both sampleMissBuf
+    // (512-byte aligned per block) and sub_miss (256-byte aligned), so transposing
+    // and accumulating sub_miss across j is completely lock-free and race-free.
+    #pragma omp parallel
+    {
+        std::array<uintptr_t, 64> transposeInput{};
+        alignas(32) plink2::VecW transposeScratch[plink2::kPglBitTransposeBufvecs];
+
+        #pragma omp for schedule(static)
         for(int j = 0; j < numNSampleBlock; j++){
             const int baseMissIndex = j * markerPerN;
-            if (markerPerN == 64) {
-                for(int k = baseMarkerIndex; k < lastValidIndex; k++){
-                    transposeInput[static_cast<std::size_t>(k - baseMarkerIndex)] =
-                        gbufitems[validIndexBuf[k]].missing[j];
+            for(int i = 0; i < numNblock; i++){
+                const int baseMarkerIndex = markerPerN * i;
+                const int lastValidIndex  = std::min(markerPerN * (i + 1), curNumValidMarkers);
+                uintptr_t *block_buf = sampleMissBuf.data() + i * blockStride;
+                if (markerPerN == 64) {
+                    for(int k = baseMarkerIndex; k < lastValidIndex; k++){
+                        transposeInput[static_cast<std::size_t>(k - baseMarkerIndex)] =
+                            gbufitems[validIndexBuf[k]].missing[j];
+                    }
+                    for(int k = lastValidIndex; k < markerPerN * (i + 1); k++){
+                        transposeInput[static_cast<std::size_t>(k - baseMarkerIndex)] = 0UL;
+                    }
+                    // Transpose [marker x sample] missing bits into [sample x marker].
+                    // Bit order inside each word is irrelevant for downstream AND+popcount.
+                    plink2::TransposeBitblock(
+                        transposeInput.data(), 1, 1,
+                        static_cast<uint32_t>(markerPerN), static_cast<uint32_t>(markerPerN),
+                        &block_buf[baseMissIndex], transposeScratch);
+                } else {
+                    for(int k = baseMarkerIndex; k < lastValidIndex; k++){
+                        block_buf[baseMissIndex + k - baseMarkerIndex] = gbufitems[validIndexBuf[k]].missing[j];
+                    }
+                    for(int k = lastValidIndex; k < markerPerN * (i + 1); k++){
+                        block_buf[baseMissIndex + k - baseMarkerIndex] = 0UL;
+                    }
                 }
-                for(int k = lastValidIndex; k < markerPerN * (i + 1); k++){
-                    transposeInput[static_cast<std::size_t>(k - baseMarkerIndex)] = 0UL;
-                }
-                // Transpose [marker x sample] missing bits into [sample x marker].
-                // Bit order inside each word is irrelevant for downstream AND+popcount.
-                plink2::TransposeBitblock(
-                    transposeInput.data(), 1, 1,
-                    static_cast<uint32_t>(markerPerN), static_cast<uint32_t>(markerPerN),
-                    &block_buf[baseMissIndex], transposeScratch.data());
-            } else {
-                for(int k = baseMarkerIndex; k < lastValidIndex; k++){
-                    block_buf[baseMissIndex + k - baseMarkerIndex] = gbufitems[validIndexBuf[k]].missing[j];
-                }
-                for(int k = lastValidIndex; k < markerPerN * (i + 1); k++){
-                    block_buf[baseMissIndex + k - baseMarkerIndex] = 0UL;
-                }
-            }
-            if(!grm_skip_global_state){
-                for(int k = baseMissIndex; k < baseMissIndex + markerPerN; k++){
-                    sub_miss[k] += std::popcount(block_buf[k]);
+                if(!grm_skip_global_state){
+                    for(int k = baseMissIndex; k < baseMissIndex + markerPerN; k++){
+                        sub_miss[k] += std::popcount(block_buf[k]);
+                    }
                 }
             }
         }
-    }
 
-
-    // Single parallel region: each thread processes its pair range across all blocks.
-    // This reduces fork/join barriers from numNblock to 1, and keeps each thread's
-    // N[] output range hot in cache across the inner block loop.
-    #pragma omp parallel for schedule(static)
-    for(int index = 0; index < (int)index_grm_pairs.size(); index++){
-        const auto index_pair = index_grm_pairs[index];
-        for(int i = 0; i < numNblock; i++){
-            N_thread(index_pair.first, index_pair.second, sampleMissBuf.data() + i * blockStride);
+        // Reuse the same parallel region: each thread processes its pair range across all blocks.
+        #pragma omp for schedule(static)
+        for(int index = 0; index < (int)index_grm_pairs.size(); index++){
+            const auto index_pair = index_grm_pairs[index];
+            for(int i = 0; i < numNblock; i++){
+                N_thread(index_pair.first, index_pair.second, sampleMissBuf.data() + i * blockStride);
+            }
         }
     }
 
@@ -1174,332 +1150,27 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     }
 }
 
-    /*
-    int num_process_block = (num_marker + num_marker_block - 1) / num_marker_block;
-    this->cur_num_block = (num_marker + num_marker_process_block - 1) / num_marker_process_block;
-    num_process_block = cur_num_block;
-    static int keep_sample_size = index_keep.size();
-    static int geno_num64 = geno->num_item_1geno;
-    static int geno_num8 = geno_num64 * 8;
-
-    #pragma omp parallel for schedule(dynamic)
-    for(int index_process_block = 0; index_process_block < num_process_block; index_process_block++){
-        int base_marker_index = index_process_block * num_marker_process_block;
-        uint8_t *cur_buf = (uint8_t*) (buf + base_marker_index * geno_num64);
-        int num_marker_in_process_block = index_process_block == num_process_block - 1 ?
-                                      (num_marker - base_marker_index): num_marker_process_block;
-        // recode genotype
-        for(int index_indi = 0; index_indi < part_keep_indices.second + 1; index_indi += 1) {
-            uint32_t raw_index = index_indi;
-
-            for (int marker_index = 0; marker_index != num_marker_in_process_block; marker_index++) {
-                uint16_t temp_geno = (*(cur_buf  + marker_index * geno_num8 + raw_index / 4)
-                        >> ((raw_index % 4) * 2)) & 3LU;
-                if (temp_geno == 1) {
-                    #pragma omp atomic
-                    sub_miss[index_indi] += 1;
-                    //cmask
-                    #pragma omp atomic
-                    cmask_buf[index_indi + ((base_marker_index + marker_index) / num_cmask_block)*keep_sample_size] |=
-                            (1LLU << ((base_marker_index + marker_index) % num_cmask_block));
-                }
-            }
-       }
-    }
-    */
-
-
-/*
-void GRM::calculate_GRM(uint64_t *buf, int num_marker) {
-    //prepare the 7 freq arrays in current range;
-    double * devs = new double[num_marker];
-    if(!isDominance){
-        #pragma omp parallel for schedule(dynamic)
-        for (int index_marker = 0; index_marker < num_marker; index_marker++) {
-            double af = geno->AFA1[finished_marker + index_marker];
-            double mu = af * 2.0;
-            double dev = mu * (1.0 - af);
-            double rdev = (dev < 1.0e-50) ? 0 : (1.0 / dev);
-            rdev = isMtd? 1.0 : rdev;
-            GRM_table[index_marker][0] = (2.0 - mu) * (2.0 - mu) * rdev;  // 00 00
-            GRM_table[index_marker][2] = (2.0 - mu) * (1.0 - mu) * rdev;  // 00 10
-            GRM_table[index_marker][3] = (2.0 - mu) * (0.0 - mu) * rdev;  // 00 11
-            GRM_table[index_marker][4] = (1.0 - mu) * (1.0 - mu) * rdev;  // 10 10
-            GRM_table[index_marker][5] = (0.0 - mu) * (1.0 - mu) * rdev;  // 11 10
-            GRM_table[index_marker][6] = (0.0 - mu) * (0.0 - mu) * rdev;  // 11 11
-            GRM_table[index_marker][7] = 0.0;                             // 01 01
-        }
-    }else{
-        #pragma omp parallel for schedule(dynamic)
-        for (int index_marker = 0; index_marker < num_marker; index_marker++) {
-            double af = geno->AFA1[finished_marker + index_marker];
-            double mu = af * 2.0;
-            double dev = mu * (1.0 - af);
-            double rdev = (dev < 1.0e-50) ? 0 : (1.0 / dev);
-            double rdev2 = rdev * rdev; 
-            rdev2 = isMtd ? 1.0 : rdev2;
-            double psq = 0.5 * mu * mu;
-            double A00 = 2.0 * mu - 2 - psq;
-            double A10 = mu - psq;
-            double A11 = 0.0 - psq;
-
-            GRM_table[index_marker][0] = A00 * A00 * rdev2;  // 00 00
-            GRM_table[index_marker][2] = A00 * A10 * rdev2;  // 00 10
-            GRM_table[index_marker][3] = A00 * A11 * rdev2;  // 00 11
-            GRM_table[index_marker][4] = A10 * A10 * rdev2;  // 10 10
-            GRM_table[index_marker][5] = A11 * A10 * rdev2;  // 11 10
-            GRM_table[index_marker][6] = A11 * A11 * rdev2;  // 11 11
-            GRM_table[index_marker][7] = 0.0;                // 01 01
-        }
-    }
- 
-
-    //init the remained arrays to 0;
-    #pragma omp parallel for schedule(dynamic)
-    for(int index_marker = num_marker; index_marker < Constants::NUM_MARKER_READ; index_marker++){
-        for(int i = 0; i != 8; i++){
-            GRM_table[index_marker][i] = 0.0;
-        }
-    }
-
-    int num_block = (num_marker + num_marker_block - 1) / num_marker_block;
-
-    int length = elements.size();
-
-    //init GRM lookup table
-    #pragma omp parallel for schedule(dynamic)
-    for(int cur_block = 0; cur_block < num_block; cur_block++) {
-        int cur_block_base = cur_block * num_marker_block;
-        for (int e1 = 0; e1 != length; e1++) {
-            for (int e2 = 0; e2 != length; e2++) {
-                for (int e3 = 0; e3 != length; e3++) {
-                    for (int e4 = 0; e4 != length; e4++) {
-                        for (int e5 = 0; e5 != length; e5++) {
-                            lookup_GRM_table[cur_block][elements[e5]
-                                             | (elements[e4] << 3)
-                                             | (elements[e3] << 6)
-                                             | (elements[e2] << 9)
-                                             | (elements[e1] << 12)] = GRM_table[cur_block_base][elements[e5]] +
-                                                                       GRM_table[cur_block_base + 1][elements[e4]] +
-                                                                       GRM_table[cur_block_base + 2][elements[e3]] +
-                                                                       GRM_table[cur_block_base + 3][elements[e2]] +
-                                                                       GRM_table[cur_block_base + 4][elements[e1]];
-                        }
-                    }
-                }
-            }
-        }
-
-    }
-
-
-    memset(this->geno_buf, 0, num_byte_geno);
-    memset(this->mask_buf, 0, num_byte_geno);
-    memset(this->cmask_buf, 0, num_byte_cmask);
-
-    int num_process_block = (num_marker + num_marker_block - 1) / num_marker_block;
-    this->cur_num_block = (num_marker + num_marker_process_block - 1) / num_marker_process_block;
-    num_process_block = cur_num_block;
-    static int keep_sample_size = index_keep.size();
-
-    static int geno_num64 = geno->num_item_1geno;
-    static int needs_block_geno64 = (part_keep_indices.second + 31) / 32;
-    static int super_block_size = num_block_handle * keep_sample_size;
-    static int super_N_size = num_cmask_block / num_marker_block;
-*/
-/* Don't adapt this code, worse speed
-    //#pragma omp parallel for schedule(dynamic) 
-    for(int index_process_block = 0; index_process_block < num_process_block; index_process_block++){
-        int super_block_num = index_process_block / num_block_handle * super_block_size;
-        int super_block_item = index_process_block % num_block_handle;
-        int super_block_start = super_block_num + super_block_item;
-        int super_N_start = index_process_block / super_N_size * keep_sample_size;
-        int super_N_move = index_process_block * num_marker_block % num_cmask_block;
-
-        int base_marker_index = index_process_block * num_marker_block;
-        int num_marker_in_process_block = index_process_block == num_process_block - 1 ?
-                                      (num_marker - base_marker_index): num_marker_block;
-        uint64_t * gbuf = buf + base_marker_index * geno_num64; 
-        uint32_t base_sample = 0;
-        for(int geno64_block = 0; geno64_block < needs_block_geno64; geno64_block++){
-            int num_sample_geno = geno64_block == geno_num64 - 1 ?
-                                  (keep_sample_size - 32 * geno64_block) : 32;
-
-            uint64_t genot[num_marker_in_process_block];
-            for(int index = 0; index < num_marker_in_process_block; index++){
-                genot[index] = gbuf[geno64_block + index * geno_num64];
-            }
-
-            for(int index_sample = 0; index_sample < num_sample_geno; index_sample++){
-                uint32_t real_index_sample = base_sample + index_sample;
-                //if(real_index_sample > part_keep_indices.second)break;
-               // uint32_t base_geno_buf = real_index_sample * num_process_block + index_process_block;
-                uint32_t base_geno_buf = super_block_start + real_index_sample * num_block_handle;
-                for(int index = 0; index < num_marker_in_process_block; index++){
-                    uint16_t temp_geno = (uint16_t) (genot[index] >> (index_sample * 2)) & 3LU;
-                    int move_bit = index * 3;
-                    uint16_t t2_geno = temp_geno << move_bit;
-                    //#pragma omp atomic
-                    geno_buf[base_geno_buf] |= t2_geno;
-                    if(temp_geno == 1){
-                     //   #pragma omp critical
-                        {
-                            mask_buf[base_geno_buf] |= (7LU << move_bit);
-                            sub_miss[real_index_sample]++;
-                            cmask_buf[super_N_start + real_index_sample] |= (1LLU << (super_N_move + index));
-                        }
-                    }
-                }
-                for(int index = num_marker_in_process_block; index < num_marker_block; index++){
-                    int move_bit = index * 3;
-                    uint16_t m2_mask = (7LU << move_bit);
-                    //#pragma omp atomic
-                    mask_buf[base_geno_buf] |= m2_mask;
-                }
-            }
-
-            base_sample += 32;
-
-        }
-
-    }
-    */
-
-/*
-#ifndef NDEBUG
-    if(finished_marker == 0 ){
-        FILE *test = fopen("test_b0.bin", "wb");
-        fwrite(geno_buf, 1, num_byte_geno, test);
-        FILE *test_cmask = fopen("cmask_b0.bin", "wb");
-        fwrite(cmask_buf, 1, num_byte_cmask, test_cmask);
-        fclose(test);
-        fclose(test_cmask);
-    }
-#endif
-        
-    static int geno_num8 = geno_num64 * 8;
-
-
-    #pragma omp parallel for schedule(dynamic)
-    for(int index_process_block = 0; index_process_block < num_process_block; index_process_block++){
-        int base_marker_index = index_process_block * num_marker_process_block;
-        uint8_t *cur_buf = (uint8_t*) (buf + base_marker_index * geno_num64);
-        int base_buf_pos = num_block_handle * index_process_block * keep_sample_size;
-        uint16_t *cur_geno = this->geno_buf + base_buf_pos;
-        uint16_t *cur_mask = this->mask_buf + base_buf_pos;
-        int num_marker_in_process_block = index_process_block == num_process_block - 1 ?
-                                      (num_marker - base_marker_index): num_marker_process_block;
-        // recode genotype
-        for(int index_indi = 0; index_indi < part_keep_indices.second + 1; index_indi += 1) {
-            uint32_t raw_index = index_indi;
-            int indi_block = index_indi * num_block_handle;
-
-            uint16_t *p_geno = cur_geno + indi_block;
-            uint16_t *p_mask = cur_mask + indi_block;
-
-            for (int marker_index = 0; marker_index != num_marker_in_process_block; marker_index++) {
-                int cur_block = marker_index / num_marker_block;
-                int cur_block_pos = (marker_index % num_marker_block) * 3;
-                uint16_t temp_geno = (*(cur_buf  + marker_index * geno_num8 + raw_index / 4)
-                        >> ((raw_index % 4) * 2)) & 3LU;
-                uint16_t t2_geno = (temp_geno << cur_block_pos);
-                #pragma omp atomic
-                *(p_geno + cur_block) |= t2_geno;
-                if (temp_geno == 1) {
-                    #pragma omp atomic
-                    *(p_mask + cur_block) |= (7LU << cur_block_pos);
-                    #pragma omp atomic
-                    sub_miss[index_indi] += 1;
-                    //cmask
-                    #pragma omp atomic
-                    cmask_buf[index_indi + ((base_marker_index + marker_index) / num_cmask_block)*keep_sample_size] |=
-                            (1LLU << ((base_marker_index + marker_index) % num_cmask_block));
-                }
-            }
-
-            for (int marker_index = num_marker_in_process_block;
-                 marker_index != num_marker_process_block; marker_index++) {
-                int cur_block = marker_index / num_marker_block;
-                int cur_block_pos = (marker_index % num_marker_block) * 3;
-                #pragma omp atomic
-                *(p_mask + cur_block) |= (7LU << cur_block_pos);
-
-            }
-        }
-    }
-
-    #pragma omp parallel for
-    for(int index = 0; index < index_grm_pairs.size(); index++){
-        auto index_pair = index_grm_pairs[index];
-        grm_thread(index_pair.first, index_pair.second);
-        //N_thread(index_pair.first, index_pair.second);
-    }
-
-    #pragma omp parallel for
-    for(int index = 0; index < index_grm_pairs.size(); index++){
-        auto index_pair = index_grm_pairs[index];
-        //grm_thread(index_pair.first, index_pair.second);
-        N_thread(index_pair.first, index_pair.second);
-    }
-
-    //finished_marker += num_marker;
-//}
-*/
-/* don't use 
-    //submit thread
-    int pair_size = index_grm_pairs.size();
-    for(int index = 0; index != pair_size - 1; index++){
-        THREADS.AddJob(std::bind(&GRM::grm_thread, this, index_grm_pairs[index].first, index_grm_pairs[index].second));
-    }
-
-    for(int index = 0; index != pair_size - 1; index++){
-        THREADS.AddJob(std::bind(&GRM::N_thread, this, index_grm_pairs[index].first, index_grm_pairs[index].second));
-    }
-
-    auto last_pair = index_grm_pairs[pair_size - 1];
-    grm_thread(last_pair.first, last_pair.second);
-    N_thread(last_pair.first, last_pair.second);
-
-    THREADS.WaitAll();
-    */
-
-    //std::stringstream out_message;
-    //out_message << std::fixed << std::setprecision(2) << finished_marker * 100.0 / geno->marker->count_extract();
-    //LOGGER.i(0, out_message.str() + "% has been finished");
-
-
-
 void GRM::deduce_GRM(){
     LOGGER.i(0, "The GRM computation is completed.");
-    float thresh = -99;
+    float thresh = -99.0f;
     bool isSparse = false;
     if(options_d.find("sparse_cutoff") != options_d.end()){
-        thresh = options_d["sparse_cutoff"];
+        thresh = static_cast<float>(options_d["sparse_cutoff"]);
         isSparse = true;
         LOGGER.i(0, "Saving sparse GRM with a cutoff " + to_string(thresh) + "...");
     }else{
         LOGGER.i(0, "Saving GRM...");
     }
-    //Just for test
-#ifndef NDEBUG
-    fclose(o_geno0);
-    fclose(o_mask0);
-#endif
 
-    //clock_t begin = t_begin();
-    FILE *grm_out, *N_out;
+    FILE *grm_out = nullptr, *N_out = nullptr;
     if(isSparse){
-        string grm_name = o_name + ".grm.sp";
-        grm_out = fopen(grm_name.c_str(), "wb");
-        N_out = NULL;
+        grm_out = fopen((o_name + ".grm.sp").c_str(), "wb");
         if(!grm_out){
             LOGGER.e(0, "can't open " + o_name + ".grm.sp to write");
         }
     }else{
-        string grm_name = o_name + ".grm.bin";
-        string N_name = o_name + ".grm.N.bin";
-        grm_out = fopen(grm_name.c_str(), "wb");
-        N_out = fopen(N_name.c_str(), "wb");
+        grm_out = fopen((o_name + ".grm.bin").c_str(), "wb");
+        N_out   = fopen((o_name + ".grm.N.bin").c_str(), "wb");
         if((!grm_out) || (!N_out)){
             LOGGER.e(0, "can't open " + o_name + ".grm.bin or .grm.N.bin to write");
         }
@@ -1508,249 +1179,127 @@ void GRM::deduce_GRM(){
         setvbuf(N_out,   nullptr, _IOFBF, 4 << 20);
     }
 
-    float mtd_weight = 1.0;
+    float mtd_weight = 1.0f;
     if(options_b["isMtd"]){
-        float weight = 0;
+        float weight = 0.0f;
         if(!isDominance){
-            for(int i = 0; i < numValidMarkers; i++){
-                //float af = geno->AFA1[i];
-                //float sd = 2.0 * af * (1.0 - af); 
-                weight += sd[i];
-            }
+            for(uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i];
         }else{
-            for(int i = 0; i < numValidMarkers; i++){
-                //float af = geno->AFA1[i];
-                //float sd = 2.0 * af * (1.0 - af); 
-                weight += sd[i] * sd[i];
-            }
+            for(uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i] * sd[i];
         }
-        mtd_weight = 1.0 / (weight / numValidMarkers);
+        if(weight > 0.0f) mtd_weight = static_cast<float>(numValidMarkers) / weight;
     }
 
- 
-    /* X chr adjustment
-    float weights[5];
-    weights[2] = 0.5 * mtd_weight; // heterogametic-heterogametic
-    weights[3] = sqrt(0.5) * mtd_weight; // heterogametic-homogametic;
-    weights[4] = 1.0 * mtd_weight; // homogametic-homogametic;
-    // don't need now.
-    */
+    // Set tile bounds to cover the entire [part_keep_indices.first, part_keep_indices.second + 1)
+    // pass and delegate to flush_grm_tile (grm_tiling_enabled == false selects packed N[] indexing).
+    grm_tile_rs   = static_cast<int>(part_keep_indices.first);
+    grm_tile_re   = static_cast<int>(part_keep_indices.second) + 1;
+    grm_tile_rows = grm_m;
+    grm_tile_cols = grm_n;
 
-    uint32_t num_sample = index_keep.size();
-    std::vector<float> w_grm(num_sample);
-    std::vector<float> w_N(num_sample);
+    std::vector<float> w_N;
+    std::vector<float> grm_block;
+    std::string sparse_buf;
+    flush_grm_tile(grm_out, N_out, thresh, isSparse, mtd_weight,
+                   w_N, grm_block, sparse_buf);
 
-    uint32_t *po_N = N;
-    //LOGGER << "mtd weight: " << mtd_weight << std::endl;
-   
-    /*
-    std::ofstream osub("test1.txt");
-    for(int i = 0; i < part_keep_indices.second + 1; i++){
-        osub << sub_miss[i] << std::endl;
-    }
-    osub.close();
-    */
-    
-    if(bBLAS){
-        // The BLAS GRM buffer is column-major [grm_m × grm_n_write] (doubles).
-        // Writing row by row requires stride-m reads (one cache miss per column step).
-        // To keep memory low we process the output in blocks of BLAS_OUT_BLOCK rows:
-        // each block allocates a row-major float slab of at most
-        // BLAS_OUT_BLOCK × grm_n_write floats rather than a single grm_m × grm_n_write.
-        const int grm_n_write = static_cast<int>(part_keep_indices.second + 1);
-        constexpr int BLAS_OUT_BLOCK = 1024;
-
-        // Worst-case block: BLAS_OUT_BLOCK rows × grm_n_write cols (last block).
-        // Allocate once and reuse to avoid per-iteration malloc/free overhead.
-        std::vector<float> grm_block(static_cast<size_t>(BLAS_OUT_BLOCK) * grm_n_write);
-        // Sparse path: accumulate formatted text for an entire BLAS_OUT_BLOCK into a
-        // pre-reserved string, then fputs once per block.  Avoids O(n²) small heap
-        // allocations from constructing a new stringstream per row.
-        // Reserve heuristic: BLAS_OUT_BLOCK rows × grm_n_write cols × ~25 chars/entry × 5% density.
-        std::string sparse_buf;
-        if(isSparse) sparse_buf.reserve(
-            static_cast<size_t>(BLAS_OUT_BLOCK) * grm_n_write / 20 * 25);
-
-        for(int block_start = static_cast<int>(part_keep_indices.first);
-                block_start < grm_n_write;
-                block_start += BLAS_OUT_BLOCK){
-            const int block_end  = std::min(block_start + BLAS_OUT_BLOCK, grm_n_write);
-            const int block_rows = block_end - block_start;
-            // Lower-triangle output for row pair1 only needs columns 0..pair1,
-            // so the widest row in this block needs block_end columns.
-            const int block_cols = block_end;
-            const int local_block_start = block_start - static_cast<int>(part_keep_indices.first);
-            {
-                using RowMajF = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-                Eigen::Map<const Eigen::MatrixXd> G_cm(grm, grm_m, grm_n_write);
-                Eigen::Map<RowMajF>(grm_block.data(), block_rows, block_cols) =
-                    G_cm.block(local_block_start, 0, block_rows, block_cols).cast<float>();
-            }
-
-            if(isSparse) sparse_buf.clear();
-
-            for(int pair1 = block_start; pair1 < block_end; pair1++){
-                const int local_block_r = pair1 - block_start;
-                const uint32_t sub_miss1 = numValidMarkers - sub_miss[pair1];
-                const float *row = grm_block.data() + static_cast<size_t>(local_block_r) * block_cols;
-
-                for(int pair2 = 0; pair2 != pair1 + 1; pair2++){
-                    const uint32_t sub_N = *(po_N + pair2) + sub_miss1 - sub_miss[pair2];
-                    w_N[pair2]   = static_cast<float>(sub_N);
-                    w_grm[pair2] = sub_N ? row[pair2] / sub_N * mtd_weight : 0.0f;
-                }
-                if(!isSparse){
-                    fwrite(w_grm.data(), sizeof(float), pair1 + 1, grm_out);
-                    fwrite(w_N.data(),  sizeof(float), pair1 + 1, N_out);
-                }else{
-                    for(int i = 0; i <= pair1; i++){
-                        if(w_grm[i] >= thresh){
-                            std::format_to(std::back_inserter(sparse_buf),
-                                "{}\t{}\t{:.{}g}\n",
-                                pair1, i, w_grm[i],
-                                std::numeric_limits<float>::digits10 + 2);
-                        }
-                    }
-                }
-                po_N += pair1 + 1;
-            }
-            if(isSparse && !sparse_buf.empty())
-                fputs(sparse_buf.c_str(), grm_out);
-        } // end block loop
-    }
-    /* // don't need special case
-    else{
-        if(!options_b["homogametic_chr"]){
-            for(int pair1 = part_keep_indices.first; pair1 != part_keep_indices.second + 1; pair1++){
-                uint32_t sub_miss1 = finished_marker - sub_miss[pair1];
-                for(int pair2 = 0; pair2 != pair1 + 1; pair2++){
-                    uint32_t sub_N = *po_N + sub_miss1 - sub_miss[pair2];
-                    w_N[pair2] = (float)sub_N;
-
-                    if(sub_N){
-                        w_grm[pair2] = (float)((*po_grm)/sub_N) * mtd_weight;
-                    }else{
-                        w_grm[pair2] = 0.0;
-                    }
-                    po_N++;
-                    po_grm++;
-                }
-                //fwrite(w_grm, sizeof(float), pair1 + 1, grm_out);
-                //fwrite(w_N, sizeof(float), pair1 + 1, N_out);
-                write_GRM(w_grm.data(), w_N.data(), grm_out, N_out, pair1, thresh);
-            }
-        }else{
-            for(uint32_t pair1 = part_keep_indices.first; pair1 != part_keep_indices.second + 1; pair1++){
-                uint32_t sub_miss1 = finished_marker - sub_miss[pair1];
-                int8_t weight1 = pheno->get_sex(pair1);
-                for(uint32_t pair2 = 0; pair2 != pair1 + 1; pair2++){
-                    uint32_t sub_N = *po_N + sub_miss1 - sub_miss[pair2];
-                    w_N[pair2] = (float)sub_N;
-
-                    if(sub_N){
-                        int8_t weight2 = weight1 + pheno->get_sex(pair2);
-                        w_grm[pair2] = weights[weight2] * ((*po_grm) /sub_N);
-
-                    }else{
-                        w_grm[pair2] = 0.0;
-                    }
-                    po_N++;
-                    po_grm++;
-                }
-                //fwrite(w_grm, sizeof(float), pair1 + 1, grm_out);
-                //fwrite(w_N, sizeof(float), pair1 + 1, N_out);
-                write_GRM(w_grm.data(), w_N.data(), grm_out, N_out, pair1, thresh);
-            }
-        }
-    }
-    */
-
-
-    if(grm_out)fclose(grm_out);
-    if(N_out)fclose(N_out);
-    //t_print(begin, "  GRM deduce finished");
+    if(grm_out) fclose(grm_out);
+    if(N_out)   fclose(N_out);
     if(!isSparse){
         LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.bin]");
         LOGGER.i(0, "Number of SNPs in each pair of individuals has been saved in the file [" + o_name + ".grm.N.bin]");
     }else{
         LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.sp]");
     }
-
 }
 
 
-// Write one tile's normalised rows to already-open output files.
-// Uses grm (tile_rows × tile_cols column-major doubles) and
-// N   (tile_rows × tile_cols uint32s, rectangular layout) from object state.
+// Write one tile's (or full non-tiled pass's) normalised rows to already-open output files.
+// Uses grm (tile_rows × tile_cols column-major doubles) and N from object state:
+//   - grm_tiling_enabled == true:  N is rectangular (tile_rows × tile_cols)
+//   - grm_tiling_enabled == false: N is packed lower-triangular starting at tile_rs
 //
-// w_grm/w_N/grm_block/sparse_buf are caller-owned scratch, sized once by
-// processMakeGRM to the worst-case (final, widest) tile and reused across
-// every call -- previously these were function-local vectors, reallocated
-// fresh (and growing) on every tile call in the tiled loop, the same
-// "allocate worst-case once, reuse" treatment the grm/N buffers just above
-// this function in processMakeGRM already get, with a comment explaining
-// exactly why (avoid the malloc/page-fault churn across many tiles).
+// w_N/grm_block/sparse_buf are caller-owned scratch, sized once by
+// processMakeGRM to the worst-case (final, widest) tile and reused across calls.
 void GRM::flush_grm_tile(FILE *grm_out, FILE *N_out,
                          float thresh, bool isSparse, float mtd_weight,
-                         std::vector<float>& w_grm, std::vector<float>& w_N,
+                         std::vector<float>& w_N,
                          std::vector<float>& grm_block, std::string& sparse_buf){
     const int tile_rs   = grm_tile_rs;
     const int tile_re   = grm_tile_re;
     const int tile_rows = grm_tile_rows;
     const int tile_cols = grm_tile_cols;   // == tile_re
 
-    if (static_cast<int>(w_grm.size()) < tile_re) w_grm.resize(tile_re);
-    if (static_cast<int>(w_N.size())   < tile_re) w_N.resize(tile_re);
+    if (!isSparse && static_cast<int>(w_N.size()) < tile_re) w_N.resize(tile_re);
 
     constexpr int BLAS_OUT_BLOCK = 1024;
 
     // Worst-case block for THIS tile: BLAS_OUT_BLOCK rows × tile_cols cols.
-    // grm_block is sized by the caller to the final (widest) tile, so this
-    // is a no-op resize on every call after the first.
     const size_t needed = static_cast<size_t>(BLAS_OUT_BLOCK) * tile_cols;
     if (grm_block.size() < needed) grm_block.resize(needed);
-    // Sparse path: accumulate formatted text for an entire BLAS_OUT_BLOCK into a
-    // pre-reserved string, then fputs once per block.  Avoids O(n²) small heap
-    // allocations from constructing a new stringstream per row.
-    // Reserve heuristic: BLAS_OUT_BLOCK rows × tile_cols cols × ~25 chars/entry × 5% density.
     if(isSparse) sparse_buf.reserve(std::max(sparse_buf.capacity(),
         static_cast<size_t>(BLAS_OUT_BLOCK) * tile_cols / 20 * 25));
+
+    const auto get_N_row = [&](int pair1) -> const uint32_t* {
+        if (grm_tiling_enabled) {
+            return N + static_cast<size_t>(pair1 - tile_rs) * tile_cols;
+        }
+        const size_t start_pos = static_cast<size_t>(pair1 + 1 + tile_rs) *
+                                 static_cast<size_t>(pair1 - tile_rs) / 2;
+        return N + start_pos;
+    };
 
     for(int block_start = tile_rs; block_start < tile_re; block_start += BLAS_OUT_BLOCK){
         const int block_end  = std::min(block_start + BLAS_OUT_BLOCK, tile_re);
         const int block_rows = block_end - block_start;
         const int block_cols = block_end;           // lower-triangle max column
         const int local_block_start = block_start - tile_rs;
-        {
-            using RowMajF = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-            Eigen::Map<const Eigen::MatrixXd> G_cm(grm, tile_rows, tile_cols);
-            Eigen::Map<RowMajF>(grm_block.data(), block_rows, block_cols) =
-                G_cm.block(local_block_start, 0, block_rows, block_cols).cast<float>();
+
+        // 1. Parallel column-major double -> row-major float transpose of the
+        //    needed lower-triangle entries (pair2 <= pair1, i.e. c <= block_start + r).
+        #pragma omp parallel for schedule(static)
+        for(int c = 0; c < block_cols; ++c){
+            const double *col_src = grm + static_cast<size_t>(c) * tile_rows + local_block_start;
+            const int r_start = std::max(0, c - block_start);
+            for(int r = r_start; r < block_rows; ++r){
+                grm_block[static_cast<size_t>(r) * block_cols + c] = static_cast<float>(col_src[r]);
+            }
+        }
+
+        // 2. Parallel in-place normalisation by pairwise non-missing count sub_N.
+        #pragma omp parallel for schedule(guided)
+        for(int pair1 = block_start; pair1 < block_end; ++pair1){
+            const int local_r = pair1 - block_start;
+            const uint32_t sub_miss1 = numValidMarkers - sub_miss[pair1];
+            float *row = grm_block.data() + static_cast<size_t>(local_r) * block_cols;
+            const uint32_t *N_row = get_N_row(pair1);
+            for(int pair2 = 0; pair2 <= pair1; ++pair2){
+                const uint32_t sub_N = N_row[pair2] + sub_miss1 - sub_miss[pair2];
+                row[pair2] = sub_N ? (row[pair2] / static_cast<float>(sub_N)) * mtd_weight : 0.0f;
+            }
         }
 
         if(isSparse) sparse_buf.clear();
 
+        // 3. Sequential output emission.
         for(int pair1 = block_start; pair1 < block_end; pair1++){
             const int local_r = pair1 - block_start;
-            const int tile_r  = pair1 - tile_rs;
-            const uint32_t sub_miss1 = numValidMarkers - sub_miss[pair1];
-            const float    *row   = grm_block.data() + static_cast<size_t>(local_r) * block_cols;
-            const uint32_t *N_row = N + static_cast<size_t>(tile_r) * tile_cols;
+            const float *row  = grm_block.data() + static_cast<size_t>(local_r) * block_cols;
 
-            for(int pair2 = 0; pair2 <= pair1; pair2++){
-                const uint32_t sub_N = N_row[pair2] + sub_miss1 - sub_miss[pair2];
-                w_N[pair2]   = static_cast<float>(sub_N);
-                w_grm[pair2] = sub_N ? row[pair2] / sub_N * mtd_weight : 0.0f;
-            }
             if(!isSparse){
-                fwrite(w_grm.data(), sizeof(float), pair1 + 1, grm_out);
-                fwrite(w_N.data(),   sizeof(float), pair1 + 1, N_out);
+                const uint32_t sub_miss1 = numValidMarkers - sub_miss[pair1];
+                const uint32_t *N_row    = get_N_row(pair1);
+                for(int pair2 = 0; pair2 <= pair1; ++pair2){
+                    w_N[pair2] = static_cast<float>(N_row[pair2] + sub_miss1 - sub_miss[pair2]);
+                }
+                fwrite(row,        sizeof(float), pair1 + 1, grm_out);
+                fwrite(w_N.data(), sizeof(float), pair1 + 1, N_out);
             } else {
                 for(int i = 0; i <= pair1; i++){
-                    if(w_grm[i] >= thresh){
+                    if(row[i] >= thresh){
                         std::format_to(std::back_inserter(sparse_buf),
                             "{}\t{}\t{:.{}g}\n",
-                            pair1, i, w_grm[i],
+                            pair1, i, row[i],
                             std::numeric_limits<float>::digits10 + 2);
                     }
                 }
@@ -1853,98 +1402,6 @@ void GRM::N_thread(int grm_index_from, int grm_index_to, const uintptr_t* cur_cm
         }
     }
     //}
-}
-
-void GRM::grm_thread(int grm_index_from, int grm_index_to) {
-
-    double *po_grm;
-    uint64_t geno, mask;
-    uint64_t *p_geno1, *p_geno2, geno1;
-    uint64_t *p_mask1, *p_mask2, mask1;
-    uint64_t *cur_geno, *cur_mask;
-    uint16_t geno_p1, geno_p2, geno_p3, geno_p4;
-    double *table0, *table1, *table2, *table3;
-    int cur_geno_block, start_geno_block;
-    uint64_t grm_pos_offset = ((uint64_t)grm_index_from + 1 + part_keep_indices.first) * (grm_index_from - part_keep_indices.first) / 2;
-    double *po_grm_start = grm + grm_pos_offset;
-    for (int cur_block = 0; cur_block != cur_num_block; cur_block++) {
-        cur_geno_block = cur_block * num_block_handle;
-        start_geno_block = cur_geno_block * index_keep.size();
-
-        table0 = lookup_GRM_table[cur_geno_block];
-        table1 = lookup_GRM_table[cur_geno_block + 1];
-        table2 = lookup_GRM_table[cur_geno_block + 2];
-        table3 = lookup_GRM_table[cur_geno_block + 3];
-
-        cur_geno = (uint64_t *) (geno_buf + start_geno_block);
-        cur_mask = (uint64_t *) (mask_buf + start_geno_block);
-
-        po_grm = po_grm_start;
-
-        p_geno1 = cur_geno + grm_index_from;
-        p_mask1 = cur_mask + grm_index_from;
-
-        for (int index_pair1 = grm_index_from; index_pair1 != grm_index_to + 1; index_pair1++) {
-            geno1 = *(p_geno1);
-            mask1 = *(p_mask1);
-            //Just for test
-            #ifndef NDEBUG
-            if(index_pair1 == 0){
-                fwrite(p_geno1, sizeof(uint64_t), 1, o_geno0);
-                fwrite(p_mask1, sizeof(uint64_t), 1, o_mask0);
-            }
-            #endif
-            p_geno2 = cur_geno;
-            p_mask2 = cur_mask;
-            if(mask1) {
-                for (int index_pair2 = 0; index_pair2 != index_pair1 + 1; index_pair2++) {
-                    geno = geno1 + *(p_geno2);
-                    mask = mask1 | *(p_mask2);
-
-                    geno |= mask;
-
-                    geno_p1 = (uint16_t) geno;
-                    geno_p2 = (uint16_t) (geno >> 16);
-                    geno_p3 = (uint16_t) (geno >> 32);
-                    geno_p4 = (uint16_t) (geno >> 48);
-
-                    *po_grm += table0[geno_p1] +
-                               table1[geno_p2] +
-                               table2[geno_p3] +
-                               table3[geno_p4];
-
-
-                    p_geno2++;
-                    p_mask2++;
-                    po_grm++;
-                }
-            }else{
-                for (int index_pair2 = 0; index_pair2 != index_pair1 + 1; index_pair2++) {
-                    geno = geno1 + *(p_geno2);
-
-                    geno |= *(p_mask2);
-
-                    geno_p1 = (uint16_t) geno;
-                    geno_p2 = (uint16_t) (geno >> 16);
-                    geno_p3 = (uint16_t) (geno >> 32);
-                    geno_p4 = (uint16_t) (geno >> 48);
-
-                    *po_grm += table0[geno_p1] +
-                               table1[geno_p2] +
-                               table2[geno_p3] +
-                               table3[geno_p4];
-
-                    p_geno2++;
-                    p_mask2++;
-                    po_grm++;
-                }
-            }
-
-            p_geno1++;
-            p_mask1++;
-        }
-
-    }
 }
 
 vector<uint32_t> GRM::divide_parts_mem(uint32_t n_sample, uint32_t num_parts){
@@ -2314,7 +1771,7 @@ int GRM::registerOption(map<string, vector<string>>& options_in) {
 
 }
 
-void GRM::processMakeGRM(){
+void GRM::processMakeGRM(bool is_homogametic){
     gbufitems = new GenoBufItem[nMarkerBlock];
     {
         const int markerPerN = static_cast<int>(sizeof(uintptr_t) * CHAR_BIT);
@@ -2322,14 +1779,6 @@ void GRM::processMakeGRM(){
         const int numNblockMax = (nMarkerBlock + markerPerN - 1) / markerPerN;
         sampleMissBuf.resize(static_cast<size_t>(numNSampleBlock) * markerPerN * numNblockMax);
     }
-    /*
-    uint32_t sampleCT, missPtrSize; 
-    geno->setGenoItemSize(sampleCT, missPtrSize);
-    for(int i = 0; i < nMarkerBlock; i++){
-        gbufitems[i].geno.resize(sampleCT);
-        gbufitems[i].missing.resize(missPtrSize);
-    }
-    */
     this->num_byte_geno = sizeof(double) * nMarkerBlock * stdGenoLD;
     int ret = posix_memalign((void **)&stdGeno, 64, num_byte_geno);
     if(ret != 0){
@@ -2342,12 +1791,13 @@ void GRM::processMakeGRM(){
             calculate_GRM_blas(buf, idx);
         });
     }else{
-        //callBacks.push_back(bind(&GRM::calculate_GRM, &grm, _1, _2));
         LOGGER.e(0, "the original version has been deleted. Please use GCTA >= 1.92.4");
     }
     geno->setGRMMode(true, isDominance);
     const bool isSTD = !isMtd;
-    const vector<uint32_t> processIndex = marker->get_extract_index_autosome();
+    const vector<uint32_t> processIndex = is_homogametic
+        ? marker->get_extract_index_X()
+        : marker->get_extract_index_autosome();
     sd.reserve(processIndex.size());
 
     grm_tile_budget_bytes = (options_d.count("grm_tile_budget_bytes") > 0)
@@ -2432,23 +1882,13 @@ void GRM::processMakeGRM(){
 
         // flush_grm_tile's output-formatting scratch, sized once to the final
         // (widest) tile -- tile_ranges is monotonically widening in `re`, so
-        // tile_ranges.back() is always the widest-column case. This buffer's
-        // shape (BLAS_OUT_BLOCK rows x tile_cols) doesn't depend on tile_rows,
-        // so it doesn't have the grm/N reuse problem above and can stay
-        // allocated once and reused across every flush_grm_tile call below.
+        // tile_ranges.back() is always the widest-column case.
         constexpr int BLAS_OUT_BLOCK = 1024;
         const int widest_tile_cols = tile_ranges.back().second;
-        std::vector<float> flush_w_grm(widest_tile_cols);
         std::vector<float> flush_w_N(widest_tile_cols);
         std::vector<float> flush_grm_block(static_cast<size_t>(BLAS_OUT_BLOCK) * widest_tile_cols);
         std::string flush_sparse_buf;
 
-        // sub_miss / sd / numValidMarkers / finished_marker depend only on global
-        // genotype state (all markers × all samples), not on which tile row-range is
-        // being processed.  Initialise them once here and let calculate_GRM_blas
-        // populate them on the first tile; subsequent tiles reuse the values via
-        // grm_skip_global_state so the expensive flip64+popcount work is done once.
-        // +64: false-sharing guard — see matching comment in the constructor (non-tiled path).
         sub_miss.assign(index_keep.size() + 64, 0);
         numValidMarkers = 0;
         finished_marker = 0;
@@ -2471,30 +1911,14 @@ void GRM::processMakeGRM(){
             if(posix_memalign((void**)&N, 64, tile_rect_elems * sizeof(uint32_t)) != 0)
                 LOGGER.e(0, "Can't allocate N tile buffer.");
 
-            // Trapezoid element count actually touched by this tile (see
-            // solve_tile_budget_end): [re*(re+1) - rs*(rs+1)] / 2. Reported
-            // instead of the full rows*cols rectangle so the logged size
-            // matches the RSS the budget solver now targets, not the
-            // (larger) addressable buffer footprint.
             const double drs = tile_rs, dre = tile_re;
             const size_t tile_elems = static_cast<size_t>((dre * (dre + 1.0) - drs * (drs + 1.0)) / 2.0);
             const double tile_gb    = tile_elems * 12.0 / (1024.0 * 1024.0 * 1024.0);
             LOGGER.i(0, "  Tile rows " + to_string(tile_rs) + "-" + to_string(tile_re - 1)
                         + " (" + to_string(tile_gb).substr(0, 4) + " GB grm+N)");
 
-            // grm: no memset needed. calculate_GRM_blas's first call for this tile
-            // uses beta=0 (see grm_first_accum), so cblas_dsyrk/dgemm zero-initialize
-            // exactly the elements they write -- lower triangle only for the diagonal
-            // block, full rectangle for the off-diagonal block -- instead of us
-            // blanket-zeroing the whole (grm_tile_rows x grm_tile_cols) rectangle and
-            // faulting in the diagonal block's never-read upper triangle.
             grm_first_accum = true;
 
-            // N is populated by N_thread's popcount loop, not BLAS, so it still needs
-            // explicit zeroing. But N_thread only ever writes columns [0, pair1] for
-            // row pair1 (the lower-triangle footprint of this tile's rectangle, same
-            // shape grm's diagonal block uses) -- so only zero that footprint per row
-            // instead of the full grm_tile_cols-wide rectangle.
             for(int r = 0; r < grm_tile_rows; r++){
                 const int pair1 = tile_rs + r;               // global row index
                 const int valid_cols = pair1 + 1;             // N_thread writes cols [0, pair1]
@@ -2502,10 +1926,6 @@ void GRM::processMakeGRM(){
                        static_cast<size_t>(valid_cols) * sizeof(uint32_t));
             }
 
-            // Rebuild thread pair ranges for this tile's row range [tile_rs, tile_re).
-            // N_thread and the grm accumulation buffer are both sized for this tile, so the
-            // pairs must index into the tile's local coordinate space (global indices
-            // tile_rs .. tile_re-1), not the full part_keep_indices range.
             index_grm_pairs.clear();
             vector<uint32_t> tile_parts = divide_parts(tile_rs, tile_re - 1, num_thread);
             index_grm_pairs.push_back(std::make_pair(tile_rs, tile_parts[0]));
@@ -2515,12 +1935,8 @@ void GRM::processMakeGRM(){
             const bool is_first_tile = !grm_skip_global_state;
             geno->loopDouble(processIndex, nMarkerBlock, true, true, isSTD, true, callBacks);
 
-            // After the first tile sub_miss/sd/numValidMarkers are complete.
-            // All subsequent tiles skip that work.
             grm_skip_global_state = true;
 
-            // mtd_weight depends only on sd[]/numValidMarkers, which are frozen after
-            // the first tile (see above) -- compute once here rather than every tile.
             if(is_first_tile && options_b["isMtd"]){
                 float weight = 0.0f;
                 if(!isDominance)
@@ -2531,10 +1947,8 @@ void GRM::processMakeGRM(){
             }
 
             flush_grm_tile(grm_out, N_out, thresh, isSparse, mtd_weight,
-                          flush_w_grm, flush_w_N, flush_grm_block, flush_sparse_buf);
+                           flush_w_N, flush_grm_block, flush_sparse_buf);
 
-            // Free this tile's buffers now rather than reusing them for the
-            // next tile, to keep allocation shape correct.
             posix_mem_free(grm); grm = nullptr;
             posix_mem_free(N);   N   = nullptr;
         }
@@ -2562,49 +1976,7 @@ void GRM::processMakeGRM(){
 }
 
 void GRM::processMakeGRMX(){
-    gbufitems = new GenoBufItem[nMarkerBlock];
-    {
-        const int markerPerN = static_cast<int>(sizeof(uintptr_t) * CHAR_BIT);
-        const int numNSampleBlock = (grm_n + markerPerN - 1) / markerPerN;
-        const int numNblockMax = (nMarkerBlock + markerPerN - 1) / markerPerN;
-        sampleMissBuf.resize(static_cast<size_t>(numNSampleBlock) * markerPerN * numNblockMax);
-    }
-    /*
-    uint32_t sampleCT, missPtrSize; 
-    geno->setGenoItemSize(sampleCT, missPtrSize);
-    for(int i = 0; i < nMarkerBlock; i++){
-        gbufitems[i].geno.resize(sampleCT);
-        gbufitems[i].missing.resize(missPtrSize);
-    }
-    */
-    this->num_byte_geno = sizeof(double) * nMarkerBlock * stdGenoLD;
-    int ret = posix_memalign((void **)&stdGeno, 64, num_byte_geno);
-    if(ret != 0){
-        LOGGER.e(0, "can't allocate enough memory for the genotype buffer.");
-    }
-    
-    vector<function<void (uintptr_t *, std::span<const uint32_t>)>> callBacks;
-    if(options.find("use_blas") != options.end()){
-        callBacks.push_back([this](uintptr_t *buf, std::span<const uint32_t> idx){
-            calculate_GRM_blas(buf, idx);
-        });
-    }else{
-        //callBacks.push_back(bind(&GRM::calculate_GRM, &grm, _1, _2));
-        LOGGER.e(0, "the original version has been deleted. Please use GCTA >= 1.92.4");
-    }
-    geno->setGRMMode(true, isDominance);
-    bool isSTD = true;
-    if(isMtd) isSTD = false;
-    vector<uint32_t> processIndex = marker->get_extract_index_X();
-    sd.reserve(processIndex.size());
-    LOGGER << "Computing GRM..." << std::endl;
-    geno->loopDouble(processIndex, nMarkerBlock, true, true, isSTD, true, callBacks);
-    LOGGER << numValidMarkers << " valid SNPs are included."<< std::endl;
-    deduce_GRM();
-    delete[] gbufitems;
-    posix_mem_free(stdGeno);
-    geno->setGRMMode(false, false);
-
+    processMakeGRM(true);
 }
 
 void GRM::processMain() {

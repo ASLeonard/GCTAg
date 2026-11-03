@@ -183,84 +183,14 @@ inline int gcta_dsyevr(gcta_blas_int n, double* a, gcta_blas_int lda,
 // entry points directly, matching the pattern used by gcta_dsyevr.
 #if defined(GCTA_USE_ACCELERATE)
 extern "C" {
-void sgeqrf_(const gcta_blas_int* m, const gcta_blas_int* n, float* A,
-             const gcta_blas_int* lda, float* tau, float* work,
-             const gcta_blas_int* lwork, gcta_blas_int* info);
-void sorgqr_(const gcta_blas_int* m, const gcta_blas_int* n, const gcta_blas_int* k,
-             float* A, const gcta_blas_int* lda, const float* tau,
-             float* work, const gcta_blas_int* lwork, gcta_blas_int* info);
 void dgeqrf_(const gcta_blas_int* m, const gcta_blas_int* n, double* A,
              const gcta_blas_int* lda, double* tau, double* work,
              const gcta_blas_int* lwork, gcta_blas_int* info);
 void dorgqr_(const gcta_blas_int* m, const gcta_blas_int* n, const gcta_blas_int* k,
              double* A, const gcta_blas_int* lda, const double* tau,
              double* work, const gcta_blas_int* lwork, gcta_blas_int* info);
-double dlansy_(const char* norm, const char* uplo, const gcta_blas_int* n, const double* a,
-               const gcta_blas_int* lda, double* work);
-void dpocon_(const char* uplo, const gcta_blas_int* n, const double* a, const gcta_blas_int* lda,
-             const double* anorm, double* rcond, double* work, gcta_blas_int* iwork, gcta_blas_int* info);
 }
 #endif
-
-// Portable one-norm of a symmetric matrix (only the lower triangle is
-// referenced), feeding gcta_dpocon's pre-factorization anorm argument.
-inline double gcta_dlansy_one(gcta_blas_int n, const double* a, gcta_blas_int lda) {
-#if defined(GCTA_USE_ACCELERATE)
-    char norm = '1', uplo = 'L';
-    std::vector<double> work(n);
-    return dlansy_(&norm, &uplo, &n, a, &lda, work.data());
-#else
-    return LAPACKE_dlansy(LAPACK_COL_MAJOR, '1', 'L', n, a, lda);
-#endif
-}
-
-// Reciprocal condition number estimate (DPOCON) of an SPD matrix already
-// Cholesky-factored in place (lower triangle), given its pre-factorization
-// one-norm `anorm` from gcta_dlansy_one. Returns 0 on success (rcond
-// written), non-zero LAPACK info otherwise.
-inline int gcta_dpocon(gcta_blas_int n, const double* chol_lower, gcta_blas_int lda, double anorm, double* rcond) {
-#if defined(GCTA_USE_ACCELERATE)
-    char uplo = 'L';
-    gcta_blas_int info = 0;
-    std::vector<double> work(3 * n);
-    std::vector<gcta_blas_int> iwork(n);
-    dpocon_(&uplo, &n, chol_lower, &lda, &anorm, rcond, work.data(), iwork.data(), &info);
-    return static_cast<int>(info);
-#else
-    return static_cast<int>(LAPACKE_dpocon(LAPACK_COL_MAJOR, 'L', n, chol_lower, lda, anorm, rcond));
-#endif
-}
-
-
-inline int gcta_sgeqrf(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, float* tau) {
-#if defined(GCTA_USE_ACCELERATE)
-    gcta_blas_int lwork = -1, info = 0;
-    float wkopt = 0.0f;
-    sgeqrf_(&m, &k, A, &lda, tau, &wkopt, &lwork, &info);
-    if (info != 0) return static_cast<int>(info);
-    lwork = static_cast<gcta_blas_int>(wkopt);
-    Eigen::VectorXf work(lwork);
-    sgeqrf_(&m, &k, A, &lda, tau, work.data(), &lwork, &info);
-    return static_cast<int>(info);
-#else
-    return static_cast<int>(LAPACKE_sgeqrf(LAPACK_COL_MAJOR, m, k, A, lda, tau));
-#endif
-}
-
-inline int gcta_sorgqr(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, const float* tau) {
-#if defined(GCTA_USE_ACCELERATE)
-    gcta_blas_int lwork = -1, info = 0;
-    float wkopt = 0.0f;
-    sorgqr_(&m, &k, &k, A, &lda, tau, &wkopt, &lwork, &info);
-    if (info != 0) return static_cast<int>(info);
-    lwork = static_cast<gcta_blas_int>(wkopt);
-    Eigen::VectorXf work(lwork);
-    sorgqr_(&m, &k, &k, A, &lda, tau, work.data(), &lwork, &info);
-    return static_cast<int>(info);
-#else
-    return static_cast<int>(LAPACKE_sorgqr(LAPACK_COL_MAJOR, m, k, k, A, lda, tau));
-#endif
-}
 
 // Factor A (m x k, column-major, m >= k) in place: on return, the upper
 // k x k triangle of A holds R, the rest holds Householder reflectors, and
@@ -329,20 +259,11 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* Y, 
     G.resize(k, k);
     for (int pass = 0; pass < 2; ++pass) {
         cblas_dsyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0, Y, ldY, 0.0, G.data(), k);
-        //const double anorm = (pass == 0) ? gcta_dlansy_one(k, G.data(), k) : 0.0;
         const int info = gcta_dpotrf(k, G.data(), k);
         if (info != 0) {
             if (pass != 0) break;  // pass 0's Q already orthonormal; skip the refinement.
             return gcta_qr_thin_Q(m, k, Y, ldY);
         }
-        /*
-        if (pass == 0) {
-            double rcond = 0.0;
-            gcta_dpocon(k, G.data(), k, anorm, &rcond);
-            const double kappa_Y = (rcond > 0.0) ? std::sqrt(1.0 / rcond) : std::numeric_limits<double>::infinity();
-            LOGGER.i(0, "gcta_cholesky_qr_thin_Q: k=" + std::to_string(k) + " kappa(Y)=" + std::to_string(kappa_Y));
-        }
-        */
         cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
                     m, k, 1.0, G.data(), k, Y, ldY);
     }
@@ -352,7 +273,7 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* Y, 
 // Same as gcta_cholesky_qr_thin_Q, but also returns the composed upper
 // triangular factor R (k x k, column-major, leading dimension ldR) such that
 // the original Y equals Q*R. Used by callers (Nystrom) that need R for a
-// follow-on small SVD but, unlike tall_skinny_thin_svd, can't afford an extra
+// follow-on small eigendecomposition and can't afford an extra
 // n x k copy of Y to recover it afterwards as Q^T*Y_original. Falls back to
 // gcta_qr_thin_Q's dgeqrf/dorgqr (R read off its upper triangle) if the first
 // DPOTRF fails; a rare second-pass failure just keeps the first pass's
@@ -365,7 +286,6 @@ inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, double* Y,
     G.resize(k, k);
     for (int pass = 0; pass < 2; ++pass) {
         cblas_dsyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0, Y, ldY, 0.0, G.data(), k);
-        //const double anorm = (pass == 0) ? gcta_dlansy_one(k, G.data(), k) : 0.0;
         const int info = gcta_dpotrf(k, G.data(), k);
         if (info != 0) {
             if (pass != 0) break;  // pass 0's Q/R already valid; skip the refinement.
@@ -376,14 +296,6 @@ inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, double* Y,
                        .triangularView<Eigen::Upper>();
             return gcta_dorgqr(m, k, Y, ldY, tau.data());
         }
-        /*
-        if (pass == 0) {
-            double rcond = 0.0;
-            gcta_dpocon(k, G.data(), k, anorm, &rcond);
-            const double kappa_Y = (rcond > 0.0) ? std::sqrt(1.0 / rcond) : std::numeric_limits<double>::infinity();
-            LOGGER.i(0, "gcta_cholesky_qr_thin_QR: k=" + std::to_string(k) + " kappa(Y)=" + std::to_string(kappa_Y));
-        }
-        */
         const Eigen::MatrixXd R_pass = Eigen::MatrixXd(G.triangularView<Eigen::Lower>()).transpose();
         cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
                     m, k, 1.0, G.data(), k, Y, ldY);
@@ -391,43 +303,5 @@ inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, double* Y,
     }
     return 0;
 }
-
-// Scalar-generic QR factor/form-Q, dispatched at compile time so
-// symmetric_eigendecomp.hpp doesn't need an #ifdef per call site — the
-// SVDScalar typedef there picks the specialization.
-template <typename Scalar>
-inline int gcta_geqrf(gcta_blas_int m, gcta_blas_int k, Scalar* A, gcta_blas_int lda, Scalar* tau);
-
-template <>
-inline int gcta_geqrf<double>(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_int lda, double* tau) {
-    return gcta_dgeqrf(m, k, A, lda, tau);
-}
-
-template <>
-inline int gcta_geqrf<float>(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, float* tau) {
-    return gcta_sgeqrf(m, k, A, lda, tau);
-}
-
-template <typename Scalar>
-inline int gcta_orgqr(gcta_blas_int m, gcta_blas_int k, Scalar* A, gcta_blas_int lda, const Scalar* tau);
-
-template <>
-inline int gcta_orgqr<double>(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_int lda, const double* tau) {
-    return gcta_dorgqr(m, k, A, lda, tau);
-}
-
-template <>
-inline int gcta_orgqr<float>(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, const float* tau) {
-    return gcta_sorgqr(m, k, A, lda, tau);
-}
-
-template <typename Scalar>
-inline int gcta_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, Scalar* A, gcta_blas_int lda) {
-    Eigen::Matrix<Scalar, Eigen::Dynamic, 1> tau(k);
-    int info = gcta_geqrf<Scalar>(m, k, A, lda, tau.data());
-    if (info != 0) return info;
-    return gcta_orgqr<Scalar>(m, k, A, lda, tau.data());
-}
-
 
 #endif  //END GCTA_CPU_H

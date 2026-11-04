@@ -56,7 +56,8 @@ struct RemlCtx {
     // GRM components: A[r_indx[i]] is the i-th variance component matrix.
     // For standard single-GRM REML: A = {GRM, empty} and r_indx = {0, 1}.
     // An empty matrix (size() == 0) represents the identity component (residual).
-    std::vector<RemlMat> A;
+    // Stored in float32 (matching .grm.bin's native precision, upper triangle only).
+    std::vector<Eigen::MatrixXf> A;
     std::vector<int>     r_indx;  // typically {0, 1}
     RemlMat grm_N;   // from _grm_N — used only for Woodbury MP-k M estimation
 
@@ -161,7 +162,7 @@ struct RemlCtx {
     int     woodbury_basis_rank_  = 0;     // actual rank used (<= woodbury_basis_rank or MP)
     float woodbury_basis_eigen_mass = 0.99f;    // fraction of eigenvalue mass captured by Uk
     bool woodbury_basis_eigen_adaptive = true; // true → adaptively raise k until mass target is reached rather than doubling
-    RemlMat Uk;                      // n x k leading eigenvectors of K
+    Eigen::MatrixXf Uk;              // n x k leading eigenvectors of K (float32)
     RemlVec dk;                      // k eigenvalues (clamped >= 0)
     double  lambda_tail     = 0.0;   // average bulk eigenvalue
     double  tail_d_var      = 0.0;   // var of tail eigenvalues (2nd-order logdet corr)

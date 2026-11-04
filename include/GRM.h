@@ -83,7 +83,7 @@ private:
     int num_count_handle = 2;
 
     bool bBLAS;
-    double *stdGeno = NULL;
+    float *stdGeno = NULL;
 
     void output_id();
 
@@ -114,12 +114,13 @@ private:
     int grm_n = 0;               // part_keep_indices.second + 1
     int grm_m = 0;               // part_keep_indices.second - part_keep_indices.first + 1
     int grm_s_n = 0;             // grm_n - grm_m
-    int grm_bytes_std_geno = 0;  // sizeof(double) * grm_n
-    int stdGenoLD = 0;           // leading dimension of stdGeno: grm_n rounded up to multiple of 8 (64-byte column alignment)
+    int grm_bytes_std_geno = 0;  // sizeof(float) * grm_n
+    int stdGenoLD = 0;           // leading dimension of stdGeno: grm_n rounded up to multiple of 16 (64-byte column alignment)
 
     // Pre-allocated scratch buffers reused across calculate_GRM_blas calls
     std::vector<int> validIndexBuf;
     std::vector<uintptr_t> sampleMissBuf;
+    std::vector<float> grm_f32_tile_;
 
     // Block-tiled GRM: when grm_tile_size > 0 (set via --GRM-tile-size),
     // processMakeGRM iterates over grm_tile_size-row tiles.  For each tile

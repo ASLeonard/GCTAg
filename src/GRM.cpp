@@ -932,12 +932,16 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
     grm_n = static_cast<int>(part_keep_indices.second) + 1;
     grm_m = static_cast<int>(part_keep_indices.second) - static_cast<int>(part_keep_indices.first) + 1;
     grm_s_n = grm_n - grm_m;
-    grm_bytes_std_geno = static_cast<int>(sizeof(double)) * grm_n;
-    // Round grm_n up to next multiple of 8 (64 bytes) so every column of stdGeno
+    grm_bytes_std_geno = static_cast<int>(sizeof(float)) * grm_n;
+    // Round grm_n up to next multiple of 16 (64 bytes) so every column of stdGeno
     // is 64-byte aligned. Required by single-threaded AVX/AVX-512 BLAS kernels.
-    stdGenoLD = (grm_n + 7) / 8 * 8;
+    stdGenoLD = (grm_n + 15) / 16 * 16;
     // Pre-allocate scratch buffers for calculate_GRM_blas
     validIndexBuf.reserve(nMarkerBlock);
+    {
+        const int max_tile_dim = std::min(4096, std::max(1, grm_n));
+        grm_f32_tile_.resize(static_cast<size_t>(max_tile_dim) * max_tile_dim);
+    }
     {
         const int markerPerN = static_cast<int>(sizeof(uintptr_t) * CHAR_BIT);
         const int numNSampleBlock = (grm_n + markerPerN - 1) / markerPerN;
@@ -985,7 +989,8 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     for(int i = 0; i < num_marker; i++){
         GenoBufItem &item = gbufitems[i];
         item.extractedMarkerIndex = markerIndex[i];
-        item.geno_ptr = stdGeno + static_cast<size_t>(i) * stdGenoLD;
+        item.geno_ptr = nullptr;
+        item.geno_f32_ptr = stdGeno + static_cast<size_t>(i) * stdGenoLD;
         geno->getGenoDouble(buf, i, &item);
     }
 
@@ -1017,72 +1022,119 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         }
     }
 
-    static constexpr double alpha = 1.0;
-    // beta=0 on the *first* accumulation for this grm buffer (full pass or current
-    // tile) makes cblas_dsyrk/cblas_dgemm write straight into unzeroed memory instead
-    // of accumulating, so the very first touch of every page is confined to the
-    // elements that call actually writes: the lower triangle only for *syrk, the full
-    // rectangle for *gemm. beta=1 on every later block accumulates as before. This is
-    // what lets selfadjointView-style "lower triangle only" storage translate into
-    // actual reduced peak RSS -- a blanket memset before the loop would fault in the
-    // untouched upper triangle regardless of what BLAS does afterwards.
-    const double blas_beta = grm_first_accum ? 0.0 : 1.0;
-    if(grm_tiling_enabled){
-        // Block-tiled path: split into off-diagonal dgemm + diagonal dsyrk.
-        //
-        // grm buffer is column-major (grm_tile_rows × grm_tile_cols):
-        //   cols [0, tile_rs)    — off-diagonal, filled by dgemm
-        //   cols [tile_rs, tile_re) — diagonal block (lower triangle), filled by dsyrk
-        //
-        // A_tile = stdGeno[tile_rs : tile_re, :] — (tile_rows × k), stored column-major
-        // with leading dimension stdGenoLD.
+    // Mixed-precision BLAS3: run cblas_ssyrk / cblas_sgemm (beta=0.0f) on L3-sized
+    // 4096x4096 float32 tiles (grm_f32_tile_), then widen and accumulate into
+    // double* grm. On the first accumulation for this grm buffer (grm_first_accum),
+    // write directly to unzeroed memory instead of accumulating so untouched upper-
+    // triangle pages of grm stay unfaulted in physical RAM.
+    constexpr int kTile = 4096;
+    const bool first_accum = grm_first_accum;
 
-        // Off-diagonal block: only present when tile starts after column 0.
-        // C(tile_rows x tile_rs) := alpha * A_tile * A_top^T + beta * C
-        if(grm_tile_rs > 0){
-            cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans,
-                        grm_tile_rows, grm_tile_rs, curNumValidMarkers,
-                        alpha,
-                        stdGeno + grm_tile_rs, stdGenoLD,
-                        stdGeno, stdGenoLD,
-                        blas_beta,
-                        grm, grm_tile_rows);
+    auto accum_sgemm_to_f64 = [&](int M, int N_cols, int K,
+                                  const float* A, int lda,
+                                  const float* B, int ldb,
+                                  double* C, int ldc) {
+        for (int c0 = 0; c0 < N_cols; c0 += kTile) {
+            const int cols = std::min(kTile, N_cols - c0);
+            for (int r0 = 0; r0 < M; r0 += kTile) {
+                const int rows = std::min(kTile, M - r0);
+                if (K > 0) {
+                    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasTrans,
+                                rows, cols, K,
+                                1.0f,
+                                A + r0, lda,
+                                B + c0, ldb,
+                                0.0f,
+                                grm_f32_tile_.data(), rows);
+                }
+                #pragma omp parallel for schedule(static)
+                for (int c = 0; c < cols; ++c) {
+                    double* dst_col = C + r0 + static_cast<size_t>(c0 + c) * ldc;
+                    if (K == 0) {
+                        if (first_accum)
+                            std::memset(dst_col, 0, static_cast<size_t>(rows) * sizeof(double));
+                        continue;
+                    }
+                    const float* src_col = grm_f32_tile_.data() + static_cast<size_t>(c) * rows;
+                    if (first_accum) {
+                        for (int r = 0; r < rows; ++r)
+                            dst_col[r] = static_cast<double>(src_col[r]);
+                    } else {
+                        for (int r = 0; r < rows; ++r)
+                            dst_col[r] += static_cast<double>(src_col[r]);
+                    }
+                }
+            }
         }
+    };
 
-        // Diagonal block (dsyrk — ~2× fewer flops than equivalent dgemm).
-        // Only the lower triangle is written; flush_grm_tile only reads pair2 <= pair1.
+    auto accum_ssyrk_lower_to_f64 = [&](int N_dim, int K,
+                                        const float* A, int lda,
+                                        double* C, int ldc) {
+        for (int c0 = 0; c0 < N_dim; c0 += kTile) {
+            const int cols = std::min(kTile, N_dim - c0);
+            if (K > 0) {
+                cblas_ssyrk(CblasColMajor, CblasLower, CblasNoTrans,
+                            cols, K,
+                            1.0f,
+                            A + c0, lda,
+                            0.0f,
+                            grm_f32_tile_.data(), cols);
+            }
+            #pragma omp parallel for schedule(guided)
+            for (int c = 0; c < cols; ++c) {
+                double* dst_col = C + (c0 + c) + static_cast<size_t>(c0 + c) * ldc;
+                const int len = cols - c;
+                if (K == 0) {
+                    if (first_accum)
+                        std::memset(dst_col, 0, static_cast<size_t>(len) * sizeof(double));
+                    continue;
+                }
+                const float* src_col = grm_f32_tile_.data() + c + static_cast<size_t>(c) * cols;
+                if (first_accum) {
+                    for (int r = 0; r < len; ++r)
+                        dst_col[r] = static_cast<double>(src_col[r]);
+                } else {
+                    for (int r = 0; r < len; ++r)
+                        dst_col[r] += static_cast<double>(src_col[r]);
+                }
+            }
+            const int rem_rows = N_dim - (c0 + cols);
+            if (rem_rows > 0) {
+                accum_sgemm_to_f64(rem_rows, cols, K,
+                                   A + c0 + cols, lda,
+                                   A + c0, lda,
+                                   C + (c0 + cols) + static_cast<size_t>(c0) * ldc, ldc);
+            }
+        }
+    };
+
+    if(grm_tiling_enabled){
+        if(grm_tile_rs > 0){
+            accum_sgemm_to_f64(grm_tile_rows, grm_tile_rs, curNumValidMarkers,
+                               stdGeno + grm_tile_rs, stdGenoLD,
+                               stdGeno, stdGenoLD,
+                               grm, grm_tile_rows);
+        }
         double *grm_diag = grm + static_cast<size_t>(grm_tile_rs) * grm_tile_rows;
-        cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans,
-                    grm_tile_rows, curNumValidMarkers,
-                    alpha,
-                    stdGeno + grm_tile_rs, stdGenoLD,
-                    blas_beta,
-                    grm_diag, grm_tile_rows);
+        accum_ssyrk_lower_to_f64(grm_tile_rows, curNumValidMarkers,
+                                 stdGeno + grm_tile_rs, stdGenoLD,
+                                 grm_diag, grm_tile_rows);
     } else if(part_keep_indices.first == 0){
-        cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans,
-                    grm_n, curNumValidMarkers,
-                    alpha,
-                    stdGeno, stdGenoLD,
-                    blas_beta,
-                    grm, grm_n);
+        accum_ssyrk_lower_to_f64(grm_n, curNumValidMarkers,
+                                 stdGeno, stdGenoLD,
+                                 grm, grm_n);
     }else{
-        // C(grm_m x grm_s_n) := alpha * A_bot * A_top^T + beta * C
-        cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans,
-                    grm_m, grm_s_n, curNumValidMarkers,
-                    alpha,
-                    stdGeno + part_keep_indices.first, stdGenoLD,
-                    stdGeno, stdGenoLD,
-                    blas_beta,
-                    grm, grm_m);
+        accum_sgemm_to_f64(grm_m, grm_s_n, curNumValidMarkers,
+                           stdGeno + part_keep_indices.first, stdGenoLD,
+                           stdGeno, stdGenoLD,
+                           grm, grm_m);
         double *grm_start = grm + (uint64_t)grm_s_n * grm_m;
-        cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans,
-                    grm_m, curNumValidMarkers,
-                    alpha,
-                    stdGeno + part_keep_indices.first, stdGenoLD,
-                    blas_beta,
-                    grm_start, grm_m);
+        accum_ssyrk_lower_to_f64(grm_m, curNumValidMarkers,
+                                 stdGeno + part_keep_indices.first, stdGenoLD,
+                                 grm_start, grm_m);
     }
-    grm_first_accum = false;  // every later marker block for this buffer accumulates (beta=1)
+    grm_first_accum = false;  // every later marker block for this buffer accumulates
 
     const int markerPerN = sizeof(uintptr_t) * CHAR_BIT;
     const int numNblock = (curNumValidMarkers + markerPerN - 1) / markerPerN;
@@ -1779,7 +1831,7 @@ void GRM::processMakeGRM(bool is_homogametic){
         const int numNblockMax = (nMarkerBlock + markerPerN - 1) / markerPerN;
         sampleMissBuf.resize(static_cast<size_t>(numNSampleBlock) * markerPerN * numNblockMax);
     }
-    this->num_byte_geno = sizeof(double) * nMarkerBlock * stdGenoLD;
+    this->num_byte_geno = sizeof(float) * nMarkerBlock * stdGenoLD;
     int ret = posix_memalign((void **)&stdGeno, 64, num_byte_geno);
     if(ret != 0){
         LOGGER.e(0, "can't allocate enough memory for the genotype buffer.");

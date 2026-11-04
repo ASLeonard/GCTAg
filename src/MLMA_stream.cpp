@@ -403,7 +403,7 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
         #pragma omp parallel for schedule(static)
         for (int32_t i = 0; i < ctx.n; ++i) {
             for (int32_t j = 0; j < k; ++j)
-                Uk_f(j, i) = static_cast<float>(ctx.Uk(i, j));
+                Uk_f(j, i) = ctx.Uk(i, j);
         }
         ctx.Uk.resize(0, 0);
         write_exact(fd, Uk_f.data(), static_cast<size_t>(ctx.n) * k * sizeof(float), filename);
@@ -566,12 +566,12 @@ void load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ctx, uint64_t
     read_exact(fd, dk_f.data(), dk_bytes, filename);
     close(fd);
 
-    // k x n float -> n x k double; parallel over samples (contiguous reads).
+    // k x n float -> n x k float; parallel over samples (contiguous reads).
     ctx.Uk.resize(ctx.n, k);
     #pragma omp parallel for schedule(static)
     for (int32_t i = 0; i < ctx.n; ++i)
         for (int32_t j = 0; j < k; ++j)
-            ctx.Uk(i, j) = static_cast<double>(Uk_f(j, i));
+            ctx.Uk(i, j) = Uk_f(j, i);
     Uk_f.resize(0, 0);
 
     ctx.dk                       = dk_f.cast<double>();
@@ -635,14 +635,14 @@ void write_hsq_from_ctx(const string& out_prefix, const RemlCtx& ctx)
 // individual's eigenvector — worse than no warm start at all — so any
 // mismatch between the file's sample set and the current analysis sample
 // set is a hard error, not a fallback.
-Eigen::MatrixXd load_pca_warm_start(const string& eigenvec_prefix,
+Eigen::MatrixXf load_pca_warm_start(const string& eigenvec_prefix,
                                      const vector<string>& analysis_ids)
 {
     const string path = eigenvec_prefix + ".eigenvec";
     std::ifstream in(path);
     if (!in) LOGGER.e(0, "--reml-woodbury-basis-warm-start: cannot open [" + path + "].");
 
-    std::unordered_map<string, vector<double>> by_id;
+    std::unordered_map<string, vector<float>> by_id;
     by_id.reserve(analysis_ids.size() * 2);
 
     string line, fid, iid;
@@ -652,8 +652,8 @@ Eigen::MatrixXd load_pca_warm_start(const string& eigenvec_prefix,
         std::istringstream ss(line);
         if (!(ss >> fid >> iid))
             LOGGER.e(0, "--reml-woodbury-basis-warm-start: malformed line in [" + path + "].");
-        vector<double> pcs;
-        double v;
+        vector<float> pcs;
+        float v;
         while (ss >> v) pcs.push_back(v);
         if (k < 0) k = static_cast<int>(pcs.size());
         else if (static_cast<int>(pcs.size()) != k)
@@ -664,7 +664,7 @@ Eigen::MatrixXd load_pca_warm_start(const string& eigenvec_prefix,
         LOGGER.e(0, "--reml-woodbury-basis-warm-start: no eigenvectors read from [" + path + "].");
 
     const int n = static_cast<int>(analysis_ids.size());
-    Eigen::MatrixXd Uk(n, k);
+    Eigen::MatrixXf Uk(n, k);
     for (int i = 0; i < n; ++i) {
         const auto it = by_id.find(analysis_ids[i]);
         if (it == by_id.end())
@@ -1229,7 +1229,7 @@ void MLMA::processMain()
                             "--reml-trace-hutchpp is ignored.");
 
             int grm_chunk_rows = 0;
-            Eigen::MatrixXd G_n;      // left empty when grm_chunked
+            Eigen::MatrixXf G_n;      // left empty when grm_chunked
             double m_all = options_d["woodbury_basis_rank"] == -1 ? 0.0 : -1.0;  // only populated when dense GRM and Woodbury-MP mode is selected
             gcta_grm_io::ChunkedGrmHandle chunked_grm;  // only populated when grm_chunked
 

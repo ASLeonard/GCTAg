@@ -31,6 +31,9 @@
 #elif defined(GCTA_USE_AOCL)
   #include <cblas.h>
   #include <lapacke.h>
+  #if __has_include(<blis.h>)
+    #include <blis.h>
+  #endif
   typedef lapack_int gcta_blas_int;
 
 #elif defined(GCTA_USE_ACCELERATE)
@@ -401,6 +404,128 @@ inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, float* Y, 
         Rmat = (pass == 0) ? R_pass : Eigen::MatrixXd(R_pass * Rmat);
     }
     return 0;
+}
+
+// Compute C(rows x cols, column-major, leading dim ldc) = A(rows x K, lda) * B(cols x K, ldb)^T
+// where A and B are column-major int8_t matrices in {0, 1, 2} and C is a column-major int32_t matrix.
+// On AOCL with BLIS_ENABLE_ADDON_AOCL_GEMM, dispatches directly to Zen 4 AVX-512 VNNI
+// aocl_gemm_s8s8s32os32 via row-major transpose equivalence:
+//   C_colmajor(rows x cols, ldc) == C_rowmajor(cols x rows, ldc) = B_rowmajor^T(cols x K) * A_rowmajor(K x rows).
+// On other BLAS backends (where K <= 1024 and A, B in {0, 1, 2} so every dot product is <= 4096,
+// well below float32's exact integer limit 2^24 = 16,777,216), converts the tile panels A and B
+// to float32 scratch buffers and runs cblas_sgemm, yielding the exact same int32_t integers.
+inline void gcta_gemm_s8s8s32_colmajor_nt(
+    gcta_blas_int rows, gcta_blas_int cols, gcta_blas_int K,
+    const int8_t* A, gcta_blas_int lda,
+    const int8_t* B, gcta_blas_int ldb,
+    int32_t* C, gcta_blas_int ldc,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_B_f32,
+    std::vector<float>& scratch_C_f32)
+{
+    if (rows <= 0 || cols <= 0 || K <= 0) return;
+#if defined(GCTA_USE_AOCL) && defined(BLIS_ENABLE_ADDON_AOCL_GEMM)
+    (void)scratch_A_f32;
+    (void)scratch_B_f32;
+    (void)scratch_C_f32;
+    aocl_gemm_s8s8s32os32('r', 't', 'n',
+                          cols, rows, K,
+                          1,
+                          B, ldb, 'n',
+                          A, lda, 'n',
+                          0,
+                          C, ldc,
+                          nullptr);
+#else
+    const size_t size_A = static_cast<size_t>(rows) * static_cast<size_t>(K);
+    if (scratch_A_f32.size() < size_A) scratch_A_f32.resize(size_A);
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int k = 0; k < K; ++k) {
+        const int8_t* src = A + static_cast<size_t>(k) * lda;
+        float* dst = scratch_A_f32.data() + static_cast<size_t>(k) * rows;
+        for (gcta_blas_int r = 0; r < rows; ++r) {
+            dst[r] = static_cast<float>(src[r]);
+        }
+    }
+    const size_t size_B = static_cast<size_t>(cols) * static_cast<size_t>(K);
+    if (scratch_B_f32.size() < size_B) scratch_B_f32.resize(size_B);
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int k = 0; k < K; ++k) {
+        const int8_t* src = B + static_cast<size_t>(k) * ldb;
+        float* dst = scratch_B_f32.data() + static_cast<size_t>(k) * cols;
+        for (gcta_blas_int c = 0; c < cols; ++c) {
+            dst[c] = static_cast<float>(src[c]);
+        }
+    }
+    const size_t size_C = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+    if (scratch_C_f32.size() < size_C) scratch_C_f32.resize(size_C);
+    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasTrans,
+                rows, cols, K,
+                1.0f,
+                scratch_A_f32.data(), rows,
+                scratch_B_f32.data(), cols,
+                0.0f,
+                scratch_C_f32.data(), rows);
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int c = 0; c < cols; ++c) {
+        const float* src = scratch_C_f32.data() + static_cast<size_t>(c) * rows;
+        int32_t* dst = C + static_cast<size_t>(c) * ldc;
+        for (gcta_blas_int r = 0; r < rows; ++r) {
+            dst[r] = static_cast<int32_t>(src[r]);
+        }
+    }
+#endif
+}
+
+// Compute the lower triangle of C(cols x cols, column-major, leading dim ldc) = A(cols x K, lda) * A(cols x K, lda)^T.
+inline void gcta_syrk_s8s8s32_lower_colmajor_nt(
+    gcta_blas_int cols, gcta_blas_int K,
+    const int8_t* A, gcta_blas_int lda,
+    int32_t* C, gcta_blas_int ldc,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_C_f32)
+{
+    if (cols <= 0 || K <= 0) return;
+#if defined(GCTA_USE_AOCL) && defined(BLIS_ENABLE_ADDON_AOCL_GEMM)
+    (void)scratch_A_f32;
+    (void)scratch_C_f32;
+    aocl_gemm_s8s8s32os32('r', 't', 'n',
+                          cols, cols, K,
+                          1,
+                          A, lda, 'n',
+                          A, lda, 'n',
+                          0,
+                          C, ldc,
+                          nullptr);
+#else
+    const size_t size_A = static_cast<size_t>(cols) * static_cast<size_t>(K);
+    if (scratch_A_f32.size() < size_A) scratch_A_f32.resize(size_A);
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int k = 0; k < K; ++k) {
+        const int8_t* src = A + static_cast<size_t>(k) * lda;
+        float* dst = scratch_A_f32.data() + static_cast<size_t>(k) * cols;
+        for (gcta_blas_int r = 0; r < cols; ++r) {
+            dst[r] = static_cast<float>(src[r]);
+        }
+    }
+    const size_t size_C = static_cast<size_t>(cols) * static_cast<size_t>(cols);
+    if (scratch_C_f32.size() < size_C) scratch_C_f32.resize(size_C);
+    cblas_ssyrk(CblasColMajor, CblasLower, CblasNoTrans,
+                cols, K,
+                1.0f,
+                scratch_A_f32.data(), cols,
+                0.0f,
+                scratch_C_f32.data(), cols);
+    #pragma omp parallel for schedule(guided)
+    for (gcta_blas_int c = 0; c < cols; ++c) {
+        const float* src = scratch_C_f32.data() + c + static_cast<size_t>(c) * cols;
+        int32_t* dst = C + c + static_cast<size_t>(c) * ldc;
+        const gcta_blas_int len = cols - c;
+        for (gcta_blas_int r = 0; r < len; ++r) {
+            dst[r] = static_cast<int32_t>(src[r]);
+        }
+    }
+#endif
 }
 
 #endif  //END GCTA_CPU_H

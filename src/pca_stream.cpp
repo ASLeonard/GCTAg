@@ -119,6 +119,10 @@ int PCAStream::registerOption(map<string, vector<string>>& options_in)
             LOGGER.w(0, "--svd-power-iter expects exactly one value; using the first one.");
         options_in.erase("--svd-power-iter");
     }
+    if (options_in.find("--seed") != options_in.end() && !options_in["--seed"].empty()) {
+        options_d["seed"] = std::stod(options_in["--seed"][0]);
+        options_in.erase("--seed");
+    }
 
     processFunctions.push_back("PCAStream");
     options_in.erase("--pca");
@@ -133,6 +137,12 @@ void PCAStream::processMain()
         const string grm_pfx    = options.at("grm");
         const string out_prefix = options.at("out");
         string pca_approx = options.count("pca_approx") ? options.at("pca_approx") : string();
+
+        if (options_d.count("seed")) {
+            const auto seed = static_cast<std::mt19937::result_type>(options_d.at("seed"));
+            gcta_eigh::shared_rng().seed(seed);
+            LOGGER.i(0, "Using random seed: " + to_string(seed) + ".");
+        }
 
         // ---- Sample set: full GRM ID list, optionally filtered by --keep/--remove ----
         const vector<string> grm_ids = Pheno::read_sublist(grm_pfx + ".grm.id");
@@ -197,7 +207,8 @@ void PCAStream::processMain()
             // work is cheap (ID matching + one N-mean read, no tile reads
             // yet) but it's a real behavior change worth knowing about.
             chunked_handle = gcta_grm_io::make_chunked_grm_reader(
-                grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--pca");
+                grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--pca",
+                /*need_m_snps=*/false);
             chunk_size = chunked_handle.chunk_rows;
             if (chunk_size >= n) {
                 // The whole GRM fits in a single block: chunking then buys nothing
@@ -217,6 +228,7 @@ void PCAStream::processMain()
 
         // ---- GRM access: chunked tile reader, or dense (fallback / comparison) ----
         gcta_chunked::TileReader chunked_reader;
+        gcta_chunked::TileReaderF32 chunked_reader_f32;
         Eigen::MatrixXd G_dense;      // populated only for exact mode (!grm_chunked && pca_approx.empty())
         Eigen::MatrixXf G_dense_f32;  // populated for --pca-approx when !grm_chunked
 
@@ -224,6 +236,7 @@ void PCAStream::processMain()
             // make_chunked_grm_reader already logged the budget/chunk_size
             // split above; nothing further to log here.
             chunked_reader = std::move(chunked_handle.reader);
+            chunked_reader_f32 = std::move(chunked_handle.reader_f32);
         } else if (!pca_approx.empty()) {
             double m_snps_unused = -1.0;
             gcta_grm_io::load_and_subset_grm_upper(
@@ -234,12 +247,32 @@ void PCAStream::processMain()
                 grm_pfx, analysis_ids, G_dense, m_snps_unused, "--pca");
         }
 
+        double trace_total = 0.0;
+        bool have_trace_total = false;
+        if (!grm_chunked) {
+            if (G_dense_f32.size() > 0) trace_total = G_dense_f32.diagonal().cast<double>().sum();
+            else if (G_dense.size() > 0) trace_total = G_dense.diagonal().sum();
+            have_trace_total = true;
+            LOGGER.i(0, "Total variance (tr(G)) = " + to_string(trace_total));
+        } else if (pca_approx != "rSVD") {
+            trace_total = gcta_chunked::chunked_diagonal(chunked_reader, n, chunk_size).sum();
+            have_trace_total = true;
+            LOGGER.i(0, "Total variance (tr(G)) = " + to_string(trace_total));
+        }
+
         auto apply_f32 = [&](const Eigen::Ref<const Eigen::MatrixXf>& X) -> Eigen::MatrixXf {
-            if (grm_chunked)
-                return gcta_chunked::chunked_symmetric_matvec(
-                    chunked_reader, n, chunk_size, X.cast<double>()).cast<float>();
-            else
+            if (grm_chunked) {
+                double* tr_ptr = have_trace_total ? nullptr : &trace_total;
+                Eigen::MatrixXf Y = gcta_chunked::chunked_symmetric_matvec_f32(
+                    chunked_reader_f32, n, chunk_size, X, tr_ptr);
+                if (!have_trace_total) {
+                    have_trace_total = true;
+                    LOGGER.i(0, "Total variance (tr(G)) = " + to_string(trace_total));
+                }
+                return Y;
+            } else {
                 return G_dense_f32.selfadjointView<Eigen::Upper>() * X;
+            }
         };
 
         auto apply_f64 = [&](const Eigen::Ref<const Eigen::VectorXd>& x) -> Eigen::VectorXd {
@@ -248,19 +281,6 @@ void PCAStream::processMain()
             else
                 return (G_dense_f32.selfadjointView<Eigen::Upper>() * x.cast<float>()).cast<double>();
         };
-
-        // Capture the full trace once here so that a partial spectrum can still be
-        // reported as a proportion of total variance, rather than as if it were the
-        // full sum of eigenvalues. For chunked execution we intentionally read only
-        // the diagonal tiles, not the full matrix.
-        // The GRM can be overwritten in place, so we must compute the trace first.
-        const double trace_total = [&]() {
-            if (grm_chunked) return gcta_chunked::chunked_diagonal(chunked_reader, n, chunk_size).sum();
-            if (G_dense_f32.size() > 0) return G_dense_f32.diagonal().cast<double>().sum();
-            if (G_dense.size() > 0) return G_dense.diagonal().sum();
-            return 0.0;
-        }();
-        LOGGER.i(0, "Total variance (tr(G)) = " + to_string(trace_total));
 
         Eigen::VectorXd eval;
         Eigen::MatrixXd evec;
@@ -342,6 +362,7 @@ void PCAStream::processMain()
         // writes below, rather than sitting at peak size through them.
         if (!used_dsyevd) G_dense.resize(0, 0);
         chunked_reader = nullptr;
+        chunked_reader_f32 = nullptr;
 
         // ---- Write .eigenval / .eigenvec — identical format to gcta::pca()'s writer ----
         auto append_double = [](string &buf, double v) {

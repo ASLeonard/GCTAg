@@ -50,6 +50,7 @@ namespace gcta_chunked {
 // at the memory budgets this is sized against.
 
 using TileReader = std::function<Eigen::Ref<const Eigen::MatrixXd>(int rs, int re, int cs, int ce)>;
+using TileReaderF32 = std::function<Eigen::Ref<const Eigen::MatrixXf>(int rs, int re, int cs, int ce)>;
 
 struct BlockPartition {
     std::vector<int> starts;  // starts[i]..starts[i+1) is block i; starts.back() == n
@@ -173,6 +174,69 @@ inline Eigen::MatrixXd chunked_symmetric_matvec(
             }
         }
     }
+    return Y;
+}
+
+// Single-precision counterpart to chunked_symmetric_matvec: keeps the tile and
+// output accumulator Y in native float32 (matching the on-disk .grm.bin precision
+// and the in-memory K_f32 rSVD matvec path) without widening tiles or X to double.
+// When trace_K_out and/or trace_K2_out are non-null, accumulates trace(K) and
+// trace(K^2) in double during the same single-pass tile sweep, eliminating
+// separate full-file pre-scans of .grm.bin on network filesystems (e.g. Lustre).
+inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
+    const TileReaderF32& read_tile,
+    int n,
+    int block_size,
+    const Eigen::Ref<const Eigen::MatrixXf>& X,
+    double* trace_K_out = nullptr,
+    double* trace_K2_out = nullptr)
+{
+    const BlockPartition part(n, block_size);
+    const int m = part.num_blocks();
+
+    Eigen::MatrixXf Y = Eigen::MatrixXf::Zero(n, X.cols());
+    const bool want_tr  = (trace_K_out != nullptr);
+    const bool want_tr2 = (trace_K2_out != nullptr);
+    double tr_K  = 0.0;
+    double tr_K2 = 0.0;
+
+    for (int i = 0; i < m; ++i) {
+        const int rs = part.block_start(i), re = part.block_end(i);
+        const int rows_i = re - rs;
+
+        for (int j = 0; j <= i; ++j) {
+            const int cs = part.block_start(j), ce = part.block_end(j);
+            auto tile = read_tile(rs, re, cs, ce);  // (re-rs) x (ce-cs) float32 view; consumed before next call
+
+            if (i == j) {
+                if (want_tr) {
+                    tr_K += tile.diagonal().cast<double>().sum();
+                }
+                if (want_tr2) {
+                    double lower_incl_diag_sq = 0.0;
+                    #pragma omp parallel for reduction(+:lower_incl_diag_sq) schedule(dynamic, 64)
+                    for (int c = 0; c < tile.cols(); ++c)
+                        lower_incl_diag_sq += tile.col(c).tail(tile.rows() - c).cast<double>().squaredNorm();
+                    const double diag_sq = tile.diagonal().cast<double>().squaredNorm();
+                    tr_K2 += 2.0 * lower_incl_diag_sq - diag_sq;
+                }
+                Y.middleRows(rs, rows_i).noalias() +=
+                    tile.selfadjointView<Eigen::Lower>() * X.middleRows(rs, rows_i);
+            } else {
+                if (want_tr2) {
+                    double off_sq = 0.0;
+                    #pragma omp parallel for reduction(+:off_sq) schedule(static)
+                    for (int c = 0; c < tile.cols(); ++c)
+                        off_sq += tile.col(c).cast<double>().squaredNorm();
+                    tr_K2 += 2.0 * off_sq;
+                }
+                Y.middleRows(rs, rows_i).noalias() += tile * X.middleRows(cs, ce - cs);
+                Y.middleRows(cs, ce - cs).noalias() += tile.transpose() * X.middleRows(rs, rows_i);
+            }
+        }
+    }
+    if (trace_K_out)  *trace_K_out  = tr_K;
+    if (trace_K2_out) *trace_K2_out = tr_K2;
     return Y;
 }
 

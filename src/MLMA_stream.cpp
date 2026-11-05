@@ -697,6 +697,11 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
                                   && !options_in["--load-reml"].empty();
     // --save-reml is a boolean flag (no argument): the REML state is always
     // written to "<out>.reml". Any value accidentally supplied is ignored.
+    if (options_in.find("--reml-woodbury-basis-reuse") != options_in.end()
+            && options_in.find("--reml-woodbury-reuse") == options_in.end()) {
+        options_in["--reml-woodbury-reuse"] = std::move(options_in["--reml-woodbury-basis-reuse"]);
+        options_in.erase("--reml-woodbury-basis-reuse");
+    }
     const bool has_save_reml   = options_in.find("--save-reml")   != options_in.end();
     const bool has_reuse       = options_in.find("--reml-woodbury-reuse") != options_in.end();
 
@@ -1230,12 +1235,13 @@ void MLMA::processMain()
 
             int grm_chunk_rows = 0;
             Eigen::MatrixXf G_n;      // left empty when grm_chunked
-            double m_all = options_d["woodbury_basis_rank"] == -1 ? 0.0 : -1.0;  // only populated when dense GRM and Woodbury-MP mode is selected
+            double m_all = (woodbury_basis_rank == -1) ? 0.0 : -1.0;  // only populated when Woodbury-MP mode is selected
             gcta_grm_io::ChunkedGrmHandle chunked_grm;  // only populated when grm_chunked
 
             if (grm_chunked) {
                 chunked_grm = gcta_grm_io::make_chunked_grm_reader(
-                    grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget");
+                    grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget",
+                    /*need_m_snps=*/(woodbury_basis_rank == -1));
                 grm_chunk_rows = chunked_grm.chunk_rows;
                 m_all = chunked_grm.m_snps;
                 if (grm_chunk_rows >= n) {
@@ -1247,7 +1253,9 @@ void MLMA::processMain()
                 }
             }
             if (!grm_chunked && !reuse_basis) {
-                load_and_subset_grm_upper(grm_pfx, analysis_ids, G_n, m_all, "--mlma");
+                double m_all_load = (m_all > 0.0) ? -1.0 : m_all;
+                load_and_subset_grm_upper(grm_pfx, analysis_ids, G_n, m_all_load, "--mlma");
+                if (m_all <= 0.0) m_all = m_all_load;
             }
 
 
@@ -1275,6 +1283,7 @@ void MLMA::processMain()
                 // without a reader.
                 ctx.grm_chunk_rows_from_budget = chunked_grm.chunk_rows;
                 ctx.grm_tile_reader = std::move(chunked_grm.reader);
+                ctx.grm_tile_reader_f32 = std::move(chunked_grm.reader_f32);
             } else {
                 ctx.A[0] = std::move(G_n);
             }

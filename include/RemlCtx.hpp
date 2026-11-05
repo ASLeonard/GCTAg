@@ -72,7 +72,8 @@ struct RemlCtx {
     // float32-on-disk should be widened to double at the tile level, not for
     // the whole file up front).
     double                      grm_chunked_budget = 0.0;  // GB budget for streaming chunk rows, off by default
-    gcta_chunked::TileReader grm_tile_reader;               // caller-populated when chunked
+    gcta_chunked::TileReader    grm_tile_reader;           // caller-populated when chunked (double tiles)
+    gcta_chunked::TileReaderF32 grm_tile_reader_f32;       // caller-populated when chunked (float32 tiles for rSVD)
     int grm_chunk_rows_from_budget = 0;
 
     // Set once, in reml::compute(), before the AI-REML/EM-REML loop begins,

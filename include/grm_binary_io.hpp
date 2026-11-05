@@ -442,8 +442,56 @@ public:
         return tile;
     }
 
+    // Native float32 counterpart to read_tile: avoids widening .grm.bin's float32
+    // entries to double when the consumer (e.g. chunked_symmetric_matvec_f32 for
+    // Woodbury basis rSVD or --pca-approx rSVD) runs in float32.
+    Eigen::Ref<const Eigen::MatrixXf> read_tile_f32(int rs, int re, int cs, int ce) const {
+        const int tile_rows = re - rs, tile_cols = ce - cs;
+        if (tile_scratch_f32_.rows() < tile_rows || tile_scratch_f32_.cols() < tile_cols) {
+            tile_scratch_f32_.resize(std::max<Eigen::Index>(tile_scratch_f32_.rows(), tile_rows),
+                                     std::max<Eigen::Index>(tile_scratch_f32_.cols(), tile_cols));
+        }
+        auto tile = tile_scratch_f32_.topLeftCorner(tile_rows, tile_cols);
+        const bool diagonal_tile = (rs == cs);
+
+        ensure_band(kp_[rs], kp_[re - 1] + 1);
+
+        const float* buf = band_buf_.data();
+        const size_t band_elem_lo = static_cast<size_t>(band_lo_) * (band_lo_ + 1) / 2;
+
+        if (kp_is_identity_) {
+            #pragma omp parallel for schedule(dynamic, 64)
+            for (int lp = 0; lp < tile_rows; ++lp) {
+                const int gi = rs + lp;
+                const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
+                if (lq_end == 0) continue;
+                const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2 - band_elem_lo;
+                const float* row_span = buf + row_base + cs;
+                tile.row(lp).head(lq_end) =
+                    Eigen::Map<const Eigen::RowVectorXf>(row_span, lq_end);
+            }
+            return tile;
+        }
+
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (int lp = 0; lp < tile_rows; ++lp) {
+            const int gi = kp_[rs + lp];
+            const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
+            if (lq_end == 0) continue;
+            const int gj_lo = kp_[cs];
+            const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2 - band_elem_lo;
+            const float* row_span = buf + row_base + gj_lo;
+            for (int lq = 0; lq < lq_end; ++lq) {
+                const int gj = kp_[cs + lq];
+                tile(lp, lq) = row_span[gj - gj_lo];
+            }
+        }
+        return tile;
+    }
+
 private:
     mutable Eigen::MatrixXd tile_scratch_;
+    mutable Eigen::MatrixXf tile_scratch_f32_;
 
     // [band_lo_, band_hi_) = file-row range currently resident in
     // band_buf_. The packed layout has row_base(i+1) == row_base(i) + (i+1),
@@ -571,6 +619,7 @@ inline double chunked_reader_reserved_gb(double total_budget_gb) {
 
 struct ChunkedGrmHandle {
     gcta_chunked::TileReader reader;
+    gcta_chunked::TileReaderF32 reader_f32;
     std::shared_ptr<const ChunkedGrmReader> file;
     double m_snps = 0.0;
     int chunk_rows = 0;   // block_size for chunked_symmetric_matvec/diagonal/trace_K_squared,
@@ -602,7 +651,8 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
     const std::vector<std::string>& analysis_ids,
     double budget_gb,
     int k_ext = 0,
-    const std::string& feature_flag = "--grm-chunked-budget")
+    const std::string& feature_flag = "--grm-chunked-budget",
+    bool need_m_snps = true)
 {
     const std::vector<std::string> grm_ids = Pheno::read_sublist(prefix + ".grm.id");
     const int n_grm = static_cast<int>(grm_ids.size());
@@ -633,12 +683,20 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
 
     ChunkedGrmHandle handle;
     handle.chunk_rows = chunk_rows;
-    handle.m_snps = read_grm_N_mean(prefix, n_grm);
+    if (need_m_snps) {
+        handle.m_snps = read_grm_N_mean(prefix, n_grm);
+    } else {
+        LOGGER.i(0, "Skipping SNP count read from .grm.N.bin.");
+        handle.m_snps = -1.0;
+    }
     auto file = std::make_shared<ChunkedGrmReader>(prefix + ".grm.bin", std::move(kp), n_grm,
                                                     static_cast<size_t>(reader_reserved_gb * 1e9));
     handle.file = file;
     handle.reader = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXd> {
         return file->read_tile(rs, re, cs, ce);
+    };
+    handle.reader_f32 = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXf> {
+        return file->read_tile_f32(rs, re, cs, ce);
     };
     return handle;
 }

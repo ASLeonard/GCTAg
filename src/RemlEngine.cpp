@@ -1799,15 +1799,15 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     // K_f32 is upper-triangle-only storage (row <= col valid; see
     // grm_binary_io.hpp upper_only load path). No valid data below the
     // diagonal.
+    // On the chunked path, trace(K) and trace(K^2) are accumulated during the
+    // first rSVD matvec pass (inside chunked_symmetric_matvec_f32) rather than
+    // running two separate pre-scans of .grm.bin before the first apply() call.
     const Eigen::MatrixXf& K_f32 = ctx.A[ctx.r_indx[0]];
-    const double trace_K_full = grm_chunked
-        ? gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, grm_chunk_rows).sum()
-        : K_f32.diagonal().cast<double>().sum();
-
+    double trace_K_full = 0.0;
     double trace_K2 = 0.0;
-    if (grm_chunked) {
-        trace_K2 = gcta_chunked::chunked_trace_K_squared(ctx.grm_tile_reader, n, grm_chunk_rows);
-    } else {
+    bool have_chunked_traces = !grm_chunked;
+    if (!grm_chunked) {
+        trace_K_full = K_f32.diagonal().cast<double>().sum();
         // Previously read K_f32.col(j).tail(n-j-1) -- rows j+1..n-1 of
         // column j, i.e. the LOWER triangle. That was a correctness bug
         // waiting to happen under upper-only storage (it happened to be
@@ -1841,12 +1841,33 @@ void compute_woodbury_basis(RemlCtx& ctx) {
         const double gamma = static_cast<double>(n) / M;
         lambda_plus = std::pow(1.0 + std::sqrt(gamma), 2.0);
     }
-    const double target_mass = (mode == WoodburyMode::EIG) ? (ctx.woodbury_basis_eigen_mass * trace_K_full) : 0.0;
+    double target_mass = (mode == WoodburyMode::EIG && have_chunked_traces)
+        ? (ctx.woodbury_basis_eigen_mass * trace_K_full) : 0.0;
 
     auto apply = [&](const Eigen::Ref<const Eigen::MatrixXf>& X) -> Eigen::MatrixXf {
-        if (grm_chunked)
+        if (grm_chunked) {
+            if (ctx.grm_tile_reader_f32) {
+                double* tr_ptr  = have_chunked_traces ? nullptr : &trace_K_full;
+                double* tr2_ptr = have_chunked_traces ? nullptr : &trace_K2;
+                Eigen::MatrixXf Y = gcta_chunked::chunked_symmetric_matvec_f32(
+                    ctx.grm_tile_reader_f32, n, grm_chunk_rows, X, tr_ptr, tr2_ptr);
+                if (!have_chunked_traces) {
+                    have_chunked_traces = true;
+                    if (mode == WoodburyMode::EIG)
+                        target_mass = ctx.woodbury_basis_eigen_mass * trace_K_full;
+                }
+                return Y;
+            }
+            if (!have_chunked_traces) {
+                trace_K_full = gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, grm_chunk_rows).sum();
+                trace_K2 = gcta_chunked::chunked_trace_K_squared(ctx.grm_tile_reader, n, grm_chunk_rows);
+                have_chunked_traces = true;
+                if (mode == WoodburyMode::EIG)
+                    target_mass = ctx.woodbury_basis_eigen_mass * trace_K_full;
+            }
             return gcta_chunked::chunked_symmetric_matvec(
                 ctx.grm_tile_reader, n, grm_chunk_rows, X.cast<double>()).cast<float>();
+        }
         // Return-by-value forces full evaluation into a fresh Eigen::MatrixXf
         // temporary, not an in-place block write, so this is not subject to
         // the selfadjointView-on-block-target scalar-fallback issue.

@@ -122,9 +122,9 @@ int main(int argc, char *argv[]){
         "--reml-woodbury-basis", "--reml-woodbury-basis-MP-margin", "--reml-woodbury-basis-MP-confirm",
         "--reml-woodbury-basis-EIG-mass", "--reml-woodbury-basis-EIG-k-buffer", "--reml-woodbury-basis-EIG-check-step", "--reml-woodbury-basis-EIG-k-max",
         "--reml-woodbury-basis-VAR-tail", "--reml-woodbury-basis-range", "--reml-woodbury-basis-posthoc-correction", "--reml-woodbury-basis-mem-budget",
-        "--reml-woodbury-basis-save", "--reml-woodbury-basis-reuse", "--reml-woodbury-basis-warm-start",
+        "--reml-woodbury-basis-save", "--reml-woodbury-basis-reuse", "--reml-woodbury-reuse", "--reml-woodbury-basis-warm-start",
         "--reml-no-constrain", "--reml-priors", "--reml-priors-var", "--reml-diagV-adj", "--reml-maxit",  "--reml-alg",
-        "--reml-ai-robust", "--reml-ai-robust-tol", "--reml-ai-robust-risk",
+        "--reml-ai-robust", "--reml-ai-robust-tol", "--reml-ai-robust-risk", "--reml-print-trajectory",
         "--mlma-no-preadj-covar",
         "--mlma-stream", "--save-reml", "--load-reml", "--log-pval", "--model",
 

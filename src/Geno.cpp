@@ -800,7 +800,9 @@ void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     gbuf->missing.resize(missPtrSize); 
                     pmiss = gbuf->missing.data();
                 }
-                if (gbuf->geno_f32_ptr) {
+                if (gbuf->geno_i8_ptr) {
+                    PgenReader::ExtractInt8Ext(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, gbuf->geno_i8_ptr, pmiss);
+                } else if (gbuf->geno_f32_ptr) {
                     float *out_f32 = gbuf->geno_f32_ptr;
                     const GenoCodingSpecF32 spec_f32 = buildCodingSpecF32(mu, sd);
                     const float gtable256x4[1024] __attribute__((aligned(16))) =

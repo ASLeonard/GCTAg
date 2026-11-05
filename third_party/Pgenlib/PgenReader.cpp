@@ -651,6 +651,37 @@ void PgenReader::ExtractFloatExt(uintptr_t *in, const uintptr_t *subsets, uint32
     }
 }
 
+namespace {
+struct GenoInt8Lookup256x1bx4 {
+    alignas(64) unsigned char table[plink2::kLookup256x1bx4Size] = {};
+    GenoInt8Lookup256x1bx4() {
+        // 2-bit PLINK2 genovec codes: 0 -> 0, 1 -> 1, 2 -> 2, 3 (missing) -> 0.
+        table[0] = 0;
+        table[4] = 1;
+        table[8] = 2;
+        table[12] = 0;
+        plink2::InitLookup256x1bx4(table);
+    }
+};
+const GenoInt8Lookup256x1bx4 kGenoInt8Lookup;
+} // namespace
+
+void PgenReader::ExtractInt8Ext(uintptr_t *in, const uintptr_t *subsets, uint32_t rawSampleSize, uint32_t keepSize, int8_t *gOut, uintptr_t *missOut){
+    uintptr_t *bufptr = nullptr;
+    thread_local std::vector<uintptr_t> tmpbuf;
+    if(rawSampleSize == keepSize){
+        bufptr = in;
+    }else{
+        tmpbuf.resize(GetGenoBufPtrSize(keepSize));
+        bufptr = tmpbuf.data();
+        ExtractGenoExt(in, subsets, rawSampleSize, keepSize, bufptr);
+    }
+    plink2::GenoarrLookup256x1bx4(bufptr, kGenoInt8Lookup.table, keepSize, gOut);
+    if(missOut != nullptr){
+        plink2::GenoarrToMissingnessUnsafe(bufptr, keepSize, missOut);
+    }
+}
+
 
 
 void PgenReader::ReadHardcalls(vector<double> &buf, int variant_idx, int allele_idx) {

@@ -47,6 +47,7 @@ typedef struct GenoBufItem{
     uint32_t extractedMarkerIndex = 0;   // for allele lookup
     double *geno_ptr = nullptr;          // optional external genotype buffer (length >= keepSampleCT)
     float  *geno_f32_ptr = nullptr;      // optional external float32 genotype buffer (length >= keepSampleCT)
+    int8_t *geno_i8_ptr = nullptr;       // optional external int8 raw {0,1,2} genotype buffer (length >= keepSampleCT)
 
     // out
     bool valid = false;
@@ -104,6 +105,7 @@ public:
     void loopDouble(const vector<uint32_t> &extractIndex, int numMarkerBuf, bool bMakeGeno, bool bGenoCenter, bool bGenoStd, bool bMakeMiss, vector<function<void (uintptr_t *buf, std::span<const uint32_t> exIndex)>> callbacks = vector<function<void (uintptr_t *buf, std::span<const uint32_t> exIndex)>>(), bool showLog = true);
 
     bool getGenoHasInfo();
+    const string& getGenoFormat() const { return genoFormat; }
 
     void setGRMMode(bool grm, bool dominace);
     void setGenoCodingModel(const string& model_name);

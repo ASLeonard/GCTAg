@@ -243,12 +243,16 @@ bool init_varcomp(const RemlCtx& ctx,
             KX   = woodbury_basis_KZ(ctx, ctx.X);
             Ky   = woodbury_basis_Kv(ctx, y_r);
         } else if (ctx.grm_chunk_rows > 0) {
-            // Exact GRM, streamed from disk in chunks -- ctx.A is empty by
-            // design here, so this must come before (or instead of) the
-            // ctx.A-based branch below. Mirrors the trace/matvec machinery
-            // compute_woodbury_basis already uses for its chunked path.
-            trK  = gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, ctx.grm_chunk_rows).sum();
-            trK2 = gcta_chunked::chunked_trace_K_squared(ctx.grm_tile_reader, n, ctx.grm_chunk_rows);
+            // Exact GRM, streamed from disk in chunks (or in-memory packed fp16) --
+            // ctx.A is empty by design here, so this must come before (or instead
+            // of) the ctx.A-based branch below.
+            if (ctx.grm_fp16) {
+                trK  = ctx.grm_fp16_trace_K;
+                trK2 = ctx.grm_fp16_trace_K2;
+            } else {
+                trK  = gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, ctx.grm_chunk_rows).sum();
+                trK2 = gcta_chunked::chunked_trace_K_squared(ctx.grm_tile_reader, n, ctx.grm_chunk_rows);
+            }
             KX   = gcta_chunked::chunked_symmetric_matvec(ctx.grm_tile_reader, n, ctx.grm_chunk_rows, ctx.X);
             Ky   = gcta_chunked::chunked_symmetric_matvec(ctx.grm_tile_reader, n, ctx.grm_chunk_rows, y_r);
         } else if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
@@ -1738,15 +1742,15 @@ void compute_woodbury_basis(RemlCtx& ctx) {
         LOGGER.e(0, "--reml-woodbury-basis is incompatible with Fisher-scoring REML.");
     if ((int)ctx.r_indx.size() != 2)
         LOGGER.e(0, "--reml-woodbury-basis supports only single-GRM models.");
-    if (ctx.A[ctx.r_indx[0]].size() == 0 && ctx.grm_chunked_budget <= 0.0)
+    if (ctx.A[ctx.r_indx[0]].size() == 0 && ctx.grm_chunked_budget <= 0.0 && !ctx.grm_fp16)
         LOGGER.e(0, "--reml-woodbury: GRM component is identity; cannot compute basis.");
-    if (ctx.grm_chunked_budget > 0.0 && !ctx.grm_tile_reader)
-        LOGGER.e(0, "--reml-woodbury: --grm-chunked-budget is set but ctx.grm_tile_reader is empty "
+    if ((ctx.grm_chunked_budget > 0.0 || ctx.grm_fp16) && !ctx.grm_tile_reader)
+        LOGGER.e(0, "--reml-woodbury: tiled GRM mode is set but ctx.grm_tile_reader is empty "
                     "— the GRM component wasn't actually loaded either way.");
 
     const WoodburyMode mode = ctx.woodbury_mode();
     const int  n = ctx.n;
-    const bool grm_chunked = ctx.grm_chunked_budget > 0.0;
+    const bool grm_chunked = (ctx.grm_chunked_budget > 0.0) || ctx.grm_fp16;
 
     int k_svd_budget_ceiling = n - 1;
     if (grm_chunked && ctx.svd_mem_budget_gb > 0.0) {
@@ -1760,12 +1764,14 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     int grm_chunk_rows = 0;
     if (grm_chunked) {
         grm_chunk_rows = setup_chunked_grm_stream(ctx, "--reml-woodbury-basis");
-        // Y is not reserved by setup_chunked_grm_stream -- report its worst-case
-        // size (at the current k_svd ceiling) here so it's visible without being enforced.
-        const double y_worst_case_gb = static_cast<double>(sizeof(float)) * n * static_cast<double>(k_svd_budget_ceiling) / 1e9;
-        LOGGER << "--reml-woodbury-basis: at the current k_svd ceiling of " << k_svd_budget_ceiling
-               << ", the basis matrix (Y) may need up to ~" << y_worst_case_gb
-               << "GB, not covered by --grm-chunked-budget." << std::endl;
+        if (ctx.grm_chunked_budget > 0.0) {
+            // Y is not reserved by setup_chunked_grm_stream -- report its worst-case
+            // size (at the current k_svd ceiling) here so it's visible without being enforced.
+            const double y_worst_case_gb = static_cast<double>(sizeof(float)) * n * static_cast<double>(k_svd_budget_ceiling) / 1e9;
+            LOGGER << "--reml-woodbury-basis: at the current k_svd ceiling of " << k_svd_budget_ceiling
+                   << ", the basis matrix (Y) may need up to ~" << y_worst_case_gb
+                   << "GB, not covered by --grm-chunked-budget." << std::endl;
+        }
     }
 
 
@@ -1805,8 +1811,11 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     const Eigen::MatrixXf& K_f32 = ctx.A[ctx.r_indx[0]];
     double trace_K_full = 0.0;
     double trace_K2 = 0.0;
-    bool have_chunked_traces = !grm_chunked;
-    if (!grm_chunked) {
+    bool have_chunked_traces = !grm_chunked || ctx.grm_fp16;
+    if (ctx.grm_fp16) {
+        trace_K_full = ctx.grm_fp16_trace_K;
+        trace_K2     = ctx.grm_fp16_trace_K2;
+    } else if (!grm_chunked) {
         trace_K_full = K_f32.diagonal().cast<double>().sum();
         // Previously read K_f32.col(j).tail(n-j-1) -- rows j+1..n-1 of
         // column j, i.e. the LOWER triangle. That was a correctness bug
@@ -2047,9 +2056,11 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     th0.resize(0);
     eval_all.resize(0);
 
-    // Release dense GRM K before finalizing/moving Uk unless post-hoc correction needs it.
-    if (!ctx.woodbury_basis_posthoc_correction)
+    // Release dense/packed GRM K before finalizing/moving Uk unless post-hoc correction needs it.
+    if (!ctx.woodbury_basis_posthoc_correction) {
         ctx.A[ctx.r_indx[0]].resize(0, 0);
+        if (ctx.grm_fp16_release) ctx.grm_fp16_release();
+    }
 
     int k = finalize_and_log_woodbury_rank(mode, ctx, eval_full, k_svd, k_svd_budget_ceiling, lambda_plus, trace_K_full, trace_K2, eval_res);
 
@@ -2133,13 +2144,13 @@ void compute(RemlCtx& ctx,
         compute_woodbury_basis(ctx);
         float duration = LOGGER.tp("woodbury");
         LOGGER.i(0, "Woodbury basis computation took " + std::to_string(duration) + " seconds.");
-    } else if (ctx.reml_trace_hutchpp && ctx.grm_chunked_budget > 0.0) {
+    } else if (ctx.reml_trace_hutchpp && (ctx.grm_chunked_budget > 0.0 || ctx.grm_fp16)) {
         // Woodbury takes precedence when both are requested.
         if ((int)ctx.r_indx.size() != 2)
-            LOGGER.e(0, "--grm-chunked-budget with --reml-trace-hutchpp supports only single-GRM models.");
+            LOGGER.e(0, "--grm-chunked-budget/--grm-fp16 with --reml-trace-hutchpp supports only single-GRM models.");
         ctx.grm_chunk_rows = setup_chunked_grm_stream(ctx, "--reml-trace-hutchpp");
-    } else if (ctx.grm_chunked_budget > 0.0) {
-        // Plain exact (non-Hutch++, non-Woodbury) chunked GRM. Without this
+    } else if (ctx.grm_chunked_budget > 0.0 || ctx.grm_fp16) {
+        // Plain exact (non-Hutch++, non-Woodbury) chunked/fp16 GRM. Without this
         // branch ctx.grm_chunk_rows is never set for this path, so every
         // downstream "ctx.grm_chunk_rows > 0" gate (ai_reml, em_reml,
         // calcu_tr_PA, applyP_mat, init_varcomp's HE warm-start, ...) falls
@@ -2147,8 +2158,9 @@ void compute(RemlCtx& ctx,
         // silently treats the (empty, because it's streamed, not loaded)
         // GRM component as an identity/residual term for the entire run.
         if ((int)ctx.r_indx.size() != 2)
-            LOGGER.e(0, "--grm-chunked-budget supports only single-GRM models.");
-        ctx.grm_chunk_rows = setup_chunked_grm_stream(ctx, "--grm-chunked-budget");
+            LOGGER.e(0, "--grm-chunked-budget/--grm-fp16 supports only single-GRM models.");
+        ctx.grm_chunk_rows = setup_chunked_grm_stream(
+            ctx, ctx.grm_fp16 ? "--grm-fp16" : "--grm-chunked-budget");
     }
 
     RemlMat Vi_X_out(ctx.n, ctx.X_c), Xt_Vi_X_i_out(ctx.X_c, ctx.X_c);
@@ -2294,6 +2306,9 @@ RemlState build_reml_state(RemlCtx& ctx) {
     // Clear the remaining large, now-redundant double buffers after the float
     // copies are created. The downstream MLMA stream uses only the float state.
     ctx.A.clear();
+    if (ctx.grm_fp16_release) ctx.grm_fp16_release();
+    ctx.grm_tile_reader = nullptr;
+    ctx.grm_tile_reader_f32 = nullptr;
     ctx.grm_N.resize(0, 0);
     ctx.Vi_X.resize(0, 0);
     ctx.Xt_Vi_X_i.resize(0, 0);

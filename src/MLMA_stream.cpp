@@ -766,6 +766,7 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         options_in.erase("--reml-woodbury-basis-VAR-tail");
         options_in.erase("--reml-woodbury-basis-range");
         options_in.erase("--grm-chunked-budget");
+        options_in.erase("--grm-fp16");
         options_in.erase("--reml-ai-robust");
         options_in.erase("--reml-ai-robust-tol");
         options_in.erase("--reml-ai-robust-risk");
@@ -884,6 +885,12 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
                 LOGGER.e(0, "--grm-chunked-budget requires a target memory in GB.");
             options_d["grm_chunked_budget"] = std::stod(vals[0]);
             options_in.erase("--grm-chunked-budget");
+        }
+        if (options_in.find("--grm-fp16") != options_in.end()) {
+            if (!options_in["--grm-fp16"].empty())
+                LOGGER.w(0, "--grm-fp16 takes no argument; ignoring the supplied value.");
+            options["grm_fp16"] = "1";
+            options_in.erase("--grm-fp16");
         }
         if (options_in.find("--reml-woodbury-basis-MP-margin") != options_in.end()) {
             const auto& vals = options_in["--reml-woodbury-basis-MP-margin"];
@@ -1179,8 +1186,13 @@ void MLMA::processMain()
             const vector<string> analysis_ids = pheno->get_id(0, n - 1, "\t");
             const uint64_t id_hash = hash_sample_ids(analysis_ids);
             bool grm_chunked = !reuse_basis && options_d.count("grm_chunked_budget") > 0.0;
+            const bool grm_fp16 = !reuse_basis && options.count("grm_fp16") > 0;
             const double grm_chunked_budget = options_d.count("grm_chunked_budget")
                 ? options_d.at("grm_chunked_budget") : 0.0;
+            if (grm_chunked && grm_fp16)
+                LOGGER.e(0, "--grm-fp16 and --grm-chunked-budget are mutually exclusive: "
+                            "--grm-fp16 holds the packed fp16 lower triangle in memory, whereas "
+                            "--grm-chunked-budget streams float32 bands from disk.");
 
             // REML tuning parameters. Parsed here (ahead of the GRM load below,
             // not after it as before) because woodbury_basis_mem_budget_gb feeds
@@ -1234,11 +1246,17 @@ void MLMA::processMain()
                             "--reml-trace-hutchpp is ignored.");
 
             int grm_chunk_rows = 0;
-            Eigen::MatrixXf G_n;      // left empty when grm_chunked
+            Eigen::MatrixXf G_n;      // left empty when grm_chunked or grm_fp16
             double m_all = (woodbury_basis_rank == -1) ? 0.0 : -1.0;  // only populated when Woodbury-MP mode is selected
-            gcta_grm_io::ChunkedGrmHandle chunked_grm;  // only populated when grm_chunked
+            gcta_grm_io::ChunkedGrmHandle chunked_grm;       // only populated when grm_chunked
+            gcta_grm_io::PackedGrmFp16Handle fp16_grm;       // only populated when grm_fp16
 
-            if (grm_chunked) {
+            if (grm_fp16) {
+                fp16_grm = gcta_grm_io::load_packed_grm_fp16(
+                    grm_pfx, analysis_ids, /*need_m_snps=*/(woodbury_basis_rank == -1), "--grm-fp16");
+                grm_chunk_rows = fp16_grm.chunk_rows;
+                m_all = fp16_grm.m_snps;
+            } else if (grm_chunked) {
                 chunked_grm = gcta_grm_io::make_chunked_grm_reader(
                     grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget",
                     /*need_m_snps=*/(woodbury_basis_rank == -1));
@@ -1252,7 +1270,7 @@ void MLMA::processMain()
                     grm_chunked = false;
                 }
             }
-            if (!grm_chunked && !reuse_basis) {
+            if (!grm_chunked && !grm_fp16 && !reuse_basis) {
                 double m_all_load = (m_all > 0.0) ? -1.0 : m_all;
                 load_and_subset_grm_upper(grm_pfx, analysis_ids, G_n, m_all_load, "--mlma");
                 if (m_all <= 0.0) m_all = m_all_load;
@@ -1276,7 +1294,19 @@ void MLMA::processMain()
                 ctx.y_Ssq = ctx.y.squaredNorm();
             }
             ctx.A.resize(2);
-            if (grm_chunked) {
+            if (grm_fp16) {
+                ctx.grm_fp16 = true;
+                ctx.grm_fp16_trace_K = fp16_grm.trace_K;
+                ctx.grm_fp16_trace_K2 = fp16_grm.trace_K2;
+                ctx.grm_chunk_rows_from_budget = fp16_grm.chunk_rows;
+                ctx.grm_tile_reader = std::move(fp16_grm.reader);
+                ctx.grm_tile_reader_f32 = std::move(fp16_grm.reader_f32);
+                ctx.grm_fp16_release = [file = std::move(fp16_grm.file), &ctx]() mutable {
+                    file.reset();
+                    ctx.grm_tile_reader = nullptr;
+                    ctx.grm_tile_reader_f32 = nullptr;
+                };
+            } else if (grm_chunked) {
                 // ctx.A[0] stays empty (default RemlMat()); RemlEngine reads
                 // K through ctx.grm_tile_reader instead. See the guard in
                 // compute_woodbury_basis_basis that errors out if this flag is set

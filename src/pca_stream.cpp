@@ -93,6 +93,12 @@ int PCAStream::registerOption(map<string, vector<string>>& options_in)
         options_d["grm_chunked_budget"] = std::stod(vals[0]);
         options_in.erase("--grm-chunked-budget");
     }
+    if (options_in.find("--grm-fp16") != options_in.end()) {
+        if (!options_in["--grm-fp16"].empty())
+            LOGGER.w(0, "--grm-fp16 takes no argument; ignoring the supplied value.");
+        options["grm_fp16"] = "1";
+        options_in.erase("--grm-fp16");
+    }
 
     if (options_in.find("--svd-method") != options_in.end()) {
         const auto& vals = options_in["--svd-method"];
@@ -184,12 +190,15 @@ void PCAStream::processMain()
         const double grm_chunked_budget = options_d.count("grm_chunked_budget")
             ? options_d.at("grm_chunked_budget") : 0.0;
         bool grm_chunked = grm_chunked_budget > 0.0;
+        const bool grm_fp16 = options.count("grm_fp16") > 0;
         int svd_power_iter = options.count("svd_power_iter")
             ? std::stoi(options.at("svd_power_iter")) : 3;
 
-        if (pca_approx.empty() && grm_chunked)
+        if (grm_chunked && grm_fp16)
+            LOGGER.e(0, "--grm-fp16 and --grm-chunked-budget are mutually exclusive.");
+        if (pca_approx.empty() && (grm_chunked || grm_fp16))
             LOGGER.e(0, "--pca exact mode (dsyevr/dsyevd) requires dense GRM loading. "
-                        "Remove --grm-chunked-budget, or set --pca-approx to Lanczos/rSVD.");
+                        "Remove --grm-chunked-budget/--grm-fp16, or set --pca-approx to Lanczos/rSVD.");
 
         // Row-chunk size for streaming reads off the GRM (chunked_symmetric_matvec),
         // and the reader's own row-band cache reservation, are now both solved
@@ -198,6 +207,7 @@ void PCAStream::processMain()
         // RemlCtx, so it has no other reason to duplicate that arithmetic.
         int chunk_size = 0;
         gcta_grm_io::ChunkedGrmHandle chunked_handle;  // only populated when grm_chunked
+        gcta_grm_io::PackedGrmFp16Handle fp16_handle;  // only populated when grm_fp16
         if (grm_chunked) {
             // NOTE: this now opens the file and ID-matches against
             // .grm.id/.grm.N.bin unconditionally whenever grm_chunked is
@@ -232,7 +242,14 @@ void PCAStream::processMain()
         Eigen::MatrixXd G_dense;      // populated only for exact mode (!grm_chunked && pca_approx.empty())
         Eigen::MatrixXf G_dense_f32;  // populated for --pca-approx when !grm_chunked
 
-        if (grm_chunked) {
+        if (grm_fp16) {
+            fp16_handle = gcta_grm_io::load_packed_grm_fp16(
+                grm_pfx, analysis_ids, /*need_m_snps=*/false, "--grm-fp16");
+            chunk_size = fp16_handle.chunk_rows;
+            chunked_reader = std::move(fp16_handle.reader);
+            chunked_reader_f32 = std::move(fp16_handle.reader_f32);
+            grm_chunked = true;
+        } else if (grm_chunked) {
             // make_chunked_grm_reader already logged the budget/chunk_size
             // split above; nothing further to log here.
             chunked_reader = std::move(chunked_handle.reader);
@@ -249,7 +266,11 @@ void PCAStream::processMain()
 
         double trace_total = 0.0;
         bool have_trace_total = false;
-        if (!grm_chunked) {
+        if (grm_fp16) {
+            trace_total = fp16_handle.trace_K;
+            have_trace_total = true;
+            LOGGER.i(0, "Total variance (tr(G)) = " + to_string(trace_total));
+        } else if (!grm_chunked) {
             if (G_dense_f32.size() > 0) trace_total = G_dense_f32.diagonal().cast<double>().sum();
             else if (G_dense.size() > 0) trace_total = G_dense.diagonal().sum();
             have_trace_total = true;
@@ -363,6 +384,7 @@ void PCAStream::processMain()
         if (!used_dsyevd) G_dense.resize(0, 0);
         chunked_reader = nullptr;
         chunked_reader_f32 = nullptr;
+        fp16_handle.file.reset();
 
         // ---- Write .eigenval / .eigenvec — identical format to gcta::pca()'s writer ----
         auto append_double = [](string &buf, double v) {

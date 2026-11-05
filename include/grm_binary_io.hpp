@@ -701,6 +701,329 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
     return handle;
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in packed lower-triangular IEEE fp16 in-memory GRM (--grm-fp16)
+// ---------------------------------------------------------------------------
+// Stores the n(n+1)/2 lower-triangular entries in IEEE 754 binary16 (2 bytes/entry,
+// 10 mantissa bits => ~9.8e-4 relative precision, no overflow for related/inbred
+// individuals), while keeping the diagonal in exact float32 and accumulating
+// trace(K) and trace(K^2) in double from the raw float32 .grm.bin stream during
+// load. At N = 500,000, this reduces in-memory GRM storage from 1,000 GB
+// (Eigen::MatrixXf(n, n)) to 250 GB (4x reduction) and eliminates all disk I/O
+// during rSVD power iterations.
+#if defined(__FLT16_MANT_DIG__)
+using GrmFp16 = _Float16;
+inline GrmFp16 f32_to_fp16(float x) noexcept { return static_cast<_Float16>(x); }
+inline float   fp16_to_f32(GrmFp16 h) noexcept { return static_cast<float>(h); }
+#else
+using GrmFp16 = uint16_t;
+inline GrmFp16 f32_to_fp16(float x) noexcept {
+    uint32_t u = 0;
+    std::memcpy(&u, &x, sizeof(u));
+    const uint32_t sign = (u >> 16) & 0x8000u;
+    const int32_t  exp  = static_cast<int32_t>((u >> 23) & 0xFFu) - 127 + 15;
+    uint32_t       mant = u & 0x007FFFFFu;
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<uint16_t>(sign);
+        mant |= 0x00800000u;
+        const int shift = 14 - exp;
+        const uint32_t round_bit = 1u << (shift - 1);
+        const uint32_t sticky    = (mant & (round_bit - 1u)) != 0u;
+        const uint32_t lsb       = (mant >> shift) & 1u;
+        return static_cast<uint16_t>(sign | ((mant + round_bit - 1u + (sticky | lsb)) >> shift));
+    } else if (exp >= 31) {
+        return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+    const uint32_t round_bit = 0x00001000u;
+    const uint32_t sticky    = (mant & 0x00000FFFu) != 0u;
+    const uint32_t lsb       = (mant >> 13) & 1u;
+    uint32_t h = sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13);
+    h += (mant & round_bit) && (sticky || lsb);
+    return static_cast<uint16_t>(h);
+}
+inline float fp16_to_f32(GrmFp16 h) noexcept {
+    const uint32_t sign = (static_cast<uint32_t>(h) & 0x8000u) << 16;
+    const uint32_t exp  = (static_cast<uint32_t>(h) >> 10) & 0x1Fu;
+    uint32_t       mant = static_cast<uint32_t>(h) & 0x03FFu;
+    uint32_t u = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            u = sign;
+        } else {
+            uint32_t e = 127 - 14;
+            while ((mant & 0x0400u) == 0u) { mant <<= 1; --e; }
+            mant &= 0x03FFu;
+            u = sign | (e << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        u = sign | 0x7F800000u | (mant << 13);
+    } else {
+        u = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float out = 0.0f;
+    std::memcpy(&out, &u, sizeof(out));
+    return out;
+}
+#endif
+
+class PackedGrmFp16 {
+public:
+    PackedGrmFp16(int n, std::vector<GrmFp16> packed, Eigen::VectorXf diag_f32,
+                  double trace_K, double trace_K2)
+        : n_(n),
+          packed_(std::move(packed)),
+          diag_f32_(std::move(diag_f32)),
+          trace_K_(trace_K),
+          trace_K2_(trace_K2) {}
+
+    int n() const noexcept { return n_; }
+    double trace_K() const noexcept { return trace_K_; }
+    double trace_K2() const noexcept { return trace_K2_; }
+    const Eigen::VectorXf& diagonal_f32() const noexcept { return diag_f32_; }
+
+    Eigen::Ref<const Eigen::MatrixXf> read_tile_f32(int rs, int re, int cs, int ce) const {
+        const int tile_rows = re - rs, tile_cols = ce - cs;
+        if (tile_scratch_f32_.rows() < tile_rows || tile_scratch_f32_.cols() < tile_cols) {
+            tile_scratch_f32_.resize(std::max<Eigen::Index>(tile_scratch_f32_.rows(), tile_rows),
+                                     std::max<Eigen::Index>(tile_scratch_f32_.cols(), tile_cols));
+        }
+        auto tile = tile_scratch_f32_.topLeftCorner(tile_rows, tile_cols);
+        const bool diagonal_tile = (rs == cs);
+        const GrmFp16* base = packed_.data();
+
+        #pragma omp parallel for schedule(dynamic, 32)
+        for (int lp = 0; lp < tile_rows; ++lp) {
+            const int gi = rs + lp;
+            const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
+            if (lq_end == 0) continue;
+            const GrmFp16* __restrict__ src = base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
+            alignas(64) float row_f32[64];
+            for (int lq0 = 0; lq0 < lq_end; lq0 += 64) {
+                const int bw = std::min(64, lq_end - lq0);
+                #pragma omp simd
+                for (int k = 0; k < bw; ++k)
+                    row_f32[k] = fp16_to_f32(src[lq0 + k]);
+                tile.row(lp).segment(lq0, bw) = Eigen::Map<const Eigen::RowVectorXf>(row_f32, bw);
+            }
+            if (diagonal_tile) {
+                tile(lp, lp) = diag_f32_[gi];
+            }
+        }
+        return tile;
+    }
+
+    Eigen::Ref<const Eigen::MatrixXd> read_tile(int rs, int re, int cs, int ce) const {
+        const int tile_rows = re - rs, tile_cols = ce - cs;
+        if (tile_scratch_f64_.rows() < tile_rows || tile_scratch_f64_.cols() < tile_cols) {
+            tile_scratch_f64_.resize(std::max<Eigen::Index>(tile_scratch_f64_.rows(), tile_rows),
+                                     std::max<Eigen::Index>(tile_scratch_f64_.cols(), tile_cols));
+        }
+        auto tile = tile_scratch_f64_.topLeftCorner(tile_rows, tile_cols);
+        const bool diagonal_tile = (rs == cs);
+        const GrmFp16* base = packed_.data();
+
+        #pragma omp parallel for schedule(dynamic, 32)
+        for (int lp = 0; lp < tile_rows; ++lp) {
+            const int gi = rs + lp;
+            const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
+            if (lq_end == 0) continue;
+            const GrmFp16* __restrict__ src = base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
+            alignas(64) double row_f64[64];
+            for (int lq0 = 0; lq0 < lq_end; lq0 += 64) {
+                const int bw = std::min(64, lq_end - lq0);
+                #pragma omp simd
+                for (int k = 0; k < bw; ++k)
+                    row_f64[k] = static_cast<double>(fp16_to_f32(src[lq0 + k]));
+                tile.row(lp).segment(lq0, bw) = Eigen::Map<const Eigen::RowVectorXd>(row_f64, bw);
+            }
+            if (diagonal_tile) {
+                tile(lp, lp) = static_cast<double>(diag_f32_[gi]);
+            }
+        }
+        return tile;
+    }
+
+private:
+    int n_ = 0;
+    std::vector<GrmFp16> packed_;
+    Eigen::VectorXf diag_f32_;
+    double trace_K_ = 0.0;
+    double trace_K2_ = 0.0;
+    mutable Eigen::MatrixXf tile_scratch_f32_;
+    mutable Eigen::MatrixXd tile_scratch_f64_;
+};
+
+struct PackedGrmFp16Handle {
+    gcta_chunked::TileReader reader;
+    gcta_chunked::TileReaderF32 reader_f32;
+    std::shared_ptr<PackedGrmFp16> file;
+    double m_snps = -1.0;
+    double trace_K = 0.0;
+    double trace_K2 = 0.0;
+    int chunk_rows = 0;
+};
+
+inline PackedGrmFp16Handle load_packed_grm_fp16(
+    const std::string& grm_prefix,
+    const std::vector<std::string>& analysis_ids,
+    bool need_m_snps = false,
+    const std::string& caller_flag = "--grm-fp16",
+    size_t grm_read_chunk_bytes = (1ull << 30) /* 1GiB */)
+{
+    LOGGER.ts("grm_fp16");
+    using std::to_string;
+
+    const std::vector<std::string> grm_ids = Pheno::read_sublist(grm_prefix + ".grm.id");
+    const int n_grm = static_cast<int>(grm_ids.size());
+    if (n_grm == 0)
+        LOGGER.e(0, "GRM id file [" + grm_prefix + ".grm.id] is empty.");
+
+    const int n = static_cast<int>(analysis_ids.size());
+    const std::vector<int> kp = match_ids_to_grm(analysis_ids, grm_ids);
+    for (int i = 0; i < n; ++i) {
+        if (kp[i] < 0)
+            LOGGER.e(0, caller_flag + ": individual [" + analysis_ids[i] +
+                        "] not found in GRM [" + grm_prefix + "].");
+    }
+
+    bool is_identity = (n_grm == n);
+    bool is_monotonic = true;
+    for (int i = 0; i < n; ++i) {
+        if (kp[i] != i) is_identity = false;
+        if (i > 0 && kp[i] <= kp[i - 1]) is_monotonic = false;
+    }
+    if (!is_monotonic)
+        LOGGER.e(0, caller_flag + " requires the analysis sample order to match "
+                    "(or be an ordered subset of) [" + grm_prefix + ".grm.id]'s row order.");
+
+    const size_t tri_grm  = static_cast<size_t>(n_grm) * (n_grm + 1) / 2;
+    const size_t byte_len = tri_grm * sizeof(float);
+    const std::string bin_path = grm_prefix + ".grm.bin";
+    const int fd = ::open(bin_path.c_str(), O_RDONLY);
+    if (fd == -1)
+        LOGGER.e(0, "cannot open [" + bin_path + "].");
+    {
+        struct stat st{};
+        if (::fstat(fd, &st) != 0 || static_cast<size_t>(st.st_size) < byte_len) {
+            ::close(fd);
+            LOGGER.e(0, "unexpected size in [" + bin_path + "]. "
+                        "Expected " + to_string(tri_grm) + " float32 entries for n=" +
+                        to_string(n_grm) + ".");
+        }
+    }
+
+    const size_t tri_n = static_cast<size_t>(n) * (n + 1) / 2;
+    const double packed_gb = static_cast<double>(tri_n * sizeof(GrmFp16)) / 1e9;
+    LOGGER.i(0, caller_flag + ": loading [" + bin_path + "] into packed fp16 lower triangle (" +
+                to_string(packed_gb) + " GB for n=" + to_string(n) +
+                ", 4x smaller than dense float32) ...");
+
+    std::vector<GrmFp16> packed(tri_n);
+    Eigen::VectorXf diag_f32(n);
+    double tr_K  = 0.0;
+    double tr_K2 = 0.0;
+
+    const size_t max_elems_per_chunk = std::max<size_t>(1, grm_read_chunk_bytes / sizeof(float));
+    std::vector<float> chunk_buf(max_elems_per_chunk);
+    int row_cursor = 0;
+    int j_cursor = 0;
+    while (row_cursor < n_grm && j_cursor < n) {
+        const size_t row_base_cursor = static_cast<size_t>(row_cursor) * (row_cursor + 1) / 2;
+        const size_t target = row_base_cursor + max_elems_per_chunk;
+        const int row_end = row_bound_for_cumulative(target, row_cursor, n_grm);
+        const size_t row_base_end = static_cast<size_t>(row_end) * (row_end + 1) / 2;
+        const size_t elems_this_chunk = row_base_end - row_base_cursor;
+
+        int j_end = j_cursor;
+        if (is_identity) {
+            j_end = row_end;
+        } else {
+            while (j_end < n && kp[j_end] < row_end) ++j_end;
+        }
+
+        if (elems_this_chunk > chunk_buf.size())
+            chunk_buf.resize(elems_this_chunk);
+        read_exact(fd, chunk_buf.data(), elems_this_chunk * sizeof(float), bin_path);
+
+        if (j_end > j_cursor) {
+            if (is_identity) {
+                #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                for (int j = j_cursor; j < j_end; ++j) {
+                    const float* __restrict__ src_row = chunk_buf.data() +
+                        (static_cast<size_t>(j) * (j + 1) / 2 - row_base_cursor);
+                    GrmFp16* __restrict__ dst_row = packed.data() +
+                        static_cast<size_t>(j) * (j + 1) / 2;
+                    double row_off_sq = 0.0;
+                    #pragma omp simd reduction(+:row_off_sq)
+                    for (int i = 0; i < j; ++i) {
+                        const float v = src_row[i];
+                        dst_row[i] = f32_to_fp16(v);
+                        const double vd = static_cast<double>(v);
+                        row_off_sq += vd * vd;
+                    }
+                    const float diag_v = src_row[j];
+                    dst_row[j] = f32_to_fp16(diag_v);
+                    diag_f32[j] = diag_v;
+                    const double diag_d = static_cast<double>(diag_v);
+                    tr_K  += diag_d;
+                    tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
+                }
+            } else {
+                #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                for (int j = j_cursor; j < j_end; ++j) {
+                    const int r_grm = kp[j];
+                    const float* __restrict__ src_row = chunk_buf.data() +
+                        (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
+                    GrmFp16* __restrict__ dst_row = packed.data() +
+                        static_cast<size_t>(j) * (j + 1) / 2;
+                    double row_off_sq = 0.0;
+                    for (int i = 0; i < j; ++i) {
+                        const float v = src_row[kp[i]];
+                        dst_row[i] = f32_to_fp16(v);
+                        const double vd = static_cast<double>(v);
+                        row_off_sq += vd * vd;
+                    }
+                    const float diag_v = src_row[r_grm];
+                    dst_row[j] = f32_to_fp16(diag_v);
+                    diag_f32[j] = diag_v;
+                    const double diag_d = static_cast<double>(diag_v);
+                    tr_K  += diag_d;
+                    tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
+                }
+            }
+            j_cursor = j_end;
+        }
+        row_cursor = row_end;
+    }
+    ::close(fd);
+    chunk_buf.clear();
+    chunk_buf.shrink_to_fit();
+
+    LOGGER.i(0, "The .grm.bin packed fp16 fill took " + to_string(LOGGER.tp("grm_fp16")) + " seconds.");
+
+    PackedGrmFp16Handle handle;
+    handle.chunk_rows = std::min(n, 4096);
+    handle.trace_K = tr_K;
+    handle.trace_K2 = tr_K2;
+    if (need_m_snps) {
+        handle.m_snps = read_grm_N_mean(grm_prefix, n_grm);
+    } else {
+        LOGGER.i(0, "Skipping SNP count read from .grm.N.bin.");
+        handle.m_snps = -1.0;
+    }
+
+    auto file = std::make_shared<PackedGrmFp16>(
+        n, std::move(packed), std::move(diag_f32), tr_K, tr_K2);
+    handle.file = file;
+    handle.reader = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXd> {
+        return file->read_tile(rs, re, cs, ce);
+    };
+    handle.reader_f32 = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXf> {
+        return file->read_tile_f32(rs, re, cs, ce);
+    };
+    return handle;
+}
+
 // Merge K GRMs that share the exact same sample order (no subsetting, no
 // reindexing) into one N-weighted-average GRM, entirely streamed: never
 // holds a dense n x n matrix for any input file, nor for the output.

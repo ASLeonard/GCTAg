@@ -117,7 +117,7 @@ int main(int argc, char *argv[]){
         "--envir", "--optimal-rho", "--noSandwich", "--grid-size",
         "--GRM-tile-budget", "--nMarkers",
         "--pca", "--pca-v1", "--pca-stream", "--pca-approx",
-        "--svd-method", "--svd-oversampling", "--svd-power-iter", "--svd-seed", "--grm-chunked-budget",
+        "--svd-method", "--svd-oversampling", "--svd-power-iter", "--svd-seed", "--grm-chunked-budget", "--grm-fp16",
         "--reml-trace-hutchpp", "--reml-trace-hutchpp-fixed-probes", "--reml-no-HE-start", "--reml-force-dense-V",
         "--reml-woodbury-basis", "--reml-woodbury-basis-MP-margin", "--reml-woodbury-basis-MP-confirm",
         "--reml-woodbury-basis-EIG-mass", "--reml-woodbury-basis-EIG-k-buffer", "--reml-woodbury-basis-EIG-check-step", "--reml-woodbury-basis-EIG-k-max",

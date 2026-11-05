@@ -102,6 +102,22 @@ public:
                       float &af_out, float &additive_af_out,
                       bool &valid_out, uint32_t extractedMarkerIndex);
 
+    // Direct uncentered int8 genotype decode for BED additive MLMA streaming:
+    // writes n int8 values {0, 1, 2} (missing -> 0) into dest[], and populates
+    // miss_out bitmask when nValidN_out < keepSampleCT.
+    void getGenoInt8_bed(uintptr_t *buf, int idx, int8_t *dest,
+                         float &af_out, float &additive_af_out,
+                         double &mu_out, uint32_t &nValidN_out,
+                         uintptr_t *miss_out, bool &valid_out,
+                         uint32_t extractedMarkerIndex);
+
+    bool canUseInt8Mlma() const {
+        return genoFormat == "BED" &&
+               genoCodingModel == GenoCodingModel::ADDITIVE &&
+               iDC == 1;
+    }
+    int getMissPtrSize() const { return missPtrSize; }
+
     void loopDouble(const vector<uint32_t> &extractIndex, int numMarkerBuf, bool bMakeGeno, bool bGenoCenter, bool bGenoStd, bool bMakeMiss, vector<function<void (uintptr_t *buf, std::span<const uint32_t> exIndex)>> callbacks = vector<function<void (uintptr_t *buf, std::span<const uint32_t> exIndex)>>(), bool showLog = true);
 
     bool getGenoHasInfo();

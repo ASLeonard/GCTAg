@@ -540,6 +540,51 @@ void Geno::getGenoFloat_bed(uintptr_t *buf, int idx, float *dest,
     }
 }
 
+void Geno::getGenoInt8_bed(uintptr_t *buf, int idx, int8_t *dest,
+                           float &af_out, float &additive_af_out,
+                           double &mu_out, uint32_t &nValidN_out,
+                           uintptr_t *miss_out, bool &valid_out,
+                           uint32_t extractedMarkerIndex) {
+    valid_out   = false;
+    mu_out      = 0.0;
+    nValidN_out = 0;
+
+    SNPInfo snpinfo;
+    uintptr_t *cur_buf = buf + idx * bedRawGenoBuf1PtrSize;
+    uint8_t sexChromType = markerSexChromTypes[curBufferIndex];
+    if (sexChromType != 1) {
+        PgenReader::CountHardFreqMissExt(cur_buf, keepMaskInterPtr, rawSampleCT, keepSampleCT, &snpinfo, f_std);
+    } else {
+        string errmsg;
+        PgenReader::CountHardFreqMissExtX(cur_buf, keepMaskInterPtr, heterogameticMaskInterPtr,
+                                          rawSampleCT, keepSampleCT, keepHeterogameticSampleCT,
+                                          &snpinfo, errmsg, iDC == 1, f_std);
+    }
+
+    double af = snpinfo.af;
+    if (bHasPreAF) {
+        af = AFA1[extractedMarkerIndex];
+        snpinfo.mean = 2 * af;
+        snpinfo.std  = 2 * af * (1.0 - af);
+    }
+    double maf = std::min(af, 1.0 - af);
+    if (maf < min_maf || maf > max_maf) return;
+    if (snpinfo.nMissRate < dFilterMiss) return;
+
+    const double mu = bGRM ? (2.0 * af) : snpinfo.mean;
+    const double sd = f_std ? snpinfo.std : mu * (1.0 - af);
+    if (sd < 1.0e-50) return;
+
+    af_out          = static_cast<float>(af);
+    additive_af_out = static_cast<float>(af);
+    mu_out          = mu;
+    nValidN_out     = snpinfo.N;
+    valid_out       = true;
+
+    uintptr_t *pmiss = (snpinfo.N < keepSampleCT) ? miss_out : nullptr;
+    PgenReader::ExtractInt8Ext(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, dest, pmiss);
+}
+
 // PGEN path: decode directly into dest via geno_f32_ptr (no temporary double vector).
 void Geno::getGenoFloat_pgen(uintptr_t *buf, int idx, float *dest,
                               float &af_out, float &additive_af_out,

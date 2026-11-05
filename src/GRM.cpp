@@ -933,15 +933,12 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
     grm_m = static_cast<int>(part_keep_indices.second) - static_cast<int>(part_keep_indices.first) + 1;
     grm_s_n = grm_n - grm_m;
     grm_bytes_std_geno = static_cast<int>(sizeof(float)) * grm_n;
-    // Round grm_n up to next multiple of 16 (64 bytes) so every column of stdGeno
-    // is 64-byte aligned. Required by single-threaded AVX/AVX-512 BLAS kernels.
-    stdGenoLD = (grm_n + 15) / 16 * 16;
+    // Round up to a multiple of 64 elements so every column of stdGeno / stdGeno_i8
+    // is 64-byte aligned and has capacity >= index_keep.size() (for --make-grm-part).
+    const int ld_base = std::max(grm_n, static_cast<int>(index_keep.size()));
+    stdGenoLD = (ld_base + 63) / 64 * 64;
     // Pre-allocate scratch buffers for calculate_GRM_blas
     validIndexBuf.reserve(nMarkerBlock);
-    {
-        const int max_tile_dim = std::min(4096, std::max(1, grm_n));
-        grm_f32_tile_.resize(static_cast<size_t>(max_tile_dim) * max_tile_dim);
-    }
     {
         const int markerPerN = static_cast<int>(sizeof(uintptr_t) * CHAR_BIT);
         const int numNSampleBlock = (grm_n + markerPerN - 1) / markerPerN;
@@ -985,13 +982,26 @@ void GRM::output_id() {
 void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerIndex){
     int num_marker = markerIndex.size();
 
-    #pragma omp parallel for schedule(static)
-    for(int i = 0; i < num_marker; i++){
-        GenoBufItem &item = gbufitems[i];
-        item.extractedMarkerIndex = markerIndex[i];
-        item.geno_ptr = nullptr;
-        item.geno_f32_ptr = stdGeno + static_cast<size_t>(i) * stdGenoLD;
-        geno->getGenoDouble(buf, i, &item);
+    if (use_int8_grm) {
+        #pragma omp parallel for schedule(static)
+        for(int i = 0; i < num_marker; i++){
+            GenoBufItem &item = gbufitems[i];
+            item.extractedMarkerIndex = markerIndex[i];
+            item.geno_ptr = nullptr;
+            item.geno_f32_ptr = nullptr;
+            item.geno_i8_ptr = stdGeno_i8 + static_cast<size_t>(i) * stdGenoLD;
+            geno->getGenoDouble(buf, i, &item);
+        }
+    } else {
+        #pragma omp parallel for schedule(static)
+        for(int i = 0; i < num_marker; i++){
+            GenoBufItem &item = gbufitems[i];
+            item.extractedMarkerIndex = markerIndex[i];
+            item.geno_ptr = nullptr;
+            item.geno_i8_ptr = nullptr;
+            item.geno_f32_ptr = stdGeno + static_cast<size_t>(i) * stdGenoLD;
+            geno->getGenoDouble(buf, i, &item);
+        }
     }
 
     validIndexBuf.clear();
@@ -1004,15 +1014,26 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     int curNumValidMarkers = static_cast<int>(validIndexBuf.size());
 
     // When all markers in the block pass filters (curNumValidMarkers == num_marker),
-    // every column is already decoded in-place at stdGeno + i * stdGenoLD.
+    // every column is already decoded in-place at stdGeno / stdGeno_i8 + i * stdGenoLD.
     // Otherwise, compact valid columns forward in-place (validIndexBuf[k] >= k).
     if (curNumValidMarkers < num_marker) {
-        for (int k = 0; k < curNumValidMarkers; ++k) {
-            const int src_idx = validIndexBuf[k];
-            if (src_idx != k) {
-                std::memcpy(stdGeno + static_cast<size_t>(k) * stdGenoLD,
-                            stdGeno + static_cast<size_t>(src_idx) * stdGenoLD,
-                            static_cast<size_t>(grm_bytes_std_geno));
+        if (use_int8_grm) {
+            for (int k = 0; k < curNumValidMarkers; ++k) {
+                const int src_idx = validIndexBuf[k];
+                if (src_idx != k) {
+                    std::memcpy(stdGeno_i8 + static_cast<size_t>(k) * stdGenoLD,
+                                stdGeno_i8 + static_cast<size_t>(src_idx) * stdGenoLD,
+                                static_cast<size_t>(grm_bytes_std_geno));
+                }
+            }
+        } else {
+            for (int k = 0; k < curNumValidMarkers; ++k) {
+                const int src_idx = validIndexBuf[k];
+                if (src_idx != k) {
+                    std::memcpy(stdGeno + static_cast<size_t>(k) * stdGenoLD,
+                                stdGeno + static_cast<size_t>(src_idx) * stdGenoLD,
+                                static_cast<size_t>(grm_bytes_std_geno));
+                }
             }
         }
     }
@@ -1022,117 +1043,397 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         }
     }
 
-    // Mixed-precision BLAS3: run cblas_ssyrk / cblas_sgemm (beta=0.0f) on L3-sized
-    // 4096x4096 float32 tiles (grm_f32_tile_), then widen and accumulate into
-    // double* grm. On the first accumulation for this grm buffer (grm_first_accum),
-    // write directly to unzeroed memory instead of accumulating so untouched upper-
-    // triangle pages of grm stay unfaulted in physical RAM.
     constexpr int kTile = 4096;
     const bool first_accum = grm_first_accum;
 
-    auto accum_sgemm_to_f64 = [&](int M, int N_cols, int K,
-                                  const float* A, int lda,
-                                  const float* B, int ldb,
-                                  double* C, int ldc) {
-        for (int c0 = 0; c0 < N_cols; c0 += kTile) {
-            const int cols = std::min(kTile, N_cols - c0);
-            for (int r0 = 0; r0 < M; r0 += kTile) {
-                const int rows = std::min(kTile, M - r0);
-                if (K > 0) {
-                    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasTrans,
-                                rows, cols, K,
-                                1.0f,
-                                A + r0, lda,
-                                B + c0, ldb,
-                                0.0f,
-                                grm_f32_tile_.data(), rows);
+    if (use_int8_grm) {
+        double S_mu2 = 0.0;
+        for (int m = 0; m < curNumValidMarkers; ++m) {
+            const double mu_m = gbufitems[validIndexBuf[m]].mean;
+            mu_vec_[m] = mu_m;
+            S_mu2 += mu_m * mu_m;
+        }
+
+        // Compute per-sample row sums r_raw_[i] = sum_m g_{im} * mu_m in parallel.
+        constexpr int kRowChunk = 1024;
+        #pragma omp parallel for schedule(static)
+        for (int i0 = 0; i0 < grm_n; i0 += kRowChunk) {
+            const int len = std::min(kRowChunk, grm_n - i0);
+            double* r_slice = r_raw_.data() + i0;
+            std::memset(r_slice, 0, static_cast<size_t>(len) * sizeof(double));
+            for (int m = 0; m < curNumValidMarkers; ++m) {
+                const double mu_m = mu_vec_[m];
+                const int8_t* col_m = stdGeno_i8 + static_cast<size_t>(m) * stdGenoLD + i0;
+                for (int r = 0; r < len; ++r) {
+                    r_slice[r] += static_cast<double>(col_m[r]) * mu_m;
                 }
-                #pragma omp parallel for schedule(static)
+            }
+        }
+
+        bool block_has_missing = false;
+        const uint32_t full_keep_ct = static_cast<uint32_t>(index_keep.size());
+        for (int m = 0; m < curNumValidMarkers; ++m) {
+            if (gbufitems[validIndexBuf[m]].nValidN < full_keep_ct) {
+                block_has_missing = true;
+                break;
+            }
+        }
+
+        marker_miss_idx_.clear();
+        if (block_has_missing) {
+            std::memcpy(r_tilde_.data(), r_raw_.data(), static_cast<size_t>(grm_n) * sizeof(double));
+            const int num_words = (grm_n + 63) / 64;
+            const uintptr_t last_word_mask = (grm_n % 64 == 0)
+                ? ~static_cast<uintptr_t>(0)
+                : ((static_cast<uintptr_t>(1) << (grm_n % 64)) - 1);
+            marker_miss_offset_[0] = 0;
+            for (int m = 0; m < curNumValidMarkers; ++m) {
+                const GenoBufItem& item = gbufitems[validIndexBuf[m]];
+                if (item.nValidN < full_keep_ct && !item.missing.empty()) {
+                    const double mu2 = mu_vec_[m] * mu_vec_[m];
+                    const uintptr_t* miss_words = item.missing.data();
+                    for (int w = 0; w < num_words; ++w) {
+                        uintptr_t word = miss_words[w];
+                        if (w == num_words - 1) word &= last_word_mask;
+                        while (word != 0) {
+                            const int bit = std::countr_zero(word);
+                            const int s = w * 64 + bit;
+                            r_tilde_[s] += mu2;
+                            marker_miss_idx_.push_back(s);
+                            word &= (word - 1);
+                        }
+                    }
+                }
+                marker_miss_offset_[m + 1] = static_cast<int>(marker_miss_idx_.size());
+            }
+            if (marker_miss_idx_.empty()) {
+                block_has_missing = false;
+            }
+        }
+        const double* r_row_vec = block_has_missing ? r_tilde_.data() : r_raw_.data();
+
+        std::vector<int> row_miss_b;
+        std::vector<int> row_miss_e;
+        std::vector<int> active_row_miss_markers;
+        std::vector<int> col_miss_offset;
+        std::vector<int> col_miss_m;
+        if (block_has_missing) {
+            row_miss_b.resize(curNumValidMarkers);
+            row_miss_e.resize(curNumValidMarkers);
+            active_row_miss_markers.reserve(curNumValidMarkers);
+        }
+
+        auto prepare_col_missing = [&](int global_c0, int cols) {
+            if (!block_has_missing) return;
+            col_miss_offset.assign(cols + 1, 0);
+            for (int m = 0; m < curNumValidMarkers; ++m) {
+                const int mb = marker_miss_offset_[m];
+                const int me = marker_miss_offset_[m + 1];
+                if (mb == me) continue;
+                const auto it_b = std::lower_bound(marker_miss_idx_.begin() + mb,
+                                                   marker_miss_idx_.begin() + me,
+                                                   global_c0);
+                const auto it_e = std::lower_bound(it_b,
+                                                   marker_miss_idx_.begin() + me,
+                                                   global_c0 + cols);
+                for (auto it = it_b; it != it_e; ++it) {
+                    col_miss_offset[(*it - global_c0) + 1]++;
+                }
+            }
+            for (int c = 0; c < cols; ++c) {
+                col_miss_offset[c + 1] += col_miss_offset[c];
+            }
+            col_miss_m.resize(col_miss_offset[cols]);
+            std::vector<int> write_pos(col_miss_offset.begin(), col_miss_offset.begin() + cols);
+            for (int m = 0; m < curNumValidMarkers; ++m) {
+                const int mb = marker_miss_offset_[m];
+                const int me = marker_miss_offset_[m + 1];
+                if (mb == me) continue;
+                const auto it_b = std::lower_bound(marker_miss_idx_.begin() + mb,
+                                                   marker_miss_idx_.begin() + me,
+                                                   global_c0);
+                const auto it_e = std::lower_bound(it_b,
+                                                   marker_miss_idx_.begin() + me,
+                                                   global_c0 + cols);
+                for (auto it = it_b; it != it_e; ++it) {
+                    col_miss_m[write_pos[*it - global_c0]++] = m;
+                }
+            }
+        };
+
+        auto prepare_row_missing = [&](int global_r0, int rows) {
+            if (!block_has_missing) return;
+            active_row_miss_markers.clear();
+            for (int m = 0; m < curNumValidMarkers; ++m) {
+                const int mb = marker_miss_offset_[m];
+                const int me = marker_miss_offset_[m + 1];
+                if (mb == me) {
+                    row_miss_b[m] = row_miss_e[m] = mb;
+                    continue;
+                }
+                const int b = static_cast<int>(std::lower_bound(
+                    marker_miss_idx_.begin() + mb,
+                    marker_miss_idx_.begin() + me,
+                    global_r0) - marker_miss_idx_.begin());
+                const int e = static_cast<int>(std::lower_bound(
+                    marker_miss_idx_.begin() + b,
+                    marker_miss_idx_.begin() + me,
+                    global_r0 + rows) - marker_miss_idx_.begin());
+                row_miss_b[m] = b;
+                row_miss_e[m] = e;
+                if (b < e) {
+                    active_row_miss_markers.push_back(m);
+                }
+            }
+        };
+
+        auto accum_col_with_centering = [&](int c, int j, int row_start, int len,
+                                            const int32_t* src_col, double* dst_col) {
+            const double r_j_plus_S = S_mu2 - r_raw_[j];
+            const double* r_row_slice = r_row_vec + row_start;
+            if (first_accum) {
+                for (int r = 0; r < len; ++r) {
+                    dst_col[r] = static_cast<double>(src_col[r]) - r_row_slice[r] + r_j_plus_S;
+                }
+            } else {
+                for (int r = 0; r < len; ++r) {
+                    dst_col[r] += static_cast<double>(src_col[r]) - r_row_slice[r] + r_j_plus_S;
+                }
+            }
+            if (!block_has_missing) return;
+
+            // Step 2: markers missing in column j
+            const int cm_b = col_miss_offset[c];
+            const int cm_e = col_miss_offset[c + 1];
+            for (int idx = cm_b; idx < cm_e; ++idx) {
+                const int m = col_miss_m[idx];
+                const double mu_m = mu_vec_[m];
+                const double neg_mu2 = -mu_m * mu_m;
+                const int8_t* col_m = stdGeno_i8 + static_cast<size_t>(m) * stdGenoLD + row_start;
+                for (int r = 0; r < len; ++r) {
+                    dst_col[r] += static_cast<double>(col_m[r]) * mu_m + neg_mu2;
+                }
+                for (int r_idx = row_miss_b[m]; r_idx < row_miss_e[m]; ++r_idx) {
+                    const int s = marker_miss_idx_[r_idx];
+                    if (s >= row_start) {
+                        dst_col[s - row_start] -= neg_mu2;
+                    }
+                }
+            }
+
+            // Step 3: markers missing in rows [row_start, row_start + len)
+            for (int m : active_row_miss_markers) {
+                const int8_t g_jm = stdGeno_i8[static_cast<size_t>(m) * stdGenoLD + j];
+                if (g_jm != 0) {
+                    const double corr = mu_vec_[m] * static_cast<double>(g_jm);
+                    for (int r_idx = row_miss_b[m]; r_idx < row_miss_e[m]; ++r_idx) {
+                        const int s = marker_miss_idx_[r_idx];
+                        if (s >= row_start) {
+                            dst_col[s - row_start] += corr;
+                        }
+                    }
+                }
+            }
+        };
+
+        auto accum_i8_gemm_to_f64 = [&](int row_base, int M, int col_base, int N_cols, int K,
+                                        double* C, int ldc) {
+            for (int c0 = 0; c0 < N_cols; c0 += kTile) {
+                const int cols = std::min(kTile, N_cols - c0);
+                const int global_c0 = col_base + c0;
+                if (K > 0) prepare_col_missing(global_c0, cols);
+                for (int r0 = 0; r0 < M; r0 += kTile) {
+                    const int rows = std::min(kTile, M - r0);
+                    const int global_r0 = row_base + r0;
+                    if (K > 0) {
+                        prepare_row_missing(global_r0, rows);
+                        gcta_gemm_s8s8s32_colmajor_nt(
+                            rows, cols, K,
+                            stdGeno_i8 + global_r0, stdGenoLD,
+                            stdGeno_i8 + global_c0, stdGenoLD,
+                            grm_i32_tile_.data(), rows,
+                            i8_scratch_A_f32_, i8_scratch_B_f32_, grm_f32_tile_);
+                    }
+                    #pragma omp parallel for schedule(static)
+                    for (int c = 0; c < cols; ++c) {
+                        double* dst_col = C + r0 + static_cast<size_t>(c0 + c) * ldc;
+                        if (K == 0) {
+                            if (first_accum)
+                                std::memset(dst_col, 0, static_cast<size_t>(rows) * sizeof(double));
+                            continue;
+                        }
+                        const int32_t* src_col = grm_i32_tile_.data() + static_cast<size_t>(c) * rows;
+                        accum_col_with_centering(c, global_c0 + c, global_r0, rows, src_col, dst_col);
+                    }
+                }
+            }
+        };
+
+        auto accum_i8_syrk_lower_to_f64 = [&](int base, int N_dim, int K,
+                                              double* C, int ldc) {
+            for (int c0 = 0; c0 < N_dim; c0 += kTile) {
+                const int cols = std::min(kTile, N_dim - c0);
+                const int global_c0 = base + c0;
+                if (K > 0) {
+                    prepare_col_missing(global_c0, cols);
+                    prepare_row_missing(global_c0, cols);
+                    gcta_syrk_s8s8s32_lower_colmajor_nt(
+                        cols, K,
+                        stdGeno_i8 + global_c0, stdGenoLD,
+                        grm_i32_tile_.data(), cols,
+                        i8_scratch_A_f32_, grm_f32_tile_);
+                }
+                #pragma omp parallel for schedule(guided)
                 for (int c = 0; c < cols; ++c) {
-                    double* dst_col = C + r0 + static_cast<size_t>(c0 + c) * ldc;
+                    double* dst_col = C + (c0 + c) + static_cast<size_t>(c0 + c) * ldc;
+                    const int len = cols - c;
                     if (K == 0) {
                         if (first_accum)
-                            std::memset(dst_col, 0, static_cast<size_t>(rows) * sizeof(double));
+                            std::memset(dst_col, 0, static_cast<size_t>(len) * sizeof(double));
                         continue;
                     }
-                    const float* src_col = grm_f32_tile_.data() + static_cast<size_t>(c) * rows;
+                    const int32_t* src_col = grm_i32_tile_.data() + c + static_cast<size_t>(c) * cols;
+                    const int j = global_c0 + c;
+                    accum_col_with_centering(c, j, j, len, src_col, dst_col);
+                }
+                const int rem_rows = N_dim - (c0 + cols);
+                if (rem_rows > 0) {
+                    accum_i8_gemm_to_f64(base + c0 + cols, rem_rows,
+                                         global_c0, cols, K,
+                                         C + (c0 + cols) + static_cast<size_t>(c0) * ldc, ldc);
+                }
+            }
+        };
+
+        if (grm_tiling_enabled) {
+            if (grm_tile_rs > 0) {
+                accum_i8_gemm_to_f64(grm_tile_rs, grm_tile_rows, 0, grm_tile_rs, curNumValidMarkers,
+                                     grm, grm_tile_rows);
+            }
+            double *grm_diag = grm + static_cast<size_t>(grm_tile_rs) * grm_tile_rows;
+            accum_i8_syrk_lower_to_f64(grm_tile_rs, grm_tile_rows, curNumValidMarkers,
+                                       grm_diag, grm_tile_rows);
+        } else if (part_keep_indices.first == 0) {
+            accum_i8_syrk_lower_to_f64(0, grm_n, curNumValidMarkers,
+                                       grm, grm_n);
+        } else {
+            const int row_base = static_cast<int>(part_keep_indices.first);
+            accum_i8_gemm_to_f64(row_base, grm_m, 0, grm_s_n, curNumValidMarkers,
+                                 grm, grm_m);
+            double *grm_start = grm + static_cast<uint64_t>(grm_s_n) * grm_m;
+            accum_i8_syrk_lower_to_f64(row_base, grm_m, curNumValidMarkers,
+                                       grm_start, grm_m);
+        }
+    } else {
+        // Mixed-precision BLAS3: run cblas_ssyrk / cblas_sgemm (beta=0.0f) on L3-sized
+        // 4096x4096 float32 tiles (grm_f32_tile_), then widen and accumulate into
+        // double* grm. On the first accumulation for this grm buffer (grm_first_accum),
+        // write directly to unzeroed memory instead of accumulating so untouched upper-
+        // triangle pages of grm stay unfaulted in physical RAM.
+        auto accum_sgemm_to_f64 = [&](int M, int N_cols, int K,
+                                      const float* A, int lda,
+                                      const float* B, int ldb,
+                                      double* C, int ldc) {
+            for (int c0 = 0; c0 < N_cols; c0 += kTile) {
+                const int cols = std::min(kTile, N_cols - c0);
+                for (int r0 = 0; r0 < M; r0 += kTile) {
+                    const int rows = std::min(kTile, M - r0);
+                    if (K > 0) {
+                        cblas_sgemm(CblasColMajor, CblasNoTrans, CblasTrans,
+                                    rows, cols, K,
+                                    1.0f,
+                                    A + r0, lda,
+                                    B + c0, ldb,
+                                    0.0f,
+                                    grm_f32_tile_.data(), rows);
+                    }
+                    #pragma omp parallel for schedule(static)
+                    for (int c = 0; c < cols; ++c) {
+                        double* dst_col = C + r0 + static_cast<size_t>(c0 + c) * ldc;
+                        if (K == 0) {
+                            if (first_accum)
+                                std::memset(dst_col, 0, static_cast<size_t>(rows) * sizeof(double));
+                            continue;
+                        }
+                        const float* src_col = grm_f32_tile_.data() + static_cast<size_t>(c) * rows;
+                        if (first_accum) {
+                            for (int r = 0; r < rows; ++r)
+                                dst_col[r] = static_cast<double>(src_col[r]);
+                        } else {
+                            for (int r = 0; r < rows; ++r)
+                                dst_col[r] += static_cast<double>(src_col[r]);
+                        }
+                    }
+                }
+            }
+        };
+
+        auto accum_ssyrk_lower_to_f64 = [&](int N_dim, int K,
+                                            const float* A, int lda,
+                                            double* C, int ldc) {
+            for (int c0 = 0; c0 < N_dim; c0 += kTile) {
+                const int cols = std::min(kTile, N_dim - c0);
+                if (K > 0) {
+                    cblas_ssyrk(CblasColMajor, CblasLower, CblasNoTrans,
+                                cols, K,
+                                1.0f,
+                                A + c0, lda,
+                                0.0f,
+                                grm_f32_tile_.data(), cols);
+                }
+                #pragma omp parallel for schedule(guided)
+                for (int c = 0; c < cols; ++c) {
+                    double* dst_col = C + (c0 + c) + static_cast<size_t>(c0 + c) * ldc;
+                    const int len = cols - c;
+                    if (K == 0) {
+                        if (first_accum)
+                            std::memset(dst_col, 0, static_cast<size_t>(len) * sizeof(double));
+                        continue;
+                    }
+                    const float* src_col = grm_f32_tile_.data() + c + static_cast<size_t>(c) * cols;
                     if (first_accum) {
-                        for (int r = 0; r < rows; ++r)
+                        for (int r = 0; r < len; ++r)
                             dst_col[r] = static_cast<double>(src_col[r]);
                     } else {
-                        for (int r = 0; r < rows; ++r)
+                        for (int r = 0; r < len; ++r)
                             dst_col[r] += static_cast<double>(src_col[r]);
                     }
                 }
-            }
-        }
-    };
-
-    auto accum_ssyrk_lower_to_f64 = [&](int N_dim, int K,
-                                        const float* A, int lda,
-                                        double* C, int ldc) {
-        for (int c0 = 0; c0 < N_dim; c0 += kTile) {
-            const int cols = std::min(kTile, N_dim - c0);
-            if (K > 0) {
-                cblas_ssyrk(CblasColMajor, CblasLower, CblasNoTrans,
-                            cols, K,
-                            1.0f,
-                            A + c0, lda,
-                            0.0f,
-                            grm_f32_tile_.data(), cols);
-            }
-            #pragma omp parallel for schedule(guided)
-            for (int c = 0; c < cols; ++c) {
-                double* dst_col = C + (c0 + c) + static_cast<size_t>(c0 + c) * ldc;
-                const int len = cols - c;
-                if (K == 0) {
-                    if (first_accum)
-                        std::memset(dst_col, 0, static_cast<size_t>(len) * sizeof(double));
-                    continue;
-                }
-                const float* src_col = grm_f32_tile_.data() + c + static_cast<size_t>(c) * cols;
-                if (first_accum) {
-                    for (int r = 0; r < len; ++r)
-                        dst_col[r] = static_cast<double>(src_col[r]);
-                } else {
-                    for (int r = 0; r < len; ++r)
-                        dst_col[r] += static_cast<double>(src_col[r]);
+                const int rem_rows = N_dim - (c0 + cols);
+                if (rem_rows > 0) {
+                    accum_sgemm_to_f64(rem_rows, cols, K,
+                                       A + c0 + cols, lda,
+                                       A + c0, lda,
+                                       C + (c0 + cols) + static_cast<size_t>(c0) * ldc, ldc);
                 }
             }
-            const int rem_rows = N_dim - (c0 + cols);
-            if (rem_rows > 0) {
-                accum_sgemm_to_f64(rem_rows, cols, K,
-                                   A + c0 + cols, lda,
-                                   A + c0, lda,
-                                   C + (c0 + cols) + static_cast<size_t>(c0) * ldc, ldc);
-            }
-        }
-    };
+        };
 
-    if(grm_tiling_enabled){
-        if(grm_tile_rs > 0){
-            accum_sgemm_to_f64(grm_tile_rows, grm_tile_rs, curNumValidMarkers,
-                               stdGeno + grm_tile_rs, stdGenoLD,
+        if(grm_tiling_enabled){
+            if(grm_tile_rs > 0){
+                accum_sgemm_to_f64(grm_tile_rows, grm_tile_rs, curNumValidMarkers,
+                                   stdGeno + grm_tile_rs, stdGenoLD,
+                                   stdGeno, stdGenoLD,
+                                   grm, grm_tile_rows);
+            }
+            double *grm_diag = grm + static_cast<size_t>(grm_tile_rs) * grm_tile_rows;
+            accum_ssyrk_lower_to_f64(grm_tile_rows, curNumValidMarkers,
+                                     stdGeno + grm_tile_rs, stdGenoLD,
+                                     grm_diag, grm_tile_rows);
+        } else if(part_keep_indices.first == 0){
+            accum_ssyrk_lower_to_f64(grm_n, curNumValidMarkers,
+                                     stdGeno, stdGenoLD,
+                                     grm, grm_n);
+        }else{
+            accum_sgemm_to_f64(grm_m, grm_s_n, curNumValidMarkers,
+                               stdGeno + part_keep_indices.first, stdGenoLD,
                                stdGeno, stdGenoLD,
-                               grm, grm_tile_rows);
+                               grm, grm_m);
+            double *grm_start = grm + (uint64_t)grm_s_n * grm_m;
+            accum_ssyrk_lower_to_f64(grm_m, curNumValidMarkers,
+                                     stdGeno + part_keep_indices.first, stdGenoLD,
+                                     grm_start, grm_m);
         }
-        double *grm_diag = grm + static_cast<size_t>(grm_tile_rs) * grm_tile_rows;
-        accum_ssyrk_lower_to_f64(grm_tile_rows, curNumValidMarkers,
-                                 stdGeno + grm_tile_rs, stdGenoLD,
-                                 grm_diag, grm_tile_rows);
-    } else if(part_keep_indices.first == 0){
-        accum_ssyrk_lower_to_f64(grm_n, curNumValidMarkers,
-                                 stdGeno, stdGenoLD,
-                                 grm, grm_n);
-    }else{
-        accum_sgemm_to_f64(grm_m, grm_s_n, curNumValidMarkers,
-                           stdGeno + part_keep_indices.first, stdGenoLD,
-                           stdGeno, stdGenoLD,
-                           grm, grm_m);
-        double *grm_start = grm + (uint64_t)grm_s_n * grm_m;
-        accum_ssyrk_lower_to_f64(grm_m, curNumValidMarkers,
-                                 stdGeno + part_keep_indices.first, stdGenoLD,
-                                 grm_start, grm_m);
     }
     grm_first_accum = false;  // every later marker block for this buffer accumulates
 
@@ -1831,10 +2132,30 @@ void GRM::processMakeGRM(bool is_homogametic){
         const int numNblockMax = (nMarkerBlock + markerPerN - 1) / markerPerN;
         sampleMissBuf.resize(static_cast<size_t>(numNSampleBlock) * markerPerN * numNblockMax);
     }
-    this->num_byte_geno = sizeof(float) * nMarkerBlock * stdGenoLD;
-    int ret = posix_memalign((void **)&stdGeno, 64, num_byte_geno);
-    if(ret != 0){
-        LOGGER.e(0, "can't allocate enough memory for the genotype buffer.");
+    use_int8_grm = bBLAS && isMtd && !isDominance && !is_homogametic
+                   && (geno->getGenoFormat() == "BED")
+                   && (std::getenv("GCTA_DISABLE_INT8_GRM") == nullptr);
+    const int max_tile_dim = std::min(4096, std::max(1, grm_n));
+    if (use_int8_grm) {
+        grm_bytes_std_geno = static_cast<int>(sizeof(int8_t)) * grm_n;
+        this->num_byte_geno = sizeof(int8_t) * static_cast<uint64_t>(nMarkerBlock) * stdGenoLD;
+        int ret = posix_memalign((void **)&stdGeno_i8, 64, num_byte_geno);
+        if (ret != 0) {
+            LOGGER.e(0, "can't allocate enough memory for the int8 genotype buffer.");
+        }
+        grm_i32_tile_.resize(static_cast<size_t>(max_tile_dim) * max_tile_dim);
+        mu_vec_.resize(nMarkerBlock);
+        r_raw_.resize(grm_n);
+        r_tilde_.resize(grm_n);
+        marker_miss_offset_.resize(nMarkerBlock + 1);
+    } else {
+        grm_bytes_std_geno = static_cast<int>(sizeof(float)) * grm_n;
+        this->num_byte_geno = sizeof(float) * static_cast<uint64_t>(nMarkerBlock) * stdGenoLD;
+        int ret = posix_memalign((void **)&stdGeno, 64, num_byte_geno);
+        if (ret != 0) {
+            LOGGER.e(0, "can't allocate enough memory for the genotype buffer.");
+        }
+        grm_f32_tile_.resize(static_cast<size_t>(max_tile_dim) * max_tile_dim);
     }
     
     vector<function<void (uintptr_t *, std::span<const uint32_t>)>> callBacks;
@@ -2023,7 +2344,8 @@ void GRM::processMakeGRM(bool is_homogametic){
     }
 
     delete[] gbufitems;
-    posix_mem_free(stdGeno);
+    if (stdGeno) { posix_mem_free(stdGeno); stdGeno = nullptr; }
+    if (stdGeno_i8) { posix_mem_free(stdGeno_i8); stdGeno_i8 = nullptr; }
     geno->setGRMMode(false, false);
 }
 

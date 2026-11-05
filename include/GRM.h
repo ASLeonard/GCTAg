@@ -84,6 +84,8 @@ private:
 
     bool bBLAS;
     float *stdGeno = NULL;
+    int8_t *stdGeno_i8 = NULL;
+    bool use_int8_grm = false;
 
     void output_id();
 
@@ -121,6 +123,14 @@ private:
     std::vector<int> validIndexBuf;
     std::vector<uintptr_t> sampleMissBuf;
     std::vector<float> grm_f32_tile_;
+    std::vector<int32_t> grm_i32_tile_;
+    std::vector<float> i8_scratch_A_f32_;
+    std::vector<float> i8_scratch_B_f32_;
+    std::vector<double> mu_vec_;
+    std::vector<double> r_raw_;
+    std::vector<double> r_tilde_;
+    std::vector<int> marker_miss_offset_;
+    std::vector<int> marker_miss_idx_;
 
     // Block-tiled GRM: when grm_tile_size > 0 (set via --GRM-tile-size),
     // processMakeGRM iterates over grm_tile_size-row tiles.  For each tile

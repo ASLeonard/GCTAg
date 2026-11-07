@@ -65,6 +65,10 @@ inline int row_bound_for_cumulative(size_t target_elems, int lo, int n) {
     return std::clamp(r, lo + 1, n);
 }
 
+// Cap per-syscall I/O to 1 GiB (safely below INT_MAX on macOS/Darwin, where
+// read()/pread()/write() return EINVAL for counts > INT_MAX).
+inline constexpr size_t kMaxIoChunkBytes = 1ULL << 30;
+
 // Blocking read of exactly `count` bytes into `buf`, retrying on EINTR and
 // on short reads (both routine on network filesystems). Errors out via
 // LOGGER on unexpected EOF or a hard read error.
@@ -72,30 +76,29 @@ inline void read_exact(int fd, void* buf, size_t count, const std::string& path)
     char* p = static_cast<char*>(buf);
     size_t done = 0;
     while (done < count) {
-        const ssize_t r = ::read(fd, p + done, count - done);
+        const size_t step = std::min(kMaxIoChunkBytes, count - done);
+        const ssize_t r = ::read(fd, p + done, step);
         if (r < 0) {
             if (errno == EINTR) continue;
+            close(fd);
             LOGGER.e(0, "read() failed on [" + path + "]: " + std::string(std::strerror(errno)));
         }
-        if (r == 0)
+        if (r == 0) {
+            close(fd);
             LOGGER.e(0, "unexpected EOF reading [" + path + "].");
+        }
         done += static_cast<size_t>(r);
     }
 }
 
 // pread-based counterpart to read_exact above: reads exactly `count` bytes
-// starting at `offset`, retrying on EINTR and on short reads. pread takes
-// the offset as a call argument rather than mutating shared file-position
-// state, so unlike read()+lseek it's safe to call from any thread without
-// coordinating with others sharing the same fd -- ChunkedGrmReader only
-// ever calls this from one thread at a time regardless (see read_tile's
-// reentrancy note), but the safety property is what makes that fd share-
-// without-locking legitimate in the first place.
+// starting at `offset`, retrying on EINTR and on short reads.
 inline void read_exact_at(int fd, void* buf, size_t count, off_t offset, const std::string& path) {
     char* p = static_cast<char*>(buf);
     size_t done = 0;
     while (done < count) {
-        const ssize_t r = ::pread(fd, p + done, count - done, offset + static_cast<off_t>(done));
+        const size_t step = std::min(kMaxIoChunkBytes, count - done);
+        const ssize_t r = ::pread(fd, p + done, step, offset + static_cast<off_t>(done));
         if (r < 0) {
             if (errno == EINTR) continue;
             LOGGER.e(0, "pread() failed on [" + path + "]: " + std::string(std::strerror(errno)));
@@ -112,9 +115,11 @@ inline void write_exact(int fd, const void* buf, size_t count, const std::string
     const char* p = static_cast<const char*>(buf);
     size_t done = 0;
     while (done < count) {
-        const ssize_t w = ::write(fd, p + done, count - done);
+        const size_t step = std::min(kMaxIoChunkBytes, count - done);
+        const ssize_t w = ::write(fd, p + done, step);
         if (w < 0) {
             if (errno == EINTR) continue;
+            close(fd);
             LOGGER.e(0, "write() failed on [" + path + "]: " + std::string(std::strerror(errno)));
         }
         done += static_cast<size_t>(w);
@@ -664,21 +669,50 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
 // If your GRMs might have different sample orderings, this isn't the right
 // tool — use ChunkedGrmReader-based per-entry lookups instead (each source
 // file gets its own kp).
-inline int solve_merge_chunk_rows(int n, int K, double budget_gb) {
-    const double budget_bytes = budget_gb * 1e9;
-    const double bytes_per_row = 4.0 * static_cast<double>(n) * (2.0 * K + 2.0);
-    const int chunk_rows = static_cast<int>(budget_bytes / bytes_per_row);
-    return std::min(std::max(chunk_rows, 0), n);
+// Load a binary GRM (upper triangle only) and subset/reorder it to match
+// `analysis_ids`, writing only the upper triangle of `G_out` so lower-triangle
+// pages stay unfaulted. If `m_snps_out >= 0.0` on entry, `.grm.N.bin`'s mean
+// diagonal is read into `m_snps_out`.
+inline void load_and_subset_grm_upper(
+    const std::string& grm_prefix,
+    const std::vector<std::string>& analysis_ids,
+    Eigen::MatrixXd& G_out,
+    double& m_snps_out,
+    const std::string& caller_flag)
+{
+    std::vector<std::string> grm_ids;
+    Eigen::MatrixXd G_full;
+    read_grm_binary(grm_prefix, grm_ids, G_full, m_snps_out, /*upper_only=*/true);
+
+    const int n = static_cast<int>(analysis_ids.size());
+    const std::vector<int> kp = match_ids_to_grm(analysis_ids, grm_ids);
+    for (int i = 0; i < n; ++i) {
+        if (kp[i] < 0)
+            LOGGER.e(0, caller_flag + ": individual [" + analysis_ids[i] +
+                        "] not found in GRM [" + grm_prefix + "].");
+    }
+
+    const int n_grm = static_cast<int>(grm_ids.size());
+    bool is_identity = (n_grm == n);
+    for (int i = 0; i < n && is_identity; ++i)
+        if (kp[i] != i) is_identity = false;
+
+    if (is_identity) {
+        G_out = std::move(G_full);
+    } else {
+        G_out.resize(n, n);
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (int j = 0; j < n; ++j) {
+            const int src_col = kp[j];
+            for (int i = 0; i <= j; ++i) {
+                const int r = kp[i], c = src_col;
+                G_out(i, j) = (r <= c) ? G_full(r, c) : G_full(c, r);
+            }
+        }
+        G_full.resize(0, 0);
+    }
 }
 
-// row_block_rows: caller-chosen block size, unchanged default (4000) for
-// backward compatibility with existing callers. memory_budget_gb: if > 0,
-// OVERRIDES row_block_rows with solve_merge_chunk_rows(n, K, budget) --
-// prefer this over hand-picking row_block_rows, since the right block size
-// depends on K (number of inputs), which the caller may not know until
-// prefixes.size() is available, and because a fixed row_block_rows chosen
-// without K in mind is exactly what caused this function's memory to scale
-// unboundedly with K (see solve_merge_chunk_rows's comment above).
 inline void merge_grms(
     const std::vector<std::string>& prefixes,
     const std::string& out_prefix,

@@ -227,26 +227,6 @@ Marker::Marker() {
 
 }
 
-void Marker::setLocoBfilePrefix(const std::string& bfile_prefix) {
-    if (bfile_prefix.empty()) {
-        LOGGER.e(0, "[LOCO] empty bfile prefix in manifest.");
-    }
-
-    options["marker_file"] = bfile_prefix + ".bim";
-    options.erase("m_file");
-    options.erase("pvar_file");
-    options.erase("m_pvar");
-#ifdef BGEN_SUPPORT
-    options.erase("bgen_file");
-    options.erase("mbgen_file");
-#endif
-
-    std::ifstream f(options["marker_file"].c_str());
-    if (!f.good()) {
-        LOGGER.e(0, "[LOCO] manifest bfile not found: [" + options["marker_file"] + "]");
-    }
-}
-
 void Marker::matchSNPListFile(string filename, int num_min_fields, const std::vector<int>& field_return, std::vector<string> &fields){
     std::vector<string> temp_fields;
     std::ifstream allele_file(filename.c_str());

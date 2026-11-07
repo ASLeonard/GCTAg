@@ -38,18 +38,11 @@ public:
     ~GRM() {
         posix_mem_free(grm);
         posix_mem_free(N);
-        posix_mem_free(cmask_buf);
-        if(lookup_GRM_table) delete[] lookup_GRM_table;
-        if(geno_buf) posix_mem_free(geno_buf);
-        if(mask_buf) posix_mem_free(mask_buf);
-        //if(stdGeno) posix_mem_free(stdGeno);
         if(geno) delete geno;
     };
 
-    void calculate_GRM(uintptr_t* genobuf, std::span<const uint32_t> markerIndex);
     void calculate_GRM_blas(uintptr_t* genobuf, std::span<const uint32_t> markerIndex);
     
-    void grm_thread(int grm_index_from, int grm_index_to);
     void N_thread(int grm_index_from, int grm_index_to, const uintptr_t* cmask);
     void deduce_GRM();
     vector<uint32_t> divide_parts(uint32_t from, uint32_t to, uint32_t num_parts);
@@ -57,7 +50,7 @@ public:
 
     static int registerOption(map<string, vector<string>>& options_in);
     static void processMain();
-    void processMakeGRM();
+    void processMakeGRM(bool is_homogametic = false);
     void processMakeGRMX();
 
     void loop_block(vector<function<void (double *buf, int num_block)>> callbacks
@@ -85,34 +78,9 @@ private:
     double *grm = NULL;
     uint32_t *N = NULL;
     std::vector<uint32_t> sub_miss; // sample miss in all markers
-
-    //========
-    // for byte style calculation
-    uint16_t *geno_buf = NULL;  // genotype buffer tranpose
-    uint16_t *mask_buf = NULL;  // mask of genotype
-    uint64_t *cmask_buf = NULL; // sample count mask //used in both byte or blas
-    int cur_num_block = 0;
     int finished_marker = 0;
-    const static int num_marker_block = 5;
-    const static int num_lookup_table = 8 * 8 * 8 * 8 * 8;
-
-    const static int num_cmask_block = 60;
-
-
-    double GRM_table[Constants::NUM_MARKER_READ][8];
-    //double lookup_GRM_table[Constants::NUM_MARKER_READ / num_marker_block][num_lookup_table];
-    double (*lookup_GRM_table)[num_lookup_table] = NULL;
-
-    std::vector<uint16_t> elements = {0, 2, 3, 4, 5, 6, 7};
-    uint64_t num_byte_geno;
-    uint64_t num_byte_cmask;
-    int reg_bit_width;
-    int num_grm_handle;
-    int num_count_handle;
-    int num_block_handle;
-    int num_marker_process_block;
-    //====
-    //end for byte style calculation
+    uint64_t num_byte_geno = 0;
+    int num_count_handle = 2;
 
     bool bBLAS;
     double *stdGeno = NULL;
@@ -175,21 +143,12 @@ private:
     bool grm_first_accum = true;
 
     // Write the current tile's normalised rows to already-open output files.
-    // w_grm/w_N/grm_block/sparse_buf are caller-owned scratch (sized once by
+    // w_N/grm_block/sparse_buf are caller-owned scratch (sized once by
     // processMakeGRM to the widest tile, reused across every tile call).
     void flush_grm_tile(FILE *grm_out, FILE *N_out,
                         float thresh, bool isSparse, float mtd_weight,
-                        std::vector<float>& w_grm, std::vector<float>& w_N,
+                        std::vector<float>& w_N,
                         std::vector<float>& grm_block, std::string& sparse_buf);
-
-    //Just for testing
-#ifndef NDEBUG
-    FILE * o_geno0;
-    FILE * o_mask0;
-#endif
-
-
-
 };
 
 

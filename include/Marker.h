@@ -43,9 +43,6 @@ class Marker {
 
 public:
     Marker();
-    // LOCO helper: override active marker source to a single PLINK prefix.
-    // This makes manifest bfile the source-of-truth for per-chromosome scans.
-    static void setLocoBfilePrefix(const std::string& bfile_prefix);
     uint32_t count_raw(int part = -1);
     uint32_t count_extract();
     bool isInExtract(uint32_t index);

@@ -35,7 +35,6 @@
 #include "utils.hpp" 
 #include <omp.h>
 #include "MLMA.h"
-#include "MLMA_loco.h"
 #include "PCA_stream.h"
 #include <cstdlib>
 #include "mem.hpp"
@@ -118,12 +117,14 @@ int main(int argc, char *argv[]){
         "--envir", "--optimal-rho", "--noSandwich", "--grid-size",
         "--GRM-tile-budget", "--nMarkers",
         "--pca", "--pca-v1", "--pca-stream", "--pca-approx",
-        "--svd-method", "--grm-chunked-budget",
+        "--svd-method", "--svd-oversampling", "--svd-power-iter", "--svd-seed", "--grm-chunked-budget",
         "--reml-trace-hutchpp", "--reml-trace-hutchpp-fixed-probes", "--reml-no-HE-start", "--reml-force-dense-V",
-        "--reml-woodbury-basis", "--reml-woodbury-basis-MP-margin", "--reml-woodbury-basis-MP-confirm", "--reml-woodbury-basis-EIG-mass", "--reml-woodbury-basis-EIG-k-buffer", "--reml-woodbury-basis-VAR-tail", "--reml-woodbury-basis-range", "--reml-woodbury-basis-posthoc-correction", "--reml-woodbury-basis-mem-budget",
+        "--reml-woodbury-basis", "--reml-woodbury-basis-MP-margin", "--reml-woodbury-basis-MP-confirm",
+        "--reml-woodbury-basis-EIG-mass", "--reml-woodbury-basis-EIG-k-buffer", "--reml-woodbury-basis-EIG-check-step", "--reml-woodbury-basis-EIG-k-max",
+        "--reml-woodbury-basis-VAR-tail", "--reml-woodbury-basis-range", "--reml-woodbury-basis-posthoc-correction", "--reml-woodbury-basis-mem-budget",
+        "--reml-woodbury-basis-save", "--reml-woodbury-basis-reuse", "--reml-woodbury-basis-warm-start",
         "--reml-no-constrain", "--reml-priors", "--reml-priors-var", "--reml-diagV-adj", "--reml-maxit",  "--reml-alg",
         "--reml-ai-robust", "--reml-ai-robust-tol", "--reml-ai-robust-risk",
-        "--mlma-loco-stream", "--loco-manifest",
         "--mlma-no-preadj-covar",
         "--mlma-stream", "--save-reml", "--load-reml", "--log-pval", "--model", "--weighted-phenotypes",
 
@@ -286,16 +287,15 @@ int main(int argc, char *argv[]){
 
     //start register the options
     // Please take care of the order, C++ has few reflation feature, I did in a ugly way.
-        // Note: "mlma", "mlma_loco", and "pca_stream" must appear before "GRM" so
-        // that --grm is captured by those modules before GRM::registerOption erases it.
-        vector<string> module_names = {"phenotype", "marker", "genotype", "covar", "mlma", /*"mlma_loco",*/ "pca_stream", "GRM", "fastFAM", "LD"};
+    // Note: "mlma" and "pca_stream" must appear before "GRM" so
+    // that --grm is captured by those modules before GRM::registerOption erases it.
+    vector<string> module_names = {"phenotype", "marker", "genotype", "covar", "mlma", "pca_stream", "GRM", "fastFAM", "LD"};
     vector<int (*)(map<string, vector<string>>&)> registers = {
             Pheno::registerOption,
             Marker::registerOption,
             Geno::registerOption,
             Covar::registerOption,
             MLMA::registerOption,
-            //MLMALoco::registerOption,
             PCAStream::registerOption,
             GRM::registerOption,
             FastFAM::registerOption,
@@ -307,7 +307,6 @@ int main(int argc, char *argv[]){
             Geno::processMain,
             Covar::processMain,
             MLMA::processMain,
-            //MLMALoco::processMain,
             PCAStream::processMain,
             GRM::processMain,
             FastFAM::processMain,

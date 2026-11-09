@@ -217,23 +217,36 @@ void PCAStream::processMain()
 
         // ---- GRM access: chunked tile reader, or dense (fallback / comparison) ----
         gcta_chunked::TileReader chunked_reader;
-        Eigen::MatrixXd G_dense;  // left empty when grm_chunked
+        Eigen::MatrixXd G_dense;      // populated only for exact mode (!grm_chunked && pca_approx.empty())
+        Eigen::MatrixXf G_dense_f32;  // populated for --pca-approx when !grm_chunked
 
         if (grm_chunked) {
             // make_chunked_grm_reader already logged the budget/chunk_size
             // split above; nothing further to log here.
             chunked_reader = std::move(chunked_handle.reader);
+        } else if (!pca_approx.empty()) {
+            double m_snps_unused = -1.0;
+            gcta_grm_io::load_and_subset_grm_upper(
+                grm_pfx, analysis_ids, G_dense_f32, m_snps_unused, "--pca");
         } else {
             double m_snps_unused = -1.0;
             gcta_grm_io::load_and_subset_grm_upper(
                 grm_pfx, analysis_ids, G_dense, m_snps_unused, "--pca");
         }
 
-        auto apply = [&](const auto& X) -> Eigen::MatrixXd {
+        auto apply_f32 = [&](const Eigen::Ref<const Eigen::MatrixXf>& X) -> Eigen::MatrixXf {
             if (grm_chunked)
-                return gcta_chunked::chunked_symmetric_matvec(chunked_reader, n, chunk_size, X);
+                return gcta_chunked::chunked_symmetric_matvec(
+                    chunked_reader, n, chunk_size, X.cast<double>()).cast<float>();
             else
-                return G_dense.selfadjointView<Eigen::Upper>() * X;
+                return G_dense_f32.selfadjointView<Eigen::Upper>() * X;
+        };
+
+        auto apply_f64 = [&](const Eigen::Ref<const Eigen::VectorXd>& x) -> Eigen::VectorXd {
+            if (grm_chunked)
+                return gcta_chunked::chunked_symmetric_matvec(chunked_reader, n, chunk_size, x);
+            else
+                return (G_dense_f32.selfadjointView<Eigen::Upper>() * x.cast<float>()).cast<double>();
         };
 
         // Capture the full trace once here so that a partial spectrum can still be
@@ -243,8 +256,9 @@ void PCAStream::processMain()
         // The GRM can be overwritten in place, so we must compute the trace first.
         const double trace_total = [&]() {
             if (grm_chunked) return gcta_chunked::chunked_diagonal(chunked_reader, n, chunk_size).sum();
-            if (G_dense.size() == 0) return 0.0;
-            return G_dense.diagonal().sum();
+            if (G_dense_f32.size() > 0) return G_dense_f32.diagonal().cast<double>().sum();
+            if (G_dense.size() > 0) return G_dense.diagonal().sum();
+            return 0.0;
         }();
         LOGGER.i(0, "Total variance (tr(G)) = " + to_string(trace_total));
 
@@ -256,24 +270,28 @@ void PCAStream::processMain()
         try {
             const bool pca_nystrom = options.count("pca_nystrom") > 0;
             if (!pca_approx.empty()) {
-                gcta_eigh::EighResult res;
                 if (pca_approx == "rSVD") {
                     const int oversample = gcta_eigh::recommended_oversample(out_pc_num);
+                    gcta_eigh::EighResultF res_f;
                     if (pca_nystrom) {
                         LOGGER.i(0, "--pca rSVD + --svd-method nystrom: signed single-pass sketch (1 GRM matvec). Accuracy near PC " +
                                     std::to_string(out_pc_num) + " may be lower than power-iteration rSVD.");
-                        res = gcta_eigh::nystrom_symmetric_eigh(apply, n, out_pc_num, oversample);
+                        res_f = gcta_eigh::nystrom_symmetric_eigh<float>(apply_f32, n, out_pc_num, oversample);
                     } else {
-                        res = gcta_eigh::randomized_symmetric_eigh(apply, n, out_pc_num, oversample, svd_power_iter);
+                        res_f = gcta_eigh::randomized_symmetric_eigh<float>(apply_f32, n, out_pc_num, oversample, svd_power_iter);
                     }
+                    G_dense_f32.resize(0, 0);
+                    eval = std::move(res_f.eigenvalues);
+                    evec = res_f.eigenvectors.cast<double>();
                 } else if (pca_approx == "Lanczos") {
                     const int ncv = std::min(n, std::max(3 * out_pc_num + 1, 30));
-                    res = gcta_eigh::lanczos_symmetric_eigh(apply, n, out_pc_num, ncv);
+                    gcta_eigh::EighResult res = gcta_eigh::lanczos_symmetric_eigh(apply_f64, n, out_pc_num, ncv);
+                    G_dense_f32.resize(0, 0);
+                    eval = std::move(res.eigenvalues);
+                    evec = std::move(res.eigenvectors);
                 } else {
                     LOGGER.e(0, "--pca-approx: unrecognised method '" + pca_approx + "'. Use 'rSVD' or 'Lanczos'.");
                 }
-                eval = std::move(res.eigenvalues);
-                evec = std::move(res.eigenvectors);
             } else {
                 if (pca_nystrom)
                     LOGGER.w(0, "--svd-method is ignored in exact mode (it only applies to --pca-approx rSVD).");

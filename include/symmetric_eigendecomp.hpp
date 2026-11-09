@@ -51,10 +51,14 @@ inline Eigen::VectorXd threaded_dense_matvec(
     return A * x;
 }
 
-struct EighResult {
+template <typename Scalar = double>
+struct EighResultT {
     Eigen::VectorXd eigenvalues;   // descending, size k_target
-    Eigen::MatrixXd eigenvectors;  // n x k_target, columns match eigenvalues
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> eigenvectors;  // n x k_target, columns match eigenvalues
 };
+
+using EighResult  = EighResultT<double>;
+using EighResultF = EighResultT<float>;
 
 inline std::mt19937& shared_rng() {
     static std::mt19937 rng([] {
@@ -83,7 +87,8 @@ inline void fill_standard_normal(Eigen::Ref<Eigen::MatrixXd> matrix) {
 // longer bit-reproducible across different thread-count runs. Omega is an
 // ephemeral random sketch, so this shouldn't matter for correctness, but
 // flag it if any test depends on exact reproducibility of the sketch.
-inline void fill_standard_normal(Eigen::Ref<Eigen::MatrixXd> matrix) {
+template <typename Scalar>
+inline void fill_standard_normal_impl(Eigen::Ref<Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>> matrix) {
     const Eigen::Index rows = matrix.rows();
     const Eigen::Index cols = matrix.cols();
     if (rows == 0 || cols == 0) return;
@@ -110,8 +115,16 @@ inline void fill_standard_normal(Eigen::Ref<Eigen::MatrixXd> matrix) {
 
         for (Eigen::Index col = col_begin; col < col_end; ++col)
             for (Eigen::Index row = 0; row < rows; ++row)
-                matrix(row, col) = normal(local_rng);
+                matrix(row, col) = static_cast<Scalar>(normal(local_rng));
     }
+}
+
+inline void fill_standard_normal(Eigen::Ref<Eigen::MatrixXd> matrix) {
+    fill_standard_normal_impl<double>(matrix);
+}
+
+inline void fill_standard_normal(Eigen::Ref<Eigen::MatrixXf> matrix) {
+    fill_standard_normal_impl<float>(matrix);
 }
 
 // Keep the sketch width proportional to the target rank, but avoid the old
@@ -166,14 +179,17 @@ inline void eigh_upper_desc(Eigen::MatrixXd& B, Eigen::VectorXd& w, Eigen::Matri
 // basis for the same GRM), its leading columns seed omega instead of a
 // fresh Gaussian draw, which typically lets power_iterate_and_project()
 // converge in fewer iterations.
-template <typename MatVecApply>
-std::pair<Eigen::MatrixXd, Eigen::MatrixXd> build_randomized_sketch(
+template <typename Scalar = double, typename MatVecApply>
+std::pair<Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>,
+          Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>>
+build_randomized_sketch(
     MatVecApply&& apply,
     int n,
     int k_ext,
-    const Eigen::MatrixXd* warm_start = nullptr)
+    const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>* warm_start = nullptr)
 {
-    Eigen::MatrixXd omega;
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    Mat omega;
     if (warm_start && warm_start->rows() == n && warm_start->cols() > 0) {
         omega.resize(n, k_ext);
         const int k_copy = std::min(static_cast<int>(warm_start->cols()), k_ext);
@@ -184,7 +200,7 @@ std::pair<Eigen::MatrixXd, Eigen::MatrixXd> build_randomized_sketch(
         omega.resize(n, k_ext);
         fill_standard_normal(omega);
     }
-    Eigen::MatrixXd Y = apply(omega);
+    Mat Y = apply(omega);
     return {std::move(omega), std::move(Y)};
 }
 
@@ -194,22 +210,23 @@ std::pair<Eigen::MatrixXd, Eigen::MatrixXd> build_randomized_sketch(
 // the k_target dominant eigenpairs of A.
 //
 // `apply` is called power_iter + 1 more times. Y is consumed/overwritten.
-template <typename MatVecApply>
-EighResult power_iterate_and_project(
+template <typename Scalar = double, typename MatVecApply>
+EighResultT<Scalar> power_iterate_and_project(
     MatVecApply&& apply,
-    Eigen::MatrixXd Y,
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> Y,
     int k_target,
     int power_iter = 3)
 {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
     const int n     = static_cast<int>(Y.rows());
     const int k_ext = static_cast<int>(Y.cols());
     if (k_target > k_ext)
         throw std::invalid_argument("power_iterate_and_project: k_target exceeds sketch width k_ext.");
 
     for (int pi = 0; pi < power_iter; ++pi) {
-        // Cholesky QR2 (DSYRK+DPOTRF+DTRSM) rather than LAPACK Householder QR:
+        // Cholesky QR2 (SYRK+DPOTRF+TRSM) rather than LAPACK Householder QR:
         // all Level-3 BLAS, so it keeps scaling with thread count at large
-        // k_ext where dgeqrf/dorgqr's panel factorization stops parallelizing.
+        // k_ext where geqrf/orgqr's panel factorization stops parallelizing.
         // Deliberately not hoisting the k_ext x k_ext Gram scratch across
         // iterations: at k_ext in the thousands its malloc/free cost is
         // negligible next to the O(n*k_ext^2) SYRK/TRSM work, while keeping
@@ -229,10 +246,10 @@ EighResult power_iterate_and_project(
             throw std::runtime_error("power_iterate_and_project: orthogonalization failed (info=" +
                                       std::to_string(info) + ").");
     }
-    Eigen::MatrixXd Q = std::move(Y);
+    Mat Q = std::move(Y);
 
-    Eigen::MatrixXd AQ = apply(Q);
-    Eigen::MatrixXd B  = Q.transpose() * AQ;   // k_ext x k_ext, symmetric in exact arithmetic
+    Mat AQ = apply(Q);
+    Eigen::MatrixXd B  = (Q.transpose() * AQ).template cast<double>();   // k_ext x k_ext, symmetric in exact arithmetic
     AQ.resize(0, 0);
     // eigh_upper_desc reads only the upper triangle, so no B + B' symmetrisation is
     // needed; rayleigh_ritz_refine does the same, so the two Rayleigh-Ritz call sites
@@ -244,9 +261,9 @@ EighResult power_iterate_and_project(
     eigh_upper_desc(B, w, Z);
     B.resize(0, 0);
 
-    EighResult result;
+    EighResultT<Scalar> result;
     result.eigenvalues  = w.head(k_target);
-    result.eigenvectors = Q * Z.leftCols(k_target);
+    result.eigenvectors = Q * Z.leftCols(k_target).template cast<Scalar>();
     return result;
 }
 
@@ -289,15 +306,17 @@ EighResult power_iterate_and_project(
 //     definite; on a numerically rank-deficient block dorgqr completes Q with
 //     directions that need not be orthogonal to V0, which would invalidate the
 //     block form above.
-template <typename MatVecApply>
-EighResult expand_symmetric_eigh(
+template <typename Scalar = double, typename MatVecApply>
+EighResultT<Scalar> expand_symmetric_eigh(
     MatVecApply&& apply,
-    const Eigen::MatrixXd& V0,
+    const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& V0,
     const Eigen::VectorXd& theta0,
     int k_ext,
     int k_target,
     int power_iter = 3)
 {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    using Vec = Eigen::Matrix<Scalar, Eigen::Dynamic, 1>;
     const int n  = static_cast<int>(V0.rows());
     const int k0 = static_cast<int>(V0.cols());
     const int m  = k_ext - k0;
@@ -313,13 +332,13 @@ EighResult expand_symmetric_eigh(
     // Y <- (I - V0 V0') Y, `reps` times. One rep between power passes only has to
     // keep the next Cholesky-QR Gram matrix well conditioned; two reps ("twice is
     // enough") before the final orthogonalization give full orthogonality to V0.
-    auto deflate = [&](Eigen::MatrixXd& Y, int reps) {
+    auto deflate = [&](Mat& Y, int reps) {
         for (int rep = 0; rep < reps; ++rep) {
-            const Eigen::MatrixXd C = V0.transpose() * Y;   // k0 x m
+            const Mat C = V0.transpose() * Y;   // k0 x m
             Y.noalias() -= V0 * C;
         }
     };
-    auto orthonormalize = [&](Eigen::MatrixXd& Y) {
+    auto orthonormalize = [&](Mat& Y) {
         const int info = gcta_cholesky_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)m, Y.data(), (gcta_blas_int)n);
         if (info != 0)
             throw std::runtime_error("expand_symmetric_eigh: orthogonalization failed (info=" +
@@ -327,7 +346,7 @@ EighResult expand_symmetric_eigh(
     };
 
     // First product: m random columns plus one probe column z = V0 g.
-    Eigen::MatrixXd Y(n, m + 1);
+    Mat Y(n, m + 1);
     fill_standard_normal(Y.leftCols(m));
     Eigen::VectorXd g(k0);
     {
@@ -335,15 +354,16 @@ EighResult expand_symmetric_eigh(
         fill_standard_normal(gm);
         g = gm.col(0);
     }
-    Y.col(m).noalias() = V0 * g;
+    Y.col(m).noalias() = V0 * g.template cast<Scalar>();
     Y = apply(Y);
-    const Eigen::VectorXd Kz = Y.col(m);
+    const Vec Kz = Y.col(m);
     Y.conservativeResize(Eigen::NoChange, m);
     {
+        constexpr double ritz_tol = std::is_same_v<Scalar, float> ? 5e-3 : 1e-8;
         const Eigen::VectorXd expect = theta0.cwiseProduct(g);
         const double scale = expect.norm();
-        const Eigen::VectorXd got  = V0.transpose() * Kz;
-        if (scale > 0.0 && (got - expect).norm() > 1e-8 * scale)
+        const Eigen::VectorXd got  = (V0.transpose() * Kz).template cast<double>();
+        if (scale > 0.0 && (got - expect).norm() > ritz_tol * scale)
             throw std::runtime_error("expand_symmetric_eigh: locked basis fails the Ritz invariance "
                                       "check (V0' A V0 != diag(theta0)).");
     }
@@ -355,10 +375,15 @@ EighResult expand_symmetric_eigh(
     }
     deflate(Y, 2);
     orthonormalize(Y);                       // Y is now Q1
-    if ((V0.transpose() * Y).norm() > 1e-8)
-        throw std::runtime_error("expand_symmetric_eigh: fresh block is not orthogonal to the locked basis.");
+    {
+        const double ortho_tol = std::is_same_v<Scalar, float>
+            ? 5e-3 * std::sqrt(static_cast<double>(std::max(1, m)))
+            : 1e-8;
+        if (static_cast<double>((V0.transpose() * Y).norm()) > ortho_tol)
+            throw std::runtime_error("expand_symmetric_eigh: fresh block is not orthogonal to the locked basis.");
+    }
 
-    Eigen::MatrixXd KQ1 = apply(Y);          // n x m
+    Mat KQ1 = apply(Y);                      // n x m
 
     // eigh_upper_desc reads only the upper triangle: the strict lower triangle of the
     // leading k0 x k0 block and the whole lower-left block are never written or read,
@@ -366,8 +391,8 @@ EighResult expand_symmetric_eigh(
     Eigen::MatrixXd B(k_ext, k_ext);
     B.topLeftCorner(k0, k0).triangularView<Eigen::StrictlyUpper>().setZero();
     B.topLeftCorner(k0, k0).diagonal() = theta0;
-    B.topRightCorner(k0, m).noalias() = V0.transpose() * KQ1;        // V0' A Q1
-    B.bottomRightCorner(m, m).noalias() = Y.transpose() * KQ1;       // Q1' A Q1
+    B.topRightCorner(k0, m).noalias() = (V0.transpose() * KQ1).template cast<double>();        // V0' A Q1
+    B.bottomRightCorner(m, m).noalias() = (Y.transpose() * KQ1).template cast<double>();       // Q1' A Q1
     KQ1.resize(0, 0);
 
     Eigen::VectorXd w;
@@ -375,45 +400,46 @@ EighResult expand_symmetric_eigh(
     eigh_upper_desc(B, w, Z);
     B.resize(0, 0);
 
-    EighResult result;
+    EighResultT<Scalar> result;
     result.eigenvalues = w.head(k_target);
     result.eigenvectors.resize(n, k_target);
-    result.eigenvectors.noalias()  = V0 * Z.topLeftCorner(k0, k_target);
-    result.eigenvectors.noalias() += Y * Z.bottomLeftCorner(m, k_target);
+    result.eigenvectors.noalias()  = V0 * Z.topLeftCorner(k0, k_target).template cast<Scalar>();
+    result.eigenvectors.noalias() += Y  * Z.bottomLeftCorner(m, k_target).template cast<Scalar>();
     return result;
 }
 
 // Convenience one-shot entry point: sketch + power-iterate + project.
-template <typename MatVecApply>
-EighResult randomized_symmetric_eigh(
+template <typename Scalar = double, typename MatVecApply>
+EighResultT<Scalar> randomized_symmetric_eigh(
     MatVecApply&& apply,
     int n,
     int k_target,
     int oversample = 20,
     int power_iter = 3,
-    const Eigen::MatrixXd* warm_start = nullptr)
+    const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>* warm_start = nullptr)
 {
     const int k_ext = std::min(k_target + oversample, n - 1);
-    auto [omega, Y] = build_randomized_sketch(apply, n, k_ext, warm_start);
+    auto [omega, Y] = build_randomized_sketch<Scalar>(apply, n, k_ext, warm_start);
     (void)omega;
-    return power_iterate_and_project(std::forward<MatVecApply>(apply), std::move(Y), k_target, power_iter);
+    return power_iterate_and_project<Scalar>(std::forward<MatVecApply>(apply), std::move(Y), k_target, power_iter);
 }
 
 // Refine an orthonormal trial basis against the original operator. This costs
 // one additional block matvec and returns Rayleigh-Ritz eigenpairs, so callers
 // can use the resulting eigenvalues for spectral-mass decisions.
-template <typename MatVecApply>
-EighResult rayleigh_ritz_refine(
+template <typename Scalar = double, typename MatVecApply>
+EighResultT<Scalar> rayleigh_ritz_refine(
     MatVecApply&& apply,
-    Eigen::MatrixXd basis,
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> basis,
     int k_target)
 {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
     const int k_ext = static_cast<int>(basis.cols());
     if (k_target > k_ext)
         throw std::invalid_argument("rayleigh_ritz_refine: k_target exceeds basis width.");
 
-    Eigen::MatrixXd A_basis = apply(basis);
-    Eigen::MatrixXd B = basis.transpose() * A_basis;
+    Mat A_basis = apply(basis);
+    Eigen::MatrixXd B = (basis.transpose() * A_basis).template cast<double>();
     A_basis.resize(0, 0);
 
     Eigen::VectorXd w;
@@ -421,9 +447,9 @@ EighResult rayleigh_ritz_refine(
     eigh_upper_desc(B, w, Z);   // reads only the upper triangle; see power_iterate_and_project
     B.resize(0, 0);
 
-    EighResult result;
+    EighResultT<Scalar> result;
     result.eigenvalues  = w.head(k_target);
-    result.eigenvectors = basis * Z.leftCols(k_target);
+    result.eigenvectors = basis * Z.leftCols(k_target).template cast<Scalar>();
     return result;
 }
 
@@ -486,32 +512,33 @@ EighResult lanczos_symmetric_eigh(
 // approximation represents those directions instead of treating every
 // nonpositive eigenvalue as numerical noise. Only values at the backward
 // error scale of forming C are treated as its numerical nullspace.
-template <typename MatVecApply>
-EighResult nystrom_symmetric_eigh(
+template <typename Scalar = double, typename MatVecApply>
+EighResultT<Scalar> nystrom_symmetric_eigh(
     MatVecApply&& apply,
     int n,
     int k_target,
     int oversample = 20,
-    const Eigen::MatrixXd* warm_start = nullptr)
+    const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>* warm_start = nullptr)
 {
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
     const int k_ext = std::min(k_target + oversample, n - 1);
 
     // One-pass sketch: omega ~ Gaussian (or warm-started), Y = K * omega
-    auto [omega, Y] = build_randomized_sketch(apply, n, k_ext, warm_start);
+    auto [omega, Y] = build_randomized_sketch<Scalar>(apply, n, k_ext, warm_start);
 
     // C = omega^T * Y  (k_ext × k_ext)
     // Symmetric in exact arithmetic for PSD K; indefinite when K has
     // negative eigenvalues (e.g. GRM with missing genotypes).
     // Only the upper triangle is read by eigh_upper_desc, so no symmetrisation.
-    Eigen::MatrixXd C = omega.transpose() * Y;
+    Eigen::MatrixXd C = (omega.transpose() * Y).template cast<double>();
 
     // Bound the accumulated dot-product error in C = Omega^T Y. This is a
     // numerical-rank criterion, not a spectral regularizer: nonzero
     // negative eigenvalues remain part of the signed Nyström approximation.
-    const double eps = std::numeric_limits<double>::epsilon();
+    const double eps = static_cast<double>(std::numeric_limits<Scalar>::epsilon());
     const double n_eps = static_cast<double>(n) * eps;
     const double gamma_n = n_eps / (1.0 - n_eps);
-    const double eps_C = gamma_n * omega.norm() * Y.norm();
+    const double eps_C = gamma_n * static_cast<double>(omega.norm()) * static_cast<double>(Y.norm());
     omega.resize(0, 0);
 
     Eigen::VectorXd lam_C;
@@ -526,13 +553,13 @@ EighResult nystrom_symmetric_eigh(
     // K_nys = Z sign(Lambda) Z^T, where
     // Z = Y V |Lambda|^{-1/2}. This retains the signed spectrum of an
     // indefinite GRM without an additional K matvec.
-    Eigen::MatrixXd Z = Y * (V_C * lam_sqrt_abs_inv.asDiagonal());
+    Mat Z = Y * (V_C * lam_sqrt_abs_inv.asDiagonal()).template cast<Scalar>();
     Y.resize(0, 0);
     V_C.resize(0, 0);
 
     // Z is owned and mutable here (unlike tall_skinny_thin_svd's const&), so
     // this needs zero extra n x k_ext buffers: gcta_cholesky_qr_thin_QR
-    // (DSYRK+DPOTRF+DTRSM, pure Level-3 BLAS) factors Z into its own
+    // (SYRK+DPOTRF+TRSM, pure Level-3 BLAS) factors Z into its own
     // explicit Q in place and returns the tiny k_ext x k_ext R separately,
     // without an extra n-scale copy. Do NOT resize Z away below; it doubles
     // as Q for the rest of the function.
@@ -541,7 +568,7 @@ EighResult nystrom_symmetric_eigh(
                                                   R.data(), (gcta_blas_int)k_ext);
     if (info_qr != 0)
         throw std::runtime_error("nystrom_symmetric_eigh: orthogonalization failed (info=" + std::to_string(info_qr) + ").");
-    const Eigen::MatrixXd& Q = Z;   // Z now holds explicit Q; alias, not a copy
+    const Mat& Q = Z;   // Z now holds explicit Q; alias, not a copy
 
     Eigen::MatrixXd T = R * signs.asDiagonal() * R.transpose();   // upper triangle is read below
     Eigen::VectorXd w_T;
@@ -549,9 +576,9 @@ EighResult nystrom_symmetric_eigh(
     eigh_upper_desc(T, w_T, U_T);
     T.resize(0, 0);
 
-    EighResult result;
+    EighResultT<Scalar> result;
     result.eigenvalues  = w_T.head(k_target);
-    result.eigenvectors = Q * U_T.leftCols(k_target);
+    result.eigenvectors = Q * U_T.leftCols(k_target).template cast<Scalar>();
     return result;
 }
 

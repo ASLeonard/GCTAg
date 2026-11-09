@@ -168,9 +168,10 @@ inline void write_exact(int fd, const void* buf, size_t count, const std::string
 //     grm_read_chunk_bytes, independent of n) -- negligible next to G's
 //     own n²·8 bytes and to what every downstream consumer of G already
 //     needs at peak.
+template <typename Scalar>
 inline void read_grm_binary(const std::string& prefix,
                              std::vector<std::string>& ids,
-                             Eigen::MatrixXd& G,
+                             Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& G,
                              double& m_snps,
                              bool upper_only = false,
                              size_t grm_read_chunk_bytes = (1ull << 30) /* 1GiB */)
@@ -201,7 +202,7 @@ inline void read_grm_binary(const std::string& prefix,
         }
     }
 
-    // Scatter the lower-triangle float32 entries into G (double precision)
+    // Scatter the lower-triangle float32 entries into G (Scalar precision)
     // one row-aligned chunk at a time: a single blocking read() pulls the
     // next chunk in fully (read_exact, above -- one coherent sequential
     // stream, no concurrent-offset I/O), then the cast+scatter of that
@@ -209,7 +210,7 @@ inline void read_grm_binary(const std::string& prefix,
     // the triangular per-row workload). Column-contiguous write per row
     // (G.col(i).head(i+1)) for the same reason as before: it matches the
     // chunk buffer's own contiguous row-major-packed layout, keeping the
-    // cast vectorizable.
+    // copy/cast vectorizable.
     G.resize(n, n);
     const size_t max_elems_per_chunk = std::max<size_t>(1, grm_read_chunk_bytes / sizeof(float));
     std::vector<float> chunk_buf(max_elems_per_chunk);
@@ -229,7 +230,7 @@ inline void read_grm_binary(const std::string& prefix,
         for (int i = row_cursor; i < row_end; ++i) {
             const size_t local_off = static_cast<size_t>(i) * (i + 1) / 2 - row_base_cursor;
             G.col(i).head(i + 1) =
-                Eigen::Map<const Eigen::VectorXf>(chunk_buf.data() + local_off, i + 1).cast<double>();
+                Eigen::Map<const Eigen::VectorXf>(chunk_buf.data() + local_off, i + 1).template cast<Scalar>();
         }
         row_cursor = row_end;
     }
@@ -673,16 +674,19 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
 // `analysis_ids`, writing only the upper triangle of `G_out` so lower-triangle
 // pages stay unfaulted. If `m_snps_out >= 0.0` on entry, `.grm.N.bin`'s mean
 // diagonal is read into `m_snps_out`.
+template <typename Scalar>
 inline void load_and_subset_grm_upper(
     const std::string& grm_prefix,
     const std::vector<std::string>& analysis_ids,
-    Eigen::MatrixXd& G_out,
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& G_out,
     double& m_snps_out,
-    const std::string& caller_flag)
+    const std::string& caller_flag,
+    size_t grm_read_chunk_bytes = (1ull << 30) /* 1GiB */)
 {
-    std::vector<std::string> grm_ids;
-    Eigen::MatrixXd G_full;
-    read_grm_binary(grm_prefix, grm_ids, G_full, m_snps_out, /*upper_only=*/true);
+    std::vector<std::string> grm_ids = Pheno::read_sublist(grm_prefix + ".grm.id");
+    const int n_grm = static_cast<int>(grm_ids.size());
+    if (n_grm == 0)
+        LOGGER.e(0, "GRM id file [" + grm_prefix + ".grm.id] is empty.");
 
     const int n = static_cast<int>(analysis_ids.size());
     const std::vector<int> kp = match_ids_to_grm(analysis_ids, grm_ids);
@@ -692,25 +696,92 @@ inline void load_and_subset_grm_upper(
                         "] not found in GRM [" + grm_prefix + "].");
     }
 
-    const int n_grm = static_cast<int>(grm_ids.size());
     bool is_identity = (n_grm == n);
-    for (int i = 0; i < n && is_identity; ++i)
+    bool is_monotonic = true;
+    for (int i = 0; i < n; ++i) {
         if (kp[i] != i) is_identity = false;
+        if (i > 0 && kp[i] <= kp[i - 1]) is_monotonic = false;
+    }
 
     if (is_identity) {
-        G_out = std::move(G_full);
-    } else {
-        G_out.resize(n, n);
-        #pragma omp parallel for schedule(dynamic, 64)
-        for (int j = 0; j < n; ++j) {
-            const int src_col = kp[j];
-            for (int i = 0; i <= j; ++i) {
-                const int r = kp[i], c = src_col;
-                G_out(i, j) = (r <= c) ? G_full(r, c) : G_full(c, r);
+        read_grm_binary(grm_prefix, grm_ids, G_out, m_snps_out, /*upper_only=*/true, grm_read_chunk_bytes);
+        return;
+    }
+
+    if (is_monotonic) {
+        LOGGER.ts("grm");
+        using std::to_string;
+        const size_t tri      = static_cast<size_t>(n_grm) * (n_grm + 1) / 2;
+        const size_t byte_len = tri * sizeof(float);
+        const std::string bin_path = grm_prefix + ".grm.bin";
+        const int fd = ::open(bin_path.c_str(), O_RDONLY);
+        if (fd == -1)
+            LOGGER.e(0, "cannot open [" + bin_path + "].");
+        {
+            struct stat st{};
+            if (::fstat(fd, &st) != 0 || static_cast<size_t>(st.st_size) < byte_len) {
+                ::close(fd);
+                LOGGER.e(0, "unexpected size in [" + bin_path + "]. "
+                            "Expected " + to_string(tri) + " float32 entries for n=" +
+                            to_string(n_grm) + ".");
             }
         }
-        G_full.resize(0, 0);
+
+        G_out.resize(n, n);
+        const size_t max_elems_per_chunk = std::max<size_t>(1, grm_read_chunk_bytes / sizeof(float));
+        std::vector<float> chunk_buf(max_elems_per_chunk);
+        int row_cursor = 0;
+        int j_cursor = 0;
+        while (row_cursor < n_grm && j_cursor < n) {
+            const size_t row_base_cursor = static_cast<size_t>(row_cursor) * (row_cursor + 1) / 2;
+            const size_t target = row_base_cursor + max_elems_per_chunk;
+            const int row_end = row_bound_for_cumulative(target, row_cursor, n_grm);
+            const size_t row_base_end = static_cast<size_t>(row_end) * (row_end + 1) / 2;
+            const size_t elems_this_chunk = row_base_end - row_base_cursor;
+
+            int j_end = j_cursor;
+            while (j_end < n && kp[j_end] < row_end) ++j_end;
+
+            if (elems_this_chunk > chunk_buf.size())
+                chunk_buf.resize(elems_this_chunk);
+            read_exact(fd, chunk_buf.data(), elems_this_chunk * sizeof(float), bin_path);
+
+            if (j_end > j_cursor) {
+                #pragma omp parallel for schedule(dynamic, 64)
+                for (int j = j_cursor; j < j_end; ++j) {
+                    const int r_grm = kp[j];
+                    const float* row_ptr = chunk_buf.data() +
+                        (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
+                    Scalar* col_out = G_out.col(j).data();
+                    for (int i = 0; i <= j; ++i)
+                        col_out[i] = static_cast<Scalar>(row_ptr[kp[i]]);
+                }
+                j_cursor = j_end;
+            }
+            row_cursor = row_end;
+        }
+        ::close(fd);
+        LOGGER.i(0, "The .grm.bin fill took " + std::to_string(LOGGER.tp("grm")) + " seconds.");
+        if (m_snps_out < 0.0) {
+            LOGGER.i(0, "Skipping SNP count read from .grm.N.bin.");
+        } else {
+            m_snps_out = read_grm_N_mean(grm_prefix, n_grm);
+        }
+        return;
     }
+
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> G_full;
+    read_grm_binary(grm_prefix, grm_ids, G_full, m_snps_out, /*upper_only=*/true, grm_read_chunk_bytes);
+    G_out.resize(n, n);
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (int j = 0; j < n; ++j) {
+        const int src_col = kp[j];
+        for (int i = 0; i <= j; ++i) {
+            const int r = kp[i], c = src_col;
+            G_out(i, j) = (r <= c) ? G_full(r, c) : G_full(c, r);
+        }
+    }
+    G_full.resize(0, 0);
 }
 
 inline void merge_grms(

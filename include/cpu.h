@@ -189,6 +189,12 @@ void dgeqrf_(const gcta_blas_int* m, const gcta_blas_int* n, double* A,
 void dorgqr_(const gcta_blas_int* m, const gcta_blas_int* n, const gcta_blas_int* k,
              double* A, const gcta_blas_int* lda, const double* tau,
              double* work, const gcta_blas_int* lwork, gcta_blas_int* info);
+void sgeqrf_(const gcta_blas_int* m, const gcta_blas_int* n, float* A,
+             const gcta_blas_int* lda, float* tau, float* work,
+             const gcta_blas_int* lwork, gcta_blas_int* info);
+void sorgqr_(const gcta_blas_int* m, const gcta_blas_int* n, const gcta_blas_int* k,
+             float* A, const gcta_blas_int* lda, const float* tau,
+             float* work, const gcta_blas_int* lwork, gcta_blas_int* info);
 }
 #endif
 
@@ -211,6 +217,21 @@ inline int gcta_dgeqrf(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_in
 #endif
 }
 
+inline int gcta_sgeqrf(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, float* tau) {
+#if defined(GCTA_USE_ACCELERATE)
+    gcta_blas_int lwork = -1, info = 0;
+    float wkopt = 0.0f;
+    sgeqrf_(&m, &k, A, &lda, tau, &wkopt, &lwork, &info);
+    if (info != 0) return static_cast<int>(info);
+    lwork = static_cast<gcta_blas_int>(wkopt);
+    Eigen::VectorXf work(lwork);
+    sgeqrf_(&m, &k, A, &lda, tau, work.data(), &lwork, &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(LAPACKE_sgeqrf(LAPACK_COL_MAJOR, m, k, A, lda, tau));
+#endif
+}
+
 // Overwrite A (post-dgeqrf) with the explicit m x k orthonormal Q factor,
 // in place, from the reflectors produced by gcta_dgeqrf. Destroys R — call
 // after extracting R if the caller needs it.
@@ -229,6 +250,21 @@ inline int gcta_dorgqr(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_in
 #endif
 }
 
+inline int gcta_sorgqr(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, const float* tau) {
+#if defined(GCTA_USE_ACCELERATE)
+    gcta_blas_int lwork = -1, info = 0;
+    float wkopt = 0.0f;
+    sorgqr_(&m, &k, &k, A, &lda, tau, &wkopt, &lwork, &info);
+    if (info != 0) return static_cast<int>(info);
+    lwork = static_cast<gcta_blas_int>(wkopt);
+    Eigen::VectorXf work(lwork);
+    sorgqr_(&m, &k, &k, A, &lda, tau, work.data(), &lwork, &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(LAPACKE_sorgqr(LAPACK_COL_MAJOR, m, k, k, A, lda, tau));
+#endif
+}
+
 // Convenience fusion for callers that only need Q (R discarded) — the
 // power-iteration QR passes in symmetric_eigendecomp.hpp never use R.
 inline int gcta_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_int lda) {
@@ -236,6 +272,13 @@ inline int gcta_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas
     int info = gcta_dgeqrf(m, k, A, lda, tau.data());
     if (info != 0) return info;
     return gcta_dorgqr(m, k, A, lda, tau.data());
+}
+
+inline int gcta_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda) {
+    Eigen::VectorXf tau(k);
+    int info = gcta_sgeqrf(m, k, A, lda, tau.data());
+    if (info != 0) return info;
+    return gcta_sorgqr(m, k, A, lda, tau.data());
 }
 
 // CholeskyQR2: forms the m x k orthonormal factor Q of Y in place using two
@@ -270,6 +313,31 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* Y, 
     return 0;
 }
 
+// Mixed-precision CholeskyQR2 for float32 m x k subspace matrices:
+// O(m * k^2) SYRK and TRSM run in float32 (cblas_ssyrk / cblas_strsm), while
+// the tiny k x k Gram Cholesky factorization runs in double (gcta_dpotrf) to
+// avoid premature single-precision breakdown on squared condition numbers.
+inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, gcta_blas_int ldY,
+                                    Eigen::MatrixXd* workspace = nullptr) {
+    Eigen::MatrixXd local_G;
+    Eigen::MatrixXd& G = workspace ? *workspace : local_G;
+    G.resize(k, k);
+    Eigen::MatrixXf G_f(k, k);
+    for (int pass = 0; pass < 2; ++pass) {
+        cblas_ssyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0f, Y, ldY, 0.0f, G_f.data(), k);
+        G.triangularView<Eigen::Lower>() = G_f.cast<double>();
+        const int info = gcta_dpotrf(k, G.data(), k);
+        if (info != 0) {
+            if (pass != 0) break;  // pass 0's Q already orthonormal; skip the refinement.
+            return gcta_qr_thin_Q(m, k, Y, ldY);
+        }
+        G_f.triangularView<Eigen::Lower>() = G.cast<float>();
+        cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
+                    m, k, 1.0f, G_f.data(), k, Y, ldY);
+    }
+    return 0;
+}
+
 // Same as gcta_cholesky_qr_thin_Q, but also returns the composed upper
 // triangular factor R (k x k, column-major, leading dimension ldR) such that
 // the original Y equals Q*R. Used by callers (Nystrom) that need R for a
@@ -299,6 +367,37 @@ inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, double* Y,
         const Eigen::MatrixXd R_pass = Eigen::MatrixXd(G.triangularView<Eigen::Lower>()).transpose();
         cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
                     m, k, 1.0, G.data(), k, Y, ldY);
+        Rmat = (pass == 0) ? R_pass : Eigen::MatrixXd(R_pass * Rmat);
+    }
+    return 0;
+}
+
+inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, float* Y, gcta_blas_int ldY,
+                                     double* R, gcta_blas_int ldR, Eigen::MatrixXd* workspace = nullptr) {
+    Eigen::Map<Eigen::MatrixXd, 0, Eigen::OuterStride<>> Rmat(R, k, k, Eigen::OuterStride<>(ldR));
+    Eigen::MatrixXd local_G;
+    Eigen::MatrixXd& G = workspace ? *workspace : local_G;
+    G.resize(k, k);
+    Eigen::MatrixXf G_f(k, k);
+    for (int pass = 0; pass < 2; ++pass) {
+        cblas_ssyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0f, Y, ldY, 0.0f, G_f.data(), k);
+        G.triangularView<Eigen::Lower>() = G_f.cast<double>();
+        const int info = gcta_dpotrf(k, G.data(), k);
+        if (info != 0) {
+            if (pass != 0) break;  // pass 0's Q/R already valid; skip the refinement.
+            Eigen::VectorXf tau(k);
+            const int info_qr = gcta_sgeqrf(m, k, Y, ldY, tau.data());
+            if (info_qr != 0) return info_qr;
+            Rmat = Eigen::Map<Eigen::MatrixXf, 0, Eigen::OuterStride<>>(Y, k, k, Eigen::OuterStride<>(ldY))
+                       .triangularView<Eigen::Upper>()
+                       .toDenseMatrix()
+                       .cast<double>();
+            return gcta_sorgqr(m, k, Y, ldY, tau.data());
+        }
+        const Eigen::MatrixXd R_pass = Eigen::MatrixXd(G.triangularView<Eigen::Lower>()).transpose();
+        G_f.triangularView<Eigen::Lower>() = G.cast<float>();
+        cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
+                    m, k, 1.0f, G_f.data(), k, Y, ldY);
         Rmat = (pass == 0) ? R_pass : Eigen::MatrixXd(R_pass * Rmat);
     }
     return 0;

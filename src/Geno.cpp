@@ -540,37 +540,34 @@ void Geno::getGenoFloat_bed(uintptr_t *buf, int idx, float *dest,
     }
 }
 
-// PGEN path: reuse frequency/filter logic from getGenoDouble_pgen, then cast.
+// PGEN path: decode directly into dest via geno_f32_ptr (no temporary double vector).
 void Geno::getGenoFloat_pgen(uintptr_t *buf, int idx, float *dest,
                               float &af_out, float &additive_af_out,
                               bool &valid_out, uint32_t extractedMarkerIndex) {
     valid_out = false;
-    // Decode via the existing double path into a temporary GenoBufItem.
     GenoBufItem tmp;
     tmp.extractedMarkerIndex = extractedMarkerIndex;
+    tmp.geno_f32_ptr = dest;
     getGenoDouble_pgen(buf, idx, &tmp);
     if (!tmp.valid) return;
     valid_out       = true;
     af_out          = static_cast<float>(tmp.af);
     additive_af_out = static_cast<float>(tmp.additive_af);
-    for (uint32_t j = 0; j < keepSampleCT; ++j)
-        dest[j] = static_cast<float>(tmp.geno[j]);
 }
 
-// BGEN path: same strategy as PGEN — delegate to the double path, then cast.
+// BGEN path: decode directly into dest via geno_f32_ptr (no temporary double vector).
 void Geno::getGenoFloat_bgen(uintptr_t *buf, int idx, float *dest,
                               float &af_out, float &additive_af_out,
                               bool &valid_out, uint32_t extractedMarkerIndex) {
     valid_out = false;
     GenoBufItem tmp;
     tmp.extractedMarkerIndex = extractedMarkerIndex;
+    tmp.geno_f32_ptr = dest;
     getGenoDouble_bgen(buf, idx, &tmp);
     if (!tmp.valid) return;
     valid_out       = true;
     af_out          = static_cast<float>(tmp.af);
     additive_af_out = static_cast<float>(tmp.additive_af);
-    for (uint32_t j = 0; j < static_cast<uint32_t>(tmp.geno.size()); ++j)
-        dest[j] = static_cast<float>(tmp.geno[j]);
 }
 
 
@@ -704,24 +701,44 @@ void Geno::getGenoDouble_pgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
             // PGEN dosage_main uses 14-bit fractional scaling of allele
             // dosage in [0, 2].
             static constexpr double kDosageScale = 1.0 / 16384.0;
-            double *out_geno = gbuf->geno_ptr;
-            if (!out_geno) {
-                gbuf->geno.resize(keepSampleCT);
-                out_geno = gbuf->geno.data();
-            }
-            for(uint32_t j = 0; j < keepSampleCT; ++j){
-                const double dos = static_cast<double>(dosage_main[j]) * kDosageScale;
-                const double recoded = mapDosageToModel(dos, mu, model);
-                out_geno[j] = (recoded - spec.centerValue) * spec.rdev;
-            }
+            if (gbuf->geno_f32_ptr) {
+                float *out_f32 = gbuf->geno_f32_ptr;
+                for(uint32_t j = 0; j < keepSampleCT; ++j){
+                    const double dos = static_cast<double>(dosage_main[j]) * kDosageScale;
+                    const double recoded = mapDosageToModel(dos, mu, model);
+                    out_f32[j] = static_cast<float>((recoded - spec.centerValue) * spec.rdev);
+                }
+                if(sexChromType == 1){
+                    double weight;
+                    bool needWeight;
+                    setHeterogameticWeight(weight, needWeight);
+                    if(needWeight){
+                        const float fw = static_cast<float>(weight);
+                        for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
+                            out_f32[keepHeterogameticExtractIndex[i]] *= fw;
+                        }
+                    }
+                }
+            } else {
+                double *out_geno = gbuf->geno_ptr;
+                if (!out_geno) {
+                    gbuf->geno.resize(keepSampleCT);
+                    out_geno = gbuf->geno.data();
+                }
+                for(uint32_t j = 0; j < keepSampleCT; ++j){
+                    const double dos = static_cast<double>(dosage_main[j]) * kDosageScale;
+                    const double recoded = mapDosageToModel(dos, mu, model);
+                    out_geno[j] = (recoded - spec.centerValue) * spec.rdev;
+                }
 
-            if(sexChromType == 1){
-                double weight;
-                bool needWeight;
-                setHeterogameticWeight(weight, needWeight);
-                if(needWeight){
-                    for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
-                        out_geno[keepHeterogameticExtractIndex[i]] *= weight;
+                if(sexChromType == 1){
+                    double weight;
+                    bool needWeight;
+                    setHeterogameticWeight(weight, needWeight);
+                    if(needWeight){
+                        for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
+                            out_geno[keepHeterogameticExtractIndex[i]] *= weight;
+                        }
                     }
                 }
             }
@@ -778,34 +795,62 @@ void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     return;
                 }
                 const GenoCodingSpec spec = buildCodingSpec(mu, sd);
-                const double lookup[32] __attribute__ ((aligned (16))) =
-                    GET_TABLE16(spec.a0, spec.a1, spec.a2, spec.na);
-                double *out_geno = gbuf->geno_ptr;
-                if (!out_geno) {
-                    gbuf->geno.resize(keepSampleCT);
-                    out_geno = gbuf->geno.data();
-                }
                 uintptr_t * pmiss = NULL;
                 if(bMakeMiss){
                     gbuf->missing.resize(missPtrSize); 
                     pmiss = gbuf->missing.data();
                 }
-                PgenReader::ExtractDoubleExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, lookup, out_geno, pmiss); 
-                if(sexChromType == 1){
-                    double weight;
-                    bool needWeight;
-                    setHeterogameticWeight(weight, needWeight);
-                    if(needWeight){
-                        if(bGRM){
-                            for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
-                                out_geno[keepHeterogameticExtractIndex[i]] *= weight;
+                if (gbuf->geno_f32_ptr) {
+                    float *out_f32 = gbuf->geno_f32_ptr;
+                    const GenoCodingSpecF32 spec_f32 = buildCodingSpecF32(mu, sd);
+                    const float gtable256x4[1024] __attribute__((aligned(16))) =
+                        QUAD_TABLE256(spec_f32.a0, spec_f32.a1, spec_f32.a2, spec_f32.na);
+                    PgenReader::ExtractFloatExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, gtable256x4, out_f32, pmiss);
+                    if(sexChromType == 1){
+                        double weight;
+                        bool needWeight;
+                        setHeterogameticWeight(weight, needWeight);
+                        if(needWeight){
+                            const float fw = static_cast<float>(weight);
+                            if(bGRM){
+                                for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
+                                    out_f32[keepHeterogameticExtractIndex[i]] *= fw;
+                                }
+                            }else{
+                                const float correctWeight = static_cast<float>((weight - 1) * spec.rdev * spec.centerValue);
+                                for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
+                                    uint32_t curIndex = keepHeterogameticExtractIndex[i];
+                                    out_f32[curIndex] *= fw;
+                                    out_f32[curIndex] += correctWeight;
+                                }
                             }
-                        }else{
-                            double correctWeight = (weight - 1) * spec.rdev * spec.centerValue;
-                            for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
-                                uint32_t curIndex = keepHeterogameticExtractIndex[i];
-                                out_geno[curIndex] *= weight;
-                                out_geno[curIndex] += correctWeight;
+                        }
+                    }
+                } else {
+                    const double lookup[32] __attribute__ ((aligned (16))) =
+                        GET_TABLE16(spec.a0, spec.a1, spec.a2, spec.na);
+                    double *out_geno = gbuf->geno_ptr;
+                    if (!out_geno) {
+                        gbuf->geno.resize(keepSampleCT);
+                        out_geno = gbuf->geno.data();
+                    }
+                    PgenReader::ExtractDoubleExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, lookup, out_geno, pmiss); 
+                    if(sexChromType == 1){
+                        double weight;
+                        bool needWeight;
+                        setHeterogameticWeight(weight, needWeight);
+                        if(needWeight){
+                            if(bGRM){
+                                for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
+                                    out_geno[keepHeterogameticExtractIndex[i]] *= weight;
+                                }
+                            }else{
+                                double correctWeight = (weight - 1) * spec.rdev * spec.centerValue;
+                                for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
+                                    uint32_t curIndex = keepHeterogameticExtractIndex[i];
+                                    out_geno[curIndex] *= weight;
+                                    out_geno[curIndex] += correctWeight;
+                                }
                             }
                         }
                     }
@@ -1059,30 +1104,58 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                 }
                 dos_lookup[max_dos] = spec.na;
 
-                double *out_geno = gbuf->geno_ptr;
-                if (!out_geno) {
-                    gbuf->geno.resize(curSampleCT);
-                    out_geno = gbuf->geno.data();
-                }
-                for(int j = 0; j < curSampleCT; j++){
-                    out_geno[j] = dos_lookup[dosages[j]];
-                }
-                delete[] dos_lookup;
-                if(sexChromType == 1){
-                    double weight;
-                    bool needWeight;
-                    setHeterogameticWeight(weight, needWeight);
-                    if(needWeight){
-                        if(bGRM){
-                            for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
-                                out_geno[keepHeterogameticExtractIndex[i]] *= weight;
+                if (gbuf->geno_f32_ptr) {
+                    float *out_f32 = gbuf->geno_f32_ptr;
+                    for(int j = 0; j < curSampleCT; j++){
+                        out_f32[j] = static_cast<float>(dos_lookup[dosages[j]]);
+                    }
+                    delete[] dos_lookup;
+                    if(sexChromType == 1){
+                        double weight;
+                        bool needWeight;
+                        setHeterogameticWeight(weight, needWeight);
+                        if(needWeight){
+                            const float fw = static_cast<float>(weight);
+                            if(bGRM){
+                                for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
+                                    out_f32[keepHeterogameticExtractIndex[i]] *= fw;
+                                }
+                            }else{
+                                const float correctWeight = static_cast<float>((weight - 1) * spec.rdev * spec.centerValue);
+                                for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
+                                    uint32_t curIndex = keepHeterogameticExtractIndex[i];
+                                    out_f32[curIndex] *= fw;
+                                    out_f32[curIndex] += correctWeight;
+                                }
                             }
-                        }else{
-                            double correctWeight = (weight - 1) * spec.rdev * spec.centerValue;
-                            for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
-                                uint32_t curIndex = keepHeterogameticExtractIndex[i];
-                                out_geno[curIndex] *= weight;
-                                out_geno[curIndex] += correctWeight;
+                        }
+                    }
+                } else {
+                    double *out_geno = gbuf->geno_ptr;
+                    if (!out_geno) {
+                        gbuf->geno.resize(curSampleCT);
+                        out_geno = gbuf->geno.data();
+                    }
+                    for(int j = 0; j < curSampleCT; j++){
+                        out_geno[j] = dos_lookup[dosages[j]];
+                    }
+                    delete[] dos_lookup;
+                    if(sexChromType == 1){
+                        double weight;
+                        bool needWeight;
+                        setHeterogameticWeight(weight, needWeight);
+                        if(needWeight){
+                            if(bGRM){
+                                for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
+                                    out_geno[keepHeterogameticExtractIndex[i]] *= weight;
+                                }
+                            }else{
+                                double correctWeight = (weight - 1) * spec.rdev * spec.centerValue;
+                                for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
+                                    uint32_t curIndex = keepHeterogameticExtractIndex[i];
+                                    out_geno[curIndex] *= weight;
+                                    out_geno[curIndex] += correctWeight;
+                                }
                             }
                         }
                     }

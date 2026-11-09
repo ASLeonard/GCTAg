@@ -46,6 +46,7 @@ typedef struct GenoBufItem{
     // in
     uint32_t extractedMarkerIndex = 0;   // for allele lookup
     double *geno_ptr = nullptr;          // optional external genotype buffer (length >= keepSampleCT)
+    float  *geno_f32_ptr = nullptr;      // optional external float32 genotype buffer (length >= keepSampleCT)
 
     // out
     bool valid = false;

@@ -39,113 +39,79 @@ function(gcta_pin_compiler_rtlibs _label)
     set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH}" PARENT_SCOPE)
 endfunction()
 
-function(gcta_configure_binutils_from_dir _bin_dir _tool_kind _label _warn_if_missing)
-    if(_tool_kind STREQUAL "GNU")
-        set(_ar_name gcc-ar)
-        set(_ranlib_name gcc-ranlib)
-        set(_nm_name gcc-nm)
-    elseif(_tool_kind STREQUAL "LLVM")
-        set(_ar_name llvm-ar)
-        set(_ranlib_name llvm-ranlib)
-        set(_nm_name llvm-nm)
-    else()
-        message(FATAL_ERROR "Unknown binutils tool kind: ${_tool_kind}")
-    endif()
+function(gcta_configure_binutils_from_dir _bin_dir _prefix _label _warn_if_missing)
+    find_program(_tool_ar     NAMES ${_prefix}-ar     HINTS "${_bin_dir}" NO_DEFAULT_PATH)
+    find_program(_tool_ranlib NAMES ${_prefix}-ranlib HINTS "${_bin_dir}" NO_DEFAULT_PATH)
 
-    find_program(_tool_ar     NAMES ${_ar_name}     HINTS "${_bin_dir}" NO_DEFAULT_PATH)
-    find_program(_tool_ranlib NAMES ${_ranlib_name} HINTS "${_bin_dir}" NO_DEFAULT_PATH)
-    find_program(_tool_nm     NAMES ${_nm_name}     HINTS "${_bin_dir}" NO_DEFAULT_PATH)
-
-    # Under CMP0126=NEW, project() sets CMAKE_AR/RANLIB/NM as normal variables in
+    # Under CMP0126=NEW, project() sets CMAKE_AR/RANLIB as normal variables in
     # the caller scope, so both PARENT_SCOPE and CACHE FORCE are needed.
     if(_tool_ar)
         set(CMAKE_AR "${_tool_ar}" PARENT_SCOPE)
         set(CMAKE_AR "${_tool_ar}" CACHE FILEPATH "Archiver" FORCE)
         message(STATUS "${_label}: using archiver ${_tool_ar}")
     elseif(_warn_if_missing)
-        message(WARNING "${_label}: ${_ar_name} not found next to ${CMAKE_CXX_COMPILER} — LTO may be suboptimal for static libs")
+        message(WARNING "${_label}: ${_prefix}-ar not found next to ${CMAKE_CXX_COMPILER} — LTO may be suboptimal for static libs")
     endif()
 
     if(_tool_ranlib)
         set(CMAKE_RANLIB "${_tool_ranlib}" PARENT_SCOPE)
         set(CMAKE_RANLIB "${_tool_ranlib}" CACHE FILEPATH "Ranlib" FORCE)
     endif()
-
-    if(_tool_nm)
-        set(CMAKE_NM "${_tool_nm}" PARENT_SCOPE)
-        set(CMAKE_NM "${_tool_nm}" CACHE FILEPATH "NM" FORCE)
-    endif()
 endfunction()
 
 function(gcta_detect_blas_version _backend _blas_lib _blas_include_dir _out_var)
-    # Best-effort backend-specific version probe for configure-time diagnostics.
     # Relies on CMP0159=NEW so file(STRINGS ... REGEX) populates CMAKE_MATCH_<n>.
     set(_ver "unknown")
 
-    if(_backend STREQUAL "OpenBLAS")
-        set(_openblas_cfg "${_blas_include_dir}/openblas_config.h")
-        if(EXISTS "${_openblas_cfg}")
-            file(STRINGS "${_openblas_cfg}" _openblas_ver_line LIMIT_COUNT 1
-                REGEX "^#define[ \t]+OPENBLAS_VERSION[ \t]+\"([^\"]+)\"")
-            if(_openblas_ver_line)
-                set(_ver "${CMAKE_MATCH_1}")
-            endif()
+    if(_backend STREQUAL "OpenBLAS" AND EXISTS "${_blas_include_dir}/openblas_config.h")
+        file(STRINGS "${_blas_include_dir}/openblas_config.h" _line LIMIT_COUNT 1
+            REGEX "^#define[ \t]+OPENBLAS_VERSION[ \t]+\"([^\"]+)\"")
+        if(_line)
+            set(_ver "${CMAKE_MATCH_1}")
         endif()
-
-    elseif(_backend STREQUAL "MKL")
+    elseif(_backend STREQUAL "MKL" AND EXISTS "${_blas_include_dir}/mkl_version.h")
         set(_mkl_ver_h "${_blas_include_dir}/mkl_version.h")
-        if(EXISTS "${_mkl_ver_h}")
-            file(STRINGS "${_mkl_ver_h}" _mkl_major_line LIMIT_COUNT 1
-                REGEX "^#define[ \t]+__INTEL_MKL__[ \t]+([0-9]+)")
-            if(_mkl_major_line)
-                set(_mkl_major "${CMAKE_MATCH_1}")
-            endif()
-            file(STRINGS "${_mkl_ver_h}" _mkl_minor_line LIMIT_COUNT 1
-                REGEX "^#define[ \t]+__INTEL_MKL_MINOR__[ \t]+([0-9]+)")
-            if(_mkl_minor_line)
-                set(_mkl_minor "${CMAKE_MATCH_1}")
-            endif()
-            file(STRINGS "${_mkl_ver_h}" _mkl_update_line LIMIT_COUNT 1
-                REGEX "^#define[ \t]+__INTEL_MKL_UPDATE__[ \t]+([0-9]+)")
-            if(_mkl_update_line)
-                set(_mkl_update "${CMAKE_MATCH_1}")
-            endif()
-            if(DEFINED _mkl_major AND DEFINED _mkl_minor AND DEFINED _mkl_update)
-                set(_ver "${_mkl_major}.${_mkl_minor}.${_mkl_update}")
-            endif()
+        file(STRINGS "${_mkl_ver_h}" _l1 LIMIT_COUNT 1 REGEX "^#define[ \t]+__INTEL_MKL__[ \t]+([0-9]+)")
+        if(_l1)
+            set(_mkl_maj "${CMAKE_MATCH_1}")
         endif()
-
+        file(STRINGS "${_mkl_ver_h}" _l2 LIMIT_COUNT 1 REGEX "^#define[ \t]+__INTEL_MKL_MINOR__[ \t]+([0-9]+)")
+        if(_l2)
+            set(_mkl_min "${CMAKE_MATCH_1}")
+        endif()
+        file(STRINGS "${_mkl_ver_h}" _l3 LIMIT_COUNT 1 REGEX "^#define[ \t]+__INTEL_MKL_UPDATE__[ \t]+([0-9]+)")
+        if(_l3)
+            set(_mkl_upd "${CMAKE_MATCH_1}")
+        endif()
+        if(DEFINED _mkl_maj AND DEFINED _mkl_min AND DEFINED _mkl_upd)
+            set(_ver "${_mkl_maj}.${_mkl_min}.${_mkl_upd}")
+        endif()
     elseif(_backend STREQUAL "AOCL")
-        # AOCL typically exposes a BLIS version macro via blis.h.
-        set(_blis_h "${_blas_include_dir}/blis.h")
-        if(EXISTS "${_blis_h}")
-            file(STRINGS "${_blis_h}" _blis_ver_line LIMIT_COUNT 1
+        if(EXISTS "${_blas_include_dir}/blis.h")
+            file(STRINGS "${_blas_include_dir}/blis.h" _line LIMIT_COUNT 1
                 REGEX "^#define[ \t]+BLIS_VERSION_STRING[ \t]+\"([^\"]+)\"")
-            if(_blis_ver_line)
+            if(_line)
                 set(_ver "${CMAKE_MATCH_1}")
             endif()
         endif()
         if(_ver STREQUAL "unknown" AND _blas_lib)
-            # AOCL 6.0+ unified builds emit an aocl_manifest.txt sidecar next to libaocl.so or in its prefix.
             cmake_path(GET _blas_lib PARENT_PATH _blas_lib_dir)
-            foreach(_manifest_path IN ITEMS "${_blas_lib_dir}/aocl_manifest.txt" "${_blas_lib_dir}/../aocl_manifest.txt")
-                if(EXISTS "${_manifest_path}")
-                    file(STRINGS "${_manifest_path}" _aocl_ver_line LIMIT_COUNT 1
+            foreach(_manifest IN ITEMS "${_blas_lib_dir}/aocl_manifest.txt" "${_blas_lib_dir}/../aocl_manifest.txt")
+                if(EXISTS "${_manifest}")
+                    file(STRINGS "${_manifest}" _line LIMIT_COUNT 1
                         REGEX "(AOCL|Version|version)[^0-9]*([0-9]+\\.[0-9]+(\\.[0-9]+)?)")
-                    if(_aocl_ver_line)
+                    if(_line)
                         set(_ver "AOCL ${CMAKE_MATCH_2}")
                         break()
                     endif()
                 endif()
             endforeach()
         endif()
-
     elseif(_backend STREQUAL "Accelerate")
         execute_process(
             COMMAND xcrun --sdk macosx --show-sdk-version
             OUTPUT_VARIABLE _macos_sdk_ver
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET)
+            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
         if(_macos_sdk_ver)
             set(_ver "SDK ${_macos_sdk_ver}")
         endif()
@@ -169,7 +135,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # Use gcc-ar/gcc-ranlib so static libs (Pgenlib, sqlite3) also get LTO-aware
     # archiving. CMake only sets CMAKE_CXX_COMPILER_AR for executables when IPO is ON.
     cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH _gcc_bin)
-    gcta_configure_binutils_from_dir("${_gcc_bin}" "GNU" "GCC" TRUE)
+    gcta_configure_binutils_from_dir("${_gcc_bin}" "gcc" "GCC" TRUE)
     if(LINUX)
         # Pin libgomp, libstdc++, and libgcc_s to this GCC's copies so HPC
         # LD_LIBRARY_PATH cannot load incompatible system copies at runtime.
@@ -226,7 +192,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND LINUX)
         # AOCC requires its own llvm-ar / llvm-ranlib for static library creation.
         # The system 'ar' cannot handle LLVM bitcode objects produced by AOCC,
         # causing "Error running link command: no such file or directory" at archive time.
-        gcta_configure_binutils_from_dir("${GCTA_AOCC_ROOT}/bin" "LLVM" "AOCC" TRUE)
+        gcta_configure_binutils_from_dir("${GCTA_AOCC_ROOT}/bin" "llvm" "AOCC" TRUE)
 
         # Pin libstdc++ and libgcc_s resolved by AOCC at link time so HPC
         # LD_LIBRARY_PATH cannot load an incompatible system copy at runtime.
@@ -235,10 +201,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND LINUX)
 endif()
 
 # For upstream Clang (not AOCC), detect LLVM tooling next to the compiler so
-# ar/nm/ranlib come from the same LLVM install rather than PATH.
+# ar/ranlib come from the same LLVM install rather than PATH.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT GCTA_COMPILER_IS_AOCC)
     cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH _clang_bin)
-    gcta_configure_binutils_from_dir("${_clang_bin}" "LLVM" "Clang" FALSE)
+    gcta_configure_binutils_from_dir("${_clang_bin}" "llvm" "Clang" FALSE)
 endif()
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -255,10 +221,8 @@ set(GCTA_BLAS_LIBRARY "" CACHE FILEPATH "Primary BLAS .so/.a for the selected ba
 set(GCTA_LAPACKE_LIBRARY "" CACHE FILEPATH "Separate LAPACKE .so/.a, if not bundled in GCTA_BLAS_LIBRARY (e.g. apt OpenBLAS). Leave empty for MKL/conda.")
 set(GCTA_BLAS_INCLUDE_DIR "" CACHE PATH "Directory containing cblas.h / mkl.h / blis.h for the selected backend.")
 set(Boost_DIR "" CACHE PATH "Boost CMake config dir (BoostConfig.cmake). If set, uses system Boost instead of fetching.")
-option(GCTA_LIST_TARGETS "List imported and local targets during configure" OFF)
 option(GCTA_UNITY_BUILD "Enable unity builds for faster compilation" ON)
 option(GCTA_ENABLE_IPO "Enable IPO/LTO in Release builds" ON)
-option(GCTA_VERBOSE_BLAS "Print verbose BLAS detection information during configure" OFF)
 option(BGEN_SUPPORT "Enable BGEN file format support (requires SQLite)" OFF)
 set(USE_JEMALLOC "" CACHE STRING
     "Path to libjemalloc.so / libamdalloc.so (or ON/amdalloc with AOCC to auto-select bundled libamdalloc.so). Links with thp:never to avoid Linux THP over-allocation on large triangular allocations.")
@@ -512,15 +476,11 @@ else()
     if(LINUX)
         cmake_path(GET GCTA_BLAS_LIBRARY PARENT_PATH _blas_lib_dir)
         gcta_add_rpath("${_blas_lib_dir}")
-        if(NOT GCTA_COMPILER_IS_AOCC)
-            add_link_options("LINKER:-rpath-link,${_blas_lib_dir}")
-        endif()
+        add_link_options("LINKER:-rpath-link,${_blas_lib_dir}")
         if(GCTA_LAPACKE_LIBRARY)
             cmake_path(GET GCTA_LAPACKE_LIBRARY PARENT_PATH _lapack_lib_dir)
             gcta_add_rpath("${_lapack_lib_dir}")
-            if(NOT GCTA_COMPILER_IS_AOCC)
-                add_link_options("LINKER:-rpath-link,${_lapack_lib_dir}")
-            endif()
+            add_link_options("LINKER:-rpath-link,${_lapack_lib_dir}")
         endif()
     endif()
 
@@ -546,12 +506,7 @@ else()
         list(APPEND GCTA_BLAS_DEFINES GCTA_USE_AOCL EIGEN_USE_LAPACKE EIGEN_USE_BLAS)
         set(GCTA_BLAS_PROVIDER "AOCL" CACHE INTERNAL "")
 
-        # AOCL ships two separate library builds:
-        #   aocc/  — linked against libomp  (LLVM OpenMP, AOCC's runtime)
-        #   gcc/   — linked against libgomp (GCC's OpenMP runtime)
-        # Using the AOCC variant with GCC (or vice-versa) produces link errors:
-        #   "libomp.so not found" / "undefined reference to __kmpc_*"
-        # Detect the mismatch early via the presence of libomp.so in the lib dir.
+        # AOCL ships separate aocc/ (libomp) and gcc/ (libgomp) builds; catch mismatches early.
         cmake_path(GET GCTA_BLAS_LIBRARY PARENT_PATH _aocl_lib_dir)
         if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND EXISTS "${_aocl_lib_dir}/libomp.so")
             message(FATAL_ERROR
@@ -564,42 +519,6 @@ else()
                 "AOCL variant mismatch: AOCC compiler but GCC-built AOCL (no libomp.so) at ${_aocl_lib_dir}. "
                 "Consider using the aocc/ variant for best performance.")
         endif()
-
-        cmake_path(GET GCTA_BLAS_LIBRARY FILENAME _blas_lib_name)
-        set(_aocl_is_unified FALSE)
-        if(_blas_lib_name MATCHES "^libaocl\\.")
-            set(_aocl_is_unified TRUE)
-            message(STATUS "AOCL: using unified library ${_blas_lib_name}")
-        endif()
-
-        set(_aocl_using_flame FALSE)
-        if(NOT _aocl_is_unified AND (NOT GCTA_LAPACKE_LIBRARY OR GCTA_LAPACKE_LIBRARY MATCHES "flame" OR _blas_lib_name MATCHES "flame"))
-            set(_aocl_using_flame TRUE)
-        endif()
-
-        # AOCL transitive dependencies for split builds: libflame needs libaoclutils and libblis-mt.
-        # Skip any dep whose path is already in GCTA_BLAS_LIBS (e.g. libblis-mt
-        # is the primary BLAS library and must not be linked a second time) and
-        # skip when using AOCL 6.0+'s unified libaocl.so.
-        if(NOT _aocl_is_unified)
-            foreach(_aocl_dep IN ITEMS libaoclutils.so libblis-mt.so)
-                set(_aocl_dep_path "${_aocl_lib_dir}/${_aocl_dep}")
-                set(_aocl_dep_path64 "${_aocl_lib_dir}/../lib64/${_aocl_dep}")
-                if("${_aocl_dep_path}" IN_LIST GCTA_BLAS_LIBS
-                        OR "${_aocl_dep_path64}" IN_LIST GCTA_BLAS_LIBS
-                        OR (_aocl_dep STREQUAL "libblis-mt.so" AND _blas_lib_name MATCHES "^libblis-mt\\.so"))
-                    message(STATUS "AOCL: skipping ${_aocl_dep} (already linked as primary library)")
-                elseif(EXISTS "${_aocl_dep_path}")
-                    list(APPEND GCTA_BLAS_LIBS "${_aocl_dep_path}")
-                    message(STATUS "AOCL: found transitive dep ${_aocl_dep}")
-                elseif(EXISTS "${_aocl_dep_path64}")
-                    list(APPEND GCTA_BLAS_LIBS "${_aocl_dep_path64}")
-                    message(STATUS "AOCL: found transitive dep ${_aocl_dep} (lib64)")
-                elseif(_aocl_using_flame AND NOT GCTA_LAPACKE_IS_MKL)
-                    message(WARNING "AOCL: transitive dep not found: ${_aocl_dep_path}")
-                endif()
-            endforeach()
-        endif()
     else()
         list(APPEND GCTA_BLAS_DEFINES GCTA_USE_MKL EIGEN_USE_MKL_ALL)
         set(GCTA_BLAS_PROVIDER "MKL" CACHE INTERNAL "")
@@ -609,21 +528,6 @@ endif()
 message(STATUS "BLAS/LAPACK provider: ${GCTA_BLAS_PROVIDER}")
 gcta_detect_blas_version("${GCTA_BLAS_PROVIDER}" "${GCTA_BLAS_LIBRARY}" "${GCTA_BLAS_INCLUDE_DIR}" GCTA_BLAS_VERSION)
 message(STATUS "BLAS/LAPACK version: ${GCTA_BLAS_VERSION}")
-
-# Verbose BLAS logging: print detection details when requested
-if(CMAKE_VERBOSE_MAKEFILE OR GCTA_VERBOSE_BLAS)
-    message(STATUS "---- BLAS detection details ----")
-    message(STATUS "  GCTA_BLAS_BACKEND:    ${GCTA_BLAS_BACKEND}")
-    message(STATUS "  GCTA_BLAS_LIBRARY:    ${GCTA_BLAS_LIBRARY}")
-    message(STATUS "  GCTA_LAPACKE_LIBRARY: ${GCTA_LAPACKE_LIBRARY}")
-    message(STATUS "  GCTA_BLAS_INCLUDE_DIR:${GCTA_BLAS_INCLUDE_DIR}")
-    message(STATUS "  Defines:              ${GCTA_BLAS_DEFINES}")
-    message(STATUS "  Link list:")
-    foreach(_lib IN LISTS GCTA_BLAS_LIBS)
-        message(STATUS "    ${_lib}")
-    endforeach()
-    message(STATUS "---- end BLAS detection details ----")
-endif()
 
 # jemalloc / amdalloc (optional): interposes malloc/free/new/delete via linking alone —
 # no header/API usage, so only the .so path is needed. thp:never is applied
@@ -663,6 +567,10 @@ if(USE_JEMALLOC)
     endif()
     set(GCTA_JEMALLOC_LIB "${_jemalloc_realpath}")
     set(GCTA_USE_JEMALLOC TRUE)
+    if(LINUX)
+        cmake_path(GET GCTA_JEMALLOC_LIB PARENT_PATH _jemalloc_dir)
+        gcta_add_rpath("${_jemalloc_dir}")
+    endif()
     message(STATUS "jemalloc: ${GCTA_JEMALLOC_LIB} (thp:never)")
 endif()
 
@@ -726,16 +634,6 @@ target_include_directories(GCTAg PRIVATE
     third_party/plink-ng/2.0/include
     third_party/plink-ng/2.0/simde)
 
-if(GCTA_USE_JEMALLOC AND LINUX)
-    # The runtime linker needs to find this exact .so again at load time,
-    # not just at link time. If it lives outside standard search paths
-    # (a Conda env, an HPC module tree, a scratch install), bake in an
-    # rpath so the binary works without relying on LD_LIBRARY_PATH.
-    cmake_path(GET GCTA_JEMALLOC_LIB PARENT_PATH _jemalloc_dir)
-    gcta_add_rpath("${_jemalloc_dir}")
-    message(STATUS "jemalloc: added ${_jemalloc_dir} to build/install RPATH")
-endif()
-
 target_precompile_headers(GCTAg PRIVATE
     <Eigen/Dense>
     <boost/algorithm/string.hpp>
@@ -758,20 +656,6 @@ set_target_properties(GCTAg PROPERTIES
     UNITY_BUILD                   ${GCTA_UNITY_BUILD}
     INTERPROCEDURAL_OPTIMIZATION  ${GCTA_IPO_ENABLED})
 
-# LTO flavour: AOCC requires full LTO; upstream Clang prefers ThinLTO; GCC uses auto.
-set(_lto_flag "")
-if(GCTA_IPO_ENABLED)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        if(GCTA_COMPILER_IS_AOCC)
-            set(_lto_flag -flto=full)
-        else()
-            set(_lto_flag -flto=thin)
-        endif()
-    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        set(_lto_flag -flto=auto)
-    endif()
-endif()
-
 target_compile_definitions(GCTAg PRIVATE
     ${GCTA_BLAS_DEFINES}
     GCTA_BLAS_BACKEND_STR="${GCTA_BLAS_PROVIDER}"
@@ -781,21 +665,12 @@ target_compile_definitions(GCTAg PRIVATE
 
 target_compile_options(GCTAg PRIVATE
     -pipe
-    $<$<CONFIG:Release>:$<IF:$<BOOL:${APPLE}>,-mcpu=native,-march=native>>
-    $<$<CONFIG:Release>:-O3>
-    $<$<AND:$<CONFIG:Release>,$<BOOL:${_lto_flag}>>:${_lto_flag}>)
+    $<$<CONFIG:Release>:$<IF:$<BOOL:${APPLE}>,-mcpu=native,-march=native>>)
 
-# Both GCC (GNU ld) and Clang (lld or GNU ld) default to DT_RUNPATH (--enable-new-dtags).
-# DT_RUNPATH is searched *after* LD_LIBRARY_PATH, so HPC module paths prepended
-# to LD_LIBRARY_PATH win over the baked-in RPATH, breaking libstdc++/BLAS pinning.
-# --disable-new-dtags writes DT_RPATH instead, searched *before* LD_LIBRARY_PATH.
-# Applied to all Linux builds regardless of Clang variant (AOCC or upstream).
+# Both GCC (GNU ld) and Clang (lld or GNU ld) default to DT_RUNPATH (--enable-new-dtags),
+# which searches LD_LIBRARY_PATH before RPATH and breaks HPC libstdc++/BLAS pinning.
 target_link_options(GCTAg PRIVATE
-    $<$<AND:$<CONFIG:Release>,$<BOOL:${_lto_flag}>>:${_lto_flag}>
     $<$<BOOL:${LINUX}>:LINKER:--disable-new-dtags>)
-if(LINUX)
-    message(STATUS "GCTAg: using DT_RPATH (--disable-new-dtags) for HPC library pinning")
-endif()
 
 
 add_library(Pgenlib STATIC)
@@ -846,16 +721,6 @@ target_link_libraries(GCTAg PRIVATE
     Threads::Threads
     ${GCTA_BLAS_LIBS})
 
-# List all targets (verbose, only if requested)
-if(CMAKE_VERBOSE_MAKEFILE OR GCTA_LIST_TARGETS)
-    foreach(prop IN ITEMS IMPORTED_TARGETS BUILDSYSTEM_TARGETS)
-        get_property(_targets DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" PROPERTY ${prop})
-        foreach(t IN LISTS _targets)
-            message(STATUS "${prop}: ${t}")
-        endforeach()
-    endforeach()
-endif()
-
 # Remove any duplicate entries added by compiler probes, BLAS detection, and
 # toolchain logic (e.g. BLAS lib dir may match OpenMP dir on some installs).
 list(REMOVE_DUPLICATES CMAKE_BUILD_RPATH)
@@ -898,7 +763,6 @@ endif()
 message(STATUS "  Compiler:          ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}${GCTA_COMPILER_IS_AOCC_STR} (${CMAKE_CXX_COMPILER})")
 message(STATUS "  Archiver (AR):     ${CMAKE_AR}")
 message(STATUS "  Ranlib:            ${CMAKE_RANLIB}")
-message(STATUS "  NM:                ${CMAKE_NM}")
 message(STATUS "  IPO/LTO:           ${GCTA_IPO_ENABLED}")
 message(STATUS "  Install prefix:    ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "  OpenMP:            ${OpenMP_CXX_VERSION}")

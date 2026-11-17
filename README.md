@@ -68,7 +68,7 @@ The backend is required and is set with `GCTA_BLAS_BACKEND`. CMake stops with an
 
 | `GCTA_BLAS_BACKEND` | Platform | Additional variables |
 |---|---|---|
-| `AOCL` (recommended on AMD EPYC / Zen4+) | Linux | `GCTA_BLAS_LIBRARY` (e.g. `libblis-mt.so` or unified `libaocl.so`), `GCTA_BLAS_INCLUDE_DIR`, and `GCTA_LAPACKE_LIBRARY` (`libflame.so`, or `libmkl_rt.so` for multithreaded `dsyevd`/`dsyevr`; not needed if using unified `libaocl.so`) |
+| `AOCL` (>= 6.0, recommended on AMD EPYC / Zen4+) | Linux | `GCTA_BLAS_LIBRARY` (e.g. `libblis-mt.so` or unified `libaocl.so`), `GCTA_BLAS_INCLUDE_DIR`, and `GCTA_LAPACKE_LIBRARY` (`libflame.so`, or `libmkl_rt.so` for multithreaded `dsyevd`/`dsyevr`; not needed if using unified `libaocl.so`) |
 | `MKL` (2017 or above) | Linux | `GCTA_BLAS_LIBRARY` (`libmkl_rt.so`), `GCTA_BLAS_INCLUDE_DIR` |
 | `OpenBLAS` | Linux | `GCTA_BLAS_LIBRARY`, `GCTA_BLAS_INCLUDE_DIR`, and `GCTA_LAPACKE_LIBRARY` if LAPACKE is not bundled in the OpenBLAS library (e.g. distribution packages) |
 | `Accelerate` | macOS | none (uses the macOS system Accelerate framework; default on macOS) |
@@ -157,8 +157,6 @@ This installs `bin/GCTAg`. On Linux it also installs the desktop entry and icons
 | `GCTA_ENABLE_IPO` | `ON` | Link-time optimisation in Release builds. Set `OFF` to reduce link time and memory use. |
 | `GCTA_UNITY_BUILD` | `ON` | Unity builds for faster compilation. |
 | `Boost_DIR` | empty | Use an existing Boost instead of downloading one. |
-| `GCTA_VERBOSE_BLAS` | `OFF` | Print BLAS detection details during configure. |
-| `GCTA_LIST_TARGETS` | `OFF` | List imported and local CMake targets during configure. |
 
 ### AOCC (AMD compiler)
 

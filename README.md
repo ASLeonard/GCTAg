@@ -18,7 +18,7 @@
 
 ## Building GCTAg
 
-x86\_64 and ARM (including Apple Silicon) CPUs are supported on Linux and macOS. Windows is not currently supported.
+x86\_64 and ARM64 on Linux, and Apple Silicon (`arm64`) on modern macOS, are supported. Windows is not currently supported.
 
 ### Requirements
 
@@ -26,8 +26,8 @@ x86\_64 and ARM (including Apple Silicon) CPUs are supported on Linux and macOS.
 
 | Requirement | Notes |
 |---|---|
-| C++23 compiler | GCC >= 13 or Clang >= 17 (AppleClang must report version >= 17; Homebrew LLVM also works). AMD's AOCC is supported, see [AOCC](#aocc-amd-compiler). |
-| CMake >= 3.28 |  |
+| C++23 compiler | GCC >= 13 or Clang >= 17 (AppleClang must report version >= 17; Homebrew LLVM also works). AMD's AOCC >= 6.0 (Clang 21 based) is supported, see [AOCC](#aocc-amd-compiler). |
+| CMake >= 4.5 |  |
 | Git | Needed to fetch the `plink-ng` submodule. |
 | OpenMP | libgomp with GCC; libomp with Clang (on macOS: `brew install libomp`). |
 | zlib | The system shared zlib is always used; it is not downloaded. |
@@ -68,14 +68,23 @@ The backend is required and is set with `GCTA_BLAS_BACKEND`. CMake stops with an
 
 | `GCTA_BLAS_BACKEND` | Platform | Additional variables |
 |---|---|---|
-| `AOCL` (recommended on AMD EPYC / Zen4) | Linux | `GCTA_BLAS_LIBRARY` (e.g. `libblis-mt.so`), `GCTA_BLAS_INCLUDE_DIR` |
+| `AOCL` (recommended on AMD EPYC / Zen4+) | Linux | `GCTA_BLAS_LIBRARY` (e.g. `libblis-mt.so` or unified `libaocl.so`), `GCTA_BLAS_INCLUDE_DIR`, and `GCTA_LAPACKE_LIBRARY` (`libflame.so`, or `libmkl_rt.so` for multithreaded `dsyevd`/`dsyevr`; not needed if using unified `libaocl.so`) |
 | `MKL` (2017 or above) | Linux | `GCTA_BLAS_LIBRARY` (`libmkl_rt.so`), `GCTA_BLAS_INCLUDE_DIR` |
 | `OpenBLAS` | Linux | `GCTA_BLAS_LIBRARY`, `GCTA_BLAS_INCLUDE_DIR`, and `GCTA_LAPACKE_LIBRARY` if LAPACKE is not bundled in the OpenBLAS library (e.g. distribution packages) |
-| `Accelerate` | macOS | none (uses the system framework; requires macOS 13.3 or later) |
+| `Accelerate` | macOS | none (uses the macOS system Accelerate framework; default on macOS) |
 
 The library's directory is added to the binary's RPATH, so the binary resolves the BLAS you built against at run time rather than a system default.
 
 ### Configure
+
+`CMakePresets.json` provides ready-made presets (`macos`, `linux-aocl`, `linux-aocc-aocl`, `linux-aocc-aocl-mkl`, `linux-mkl`, `linux-openblas`) that read `$AOCL_ROOT` / `$MKLROOT` where applicable and can be overridden with `-D`:
+
+```sh
+cmake --preset macos              # or e.g. linux-aocc-aocl-mkl
+cmake --build --preset macos
+```
+
+Or pass explicit `-D` options directly:
 
 **Linux, AOCL** (for example on the ETH Euler cluster):
 
@@ -83,9 +92,12 @@ The library's directory is added to the binary's RPATH, so the binary resolves t
 cmake -DCMAKE_BUILD_TYPE=Release \
       -DGCTA_BLAS_BACKEND=AOCL \
       -DGCTA_BLAS_LIBRARY=/path/to/aocl/lib/libblis-mt.so \
+      -DGCTA_LAPACKE_LIBRARY=/path/to/aocl/lib/libflame.so \
       -DGCTA_BLAS_INCLUDE_DIR=/path/to/aocl/include \
       -B build/Release -S .
 ```
+
+To combine AOCL BLAS with MKL's parallel `dsyevd`/`dsyevr`, pass MKL's `libmkl_rt.so` as `-DGCTA_LAPACKE_LIBRARY=/path/to/mkl/lib/libmkl_rt.so` (and set `MKL_THREADING_LAYER` at run time as below). For unified AOCL 6.0 builds (`libaocl.so`), omit `-DGCTA_LAPACKE_LIBRARY`.
 
 **Linux, MKL:**
 
@@ -141,31 +153,33 @@ This installs `bin/GCTAg`. On Linux it also installs the desktop entry and icons
 | CMake option | Default | Description |
 |---|---|---|
 | `BGEN_SUPPORT` | `OFF` | Enable BGEN input (SQLite is downloaded automatically). |
-| `USE_JEMALLOC` | empty | Path to the `libjemalloc.so` **file**. Links jemalloc with `thp:never` to avoid Linux transparent-huge-page over-allocation on very large triangular allocations such as the GRM. |
+| `USE_JEMALLOC` | empty | Path to the `libjemalloc.so` or `libamdalloc.so` **file** (or `ON` when compiling with AOCC to auto-link its bundled `libamdalloc.so`). Links jemalloc/amdalloc with `thp:never` to avoid Linux transparent-huge-page over-allocation on very large triangular allocations such as the GRM. |
 | `GCTA_ENABLE_IPO` | `ON` | Link-time optimisation in Release builds. Set `OFF` to reduce link time and memory use. |
 | `GCTA_UNITY_BUILD` | `ON` | Unity builds for faster compilation. |
 | `Boost_DIR` | empty | Use an existing Boost instead of downloading one. |
-| `GCTA_GCC_TOOLCHAIN` | empty | GCC installation root for AOCC, see below. |
 | `GCTA_VERBOSE_BLAS` | `OFF` | Print BLAS detection details during configure. |
 | `GCTA_LIST_TARGETS` | `OFF` | List imported and local CMake targets during configure. |
 
 ### AOCC (AMD compiler)
 
-AOCC is detected automatically from the compiler's `--version` output:
+AOCC >= 6.0 (Clang 21 based) is detected automatically from the compiler's `--version` output (supporting both `clang`/`clang++` and AOCC 6.0's `aoc`/`aoc++` drivers):
 
 ```sh
 cmake -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_C_COMPILER=/path/to/aocc/bin/clang \
-      -DCMAKE_CXX_COMPILER=/path/to/aocc/bin/clang++ \
-      -DGCTA_GCC_TOOLCHAIN=/path/to/gcc-12-to-14-prefix \
+      -DCMAKE_C_COMPILER=/path/to/aocc/bin/aoc \
+      -DCMAKE_CXX_COMPILER=/path/to/aocc/bin/aoc++ \
+      -DUSE_JEMALLOC=ON \
       -DGCTA_BLAS_BACKEND=AOCL \
       -DGCTA_BLAS_LIBRARY=/path/to/aocl/lib/libblis-mt.so \
+      -DGCTA_LAPACKE_LIBRARY=/path/to/aocl/lib/libflame.so \
       -DGCTA_BLAS_INCLUDE_DIR=/path/to/aocl/include \
       -B build/Release -S .
 ```
 
-- AOCC is Clang 17 based and cannot parse the headers of GCC 15 or newer. If your default GCC is that new, set `GCTA_GCC_TOOLCHAIN` to the prefix (the directory containing `bin/gcc`) of a GCC 12-14 installation. CMake rejects anything outside that range.
+- AOCC 6.0 is LLVM 21 based and natively parses modern `libstdc++` headers without needing a separate GCC toolchain override.
+- Pass `-DUSE_JEMALLOC=ON` (or `amdalloc`) to automatically link AOCC's bundled `libamdalloc.so` (jemalloc 5.3.1) with `thp:never`.
 - Use the `aocc/` variant of AOCL with AOCC and the `gcc/` variant with GCC. A mismatch is a configure error with GCC and a warning with AOCC.
+- To pair AOCL BLAS with MKL's multithreaded LAPACK (`dsyevd`/`dsyevr`), set `-DGCTA_LAPACKE_LIBRARY=/path/to/mkl/lib/libmkl_rt.so` and `export MKL_THREADING_LAYER=IOMP5` at run time.
 
 ### Building on HPC clusters
 
@@ -181,7 +195,6 @@ cmake -DCMAKE_BUILD_TYPE=Release \
 | `zstd target not found` | A system zstd module can conflict with the downloaded one. Run `module unload zstd`, delete the build directory, and reconfigure. |
 | `plink-ng submodule is missing` | Run `git submodule update --init --recursive`. |
 | `OpenMP not found on macOS` | `brew install libomp`. |
-| AOCC fails to parse standard library headers | Set `GCTA_GCC_TOOLCHAIN` to a GCC 12-14 prefix. |
 
 ## Documentation
 

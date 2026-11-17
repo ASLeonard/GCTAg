@@ -26,10 +26,10 @@ x86\_64 and ARM64 on Linux, and Apple Silicon (`arm64`) on modern macOS, are sup
 
 | Requirement | Notes |
 |---|---|
-| C++23 compiler | GCC >= 13 or Clang >= 17 (AppleClang must report version >= 17; Homebrew LLVM also works). AMD's AOCC >= 6.0 (Clang 21 based) is supported, see [AOCC](#aocc-amd-compiler). |
+| C++23 compiler | GCC >= 16 or upstream Clang >= 23 (on macOS, install Homebrew `llvm` or `gcc`; `AppleClang` is not supported). On Linux, AMD's AOCC >= 6.0 (Clang 21 based) is also supported, see [AOCC](#aocc-amd-compiler). |
 | CMake >= 4.5 |  |
 | Git | Needed to fetch the `plink-ng` submodule. |
-| OpenMP | libgomp with GCC; libomp with Clang (on macOS: `brew install libomp`). |
+| OpenMP | Bundled with GCC (`libgomp`), Homebrew `llvm`, and AOCC (`libomp`). |
 | zlib | The system shared zlib is always used; it is not downloaded. |
 | BLAS/LAPACK backend | Chosen explicitly, see [BLAS backends](#blas-backends). It is not auto-detected. |
 | Linux kernel >= 2.6.28 | Linux only. |
@@ -77,7 +77,7 @@ The library's directory is added to the binary's RPATH, so the binary resolves t
 
 ### Configure
 
-`CMakePresets.json` provides ready-made presets (`macos`, `linux-aocl`, `linux-aocc-aocl`, `linux-aocc-aocl-mkl`, `linux-mkl`, `linux-openblas`) that read `$AOCL_ROOT` / `$MKLROOT` where applicable and can be overridden with `-D`:
+`CMakePresets.json` provides ready-made presets (`macos`, `macos-gcc`, `linux-aocl`, `linux-aocc-aocl`, `linux-aocc-aocl-mkl`, `linux-mkl`, `linux-openblas`) that read `$AOCL_ROOT` / `$MKLROOT` where applicable and can be overridden with `-D`:
 
 ```sh
 cmake --preset macos              # or e.g. linux-aocc-aocl-mkl
@@ -126,9 +126,13 @@ cmake -DCMAKE_BUILD_TYPE=Release \
 
 ```sh
 cmake -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang \
+      -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++ \
       -DGCTA_BLAS_BACKEND=Accelerate \
       -B build/Release -S .
 ```
+
+Or simply `cmake --preset macos` (Homebrew LLVM Clang >= 23) / `cmake --preset macos-gcc` (Homebrew GCC >= 16).
 
 ### Compile
 
@@ -192,7 +196,7 @@ cmake -DCMAKE_BUILD_TYPE=Release \
 | `GCTA_BLAS_LIBRARY must be set ...` | Pass the full path to the library file (not a directory) and the include directory. |
 | `zstd target not found` | A system zstd module can conflict with the downloaded one. Run `module unload zstd`, delete the build directory, and reconfigure. |
 | `plink-ng submodule is missing` | Run `git submodule update --init --recursive`. |
-| `OpenMP not found on macOS` | `brew install libomp`. |
+| `AppleClang is not supported` | Use Homebrew LLVM (`brew install llvm`) or GCC (`brew install gcc`), or run `cmake --preset macos` / `macos-gcc`. |
 
 ## Documentation
 

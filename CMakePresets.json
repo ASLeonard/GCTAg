@@ -16,8 +16,8 @@
     },
     {
       "name": "macos",
-      "displayName": "macOS (Accelerate)",
-      "description": "Release build on macOS using Apple Accelerate",
+      "displayName": "macOS (Homebrew LLVM + Accelerate)",
+      "description": "Release build on macOS using Homebrew LLVM Clang (>= 23) and Apple Accelerate",
       "inherits": "base-release",
       "condition": {
         "type": "equals",
@@ -25,7 +25,20 @@
         "rhs": "Darwin"
       },
       "cacheVariables": {
+        "CMAKE_C_COMPILER": "/opt/homebrew/opt/llvm/bin/clang",
+        "CMAKE_CXX_COMPILER": "/opt/homebrew/opt/llvm/bin/clang++",
         "GCTA_BLAS_BACKEND": "Accelerate"
+      }
+    },
+    {
+      "name": "macos-gcc",
+      "displayName": "macOS (Homebrew GCC 16 + Accelerate)",
+      "description": "Release build on macOS using Homebrew GCC >= 16 and Apple Accelerate",
+      "inherits": "macos",
+      "binaryDir": "${sourceDir}/build/Release-gcc",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "/opt/homebrew/bin/gcc-16",
+        "CMAKE_CXX_COMPILER": "/opt/homebrew/bin/g++-16"
       }
     },
     {
@@ -100,6 +113,10 @@
     {
       "name": "macos",
       "configurePreset": "macos"
+    },
+    {
+      "name": "macos-gcc",
+      "configurePreset": "macos-gcc"
     },
     {
       "name": "linux-aocl",

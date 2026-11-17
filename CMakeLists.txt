@@ -39,26 +39,6 @@ function(gcta_pin_compiler_rtlibs _label)
     set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH}" PARENT_SCOPE)
 endfunction()
 
-function(gcta_configure_binutils_from_dir _bin_dir _prefix _label _warn_if_missing)
-    find_program(_tool_ar     NAMES ${_prefix}-ar     HINTS "${_bin_dir}" NO_DEFAULT_PATH)
-    find_program(_tool_ranlib NAMES ${_prefix}-ranlib HINTS "${_bin_dir}" NO_DEFAULT_PATH)
-
-    # Under CMP0126=NEW, project() sets CMAKE_AR/RANLIB as normal variables in
-    # the caller scope, so both PARENT_SCOPE and CACHE FORCE are needed.
-    if(_tool_ar)
-        set(CMAKE_AR "${_tool_ar}" PARENT_SCOPE)
-        set(CMAKE_AR "${_tool_ar}" CACHE FILEPATH "Archiver" FORCE)
-        message(STATUS "${_label}: using archiver ${_tool_ar}")
-    elseif(_warn_if_missing)
-        message(WARNING "${_label}: ${_prefix}-ar not found next to ${CMAKE_CXX_COMPILER} — LTO may be suboptimal for static libs")
-    endif()
-
-    if(_tool_ranlib)
-        set(CMAKE_RANLIB "${_tool_ranlib}" PARENT_SCOPE)
-        set(CMAKE_RANLIB "${_tool_ranlib}" CACHE FILEPATH "Ranlib" FORCE)
-    endif()
-endfunction()
-
 function(gcta_detect_blas_version _backend _blas_lib _blas_include_dir _out_var)
     # Relies on CMP0159=NEW so file(STRINGS ... REGEX) populates CMAKE_MATCH_<n>.
     set(_ver "unknown")
@@ -127,84 +107,76 @@ function(gcta_detect_blas_version _backend _blas_lib _blas_include_dir _out_var)
     set(${_out_var} "${_ver}" PARENT_SCOPE)
 endfunction()
 
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+set(GCTA_COMPILER_IS_AOCC FALSE)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    message(FATAL_ERROR
+        "AppleClang is not supported. On macOS, use Homebrew LLVM (Clang >= 23) or GCC >= 16.")
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     message(STATUS "Compiling with GCC ${CMAKE_CXX_COMPILER_VERSION}")
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13.0)
-        message(FATAL_ERROR "GCTA requires GCC >= 13 for reliable C++23 support (found ${CMAKE_CXX_COMPILER_VERSION})")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 16.0)
+        message(FATAL_ERROR "GCTAg requires GCC >= 16 (found ${CMAKE_CXX_COMPILER_VERSION})")
     endif()
-    # Use gcc-ar/gcc-ranlib so static libs (Pgenlib, sqlite3) also get LTO-aware
-    # archiving. CMake only sets CMAKE_CXX_COMPILER_AR for executables when IPO is ON.
-    cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH _gcc_bin)
-    gcta_configure_binutils_from_dir("${_gcc_bin}" "gcc" "GCC" TRUE)
     if(LINUX)
         # Pin libgomp, libstdc++, and libgcc_s to this GCC's copies so HPC
         # LD_LIBRARY_PATH cannot load incompatible system copies at runtime.
         gcta_pin_compiler_rtlibs("GCC" libgomp.so.1 libstdc++.so.6 libgcc_s.so.1)
     endif()
-elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    message(STATUS "Compiling with Clang ${CMAKE_CXX_COMPILER_VERSION}")
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 17.0)
-        message(FATAL_ERROR "GCTA requires Clang >= 17 for reliable C++23 support (found ${CMAKE_CXX_COMPILER_VERSION})")
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    # Detect AOCC (AMD's Clang-based compiler) from --version since CMake reports ID "Clang".
+    if(LINUX)
+        execute_process(
+            COMMAND ${CMAKE_CXX_COMPILER} --version
+            OUTPUT_VARIABLE _cxx_ver_str
+            ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(_cxx_ver_str MATCHES "AOCC")
+            set(GCTA_COMPILER_IS_AOCC TRUE)
+            if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 21.0)
+                message(FATAL_ERROR
+                    "GCTAg requires AOCC >= 6.0 (Clang >= 21) (found Clang ${CMAKE_CXX_COMPILER_VERSION} in ${_cxx_ver_str})")
+            endif()
+            cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH _aocc_bin)
+            cmake_path(GET _aocc_bin          PARENT_PATH _aocc_root)
+            set(GCTA_AOCC_ROOT "${_aocc_root}" CACHE PATH "AOCC installation root" FORCE)
+            message(STATUS "Detected AOCC compiler (Clang ${CMAKE_CXX_COMPILER_VERSION}, root: ${GCTA_AOCC_ROOT})")
+            gcta_pin_compiler_rtlibs("AOCC" libomp.so libstdc++.so.6 libgcc_s.so.1)
+        endif()
     endif()
-    if(APPLE AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
-        # Derive LLVM prefix from the selected compiler path (.../bin/clang++ -> ...).
-        cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH _llvm_bin_dir)
-        cmake_path(GET _llvm_bin_dir      PARENT_PATH _llvm_prefix)
-        if(EXISTS "${_llvm_prefix}/lib/c++")
-            if(NOT CMAKE_CXX_FLAGS MATCHES "(^| )-stdlib=libc\\+\\+($| )")
-                string(APPEND CMAKE_CXX_FLAGS " -stdlib=libc++")
+
+    if(NOT GCTA_COMPILER_IS_AOCC)
+        message(STATUS "Compiling with Clang ${CMAKE_CXX_COMPILER_VERSION}")
+        if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 23.0)
+            message(FATAL_ERROR "GCTAg requires Clang >= 23 (found ${CMAKE_CXX_COMPILER_VERSION})")
+        endif()
+        if(APPLE)
+            cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH _llvm_bin)
+            cmake_path(GET _llvm_bin          PARENT_PATH _llvm_prefix)
+            if(EXISTS "${_llvm_prefix}/lib/c++")
+                link_directories("${_llvm_prefix}/lib/c++")
+                gcta_add_rpath("${_llvm_prefix}/lib/c++" "${_llvm_prefix}/lib")
+                message(STATUS "Using LLVM libc++ / libomp from ${_llvm_prefix}")
             endif()
-            if(NOT CMAKE_EXE_LINKER_FLAGS MATCHES "(^| )-L${_llvm_prefix}/lib/c\\+\\+($| )")
-                string(APPEND CMAKE_EXE_LINKER_FLAGS " -L${_llvm_prefix}/lib/c++")
-            endif()
-            link_directories("${_llvm_prefix}/lib/c++")
-            list(APPEND CMAKE_BUILD_RPATH "${_llvm_prefix}/lib/c++")
-            message(STATUS "Using LLVM libc++ from ${_llvm_prefix}/lib/c++")
         endif()
     endif()
 else()
-    message(FATAL_ERROR "GCTA can only compile with GCC or Clang")
+    message(FATAL_ERROR "GCTAg requires GCC >= 16, Clang >= 23, or AOCC >= 6.0 (found ${CMAKE_CXX_COMPILER_ID})")
 endif()
 
-# Detect AOCC (AMD's Clang-based compiler). It reports CMAKE_CXX_COMPILER_ID
-# as "Clang" but has its own libomp and a clang-specific AOCL library variant.
-# We probe the --version string since there is no dedicated CMake variable.
-set(GCTA_COMPILER_IS_AOCC FALSE)
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND LINUX)
-    execute_process(
-        COMMAND ${CMAKE_CXX_COMPILER} --version
-        OUTPUT_VARIABLE _cxx_ver_str
-        ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
-    if(_cxx_ver_str MATCHES "AOCC")
-        set(GCTA_COMPILER_IS_AOCC TRUE)
-        if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 21.0)
-            message(FATAL_ERROR
-                "GCTA requires AOCC >= 6.0 (Clang >= 21) for reliable C++23 support "
-                "(found Clang ${CMAKE_CXX_COMPILER_VERSION} in ${_cxx_ver_str})")
-        endif()
-
-        # Derive the AOCC install root from the compiler path (bin/../)
-        cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH _aocc_bin)
-        cmake_path(GET _aocc_bin PARENT_PATH _aocc_root)
-        set(GCTA_AOCC_ROOT "${_aocc_root}" CACHE PATH "AOCC installation root" FORCE)
-        message(STATUS "Detected AOCC compiler (root: ${GCTA_AOCC_ROOT})")
-
-        # AOCC requires its own llvm-ar / llvm-ranlib for static library creation.
-        # The system 'ar' cannot handle LLVM bitcode objects produced by AOCC,
-        # causing "Error running link command: no such file or directory" at archive time.
-        gcta_configure_binutils_from_dir("${GCTA_AOCC_ROOT}/bin" "llvm" "AOCC" TRUE)
-
-        # Pin libstdc++ and libgcc_s resolved by AOCC at link time so HPC
-        # LD_LIBRARY_PATH cannot load an incompatible system copy at runtime.
-        gcta_pin_compiler_rtlibs("AOCC" libstdc++.so.6 libgcc_s.so.1)
-    endif()
+# Use the compiler's matched archiver/ranlib for static targets (Pgenlib, zstd, sqlite3)
+# so LTO archives stay consistent with the compiler toolchain.
+if(CMAKE_CXX_COMPILER_AR)
+    set(CMAKE_AR "${CMAKE_CXX_COMPILER_AR}")
+endif()
+if(CMAKE_CXX_COMPILER_RANLIB)
+    set(CMAKE_RANLIB "${CMAKE_CXX_COMPILER_RANLIB}")
 endif()
 
-# For upstream Clang (not AOCC), detect LLVM tooling next to the compiler so
-# ar/ranlib come from the same LLVM install rather than PATH.
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT GCTA_COMPILER_IS_AOCC)
-    cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH _clang_bin)
-    gcta_configure_binutils_from_dir("${_clang_bin}" "llvm" "Clang" FALSE)
+# On macOS, Homebrew Clang/GCC may default to CommandLineTools' SDK while
+# xcrun (_CMAKE_OSX_SYSROOT_PATH) resolves to Xcode.app's SDK; register both
+# as implicit include dirs so FindZLIB does not inject -isystem <sdk>/usr/include
+# ahead of the compiler's C++ standard library headers.
+if(APPLE AND _CMAKE_OSX_SYSROOT_PATH)
+    list(APPEND CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES   "${_CMAKE_OSX_SYSROOT_PATH}/usr/include")
+    list(APPEND CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES "${_CMAKE_OSX_SYSROOT_PATH}/usr/include")
 endif()
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -303,7 +275,10 @@ block()
     set(ZSTD_BUILD_STATIC   ON)
     set(SPECTRA_BUILD_TESTS OFF)
     set(BUILD_TESTING       OFF)
-    set(BOOST_IOSTREAMS_ENABLE_ZLIB ON)
+    set(BOOST_IOSTREAMS_ENABLE_ZLIB  ON  CACHE BOOL "" FORCE)
+    set(BOOST_IOSTREAMS_ENABLE_BZIP2 OFF CACHE BOOL "" FORCE)
+    set(BOOST_IOSTREAMS_ENABLE_LZMA  OFF CACHE BOOL "" FORCE)
+    set(BOOST_IOSTREAMS_ENABLE_ZSTD  OFF CACHE BOOL "" FORCE)
     if(Boost_DIR)
         FetchContent_MakeAvailable(zstd)
     else()
@@ -338,23 +313,6 @@ if(Boost_DIR)
         NO_DEFAULT_PATH)
 endif()
 
-# Resolve zstd link target.
-# Check for the actual CMake target rather than relying on zstd_POPULATED,
-# which CMake 4.x no longer sets reliably after a block() scope.
-# FetchContent's zstd build always creates 'libzstd'; system installs use
-# the zstd:: namespace targets.
-if(TARGET libzstd)
-    set(GCTA_ZSTD_LIBS libzstd)
-elseif(TARGET zstd::libzstd_shared)
-    set(GCTA_ZSTD_LIBS zstd::libzstd_shared)
-elseif(TARGET zstd::libzstd_static)
-    set(GCTA_ZSTD_LIBS zstd::libzstd_static)
-else()
-    message(FATAL_ERROR
-        "zstd target not found — FetchContent may have failed. "
-        "Try: module unload zstd && rm -rf build && cmake -B build ...")
-endif()
-
 if(BGEN_SUPPORT)
     add_library(sqlite3 STATIC ${sqlite_SOURCE_DIR}/sqlite3.c)
     target_include_directories(sqlite3 PUBLIC ${sqlite_SOURCE_DIR})
@@ -362,53 +320,8 @@ endif()
 
 find_package(Threads REQUIRED)
 
-# find_package(OpenMP) cannot locate libomp on macOS or steer away from libgomp
-# on AOCC, so we pre-populate its cache variables before the call.
-if(APPLE)
-    if(NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
-        message(FATAL_ERROR "GCTAg on macOS requires Apple Silicon (arm64); found ${CMAKE_SYSTEM_PROCESSOR}.")
-    endif()
-
-    # AppleClang needs -Xpreprocessor; all other Clang variants use plain -fopenmp.
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
-        set(OpenMP_CXX_FLAGS    "-Xpreprocessor -fopenmp" CACHE STRING "" FORCE)
-    else()
-        set(OpenMP_CXX_FLAGS    "-fopenmp"                CACHE STRING "" FORCE)
-    endif()
-    set(OpenMP_CXX_LIB_NAMES "omp" CACHE STRING "" FORCE)
-
-    # Probe compiler prefix first (Homebrew Clang ships its own libomp),
-    # then fall back to a standalone Homebrew libomp install.
-    cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH _omp_bin_dir)
-    cmake_path(GET _omp_bin_dir       PARENT_PATH _omp_prefix)
-    find_path(OpenMP_CXX_INCLUDE_DIR NAMES omp.h
-        HINTS "/opt/homebrew/opt/libomp/include"
-              "${_omp_prefix}/include")
-    find_library(OpenMP_omp_LIBRARY NAMES omp libomp
-        HINTS "/opt/homebrew/opt/libomp/lib"
-              "${_omp_prefix}/lib")
-
-    if(NOT OpenMP_omp_LIBRARY OR NOT OpenMP_CXX_INCLUDE_DIR)
-        message(FATAL_ERROR "OpenMP not found on macOS. Install with: brew install libomp")
-    endif()
-    cmake_path(GET OpenMP_omp_LIBRARY PARENT_PATH _omp_lib_dir)
-    gcta_add_rpath("${_omp_lib_dir}")
-endif()
-
-if(GCTA_COMPILER_IS_AOCC)
-    # Pre-steer CMake to AOCC's libomp so it doesn't fall back to system libgomp.
-    set(OpenMP_CXX_LIB_NAMES "omp" CACHE STRING "" FORCE)
-    find_library(OpenMP_omp_LIBRARY NAMES omp
-        HINTS "${GCTA_AOCC_ROOT}/lib" NO_DEFAULT_PATH)
-    if(OpenMP_omp_LIBRARY)
-        message(STATUS "AOCC OpenMP library: ${OpenMP_omp_LIBRARY}")
-        cmake_path(GET OpenMP_omp_LIBRARY PARENT_PATH _aocc_omp_dir)
-        gcta_add_rpath("${_aocc_omp_dir}")
-    else()
-        message(WARNING
-            "AOCC: libomp.so not found under ${GCTA_AOCC_ROOT}/lib — "
-            "may fall back to system libgomp, causing runtime crashes.")
-    endif()
+if(APPLE AND NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+    message(FATAL_ERROR "GCTAg on macOS requires Apple Silicon (arm64); found ${CMAKE_SYSTEM_PROCESSOR}.")
 endif()
 
 find_package(OpenMP REQUIRED COMPONENTS CXX)
@@ -713,7 +626,7 @@ target_link_libraries(GCTAg PRIVATE
     Eigen3::Eigen
     Spectra
     STDEXEC::stdexec
-    ${GCTA_ZSTD_LIBS}
+    libzstd_static
     $<$<BOOL:${GCTA_USE_JEMALLOC}>:${GCTA_JEMALLOC_LIB}>
     OpenMP::OpenMP_CXX
     $<$<BOOL:${BGEN_SUPPORT}>:sqlite3>

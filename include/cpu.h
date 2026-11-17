@@ -38,10 +38,11 @@
   // the <Accelerate/Accelerate.h> umbrella, which pulls in <vImage/vImage.h> ->
   // <CarbonCore/AIFF.h> (defining global `struct Marker`, colliding with
   // include/Marker.h) and <vecLib/blas_new.h> (conflicting with Eigen's blas.h).
-  #include <vecLib/cblas_new.h>
+    #include <vecLib/cblas_new.h>
   #include <vecLib/lapack.h>
   typedef __LAPACK_int gcta_blas_int;
 #endif
+#include <Eigen/Core>
 
 // Portable dpotrf: Cholesky factorization of a symmetric positive-definite matrix
 // (defaults to lower triangle, column-major). Returns 0 on success, non-zero on failure.

@@ -1005,6 +1005,21 @@ int MLMA::registerOption(map<string, vector<string>>& options_in)
         }
     }
     options_in.erase("--mlma-stream");
+    if (options_in.find("--fast-mlma") != options_in.end()) {
+        const auto& vals = options_in["--fast-mlma"];
+        string mode = "2slice";
+        if (!vals.empty()) {
+            if (vals.size() > 1 || vals[0].empty())
+                LOGGER.e(0, "--fast-mlma accepts at most one value: 2slice, hybrid, or 1slice.");
+            mode = vals[0];
+            std::transform(mode.begin(), mode.end(), mode.begin(),
+                           [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+            if (mode != "2slice" && mode != "hybrid" && mode != "1slice")
+                LOGGER.e(0, "Unsupported --fast-mlma mode [" + vals[0] + "]. Allowed values: 2slice, hybrid, 1slice.");
+        }
+        options["fast_mlma"] = mode;
+        options_in.erase("--fast-mlma");
+    }
     if (options_in.find("--log-pval") != options_in.end()) {
         options["log_pval"] = "1";
         options_in.erase("--log-pval");
@@ -1043,6 +1058,15 @@ void MLMA::processMain()
         // --save-reml only fits/saves the REML state and never streams SNPs,
         // so the bim (Marker) and genotype (Geno) data are never touched.
         const bool   reml_only      = options.count("save_reml") > 0;
+        FastMlmaMode fast_mlma_mode = FastMlmaMode::Off;
+        if (options.count("fast_mlma")) {
+            const string& fm = options.at("fast_mlma");
+            if (fm == "2slice")      fast_mlma_mode = FastMlmaMode::Slice2;
+            else if (fm == "hybrid") fast_mlma_mode = FastMlmaMode::Hybrid;
+            else if (fm == "1slice") fast_mlma_mode = FastMlmaMode::Slice1;
+            if (reml_only)
+                LOGGER.w(0, "--fast-mlma applies to association scanning and has no effect with --save-reml.");
+        }
 
         if (no_adj_covar)
             LOGGER.e(0, "--mlma-no-preadj-covar is not yet supported in --MLMA. "
@@ -1411,7 +1435,7 @@ void MLMA::processMain()
 
             Eigen::VectorXf w_sqrt = pheno->get_sqrt_weight_keep();
             run_mlma_stream_association(ctx, y_vec, w_sqrt, geno, marker, n, log_pval, ofile,
-                                        mlma_tile_budget_gb);
+                                        mlma_tile_budget_gb, fast_mlma_mode);
             LOGGER << "\nAssociation results saved to [" << out_file << "]." << std::endl;
             ofile.close();
         }
@@ -1433,7 +1457,7 @@ void MLMA::processMain()
         // ---- Stream SNPs ----
         Eigen::VectorXf w_sqrt = pheno->get_sqrt_weight_keep();
         run_mlma_stream_association(state, y_vec, w_sqrt, geno, marker, n, log_pval, ofile,
-                                    mlma_tile_budget_gb);
+                                    mlma_tile_budget_gb, fast_mlma_mode);
         LOGGER << "\nAssociation results saved to [" << out_file << "]." << std::endl;
         ofile.close();
 

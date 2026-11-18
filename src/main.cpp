@@ -126,7 +126,7 @@ int main(int argc, char *argv[]){
         "--reml-no-constrain", "--reml-priors", "--reml-priors-var", "--reml-diagV-adj", "--reml-maxit",  "--reml-alg",
         "--reml-ai-robust", "--reml-ai-robust-tol", "--reml-ai-robust-risk", "--reml-print-trajectory",
         "--mlma-no-preadj-covar",
-        "--mlma-stream", "--save-reml", "--load-reml", "--log-pval", "--model",
+        "--mlma-stream", "--fast-mlma", "--save-reml", "--load-reml", "--log-pval", "--model",
 
     };
     map<string, vector<string>> options;

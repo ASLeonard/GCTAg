@@ -5,6 +5,7 @@
 #include "Logger.h"
 #include "RemlEngine.hpp"
 #include "cpu.h"
+#include "mem.hpp"
 #include "mlma_woodbury.hpp"
 
 #include <Eigen/Dense>
@@ -55,32 +56,32 @@ inline Eigen::MatrixXd compact_sample_rows(const Eigen::MatrixXd& values,
 }
 
 // Resolve the streaming block width (SNPs per tile) from a memory budget.
-// The dominant O(n * block) allocation is now a single buffer:
-//   - X_block : n floats/SNP (4 bytes) — the centered, weighted float design
-//               block consumed by BLAS.  Written directly by getGenoFloat
-//               (BED: GenoarrLookup256x4bx4; PGEN/BGEN: cast from double).
-// The old GenoBufItem::geno double[] intermediate is no longer allocated on
-// the MLMA hot path, so the budget below is sized on X_block alone -- it
-// previously also charged sizeof(double) per sample for that retired
-// buffer, which under-sized BLOCK by ~3x against a given --mlma-stream
-// budget for no RSS benefit (smaller STRSM/STRMM/GEMM tiles for nothing).
-// Per-SNP scalars (Xt_Vi_y, xvx_diag, af_v, valid_v) are O(1) per column
-// and negligible next to the O(n) term above.
-// budget_gb <= 0 preserves the previous fixed BLOCK=10000 behavior exactly
-inline int resolve_mlma_block_size(int n, double budget_gb, bool use_int8_geno = false)
+// Accounts for all O(BLOCK) streaming buffers held simultaneously per tile:
+//   - G_block_i8 (~n bytes, 64B-aligned column stride) vs X_block (4*n bytes)
+//   - Backend double-buffered raw 2-bit slots (2 × ceil(max(n, raw_n)/4) ≈ 0.5*raw_n bytes)
+//   - Woodbury projection scratch UkX_scratch (4 * wb_k bytes when Woodbury active)
+// Per-SNP scalars (Xt_Vi_y, xvx_diag, af_v, valid_v) are O(1) per column.
+// budget_gb <= 0 preserves the previous fixed BLOCK=10000 behavior exactly.
+inline int resolve_mlma_block_size(int n, double budget_gb, bool use_int8_geno = false,
+                                   int raw_n = 0, int wb_k = 0)
 {
     int block = 10000; // Somewhat arbitrary, but balance of peak RSS and throughout. Increasing may help STRSM efficiency but increases memory.
     if (budget_gb > 0.0 && n > 0) {
 
       LOGGER << "MLMA streaming memory budget: " << budget_gb << " GB" << std::endl;
-      const double bytes_per_snp_per_sample = use_int8_geno
-          ? static_cast<double>(sizeof(int8_t)) /* G_block_i8 */
-          : static_cast<double>(sizeof(float))  /* X_block */;
+      const int raw_eff = std::max(n, raw_n);
+      const double geno_bytes = use_int8_geno
+          ? static_cast<double>((static_cast<size_t>(n) + 63) / 64 * 64) /* G_block_i8 */
+          : static_cast<double>(sizeof(float)) * static_cast<double>(n); /* X_block */
+      const double raw_io_bytes = 0.5 * static_cast<double>(raw_eff);
+      const double scratch_bytes = (wb_k > 0)
+          ? static_cast<double>(sizeof(float)) * static_cast<double>(wb_k)
+          : 0.0;
       constexpr int    min_block = 256;    // floor: keep BLAS3 tiles meaningful
       constexpr int    max_block = 65536;  // ceiling: cap per-column scalar creep
 
       const double budget_bytes  = budget_gb * 1e9;
-      const double per_snp_bytes = static_cast<double>(n) * bytes_per_snp_per_sample;
+      const double per_snp_bytes = geno_bytes + raw_io_bytes + scratch_bytes;
       block   =  std::clamp(static_cast<int>(budget_bytes / per_snp_bytes), min_block, max_block);
     }
     LOGGER << "MLMA streaming block size: " << block << " SNPs per tile" << std::endl;
@@ -205,6 +206,9 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
 // Int8 Woodbury streaming association path: stores raw additive BED genotypes
 // in int8_t (1 byte/sample/SNP instead of 4 bytes/sample/SNP) and applies
 // mean-centering and sparse missing-genotype corrections algebraically.
+// When fast_mlma != FastMlmaMode::Off, pre-quantizes Uk into K-tiled INT8
+// slices and computes U_k^T G_block_i8 directly via s8s8s32 GEMM without
+// allocating X_panel_f32 or K x BLOCK UkX_scratch.
 inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                                                     const Eigen::VectorXf& Vi_y,
                                                     const Eigen::VectorXf& w_sqrt,
@@ -213,10 +217,16 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                                                     int n,
                                                     int block_size,
                                                     bool log_pval,
-                                                    std::ofstream& ofile)
+                                                    std::ofstream& ofile,
+                                                    FastMlmaMode fast_mlma = FastMlmaMode::Off)
 {
     const uint32_t total_m = marker->count_extract();
-    LOGGER << "\nStreaming association tests for " << total_m << " SNPs (int8 Woodbury path)..." << std::endl;
+    const bool use_fast_i8 = (fast_mlma != FastMlmaMode::Off);
+    LOGGER << "\nStreaming association tests for " << total_m << " SNPs ("
+           << (use_fast_i8
+               ? (std::string("fast-mlma ") + fast_mlma_mode_name(fast_mlma) + " s8s8s32 Woodbury path")
+               : std::string("int8 Woodbury path"))
+           << ")..." << std::endl;
 
     bool unit_weights = true;
     for (int s = 0; s < n; ++s) {
@@ -238,16 +248,39 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
     }
     const double* w2_ptr = unit_weights ? nullptr : w2.data();
 
-    const Eigen::VectorXf u_sum = unit_weights
-        ? wb.Uk_f.cast<double>().rowwise().sum().cast<float>().eval()
-        : (wb.Uk_f.cast<double>() * w_sqrt.cast<double>()).cast<float>().eval();
+    Eigen::VectorXf u_sum;
+    QuantizedWoodburyUk q_uk;
+    if (use_fast_i8) {
+        q_uk = build_quantized_woodbury_uk(wb, w_sqrt, unit_weights, S_w2, fast_mlma);
+        // Free float32 Uk_f immediately after quantization to cut resident memory.
+        const_cast<WoodburyMLMACache&>(wb).Uk_f.resize(0, 0);
+        LOGGER << "Fast MLMA quantized Uk (" << fast_mlma_mode_name(fast_mlma)
+               << "): k=" << q_uk.k
+               << ", tiles=" << q_uk.tiles.size()
+               << ", Q_mem=" << std::format("{:.3f}", static_cast<double>(q_uk.total_q_bytes()) / (1024.0 * 1024.0 * 1024.0))
+               << " GiB, delta_quant=" << std::format("{:.3e}", q_uk.delta_quant)
+               << "." << std::endl;
+    } else {
+        u_sum = unit_weights
+            ? wb.Uk_f.cast<double>().rowwise().sum().cast<float>().eval()
+            : (wb.Uk_f.cast<double>() * w_sqrt.cast<double>()).cast<float>().eval();
+    }
 
     const int BLOCK = block_size;
-    std::vector<int8_t> G_block_i8(static_cast<size_t>(n) * static_cast<size_t>(BLOCK), 0);
+    // Pad column stride to 64 bytes so each SNP column starts on a fresh cacheline
+    // (matches stdGenoLD in GRM.cpp and avoids false sharing across OMP threads).
+    const int ldG = (n + 63) / 64 * 64;
+    std::vector<int8_t, AlignedAllocator<int8_t, 64>> G_block_i8(
+        static_cast<size_t>(ldG) * static_cast<size_t>(BLOCK), 0);
     Eigen::VectorXf Xt_Vi_y(BLOCK);
     Eigen::VectorXf xvx_diag(BLOCK);
-    Eigen::MatrixXf UkX_scratch(wb.Uk_f.rows(), BLOCK);
+    Eigen::MatrixXf UkX_scratch;
     std::vector<float> X_panel_f32;
+    std::vector<int32_t> P_i32;
+    std::vector<float> scratch_A_f32, scratch_B_f32, scratch_C_f32;
+    if (!use_fast_i8) {
+        UkX_scratch.resize(wb.Uk_f.rows(), BLOCK);
+    }
 
     int snp_done = 0;
     int last_pct = -1;
@@ -280,7 +313,8 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
 
         #pragma omp parallel
         {
-            std::vector<uintptr_t> miss_buf(static_cast<size_t>(miss_words_alloc), 0);
+            std::vector<uintptr_t, AlignedAllocator<uintptr_t, 32>> miss_buf(
+                static_cast<size_t>(miss_words_alloc), 0);
 
             #pragma omp for schedule(dynamic, 16)
             for (int i = 0; i < bs; ++i) {
@@ -288,7 +322,7 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                 float af = 0.0f, add_af = 0.0f;
                 double mu = 0.0;
                 uint32_t nValidN = 0;
-                int8_t* col_i8 = G_block_i8.data() + static_cast<size_t>(i) * static_cast<size_t>(n);
+                int8_t* col_i8 = G_block_i8.data() + static_cast<size_t>(i) * static_cast<size_t>(ldG);
 
                 geno->getGenoInt8_bed(buf, i, col_i8, af, add_af, mu, nValidN,
                                       miss_buf.data(), valid, exIdx[i]);
@@ -368,10 +402,17 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
             }
         }
 
-        woodbury_xvx_diag_block_i8(wb, u_sum, w_sqrt, unit_weights,
-                                   G_block_i8.data(), n, bs,
-                                   valid_v, mu_v, x_norm_v, snp_miss_samples,
-                                   xvx_diag, UkX_scratch, X_panel_f32);
+        if (use_fast_i8) {
+            woodbury_xvx_diag_block_fast_i8(wb, q_uk, G_block_i8.data(), ldG, bs,
+                                            valid_v, mu_v, x_norm_v, snp_miss_samples,
+                                            xvx_diag, P_i32,
+                                            scratch_A_f32, scratch_B_f32, scratch_C_f32);
+        } else {
+            woodbury_xvx_diag_block_i8(wb, u_sum, w_sqrt, unit_weights,
+                                       G_block_i8.data(), ldG, bs,
+                                       valid_v, mu_v, x_norm_v, snp_miss_samples,
+                                       xvx_diag, UkX_scratch, X_panel_f32);
+        }
 
         for (int i = 0; i < bs; ++i) {
             const uint32_t raw      = marker->getRawIndex(exIdx[i]);
@@ -436,7 +477,8 @@ inline void run_mlma_stream_association(RemlState& state,
                                         int n,
                                         bool log_pval,
                                         std::ofstream& ofile,
-                                        double block_mem_budget_gb = 0.0)
+                                        double block_mem_budget_gb = 0.0,
+                                        FastMlmaMode fast_mlma = FastMlmaMode::Off)
 {
     Eigen::VectorXf Vi_y(n);
 
@@ -472,12 +514,23 @@ inline void run_mlma_stream_association(RemlState& state,
     const WoodburyMLMACache& wb = state.wb;
     const bool use_int8_wb = use_wb && geno->canUseInt8Mlma() &&
                              (std::getenv("GCTA_DISABLE_INT8_MLMA") == nullptr);
-    const int BLOCK = resolve_mlma_block_size(n, block_mem_budget_gb, use_int8_wb);
+    if (fast_mlma != FastMlmaMode::Off) {
+        if (!use_wb) {
+            LOGGER.w(0, "--fast-mlma requires a Woodbury REML basis; ignoring --fast-mlma.");
+            fast_mlma = FastMlmaMode::Off;
+        } else if (!use_int8_wb) {
+            LOGGER.w(0, "--fast-mlma requires the additive BED int8 streaming path; falling back to float32 Woodbury.");
+            fast_mlma = FastMlmaMode::Off;
+        }
+    }
+    const int raw_n = static_cast<int>(geno->getRawSampleCT());
+    const int wb_k  = (use_wb && fast_mlma == FastMlmaMode::Off) ? static_cast<int>(wb.Uk_f.rows()) : 0;
+    const int BLOCK = resolve_mlma_block_size(n, block_mem_budget_gb, use_int8_wb, raw_n, wb_k);
 
     if (use_int8_wb) {
         run_mlma_stream_association_woodbury_i8(wb, Vi_y, w_sqrt,
                                                 geno, marker, n,
-                                                BLOCK, log_pval, ofile);
+                                                BLOCK, log_pval, ofile, fast_mlma);
         return;
     }
 
@@ -524,9 +577,10 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
                                         int n,
                                         bool log_pval,
                                         std::ofstream& ofile,
-                                        double block_mem_budget_gb = 0.0)
+                                        double block_mem_budget_gb = 0.0,
+                                        FastMlmaMode fast_mlma = FastMlmaMode::Off)
 {
     RemlState state = reml::build_reml_state(ctx);
     run_mlma_stream_association(state, y_adj, w_sqrt, geno, marker, n, log_pval, ofile,
-                                block_mem_budget_gb);
+                                block_mem_budget_gb, fast_mlma);
 }

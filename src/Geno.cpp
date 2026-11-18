@@ -469,7 +469,7 @@ void Geno::getGenoFloat_bed(uintptr_t *buf, int idx, float *dest,
     valid_out = false;
 
     SNPInfo snpinfo;
-    uintptr_t *cur_buf = buf + idx * bedRawGenoBuf1PtrSize;
+    uintptr_t *cur_buf = buf + static_cast<std::size_t>(idx) * static_cast<std::size_t>(bedRawGenoBuf1PtrSize);
     uint8_t sexChromType = markerSexChromTypes[curBufferIndex];
     bool hasNoHET = true;
     if (sexChromType != 1) {
@@ -550,7 +550,7 @@ void Geno::getGenoInt8_bed(uintptr_t *buf, int idx, int8_t *dest,
     nValidN_out = 0;
 
     SNPInfo snpinfo;
-    uintptr_t *cur_buf = buf + idx * bedRawGenoBuf1PtrSize;
+    uintptr_t *cur_buf = buf + static_cast<std::size_t>(idx) * static_cast<std::size_t>(bedRawGenoBuf1PtrSize);
     uint8_t sexChromType = markerSexChromTypes[curBufferIndex];
     if (sexChromType != 1) {
         PgenReader::CountHardFreqMissExt(cur_buf, keepMaskInterPtr, rawSampleCT, keepSampleCT, &snpinfo, f_std);
@@ -696,7 +696,7 @@ Geno::GenoCodingSpec Geno::buildCodingSpec(double mu, double sd) const {
 
 void Geno::getGenoDouble_pgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
     SNPInfo snpinfo;
-    uintptr_t *cur_buf = buf + idx * pgenGenoBuf1PtrSize;
+    uintptr_t *cur_buf = buf + static_cast<std::size_t>(idx) * static_cast<std::size_t>(pgenGenoBuf1PtrSize);
     uintptr_t *dosage_present = cur_buf + pgenGenoPtrSize;
     uint16_t *dosage_main = reinterpret_cast<uint16_t*>(cur_buf + pgenGenoPtrSize + pgenDosagePresentPtrSize);
     uint32_t dosage_ct = static_cast<uint32_t>(cur_buf[pgenGenoBuf1PtrSize - 1]);
@@ -797,7 +797,7 @@ void Geno::getGenoDouble_pgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
 //TODO: do we need to adjust here
 void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
     SNPInfo snpinfo;
-    uintptr_t *cur_buf = buf + idx * bedRawGenoBuf1PtrSize;
+    uintptr_t *cur_buf = buf + static_cast<std::size_t>(idx) * static_cast<std::size_t>(bedRawGenoBuf1PtrSize);
     uint8_t sexChromType = markerSexChromTypes[curBufferIndex];
     bool hasNoHET = true;
     if(sexChromType != 1){
@@ -921,7 +921,7 @@ void calDosagePhase_bgen(uint32_t prob1, uint32_t prob2, uint64_t &dosage, uint3
 
 void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
     SNPInfo snpinfo;
-    uintptr_t *cur_buf = buf + idx * bgenRawGenoBuf1PtrSize;
+    uintptr_t *cur_buf = buf + static_cast<std::size_t>(idx) * static_cast<std::size_t>(bgenRawGenoBuf1PtrSize);
     uint8_t *curbuf = (uint8_t*)cur_buf;
     int fileIndex = fileIndexBuf[curBufferIndex];
 

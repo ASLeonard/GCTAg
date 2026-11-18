@@ -117,6 +117,7 @@ public:
                iDC == 1;
     }
     int getMissPtrSize() const { return missPtrSize; }
+    uint32_t getRawSampleCT() { return pheno ? pheno->count_raw() : keepSampleCT; }
 
     void loopDouble(const vector<uint32_t> &extractIndex, int numMarkerBuf, bool bMakeGeno, bool bGenoCenter, bool bGenoStd, bool bMakeMiss, vector<function<void (uintptr_t *buf, std::span<const uint32_t> exIndex)>> callbacks = vector<function<void (uintptr_t *buf, std::span<const uint32_t> exIndex)>>(), bool showLog = true);
 

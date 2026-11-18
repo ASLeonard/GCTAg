@@ -31,6 +31,8 @@
 #include "pgenlib_misc.h"
 #include "plink2_base.h"
 #include "pgenlib_read.h"
+#include "../../include/mem.hpp"
+#include <algorithm>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -156,8 +158,8 @@ void PgenReader::Load(string filename, uint32_t *raw_sample_ct, uint32_t* raw_ma
     const uintptr_t sample_subset_byte_ct = plink2::DivUp(file_sample_ct, plink2::kBitsPerVec) * plink2::kBytesPerVec;
     const uintptr_t cumulative_popcounts_byte_ct = plink2::DivUp(file_sample_ct, plink2::kBitsPerWord * plink2::kInt32PerVec) * plink2::kBytesPerVec;
     const uintptr_t genovec_byte_ct = plink2::DivUp(file_sample_ct, plink2::kNypsPerVec) * plink2::kBytesPerVec;
-    _genovecbuf_uptr_size = genovec_byte_ct;
-    _genovec_rawbuf_uptr_size = genovec_byte_ct;
+    _genovecbuf_uptr_size = GetGenoBufPtrSize(file_sample_ct);
+    _genovec_rawbuf_uptr_size = _genovecbuf_uptr_size;
     const uintptr_t ac_byte_ct = plink2::RoundUpPow2(file_sample_ct * sizeof(plink2::AlleleCode), plink2::kBytesPerVec);
     const uintptr_t ac2_byte_ct = plink2::RoundUpPow2(file_sample_ct * 2 * sizeof(plink2::AlleleCode), plink2::kBytesPerVec);
     uintptr_t multiallelic_hc_byte_ct = 0;
@@ -619,8 +621,8 @@ void PgenReader::ExtractDoubleExt(uintptr_t *in, const uintptr_t *subsets, uint3
     // --keep/--remove -- a fresh std::vector here was a malloc/free on every
     // SNP on every thread. GetGenoBufPtrSize(keepSize) is constant for the run
     // (keepSize is fixed at construction), so after each thread's first call
-    // this resize() is a same-size no-op.
-    thread_local std::vector<uintptr_t> tmpbuf;
+    // this resize() is a same-size no-op. Use 32-byte alignment for SIMD safety.
+    thread_local std::vector<uintptr_t, AlignedAllocator<uintptr_t, 32>> tmpbuf;
     if(rawSampleSize == keepSize){
         bufptr = in;
     }else{
@@ -637,7 +639,7 @@ void PgenReader::ExtractDoubleExt(uintptr_t *in, const uintptr_t *subsets, uint3
 void PgenReader::ExtractFloatExt(uintptr_t *in, const uintptr_t *subsets, uint32_t rawSampleSize, uint32_t keepSize, const float *gtable, float *gOut, uintptr_t *missOut){
     uintptr_t *bufptr = nullptr;
     // See ExtractDoubleExt above -- same rationale, same fix.
-    thread_local std::vector<uintptr_t> tmpbuf;
+    thread_local std::vector<uintptr_t, AlignedAllocator<uintptr_t, 32>> tmpbuf;
     if(rawSampleSize == keepSize){
         bufptr = in;
     }else{
@@ -668,7 +670,7 @@ const GenoInt8Lookup256x1bx4 kGenoInt8Lookup;
 
 void PgenReader::ExtractInt8Ext(uintptr_t *in, const uintptr_t *subsets, uint32_t rawSampleSize, uint32_t keepSize, int8_t *gOut, uintptr_t *missOut){
     uintptr_t *bufptr = nullptr;
-    thread_local std::vector<uintptr_t> tmpbuf;
+    thread_local std::vector<uintptr_t, AlignedAllocator<uintptr_t, 32>> tmpbuf;
     if(rawSampleSize == keepSize){
         bufptr = in;
     }else{
@@ -859,7 +861,7 @@ void PgenReader::SetSampleSubsetInternal(const vector<uint32_t> &sample_subset_0
     const uint32_t raw_sample_ctl = plink2::DivUp(raw_sample_ct, plink2::kBitsPerWord);
     plink2::FillCumulativePopcounts(_subset_include_vec, raw_sample_ctl, _subset_cumulative_popcounts);
     _subset_size = sample_subset_0based.size();
-    _genovecbuf_uptr_size = plink2::DivUp(_subset_size, plink2::kNypsPerVec) * plink2::kBytesPerVec;
+    _genovecbuf_uptr_size = GetGenoBufPtrSize(_subset_size);
 }
 
 void PgenReader::ReadAllelesPhasedInternal(int variant_idx) {
@@ -878,7 +880,13 @@ void PgenReader::ReadAllelesPhasedInternal(int variant_idx) {
     }
 }
 int PgenReader::GetGenoBufPtrSize(uint32_t sample_ct){
-    return plink2::DivUp(sample_ct, plink2::kNypsPerVec) * plink2::kBytesPerVec;
+    // Return uintptr_t word count (matching GetSubsetMaskSize / GetDosage*Size),
+    // padded to max(kBytesPerVec, 32) bytes so every strided marker slot preserves
+    // 32-byte SIMD alignment inside AlignedAllocator<uintptr_t, 32> blocks.
+    const size_t align_bytes = std::max<size_t>(plink2::kBytesPerVec, 32);
+    const size_t raw_bytes = plink2::DivUp(sample_ct, 4);
+    const size_t aligned_bytes = plink2::RoundUpPow2(raw_bytes, align_bytes);
+    return static_cast<int>(aligned_bytes / sizeof(uintptr_t));
 }
 
 int PgenReader::GetSubsetMaskSize(uint32_t sample_ct){

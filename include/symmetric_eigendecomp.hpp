@@ -531,20 +531,20 @@ EighResultT<Scalar> nystrom_symmetric_eigh(
     // negative eigenvalues (e.g. GRM with missing genotypes).
     // Only the upper triangle is read by eigh_upper_desc, so no symmetrisation.
     Eigen::MatrixXd C = (omega.transpose() * Y).template cast<double>();
-
-    // Bound the accumulated dot-product error in C = Omega^T Y. This is a
-    // numerical-rank criterion, not a spectral regularizer: nonzero
-    // negative eigenvalues remain part of the signed Nyström approximation.
-    const double eps = static_cast<double>(std::numeric_limits<Scalar>::epsilon());
-    const double n_eps = static_cast<double>(n) * eps;
-    const double gamma_n = n_eps / (1.0 - n_eps);
-    const double eps_C = gamma_n * static_cast<double>(omega.norm()) * static_cast<double>(Y.norm());
     omega.resize(0, 0);
 
     Eigen::VectorXd lam_C;
     Eigen::MatrixXd V_C;                 // eigenvectors of C (order matches lam_C)
     eigh_upper_desc(C, lam_C, V_C);
     C.resize(0, 0);
+
+    // Bound the numerical nullspace of C = Omega^T Y relative to its largest
+    // eigenvalue magnitude (rather than n * eps * ||omega||_F * ||Y||_F, which
+    // blows up past lambda_max(C) at large n in float32). Nonzero negative
+    // eigenvalues remain part of the signed Nystrom approximation.
+    const double eps = static_cast<double>(std::numeric_limits<Scalar>::epsilon());
+    const double max_abs_lam = (lam_C.size() > 0) ? lam_C.cwiseAbs().maxCoeff() : 0.0;
+    const double eps_C = std::sqrt(static_cast<double>(n)) * eps * max_abs_lam;
     const Eigen::VectorXd lam_sqrt_abs_inv = lam_C.unaryExpr(
         [eps_C](double lam) { return (std::abs(lam) > eps_C) ? 1.0 / std::sqrt(std::abs(lam)) : 0.0; });
     const Eigen::VectorXd signs = lam_C.unaryExpr(

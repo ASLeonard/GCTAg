@@ -1,5 +1,82 @@
 cmake_minimum_required(VERSION 4.5)
 
+set(GCTA_GCC_TOOLCHAIN "" CACHE PATH
+    "GCC installation prefix for Clang/AOCC on Linux (auto-detected from g++ on PATH if unset)")
+
+# Clang/AOCC on Linux delegates C++ headers, libstdc++, and libgcc_s to a host
+# GCC installation, and only searches /usr unless --gcc-toolchain=<prefix> is
+# passed. Inject it before project() so CMake's initial compiler link test finds
+# -lstdc++ on HPC systems where GCC lives in modules or scratch directories.
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+    if(DEFINED CMAKE_CXX_COMPILER AND NOT CMAKE_CXX_COMPILER STREQUAL "")
+        set(_pre_cxx_candidate "${CMAKE_CXX_COMPILER}")
+    elseif(NOT "$ENV{CXX}" STREQUAL "")
+        set(_pre_cxx_candidate "$ENV{CXX}")
+    else()
+        set(_pre_cxx_candidate "c++")
+    endif()
+    find_program(_pre_cxx_prog NAMES "${_pre_cxx_candidate}")
+    if(_pre_cxx_prog)
+        execute_process(
+            COMMAND "${_pre_cxx_prog}" --version
+            OUTPUT_VARIABLE _pre_cxx_ver
+            ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(_pre_cxx_ver MATCHES "(AOCC|[Cc]lang)")
+            if(NOT GCTA_GCC_TOOLCHAIN)
+                find_program(_path_gxx NAMES g++ g++-16 g++-15 g++-14)
+                if(_path_gxx)
+                    file(REAL_PATH "${_path_gxx}" _path_gxx_real)
+                    cmake_path(GET _path_gxx_real PARENT_PATH _path_gxx_bin)
+                    cmake_path(GET _path_gxx_bin  PARENT_PATH _path_gxx_prefix)
+                    if(_path_gxx_prefix AND NOT _path_gxx_prefix STREQUAL "/usr"
+                                        AND NOT _path_gxx_prefix STREQUAL "/")
+                        set(GCTA_GCC_TOOLCHAIN "${_path_gxx_prefix}" CACHE PATH
+                            "GCC installation prefix for Clang/AOCC on Linux (auto-detected from g++ on PATH if unset)" FORCE)
+                        message(STATUS "Pre-project: auto-detected GCTA_GCC_TOOLCHAIN=${GCTA_GCC_TOOLCHAIN} (from ${_path_gxx})")
+                    endif()
+                endif()
+            endif()
+
+            set(_tc_arg "")
+            if(GCTA_GCC_TOOLCHAIN)
+                if(NOT IS_DIRECTORY "${GCTA_GCC_TOOLCHAIN}")
+                    message(FATAL_ERROR "GCTA_GCC_TOOLCHAIN does not exist: ${GCTA_GCC_TOOLCHAIN}")
+                endif()
+                set(_tc_arg "--gcc-toolchain=${GCTA_GCC_TOOLCHAIN}")
+                foreach(_v IN ITEMS CMAKE_C_FLAGS CMAKE_CXX_FLAGS CMAKE_EXE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS)
+                    if(NOT "${${_v}}" MATCHES "(^| )--gcc-toolchain=")
+                        string(STRIP "${${_v}} ${_tc_arg}" _updated_flags)
+                        set(${_v} "${_updated_flags}" CACHE STRING "" FORCE)
+                    endif()
+                endforeach()
+                message(STATUS "Pre-project: using ${_tc_arg} for Clang/AOCC")
+            endif()
+
+            if(NOT CMAKE_CXX_FLAGS MATCHES "-stdlib=libc\\+\\+")
+                set(_stdcxx_probe_cmd "${_pre_cxx_prog}")
+                if(_tc_arg)
+                    list(APPEND _stdcxx_probe_cmd "${_tc_arg}")
+                endif()
+                list(APPEND _stdcxx_probe_cmd "-print-file-name=libstdc++.so")
+                execute_process(
+                    COMMAND ${_stdcxx_probe_cmd}
+                    OUTPUT_VARIABLE _stdcxx_probe
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+                if(NOT _stdcxx_probe OR _stdcxx_probe STREQUAL "libstdc++.so")
+                    message(FATAL_ERROR
+                        "${_pre_cxx_prog} could not locate libstdc++.so (got '${_stdcxx_probe}').\n"
+                        "On Linux, Clang/AOCC requires a GCC installation for libstdc++ and C++ headers, "
+                        "and does not search PATH automatically.\n"
+                        "Load a GCC module (e.g. 'module load gcc/14' or newer) so g++ is on PATH, "
+                        "or pass -DGCTA_GCC_TOOLCHAIN=/path/to/gcc-prefix.")
+                endif()
+            endif()
+        endif()
+    endif()
+    unset(_pre_cxx_prog CACHE)
+    unset(_path_gxx CACHE)
+endif()
+
 project(GCTAg LANGUAGES C CXX)
 
 # Prevent CMake from finding stale configs in build-tree or user package registries.
@@ -21,9 +98,13 @@ macro(gcta_add_rpath)
 endmacro()
 
 function(gcta_pin_compiler_rtlibs _label)
+    set(_tc_arg "")
+    if(GCTA_GCC_TOOLCHAIN)
+        set(_tc_arg "--gcc-toolchain=${GCTA_GCC_TOOLCHAIN}")
+    endif()
     foreach(_rtlib IN LISTS ARGN)
         execute_process(
-            COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=${_rtlib}
+            COMMAND "${CMAKE_CXX_COMPILER}" ${_tc_arg} -print-file-name=${_rtlib}
             OUTPUT_VARIABLE _rtlib_path
             OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
         if(_rtlib_path AND NOT _rtlib_path STREQUAL "${_rtlib}")

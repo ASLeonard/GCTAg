@@ -178,7 +178,7 @@ cmake -DCMAKE_BUILD_TYPE=Release \
       -B build/Release -S .
 ```
 
-- AOCC 6.0 is LLVM 21 based and natively parses modern `libstdc++` headers without needing a separate GCC toolchain override.
+- AOCC 6.0 uses the host GCC toolchain on Linux for C++ headers and `libstdc++`. CMake automatically detects `g++` from `$PATH` (e.g. after `module load gcc`) and sets `--gcc-toolchain=...`; if your GCC is not on `$PATH`, pass `-DGCTA_GCC_TOOLCHAIN=/path/to/gcc-prefix`.
 - Pass `-DUSE_JEMALLOC=ON` (or `amdalloc`) to automatically link AOCC's bundled `libamdalloc.so` (jemalloc 5.3.1) with `thp:never`.
 - Use the `aocc/` variant of AOCL with AOCC and the `gcc/` variant with GCC. A mismatch is a configure error with GCC and a warning with AOCC.
 - To pair AOCL BLAS with MKL's multithreaded LAPACK (`dsyevd`/`dsyevr`), set `-DGCTA_LAPACKE_LIBRARY=/path/to/mkl/lib/libmkl_rt.so` and `export MKL_THREADING_LAYER=IOMP5` at run time.
@@ -197,6 +197,7 @@ cmake -DCMAKE_BUILD_TYPE=Release \
 | `zstd target not found` | A system zstd module can conflict with the downloaded one. Run `module unload zstd`, delete the build directory, and reconfigure. |
 | `plink-ng submodule is missing` | Run `git submodule update --init --recursive`. |
 | `AppleClang is not supported` | Use Homebrew LLVM (`brew install llvm`) or GCC (`brew install gcc`), or run `cmake --preset macos` / `macos-gcc`. |
+| `unable to find library -lstdc++` / `could not locate libstdc++.so` | With AOCC/Clang on Linux, load a GCC module (`module load gcc/...`) so `g++` is on `$PATH`, or pass `-DGCTA_GCC_TOOLCHAIN=/path/to/gcc-prefix`. |
 
 ## Documentation
 

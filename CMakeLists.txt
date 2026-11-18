@@ -219,6 +219,9 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
             cmake_path(GET _aocc_bin          PARENT_PATH _aocc_root)
             set(GCTA_AOCC_ROOT "${_aocc_root}" CACHE PATH "AOCC installation root" FORCE)
             message(STATUS "Detected AOCC compiler (Clang ${CMAKE_CXX_COMPILER_VERSION}, root: ${GCTA_AOCC_ROOT})")
+            # CMake's Compiler/Clang.cmake defaults IPO to -flto=thin, which AOCC does not support.
+            set(CMAKE_C_COMPILE_OPTIONS_IPO   "-flto=full")
+            set(CMAKE_CXX_COMPILE_OPTIONS_IPO "-flto=full")
             gcta_pin_compiler_rtlibs("AOCC" libomp.so libstdc++.so.6 libgcc_s.so.1)
         endif()
     endif()
@@ -441,8 +444,7 @@ else()
     # OpenBLAS, MKL, and AOCL all require the user to supply explicit paths.
     # This avoids the fragile FindBLAS / BLA_VENDOR linker-probe machinery.
     # For MKL, pass libmkl_rt.so (the single-library interface).
-    #   With GCC:  set MKL_THREADING_LAYER=GNU at runtime to use libgomp.
-    #   With AOCC: set MKL_THREADING_LAYER=IOMP5 at runtime to use libomp.
+    #   src/main.cpp sets MKL_THREADING_LAYER at startup (GNU for GCC, INTEL for Clang/AOCC) unless overridden.
     # For AOCL, use the gcc/ library variant with GCC and the aocc/ variant with AOCC.
     if(NOT GCTA_BLAS_LIBRARY)
         message(FATAL_ERROR
@@ -771,10 +773,12 @@ if(LINUX)
     message(STATUS "  Build RPATH:       ${CMAKE_BUILD_RPATH}")
 endif()
 if(GCTA_BLAS_PROVIDER STREQUAL "MKL" OR GCTA_LAPACKE_IS_MKL)
-    message(STATUS "")
-    message(STATUS "  NOTE (MKL): set MKL_THREADING_LAYER at runtime:")
-    message(STATUS "    GCC:  export MKL_THREADING_LAYER=GNU")
-    message(STATUS "    AOCC: export MKL_THREADING_LAYER=IOMP5")
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set(_mkl_default_layer "GNU")
+    else()
+        set(_mkl_default_layer "INTEL")
+    endif()
+    message(STATUS "  MKL threading:     ${_mkl_default_layer} (auto-set at startup; override via MKL_THREADING_LAYER)")
 endif()
 
 message(STATUS "==========================================")

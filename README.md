@@ -97,7 +97,7 @@ cmake -DCMAKE_BUILD_TYPE=Release \
       -B build/Release -S .
 ```
 
-To combine AOCL BLAS with MKL's parallel `dsyevd`/`dsyevr`, pass MKL's `libmkl_rt.so` as `-DGCTA_LAPACKE_LIBRARY=/path/to/mkl/lib/libmkl_rt.so` (and set `MKL_THREADING_LAYER` at run time as below). For unified AOCL 6.0 builds (`libaocl.so`), omit `-DGCTA_LAPACKE_LIBRARY`.
+To combine AOCL BLAS with MKL's parallel `dsyevd`/`dsyevr`, pass MKL's `libmkl_rt.so` as `-DGCTA_LAPACKE_LIBRARY=/path/to/mkl/lib/libmkl_rt.so` (see MKL threading note below). For unified AOCL 6.0 builds (`libaocl.so`), omit `-DGCTA_LAPACKE_LIBRARY`.
 
 **Linux, MKL:**
 
@@ -109,7 +109,7 @@ cmake -DCMAKE_BUILD_TYPE=Release \
       -B build/Release -S .
 ```
 
-At run time, tell `libmkl_rt` which OpenMP layer to use: `export MKL_THREADING_LAYER=GNU` for GCC builds, or `IOMP5` for AOCC builds.
+At run time, `GCTAg` automatically sets `MKL_THREADING_LAYER` at startup to match the compiler's OpenMP runtime (`INTEL` for AOCC/Clang builds, `GNU` for GCC builds) unless `MKL_THREADING_LAYER` is already set in the environment.
 
 **Linux, OpenBLAS:**
 
@@ -181,7 +181,7 @@ cmake -DCMAKE_BUILD_TYPE=Release \
 - AOCC 6.0 uses the host GCC toolchain on Linux for C++ headers and `libstdc++`. CMake automatically detects `g++` from `$PATH` (e.g. after `module load gcc`) and sets `--gcc-toolchain=...`; if your GCC is not on `$PATH`, pass `-DGCTA_GCC_TOOLCHAIN=/path/to/gcc-prefix`.
 - Pass `-DUSE_JEMALLOC=ON` (or `amdalloc`) to automatically link AOCC's bundled `libamdalloc.so` (jemalloc 5.3.1) with `thp:never`.
 - Use the `aocc/` variant of AOCL with AOCC and the `gcc/` variant with GCC. A mismatch is a configure error with GCC and a warning with AOCC.
-- To pair AOCL BLAS with MKL's multithreaded LAPACK (`dsyevd`/`dsyevr`), set `-DGCTA_LAPACKE_LIBRARY=/path/to/mkl/lib/libmkl_rt.so` and `export MKL_THREADING_LAYER=IOMP5` at run time.
+- To pair AOCL BLAS with MKL's multithreaded LAPACK (`dsyevd`/`dsyevr`), set `-DGCTA_LAPACKE_LIBRARY=/path/to/mkl/lib/libmkl_rt.so` (`GCTAg` automatically defaults `MKL_THREADING_LAYER` to `INTEL` for AOCC builds unless already set in the environment).
 
 ### Building on HPC clusters
 

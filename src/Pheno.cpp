@@ -186,10 +186,12 @@ Pheno::Pheno() {
 
         // phenos is 0-indexed over data columns (col 0 = first data col after FID/IID).
         // Weight is expected in the column immediately after the selected pheno column.
-        int weight_col = cur_pheno + 1;
-        if(weight_col < (int)phenos.size()){
-            update_weight(pheno_subjects, phenos[weight_col]);
-            LOGGER.i(0, "Sample weights detected in phenotype file.");
+        if(options.find("weighted_phenotypes") != options.end()){
+            int weight_col = cur_pheno + 1;
+            if(weight_col < (int)phenos.size()){
+                update_weight(pheno_subjects, phenos[weight_col]);
+                LOGGER.i(0, "Sample weights detected in phenotype file.");
+            }
         }
 
         LOGGER.i(0, to_string(index_keep.size()) + " overlapping individuals with non-missing data to be included from the phenotype file.");
@@ -1092,6 +1094,10 @@ int Pheno::registerOption(map<string, vector<string>>& options_in){
 
     if(options_in.find("--filter-sex") != options_in.end()){
         options["filter_sex"] = "yes";
+    }
+
+    if(options_in.find("--weighted-phenotypes") != options_in.end()){
+        options["weighted_phenotypes"] = "yes";
     }
 
 

@@ -1,0 +1,142 @@
+{
+  "version": 10,
+  "cmakeMinimumRequired": {
+    "major": 4,
+    "minor": 5,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base-release",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "macos",
+      "displayName": "macOS (Homebrew LLVM + Accelerate)",
+      "description": "Release build on macOS using Homebrew LLVM Clang (>= 23) and Apple Accelerate",
+      "inherits": "base-release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "/opt/homebrew/opt/llvm/bin/clang",
+        "CMAKE_CXX_COMPILER": "/opt/homebrew/opt/llvm/bin/clang++",
+        "GCTA_BLAS_BACKEND": "Accelerate"
+      }
+    },
+    {
+      "name": "macos-gcc",
+      "displayName": "macOS (Homebrew GCC 16 + Accelerate)",
+      "description": "Release build on macOS using Homebrew GCC >= 16 and Apple Accelerate",
+      "inherits": "macos",
+      "binaryDir": "${sourceDir}/build/Release-gcc",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "/opt/homebrew/bin/gcc-16",
+        "CMAKE_CXX_COMPILER": "/opt/homebrew/bin/g++-16"
+      }
+    },
+    {
+      "name": "linux-aocl",
+      "displayName": "Linux (AOCL)",
+      "description": "Release build on Linux using AOCL (defaults paths from $env{AOCL_ROOT})",
+      "inherits": "base-release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "GCTA_BLAS_BACKEND": "AOCL",
+        "GCTA_BLAS_LIBRARY": "$env{AOCL_ROOT}/lib/libblis-mt.so",
+        "GCTA_LAPACKE_LIBRARY": "$env{AOCL_ROOT}/lib/libflame.so",
+        "GCTA_BLAS_INCLUDE_DIR": "$env{AOCL_ROOT}/include"
+      }
+    },
+    {
+      "name": "linux-aocc-aocl",
+      "displayName": "Linux (AOCC >= 6.0 + AOCL + amdalloc)",
+      "description": "Release build with AMD AOCC (aoc/aoc++), AOCL, and bundled libamdalloc.so",
+      "inherits": "linux-aocl",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "aoc",
+        "CMAKE_CXX_COMPILER": "aoc++",
+        "USE_JEMALLOC": "ON"
+      }
+    },
+    {
+      "name": "linux-aocc-aocl-mkl",
+      "displayName": "Linux (AOCC >= 6.0 + AOCL BLAS + MKL LAPACK + amdalloc)",
+      "description": "Hybrid build pairing AOCL BLAS with MKL multithreaded LAPACK (dsyevd/dsyevr)",
+      "inherits": "linux-aocc-aocl",
+      "cacheVariables": {
+        "GCTA_LAPACKE_LIBRARY": "$env{MKLROOT}/lib/libmkl_rt.so"
+      }
+    },
+    {
+      "name": "linux-mkl",
+      "displayName": "Linux (MKL)",
+      "description": "Release build on Linux using Intel MKL ($env{MKLROOT})",
+      "inherits": "base-release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "GCTA_BLAS_BACKEND": "MKL",
+        "GCTA_BLAS_LIBRARY": "$env{MKLROOT}/lib/libmkl_rt.so",
+        "GCTA_BLAS_INCLUDE_DIR": "$env{MKLROOT}/include"
+      }
+    },
+    {
+      "name": "linux-openblas",
+      "displayName": "Linux (OpenBLAS)",
+      "description": "Release build on Linux using OpenBLAS (supply GCTA_BLAS_LIBRARY and GCTA_BLAS_INCLUDE_DIR via -D)",
+      "inherits": "base-release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "GCTA_BLAS_BACKEND": "OpenBLAS"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "macos",
+      "configurePreset": "macos"
+    },
+    {
+      "name": "macos-gcc",
+      "configurePreset": "macos-gcc"
+    },
+    {
+      "name": "linux-aocl",
+      "configurePreset": "linux-aocl"
+    },
+    {
+      "name": "linux-aocc-aocl",
+      "configurePreset": "linux-aocc-aocl"
+    },
+    {
+      "name": "linux-aocc-aocl-mkl",
+      "configurePreset": "linux-aocc-aocl-mkl"
+    },
+    {
+      "name": "linux-mkl",
+      "configurePreset": "linux-mkl"
+    },
+    {
+      "name": "linux-openblas",
+      "configurePreset": "linux-openblas"
+    }
+  ]
+}

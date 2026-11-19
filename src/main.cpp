@@ -126,7 +126,7 @@ int main(int argc, char *argv[]){
         "--reml-no-constrain", "--reml-priors", "--reml-priors-var", "--reml-diagV-adj", "--reml-maxit",  "--reml-alg",
         "--reml-ai-robust", "--reml-ai-robust-tol", "--reml-ai-robust-risk",
         "--mlma-no-preadj-covar",
-        "--mlma-stream", "--save-reml", "--load-reml", "--log-pval", "--model",
+        "--mlma-stream", "--save-reml", "--load-reml", "--log-pval", "--model", "--weighted-phenotypes",
 
     };
     map<string, vector<string>> options;
@@ -279,6 +279,16 @@ int main(int argc, char *argv[]){
         setenv("KMP_BLOCKTIME", "0", 0);   // 0 = don't override user setting
         setenv("GOMP_SPINCOUNT", "0", 0);
         setenv("OMP_NUM_THREADS", to_string(thread_num).c_str(), 1);
+        #if defined(GCTA_USE_MKL) || defined(GCTA_LAPACKE_IS_MKL)
+            // libmkl_rt.so reads MKL_THREADING_LAYER lazily on first call; match the
+            // OpenMP runtime linked by this compiler (INTEL uses LLVM libomp/libiomp5;
+            // GNU uses libgomp) while respecting an explicit user override (0).
+            #if defined(__clang__)
+                setenv("MKL_THREADING_LAYER", "INTEL", 0);
+            #elif defined(__GNUC__)
+                setenv("MKL_THREADING_LAYER", "GNU", 0);
+            #endif
+        #endif
     #endif
     omp_set_num_threads(thread_num);
 

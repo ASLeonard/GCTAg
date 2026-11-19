@@ -31,7 +31,13 @@
 #elif defined(GCTA_USE_AOCL)
   #include <cblas.h>
   #include <lapacke.h>
-  #if __has_include(<blis.h>)
+  #if defined(GCTA_USE_AOCL_DLP)
+    #if __has_include(<aocl_dlp.h>)
+      #include <aocl_dlp.h>
+    #elif __has_include(<classic/aocl_gemm_interface_apis.h>)
+      #include <classic/aocl_gemm_interface_apis.h>
+    #endif
+  #elif __has_include(<blis.h>)
     #include <blis.h>
   #endif
   typedef lapack_int gcta_blas_int;
@@ -392,6 +398,12 @@ inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, float* Y, 
     return 0;
 }
 
+#if defined(GCTA_USE_AOCL_DLP) || (defined(GCTA_USE_AOCL) && defined(BLIS_ENABLE_ADDON_AOCL_GEMM))
+  #define GCTA_HAS_AOCL_S8_GEMM 1
+#else
+  #define GCTA_HAS_AOCL_S8_GEMM 0
+#endif
+
 // Compute C(rows x cols, column-major, leading dim ldc) = A(rows x K, lda) * B(cols x K, ldb)^T
 // where A and B are column-major int8_t matrices in {0, 1, 2} and C is a column-major int32_t matrix.
 // On AOCL with BLIS_ENABLE_ADDON_AOCL_GEMM, dispatches directly to Zen 4 AVX-512 VNNI
@@ -410,7 +422,7 @@ inline void gcta_gemm_s8s8s32_colmajor_nt(
     std::vector<float>& scratch_C_f32)
 {
     if (rows <= 0 || cols <= 0 || K <= 0) return;
-#if defined(GCTA_USE_AOCL) && defined(BLIS_ENABLE_ADDON_AOCL_GEMM)
+#if GCTA_HAS_AOCL_S8_GEMM
     (void)scratch_A_f32;
     (void)scratch_B_f32;
     (void)scratch_C_f32;
@@ -483,7 +495,7 @@ inline void gcta_gemm_s8s8s32_colmajor_nn(
     std::vector<float>& scratch_C_f32)
 {
     if (rows <= 0 || cols <= 0 || K <= 0) return;
-#if defined(GCTA_USE_AOCL) && defined(BLIS_ENABLE_ADDON_AOCL_GEMM)
+#if GCTA_HAS_AOCL_S8_GEMM
     (void)scratch_A_f32;
     (void)scratch_B_f32;
     (void)scratch_C_f32;
@@ -555,7 +567,7 @@ inline void gcta_syrk_s8s8s32_lower_colmajor_nt(
     std::vector<float>& scratch_C_f32)
 {
     if (cols <= 0 || K <= 0) return;
-#if defined(GCTA_USE_AOCL) && defined(BLIS_ENABLE_ADDON_AOCL_GEMM)
+#if GCTA_HAS_AOCL_S8_GEMM
     (void)scratch_A_f32;
     (void)scratch_C_f32;
     aocl_gemm_s8s8s32os32('r', 't', 'n',

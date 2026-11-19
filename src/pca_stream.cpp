@@ -224,62 +224,9 @@ void PCAStream::processMain()
             // split above; nothing further to log here.
             chunked_reader = std::move(chunked_handle.reader);
         } else {
-            vector<string> loaded_ids;
             double m_snps_unused = -1.0;
-            Eigen::MatrixXd G_full;
-            // upper_only=true: confirmed safe via cpu.h -- gcta_dsyevd and
-            // gcta_dsyevr both hardcode uplo='U' (LAPACK dsyevd/dsyevr with
-            // uplo='U' only ever reads the upper triangle of the input on
-            // entry; on exit with jobz='V' they overwrite the whole buffer
-            // with dense eigenvectors regardless). So the exact-eigendecomp
-            // path below was already only reading the upper triangle even
-            // under the old fully-mirrored G_dense -- the mirror was pure
-            // waste for that path. The pca_approx (rSVD/Lanczos/Nystrom)
-            // branches go through the `apply` lambda below, which is updated
-            // to selfadjointView<Eigen::Upper>() to match.
-            gcta_grm_io::read_grm_binary(grm_pfx, loaded_ids, G_full, m_snps_unused, /*upper_only=*/true);
-            const vector<int> kp = gcta_grm_io::match_ids_to_grm(analysis_ids, loaded_ids);
-            for (int i = 0; i < n; ++i)
-                if (kp[i] < 0)
-                    LOGGER.e(0, "--pca: individual [" + analysis_ids[i] + "] not found in GRM.");
-
-            // Fast path: no --keep/--remove (or a --keep/--remove that
-            // happens to preserve GRM order) means kp is the identity — skip
-            // the copy entirely rather than holding G_full and G_dense both
-            // fully resident at once for no reason.
-            const int n_grm = static_cast<int>(loaded_ids.size());
-            bool is_identity = (n_grm == n);
-            for (int i = 0; i < n && is_identity; ++i)
-                if (kp[i] != i) is_identity = false;
-
-            if (is_identity) {
-                G_dense = std::move(G_full);
-            } else {
-                G_dense.resize(n, n);
-                // G_full is upper-triangle-only (row<=col valid). Only write
-                // the upper triangle of G_dense (i <= j) -- that's all
-                // gcta_dsyevd/gcta_dsyevr (uplo='U') and the selfadjointView
-                // matvec below need -- and use a min/max lookup into G_full
-                // so every read lands in its valid region regardless of how
-                // the permutation reorders rows vs columns. Same fix as
-                // MLMA_stream.cpp's equivalent gather; see that file for the
-                // full rationale. Triangular workload -> dynamic scheduling,
-                // not static, to avoid imbalance across low-j vs high-j
-                // columns.
-                #pragma omp parallel for schedule(dynamic, 64)
-                for (int j = 0; j < n; ++j) {
-                    const int src_col = kp[j];
-                    for (int i = 0; i <= j; ++i) {
-                        const int r = kp[i], c = src_col;
-                        G_dense(i, j) = (r <= c) ? G_full(r, c) : G_full(c, r);
-                    }
-                }
-                // G_full (n_grm x n_grm, potentially much larger than G_dense
-                // when heavily filtered) goes out of scope at the end of this
-                // else-block regardless, but free it explicitly right here —
-                // no reason to keep it alive through the rest of this branch.
-                G_full.resize(0, 0);
-            }
+            gcta_grm_io::load_and_subset_grm_upper(
+                grm_pfx, analysis_ids, G_dense, m_snps_unused, "--pca");
         }
 
         auto apply = [&](const auto& X) -> Eigen::MatrixXd {

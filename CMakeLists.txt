@@ -579,7 +579,6 @@ target_sources(GCTAg PRIVATE
         src/Covar.cpp
         src/FastFAM.cpp
         src/MLMA_stream.cpp
-        #src/MLMA_loco.cpp # Disabled as out of sync with MLMA_stream
         src/pca_stream.cpp
         src/RemlEngine.cpp
         src/GRM.cpp

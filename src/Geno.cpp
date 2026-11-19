@@ -245,24 +245,6 @@ Geno::Geno(Pheno* pheno, Marker* marker) {
 Geno::~Geno(){
 }
 
-void Geno::setLocoBfilePrefix(const std::string& bfile_prefix) {
-    if (bfile_prefix.empty()) {
-        LOGGER.e(0, "[LOCO] empty bfile prefix in manifest.");
-    }
-
-    options["geno_file"] = bfile_prefix + ".bed";
-    options.erase("m_file");
-    options.erase("pgen_file");
-    options.erase("mpgen_file");
-    options.erase("bgen_file");
-    options.erase("mbgen_file");
-
-    std::ifstream f(options["geno_file"].c_str());
-    if (!f.good()) {
-        LOGGER.e(0, "[LOCO] manifest bfile not found: [" + options["geno_file"] + "]");
-    }
-}
-
 uint32_t Geno::getTotalMarker(){
     return total_markers;
 }
@@ -722,11 +704,15 @@ void Geno::getGenoDouble_pgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
             // PGEN dosage_main uses 14-bit fractional scaling of allele
             // dosage in [0, 2].
             static constexpr double kDosageScale = 1.0 / 16384.0;
-            gbuf->geno.resize(keepSampleCT);
+            double *out_geno = gbuf->geno_ptr;
+            if (!out_geno) {
+                gbuf->geno.resize(keepSampleCT);
+                out_geno = gbuf->geno.data();
+            }
             for(uint32_t j = 0; j < keepSampleCT; ++j){
                 const double dos = static_cast<double>(dosage_main[j]) * kDosageScale;
                 const double recoded = mapDosageToModel(dos, mu, model);
-                gbuf->geno[j] = (recoded - spec.centerValue) * spec.rdev;
+                out_geno[j] = (recoded - spec.centerValue) * spec.rdev;
             }
 
             if(sexChromType == 1){
@@ -735,7 +721,7 @@ void Geno::getGenoDouble_pgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                 setHeterogameticWeight(weight, needWeight);
                 if(needWeight){
                     for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
-                        gbuf->geno[keepHeterogameticExtractIndex[i]] *= weight;
+                        out_geno[keepHeterogameticExtractIndex[i]] *= weight;
                     }
                 }
             }
@@ -794,13 +780,17 @@ void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                 const GenoCodingSpec spec = buildCodingSpec(mu, sd);
                 const double lookup[32] __attribute__ ((aligned (16))) =
                     GET_TABLE16(spec.a0, spec.a1, spec.a2, spec.na);
-                gbuf->geno.resize(keepSampleCT);
+                double *out_geno = gbuf->geno_ptr;
+                if (!out_geno) {
+                    gbuf->geno.resize(keepSampleCT);
+                    out_geno = gbuf->geno.data();
+                }
                 uintptr_t * pmiss = NULL;
                 if(bMakeMiss){
                     gbuf->missing.resize(missPtrSize); 
                     pmiss = gbuf->missing.data();
                 }
-                PgenReader::ExtractDoubleExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, lookup, gbuf->geno.data(), pmiss); 
+                PgenReader::ExtractDoubleExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, lookup, out_geno, pmiss); 
                 if(sexChromType == 1){
                     double weight;
                     bool needWeight;
@@ -808,14 +798,14 @@ void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     if(needWeight){
                         if(bGRM){
                             for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
-                                gbuf->geno[keepHeterogameticExtractIndex[i]] *= weight;
+                                out_geno[keepHeterogameticExtractIndex[i]] *= weight;
                             }
                         }else{
                             double correctWeight = (weight - 1) * spec.rdev * spec.centerValue;
                             for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
                                 uint32_t curIndex = keepHeterogameticExtractIndex[i];
-                                gbuf->geno[curIndex] *= weight;
-                                gbuf->geno[curIndex] += correctWeight;
+                                out_geno[curIndex] *= weight;
+                                out_geno[curIndex] += correctWeight;
                             }
                         }
                     }
@@ -1069,9 +1059,13 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                 }
                 dos_lookup[max_dos] = spec.na;
 
-                gbuf->geno.resize(curSampleCT);
+                double *out_geno = gbuf->geno_ptr;
+                if (!out_geno) {
+                    gbuf->geno.resize(curSampleCT);
+                    out_geno = gbuf->geno.data();
+                }
                 for(int j = 0; j < curSampleCT; j++){
-                    gbuf->geno[j] = dos_lookup[dosages[j]];
+                    out_geno[j] = dos_lookup[dosages[j]];
                 }
                 delete[] dos_lookup;
                 if(sexChromType == 1){
@@ -1081,14 +1075,14 @@ void Geno::getGenoDouble_bgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     if(needWeight){
                         if(bGRM){
                             for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
-                                gbuf->geno[keepHeterogameticExtractIndex[i]] *= weight;
+                                out_geno[keepHeterogameticExtractIndex[i]] *= weight;
                             }
                         }else{
                             double correctWeight = (weight - 1) * spec.rdev * spec.centerValue;
                             for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
                                 uint32_t curIndex = keepHeterogameticExtractIndex[i];
-                                gbuf->geno[curIndex] *= weight;
-                                gbuf->geno[curIndex] += correctWeight;
+                                out_geno[curIndex] *= weight;
+                                out_geno[curIndex] += correctWeight;
                             }
                         }
                     }
@@ -1227,136 +1221,6 @@ void Geno::loopDouble(const vector<uint32_t> &extractIndex, int numMarkerBuf,
     }
     // backend destructor runs end-logic (masks freed, files closed).
 }
-
-//function for BGEN
-inline void bgen12ExtractVal(uint64_t val, uint8_t bit_prob, uint64_t mask, uint64_t &v1, uint64_t &v2){
-    v1 = val & mask;
-    v2 = (val >> bit_prob) & mask;
-}
-
-// call genotype
-void dosageFunc(uint32_t prob1, uint32_t prob2, uint64_t mask, uint32_t cutVal, uint32_t A1U, uint32_t A1L, double &gval, bool &miss){
-    gval = (double)(prob1 * 2 + prob2) / mask;
-}
-
-
-void dosageCallFunc(uint32_t prob1, uint32_t prob2, uint64_t mask, uint32_t cutVal, uint32_t A1U, uint32_t A1L, double &gval, bool &miss){
-    uint32_t dos = prob1 * 2 + prob2;
-    if(dos > A1U){
-        gval = 2.0;
-    }else if(dos < A1L){
-        gval = 0.0;
-    }else{
-        gval = 1.0;
-    }
-}
-
-void hardCallFunc(uint32_t prob1, uint32_t prob2, uint64_t mask, uint32_t cutVal, uint32_t A1U, uint32_t A1L, double &gval, bool &miss){
-    miss = false;
-    if(prob1 >= cutVal){
-        gval = 2.0;
-    }else if(prob2 >= cutVal){
-        gval = 1.0;
-    }else if(mask - prob1 - prob2 >= cutVal){
-        gval = 0.0;
-    }else{
-        gval = 0.0;
-        miss = true;
-    }
-};
-        /* obsoleted functions hard calling
-        uint8_t double_bits_prob = bits_prob * 2;
-        uint32_t A1U = floor(mask * 1.5);
-        uint32_t A1L = ceil(mask * 0.5);
-        uint32_t cutVal = ceil(mask * options_d["hard_call_thresh"]);
-
-        void (*callFunc)(uint32_t prob1, uint32_t prob2, uint64_t mask, uint32_t cutVal, uint32_t A1U, uint32_t A1L, double &gval, bool &miss);
-        if(options.find("dosage_call") != options.end()){
-            callFunc = dosageCallFunc;
-        }else if(options.find("dosage") != options.end()){
-            callFunc = dosageFunc;
-        }else{
-            callFunc = hardCallFunc;
-        }
-
-        auto callFuncB = [callFunc, mask, cutVal, A1U, A1L](uint32_t prob1, uint32_t prob2, double &gval, bool&miss){
-            callFunc(prob1, prob2, mask, cutVal, A1U, A1L, gval, miss);
-        };
-    
-        //vector<uint32_t> prob1s(n_res), prob2s(n_res);
-        vector<uint32_t> miss_index;
-        double sum_geno = 0;
-        double *base_geno = (gbuf->geno).data() + i * n_res;
-        uint64_t *base_miss;
-        uint32_t n_valid = 0;
-        if(gbuf->saveMiss) base_miss = (gbuf->miss).data() + i * n_bmiss; 
-
-        uint64_t dosage_sum = 0, fij_dosage2_sum = 0;
-        bool *lookup_miss = new bool[mask + 1];
-
-
-        for(int j = 0; j < n_res; j++){
-            uint32_t sindex = sampleKeepIndex[j];
-            uint8_t item_ploidy = sample_ploidy[sindex];
-            if(item_ploidy > 128){
-                miss_index.push_back(sindex);
-            }else if(item_ploidy == 2){
-                uint32_t start_bits = sindex * double_bits_prob;
-                uint64_t geno_temp;
-                memcpy(&geno_temp, &(X_prob[start_bits/CHAR_BIT]), sizeof(uint64_t));
-                geno_temp = geno_temp >> (start_bits % CHAR_BIT);
-                uint32_t prob1 = geno_temp & mask;
-                uint32_t prob2 = (geno_temp >> bits_prob) & mask;
-                uint32_t prob1d = prob1 * 2;
-                uint32_t dosage = prob1d + prob2;
-
-                
-
-                dosage_sum += dosage;
-
-                uint32_t fij = dosage + prob1d;
-                fij_dosage2_sum += (fij - dosage * dosage);
-            }else{
-               LOGGER.e(0, "multi-allelic SNPs detected in " + error_promp);
-            }
-        }
-
-        for(int j = 0; j < n_res; j++){
-            uint32_t sindex = sampleKeepIndex[j];
-            uint8_t item_ploidy = sample_ploidy[sindex];
-            if(item_ploidy > 128){
-                miss_index.push_back(sindex);
-            }else if(item_ploidy == 2){
-                uint32_t start_bits = sindex * double_bits_prob;
-                uint64_t geno_temp;
-                memcpy(&geno_temp, &(X_prob[start_bits/CHAR_BIT]), sizeof(uint64_t));
-                geno_temp = geno_temp >> (start_bits % CHAR_BIT);
-                uint32_t prob1 = geno_temp & mask;
-                uint32_t prob2 = (geno_temp >> bits_prob) & mask;
-
-                //total_prob += ((prob1 << 1) + prob2);
-                //prob1s[i] = prob1;
-                //prob2s[i] = prob2;
-                double gval;
-                bool miss;
-                callFuncB(prob1, prob2, gval, miss);
-                base_geno[j] = gval;
-                if(miss){
-                    miss_index.push_back(j);
-                    if(gbuf->saveMiss) base_miss[j / 64] |= (1UL << (j % 64)); 
-                }else{
-                    n_valid++;
-                }
-           }else{
-               LOGGER.e(0, "multi-allelic SNPs detected in " + error_promp);
-           }
-        }
-        delete[] dec_data;
-        Eigen::VectorXd Vgeno = Eigen::Map< Eigen::Matrix<double,Eigen::Dynamic,1> > (base_geno, n_res);
-        double af = Vgeno.sum() / (2*n_valid);
-        (gbuf->validN)[i] = n_valid;
-        (gbuf->af)[i] = af;
-        */
 
 union Geno_prob{
     char byte[4];

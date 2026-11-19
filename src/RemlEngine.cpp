@@ -1051,193 +1051,6 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
         LOGGER << "REML iteration: lambda_sq = " << std::to_string(lambda_sq) << ", step scale = " << std::to_string(step_scale) << ", delta = " << delta.transpose() << std::endl;
 }
 
-// Post-hoc, Woodbury-only tail correction. Called exactly once, only at
-// convergence, only when ctx.woodbury_basis_posthoc_correction is set --
-// NEVER from inside the AI-REML iteration loop, so it has zero effect
-// (zero extra compute, zero behavioural change) on every iteration leading
-// up to convergence, and zero cost at all when the flag is off.
-//
-// tr_PA's tail contribution gets the validated closed-form delta-method
-// correction (calcu_tr_PA_woodbury's tr_PA_corrected output). R's tail
-// contribution has no such closed form (see calcu_tr_PA_woodbury's own
-// comment) -- instead R is computed exactly via one direct matvec against
-// the true GRM (ctx.A) per score evaluation. Falls back to the flat-tail
-// approximation with a warning if ctx.A has already been freed.
-//
-// Step size: NOT the raw Newton step Hi*U_corrected taken at full strength.
-// Hi is the flat-tail model's curvature, evaluated at the flat-tail fixed
-// point -- there is no reason to trust its *magnitude* once the score being
-// solved is no longer the one it was derived from (confirmed empirically:
-// the raw full step overshoots badly and by an increasing amount as the
-// starting point approaches the true optimum). Instead of an arbitrary fixed
-// damping factor, this evaluates the corrected score a second time, at the
-// full-step trial endpoint, and takes a secant (regula falsi) step along the
-// same direction Hi proposed -- i.e. it still trusts Hi's *direction*, but
-// replaces its *magnitude* with one grounded in an actual second measurement
-// of the corrected score, not an assumed constant. Costs one additional
-// exact O(n^2) matvec (the trial-point score evaluation) on top of the one
-// already paid for the current-point score -- still only paid once per
-// converged run, still nothing paid unless the flag is on.
-RemlVec compute_woodbury_posthoc_delta(RemlCtx& ctx, const RemlMat& Hi, const RemlVec& Py,
-                                        const RemlVec& prev_varcmp, int iter) {
-    const int m = static_cast<int>(ctx.r_indx.size());
-
-    // Corrected score U(varcmp), evaluated at whatever point ctx is currently
-    // set up for (Py must be V^{-1}-projected at that same point -- true both
-    // for the current-point call below and the trial-point call further down).
-    auto corrected_score = [&](const RemlVec& Py_at) -> RemlVec {
-        RemlVec tr_PA_l(m), tr_PA_corrected_l(m);
-        calcu_tr_PA_woodbury(ctx, tr_PA_l, &tr_PA_corrected_l);
-
-        RemlVec R_raw_l(m);
-        for (int i = 0; i < m; i++) {
-            if (i == 0)
-                R_raw_l(i) = Py_at.dot(woodbury_basis_Kv(ctx, Py_at));
-            else if (ctx.A[ctx.r_indx[i]].size() == 0)
-                R_raw_l(i) = Py_at.dot(Py_at);
-            else
-                R_raw_l(i) = Py_at.dot(RemlVec(ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py_at));
-        }
-
-        RemlVec R_for_correction_l = R_raw_l;
-        if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
-            const RemlVec APy_exact_l = ctx.A[ctx.r_indx[0]].selfadjointView<Eigen::Upper>() * Py_at;   // the O(n^2) pass
-            R_for_correction_l(0) = Py_at.dot(APy_exact_l);
-        } else {
-            LOGGER.w(0, "ctx.woodbury_basis_posthoc_correction is set but the exact GRM "
-                        "(ctx.A) is not resident -- falling back to the flat-tail "
-                        "approximation for R. Keep ctx.A resident through convergence "
-                        "(skip the free in compute_woodbury_basis) to use this correction.");
-        }
-        return -0.5 * (tr_PA_corrected_l - R_for_correction_l);
-    };
-
-    // g(0): corrected score at the current (converged, flat-tail) point.
-    // ctx is already correctly set up for prev_varcmp/Py on entry -- no
-    // calcu_Vi call needed here, unlike the trial point below.
-    const RemlVec U0 = corrected_score(Py);
-    const RemlVec d  = U0; //Hi * U0;          // raw Newton direction (and, at t=1, the old full step)
-    const double  g0 = d.dot(U0);
-
-    // g(1): corrected score at the trial full-step endpoint. Requires moving
-    // ctx to that point first (same skip_P=true, dense-P-free path the main
-    // convergence refresh uses -- Woodbury cannot materialise dense P/Vi).
-    RemlVec varcmp_trial = prev_varcmp + d;
-    LOGGER << "REML: post-hoc secant trial point: varcmp_trial = " << varcmp_trial.transpose() << std::endl;
-
-    double logdet_trial = 0.0;
-    double t_star = 0.0;
-    if (calcu_Vi(ctx, varcmp_trial, logdet_trial, iter, /*skip_P=*/true)) {
-        calcu_P_impl(ctx, nullptr);
-        const RemlVec Py_trial = applyP_vec(ctx, ctx.y);
-        const RemlVec U1 = corrected_score(Py_trial);
-        const double  g1 = d.dot(U1);
-
-        constexpr double denom_eps = 1e-12;   // numerical-safety threshold, not a tuning knob
-        if (std::fabs(g0 - g1) > denom_eps) {
-            // Secant root of g(t) = g0 + t*(g1-g0) along the Hi-proposed
-            // direction. Clamped to [0, 1] -- interpolate between "no
-            // correction" (t=0, known-safe) and "full raw step" (t=1, known
-            // to overshoot), never extrapolate beyond either.
-            t_star = std::clamp(g0 / (g0 - g1), 0.0, 1.0);
-        } else {
-            LOGGER.w(0, "REML: post-hoc secant step denominator is degenerate "
-                        "(corrected score barely changed over the trial step); "
-                        "keeping the pre-correction estimate.");
-        }
-        LOGGER << "REML: post-hoc secant line search: g(0)=" << g0 << ", g(1)=" << g1
-               << ", t*=" << t_star << std::endl;
-    } else {
-        LOGGER.w(0, "REML: post-hoc secant trial point is not positive-definite; "
-                    "keeping the pre-correction estimate.");
-    }
-
-    // Restore ctx to the state it was in on entry (consistent with prev_varcmp
-    // and the caller's Py) before returning, so this function has no side
-    // effects the caller needs to know about or compensate for -- do not rely
-    // on the caller happening to re-sync state right after this returns.
-    // Local mutable copy: calcu_Vi requires non-const RemlVec& (it may
-    // constrain/clamp values in place), and prev_varcmp is a const-ref
-    // parameter here -- the mutated copy itself is discarded, only the side
-    // effect on ctx state is wanted.
-    RemlVec prev_varcmp_restore = prev_varcmp;
-    double logdet_restore = 0.0;
-    calcu_Vi(ctx, prev_varcmp_restore, logdet_restore, iter, /*skip_P=*/true);
-    calcu_P_impl(ctx, nullptr);
-
-    return t_star * d;
-}
-
-// Closed-form, non-iterative tail correction to the HE-moment variance
-// component estimate. This is NOT a Newton step and does not touch the
-// score, Hi, P, or Vi -- it recomputes sigma_g^2 via the same
-// method-of-moments ratio used for the HE warm start (init_varcomp), but
-// with tail statistics corrected using lambda_tail and tail_d_var.
-//
-// tr(K) and tr(K^2) are made fully EXACT here, not just improved: a sum of
-// a degree-<=2 polynomial in the tail eigenvalues (tr(K) is degree 1,
-// tr(K^2) is degree 2) is completely recoverable from the tail's mean and
-// variance alone -- there is no Taylor remainder for these two terms, unlike
-// log|V| or tr(V^-1 K), which needed higher moments for further accuracy.
-//
-// y'Ky cannot be made exact this way -- same obstruction as R: its tail
-// contribution sum_{i>k} d_i*(w_i'y)^2 needs eigenvector alignment
-// information tau^2 does not contain. Two options are given: the cheap
-// flat-tail approximation (matches what the rest of REML already computes
-// with, O(n*k)), or an exact O(n^2) pass against the true GRM if ctx.A is
-// still resident. Neither is a correction to this specific term -- exact
-// uses the real matrix, flat leaves the existing approximation as-is.
-//
-// The result is a standalone point estimate, entirely decoupled from
-// whatever varcmp AI-REML converged to. It is NOT a refinement of that
-// estimate and does not require it -- it can be computed and reported
-// independently, e.g. purely as a diagnostic alongside the AI-REML result.
-RemlVec compute_he_tail_corrected_varcmp(RemlCtx& ctx, bool use_exact_yKy) {
-    const int k = ctx.woodbury_basis_rank_;
-    const int n = ctx.n;
-
-    // tr(K), tr(K^2): exact, from basis statistics already computed --
-    // no extra cost, no matvec.
-    const double trK  = ctx.dk.sum() + static_cast<double>(n - k) * ctx.lambda_tail;
-    const double trK2 = ctx.dk.squaredNorm()
-                       + static_cast<double>(n - k) * (ctx.tail_d_var + ctx.lambda_tail * ctx.lambda_tail);
-
-    // y'Ky: flat-tail (cheap, O(n*k)) unless exact was requested and ctx.A
-    // is available.
-    double yKy;
-    if (use_exact_yKy && !ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
-        yKy = ctx.y.dot(RemlVec(ctx.A[ctx.r_indx[0]].selfadjointView<Eigen::Upper>() * ctx.y));   // one O(n^2) pass
-    } else {
-        if (use_exact_yKy) {
-            LOGGER.w(0, "compute_he_tail_corrected_varcmp: exact y'Ky requested but ctx.A "
-                        "is not resident -- falling back to the flat-tail approximation.");
-        }
-        yKy = ctx.y.dot(woodbury_basis_Kv(ctx, ctx.y));
-    }
-
-    const double yy = ctx.y.squaredNorm();
-    const double Vy = ctx.y_Ssq;
-    const double denom = static_cast<double>(n) * trK2 - trK * trK;
-
-    RemlVec varcmp_he(2);
-    double sg_he = (denom > 1e-10)
-        ? (static_cast<double>(n) * yKy - trK * yy) / denom
-        : Vy * 0.5;
-    // Same clamps as init_varcomp's HE warm start, for the same reason:
-    // this is the identical estimator family and can fail the same way
-    // (near-singular denominator, negative raw estimate).
-    sg_he = std::max(sg_he, 0.01 * Vy);
-    sg_he = std::min(sg_he, 0.99 * Vy);
-    varcmp_he(0) = sg_he;
-    varcmp_he(1) = std::max(Vy - sg_he, 0.01 * Vy);
-
-    LOGGER << "REML: HE tail-corrected estimate (" << (use_exact_yKy ? "exact" : "flat") << " y'Ky): "
-           << varcmp_he.transpose()
-           << "  [trK=" << trK << " trK2=" << trK2 << " yKy=" << yKy << "]" << std::endl;
-
-    return varcmp_he;
-}
-
 // tr_PA-only-corrected post-hoc step. No new matvec beyond what a converged
 // AI-REML run already computed -- Hi is reused as-is, R stays the existing
 // flat-tail approximation (woodbury_basis_Kv, O(n*k), no ctx.A needed).
@@ -1582,75 +1395,7 @@ double reml_iteration(RemlCtx& ctx,
             //varcmp = best_varcmp;   // report best-seen, not last-iterate //Deactivated on purpose without testing, as this would no longer be a "convergence" method.
             if (ctx.Vi_use_woodbury_basis && ctx.reml_mtd == 0 && ctx.woodbury_basis_posthoc_correction) {
                 const RemlVec delta_simple = compute_woodbury_posthoc_delta_simple(ctx, Hi, Py);   // side effect: logs the tr_PA correction
-                 LOGGER << "REML: Woodbury post-hoc tail correction: delta = " << delta_simple.transpose() << std::endl;
-            }   
-            if (false) { //hard disable the secant step for now, as it is not well tested and may be unstable
-                // Hi/Py here are exactly what the final ai_reml call above left
-                // behind -- still consistent with prev_varcmp, the converged
-                // (flat-tail) fixed point. Nothing above this point in the loop
-                // pays any extra cost for this feature; this is the only place
-                // it runs, and it runs at most once.
-                const RemlVec delta_corrected = compute_woodbury_posthoc_delta(ctx, Hi, Py, prev_varcmp, iter);
-                const RemlVec varcmp_post = prev_varcmp + delta_corrected;
-                const double lgL_pre = lgL;
-                varcmp = varcmp_post;
-
-                // Refresh everything downstream to be self-consistent with the
-                // corrected varcmp. Vi_X_out/Xt_Vi_X_i_out/Hi/lgL (-> ctx.logL)
-                // are otherwise only captured once, below/by the caller, from
-                // whatever state the last (pre-correction) iteration left
-                // behind -- reassigning varcmp alone does not update any of
-                // them, which is exactly what produced the earlier MLMA
-                // regression from a hand-patched factorize_only attempt.
-                //
-                // Woodbury mode cannot materialize a dense P/Vi ("Woodbury REML
-                // is incompatible with explicit V^{-1} materialisation") --
-                // skip_P must stay true, and Py/Hi are rebuilt the same
-                // implicit way ai_reml computes them every iteration
-                // (applyP_vec/applyP_mat via the low-rank+tail basis), not via
-                // calcu_Hi's dense-P path (that path is only ever exercised by
-                // the reml_mtd==2 branch below, which is not reachable here).
-                double logdet_post = 0.0;
-                if (!calcu_Vi(ctx, varcmp, logdet_post, iter, /*skip_P=*/true)) {
-                    LOGGER.w(0, "REML: post-hoc corrected variance components are not "
-                                 "positive-definite; keeping the pre-correction estimate.");
-                    varcmp = prev_varcmp;
-                    calcu_Vi(ctx, varcmp, logdet_post, iter, true);
-                }
-                const double logdet_Xt_Vi_X_post = calcu_P_impl(ctx, nullptr);
-                Py = applyP_vec(ctx, ctx.y);
-
-                const int m_post = static_cast<int>(ctx.r_indx.size());
-                RemlMat APy_post(ctx.n, m_post);
-                for (int i = 0; i < m_post; i++) {
-                    if (i == 0)
-                        APy_post.col(i) = woodbury_basis_Kv(ctx, Py);
-                    else if (ctx.A[ctx.r_indx[i]].size() == 0)
-                        APy_post.col(i) = Py;
-                    else
-                        // Block-expression target (APy_post.col(i)) -- see ai_reml
-                        // for why this must evaluate into a temporary first.
-                        APy_post.col(i) = RemlVec(ctx.A[ctx.r_indx[i]].selfadjointView<Eigen::Upper>() * Py);
-                }
-                const RemlMat PAPy_post = applyP_mat(ctx, APy_post);
-                Hi.noalias() = APy_post.transpose() * PAPy_post;
-                Hi = 0.5 * Hi;
-                if (!inverse_H(ctx, Hi)) {
-                    LOGGER.w(0, "REML: AI matrix at the post-hoc corrected point is not "
-                                 "invertible; SE reporting at the corrected point may be "
-                                 "unreliable.");
-                }
-                lgL = -0.5 * (logdet_Xt_Vi_X_post + logdet_post + ctx.y.dot(Py));
-
-                LOGGER << "REML: Woodbury post-hoc tail correction applied.\n"
-                       << "\tConverged (flat-tail) estimate: " << prev_varcmp.transpose()
-                       << "  (logL=" << lgL_pre << ")\n"
-                       << "\tCorrected estimate:              " << varcmp.transpose()
-                       << "  (logL=" << lgL << ")\n"
-                       << "\tNote: reported SE(s) are the flat-tail model's curvature (AI^-1) "
-                       << "evaluated at the corrected point, not a rigorously re-derived SE "
-                       << "for the corrected estimator itself -- treat as approximate."
-                       << std::endl;
+                LOGGER << "REML: Woodbury post-hoc tail correction: delta = " << delta_simple.transpose() << std::endl;
             }
             if (ctx.reml_mtd == 2) {
                 RemlMat P_tmp;
@@ -2346,7 +2091,7 @@ void compute(RemlCtx& ctx,
     } else if (ctx.woodbury_basis_rank != 0) {
         LOGGER.ts("woodbury");
         compute_woodbury_basis(ctx);
-        float duration = LOGGER.tp("main");
+        float duration = LOGGER.tp("woodbury");
         LOGGER.i(0, "Woodbury basis computation took " + std::to_string(duration) + " seconds.");
     } else if (ctx.reml_trace_hutchpp && ctx.grm_chunked_budget > 0.0) {
         // Woodbury takes precedence when both are requested.
@@ -2444,9 +2189,15 @@ RemlState build_reml_state(RemlCtx& ctx) {
 
     if (ctx.Vi_use_woodbury_basis) {
         // WoodburyMLMACache stores Uk_f as k×n (transposed) for GEMM efficiency.
-        // ctx.Uk is n×k — transpose before storing.
-        rs.wb.Uk_f.resize(ctx.Uk.cols(), ctx.Uk.rows());
-        rs.wb.Uk_f.noalias() = ctx.Uk.transpose().cast<float>();  // k×n
+        // ctx.Uk is n×k — parallel transpose+cast across all cores.
+        const Eigen::Index k = ctx.Uk.cols();
+        const Eigen::Index n = ctx.Uk.rows();
+        rs.wb.Uk_f.resize(k, n);
+        #pragma omp parallel for schedule(static)
+        for (Eigen::Index i = 0; i < n; ++i) {
+            for (Eigen::Index j = 0; j < k; ++j)
+                rs.wb.Uk_f(j, i) = static_cast<float>(ctx.Uk(i, j));
+        }
         ctx.Uk.resize(0, 0); //free double buffer immediately -- nothing below reads it again,
                               //same rationale as the ck/dk frees just below (was previously held
                               //alive through the ck/dk conversions for no reason; n×k doubles,
@@ -2467,12 +2218,18 @@ RemlState build_reml_state(RemlCtx& ctx) {
 
         rs.lambda_tail_f = static_cast<float>(ctx.lambda_tail);
     } else if (ctx.Vi_use_llt) {
-        // Vi_L holds the upper Cholesky factor U of V (V = U^T U, from dpotrf).
-        // Store it as float — the streaming code uses STRSV/STRSM directly,
-        // avoiding dpotri (O(n³/3)) and a second Cholesky of V^{-1} (O(n³/3)).
+        // Vi_L holds the upper Cholesky factor U of V (V = U^T U, from dpotrf('U')).
+        // Only cast the upper triangle (col(j).head(j + 1)) in parallel: MLMA_stream
+        // only ever accesses CblasUpper / triangularView<Eigen::Upper>(), so leaving
+        // the strict lower triangle untouched avoids faulting 2n² bytes of physical RAM.
         rs.is_llt = true;
-        rs.Vi_L_f.resize(ctx.Vi_L.rows(), ctx.Vi_L.cols());
-        rs.Vi_L_f.noalias() = ctx.Vi_L.cast<float>();   // n×n float, ~n²/2 significant bytes
+        const Eigen::Index n = ctx.Vi_L.cols();
+        rs.Vi_L_f.resize(ctx.Vi_L.rows(), n);
+        #pragma omp parallel for schedule(guided)
+        for (Eigen::Index j = 0; j < n; ++j) {
+            rs.Vi_L_f.col(j).head(j + 1).noalias() =
+                ctx.Vi_L.col(j).head(j + 1).cast<float>();
+        }
         ctx.Vi_L.resize(0, 0);
     } else {
         // reml_diagV_adj fallback: ctx.Vi is already the dense explicit
@@ -2480,24 +2237,17 @@ RemlState build_reml_state(RemlCtx& ctx) {
         // once — so the streaming code always applies V^{-1} via a
         // triangular product (TRMM/STRMM) instead of holding a dense matrix
         // and re-deriving a usable factor from it at association time.
-        //
-        // Factorize in place via gcta_dpotrf (as calcu_Vi already does)
-        // rather than Eigen::LLT(ctx.Vi): Eigen::LLT's constructor copies
-        // its input into internal storage before factorizing, so it can't
-        // operate in place on a caller-owned buffer -- that doubles peak
-        // RSS transiently (ctx.Vi + LLT's internal copy, both n×n doubles,
-        // alive simultaneously) for no reason, since ctx.Vi is read via
-        // selfadjointView<Upper> everywhere else in this file (only the
-        // upper triangle is guaranteed valid, matching dpotrf('U')'s contract)
-        // and is freed immediately below regardless.
         gcta_blas_int blas_n_bs = static_cast<gcta_blas_int>(ctx.n);
         if (gcta_dpotrf(blas_n_bs, ctx.Vi.data(), blas_n_bs, 'U') != 0)
             LOGGER.e(0, "Vi is not positive definite when building REML state.");
         rs.is_llt = false;
-        rs.Vi_L_f.resize(ctx.n, ctx.n);
-        rs.Vi_L_f.noalias() = ctx.Vi.cast<float>();   // upper triangle valid; lower is dpotrf
-                                                       // leftover and never read downstream --
-                                                       // same convention as the Vi_use_llt branch above
+        const Eigen::Index n = static_cast<Eigen::Index>(ctx.n);
+        rs.Vi_L_f.resize(n, n);
+        #pragma omp parallel for schedule(guided)
+        for (Eigen::Index j = 0; j < n; ++j) {
+            rs.Vi_L_f.col(j).head(j + 1).noalias() =
+                ctx.Vi.col(j).head(j + 1).cast<float>();
+        }
         ctx.Vi.resize(0, 0);
     }
 

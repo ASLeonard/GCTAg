@@ -42,36 +42,10 @@ using std::placeholders::_1;
 using std::placeholders::_2;
 using std::bind;
 
-typedef struct GenoBuffer{
-    bool center; //center or not //IN
-    bool std;  //std or not  //IN
-    bool saveMiss; // save missing or not //IN
-    bool saveGeno; // save geno or no //IN
-
-    uint32_t n_sample; // number of filtered keep samples //preIN
-    uint32_t n_marker; // number of largest buffer size; //preIN
-    uint32_t nBLMiss; // missing data 1 marker size (number of uint64_t); //preIN
-
-    uint32_t n_sub_sample = 0; // subset samples, 0 mean all; //IN
-    uint32_t indexStartMarker = 0; // which index to start.  //IN
-
-    vector<uint8_t> usedIndex; //true the index pass the filter.
-    vector<double> af; // allele frequencies
-    vector<float> info; // info scores
-    vector<uint32_t> nValidN; // non-missing samples in a marker
-    vector<uint32_t> nValidAllele; // non-missing SNPs in a marker;
-    vector<double> geno;  // genotype double per marker
-    vector<uint64_t> miss; // missing bits per marker, 1 means miss.
-
-    bool bSex = false; // sex mode (homogametic chromosome filter) //IN
-    bool hasInfo = false; // determine has info score or not //preIN
-    bool bHasPreAF = false; //use Pre AF? //preIN
-    vector<double> preAF; //pre AF //preIN
-} GenoBuf;
-
 typedef struct GenoBufItem{
     // in
     uint32_t extractedMarkerIndex = 0;   // for allele lookup
+    double *geno_ptr = nullptr;          // optional external genotype buffer (length >= keepSampleCT)
 
     // out
     bool valid = false;
@@ -97,8 +71,6 @@ class Geno {
 public:
     Geno(Pheno* pheno, Marker* marker);
     ~Geno();
-    // LOCO helper: override active genotype source to a single PLINK prefix.
-    static void setLocoBfilePrefix(const std::string& bfile_prefix);
     // Used internally by bgen2bed for BED output
     void save_bed(uint64_t *buf, int num_marker);
     void closeOut();

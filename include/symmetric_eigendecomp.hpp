@@ -23,11 +23,7 @@
  *                                  Arnoldi on a symmetric operator), useful
  *                                  when the spectrum is well separated near
  *                                  the top and few matvecs are wanted.
- *   - tall_skinny_thin_svd       : QR-then-small-SVD reduction, used to
- *                                  extract the thin SVD of an n x k sketch
- *                                  (e.g. the Nystrom sketch) without paying
- *                                  for a bidiagonal divide-and-conquer SVD
- *                                  at n scale.
+ *   - nystrom_symmetric_eigh     : Single-pass Nystrom approximation.
  */
 #pragma once
 
@@ -471,48 +467,6 @@ EighResult lanczos_symmetric_eigh(
     EighResult result;
     result.eigenvalues = eigs.eigenvalues();
     result.eigenvectors = eigs.eigenvectors();
-    return result;
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Tall-skinny thin SVD via QR reduction
-// ─────────────────────────────────────────────────────────────────────────
-
-struct ThinSVDResult {
-    Eigen::MatrixXd U;                // n x k, orthonormal columns
-    Eigen::VectorXd singular_values;  // descending, size k
-};
-
-// Thin SVD of an already-materialised n x k matrix Z (k << n), e.g. the
-// Nystrom sketch. Eigen's BDCSVD has no LAPACKE binding (unlike
-// HouseholderQR and SelfAdjointEigenSolver, which do when EIGEN_USE_LAPACKE
-// is set), so calling it directly on an n x k matrix leaves it doing
-// step to the k x k factor R, where its cost is negligible regardless of
-// how it's implemented, while the n-scale work (QR, and the final Q * U_R)
-// goes through LAPACKE_dgeqrf/dorgqr and GEMM respectively.
-inline ThinSVDResult tall_skinny_thin_svd(const Eigen::MatrixXd& Z) {
-    const int n = static_cast<int>(Z.rows());
-    const int k = static_cast<int>(Z.cols());
-
-    // Z is const& (caller retains ownership), so one n x k copy is
-    // unavoidable here — same as HouseholderQR's internal copy today, no
-    // regression. CholeskyQR2 (DSYRK+DPOTRF+DTRSM) replaces dgeqrf/dorgqr:
-    // pure Level-3 BLAS, so it keeps scaling with thread count at large k
-    // where dgeqrf/dorgqr's panel factorization stops parallelizing. R is
-    // recovered as Q^T*Z (BLAS3 GEMM) rather than threaded through the
-    // factorization, since the copy already makes the original Z available.
-    Eigen::MatrixXd Q = Z;
-    const int info = gcta_cholesky_qr_thin_Q((gcta_blas_int)n, (gcta_blas_int)k, Q.data(), (gcta_blas_int)n);
-    if (info != 0)
-        throw std::runtime_error("tall_skinny_thin_svd: orthogonalization failed (info=" + std::to_string(info) + ").");
-
-    const Eigen::MatrixXd R = Q.transpose() * Z;
-
-    Eigen::BDCSVD<Eigen::MatrixXd, Eigen::ComputeThinU> svd_r(R);
-
-    ThinSVDResult result;
-    result.singular_values = svd_r.singularValues();
-    result.U = Q * svd_r.matrixU();   // n x k GEMM
     return result;
 }
 

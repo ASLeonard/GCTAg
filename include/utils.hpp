@@ -16,12 +16,7 @@
    If not, see <http://www.gnu.org/licenses/>.
 */
 #pragma once
-#if __cplusplus >= 202002L
 #include <bit>
-#else
-#error "C++20 or newer required for std::popcount"
-#endif
-
 #include <expected>
 #include <string>
 #include <string_view>

@@ -37,10 +37,15 @@
   typedef lapack_int gcta_blas_int;
 
 #elif defined(GCTA_USE_ACCELERATE)
-  #include <veclib/cblas_new.h>
-  #include <veclib/lapack.h>
+  // Include Accelerate's modern CBLAS and LAPACK headers directly rather than
+  // the <Accelerate/Accelerate.h> umbrella, which pulls in <vImage/vImage.h> ->
+  // <CarbonCore/AIFF.h> (defining global `struct Marker`, colliding with
+  // include/Marker.h) and <vecLib/blas_new.h> (conflicting with Eigen's blas.h).
+    #include <vecLib/cblas_new.h>
+  #include <vecLib/lapack.h>
   typedef __LAPACK_int gcta_blas_int;
 #endif
+#include <Eigen/Core>
 
 // Portable dpotrf: Cholesky factorization of a symmetric positive-definite matrix
 // (defaults to lower triangle, column-major). Returns 0 on success, non-zero on failure.
@@ -125,10 +130,11 @@ inline int gcta_dsyevd(gcta_blas_int n, double* a, gcta_blas_int lda, double* w)
     // AOCL/OpenBLAS's LAPACKE_dsyevd workspace-size calculation (~2n^2)
     // overflows a 32-bit int above n ~= 32766 and crashes rather than
     // returning a nonzero info -- so callers checking info afterward can't
-    // catch it. MKL promotes internally and doesn't hit this, so it's
+    // catch it. MKL (either as the primary backend or paired via
+    // GCTA_LAPACKE_LIBRARY) promotes internally and doesn't hit this, so it's
     // exempted. -1 mirrors LAPACK's own "argument 1 (n) invalid" convention;
     // safe to reuse here since a genuine n<0 from LAPACK can't otherwise occur.
-#if !defined(GCTA_USE_MKL)
+#if !defined(GCTA_USE_MKL) && !defined(GCTA_LAPACKE_IS_MKL)
     if (n >= 32766) return -1;
 #endif
     return static_cast<int>(
@@ -180,26 +186,6 @@ inline int gcta_dsyevr(gcta_blas_int n, double* a, gcta_blas_int lda,
                        m_found, w, z, ldz, isuppz));
 #endif
 }
-
-// Raw Fortran ABI declarations are only needed on Accelerate, where veclib does
-// not expose the LAPACKE C wrappers. On OpenBLAS/MKL/AOCL we use the LAPACKE
-// entry points directly, matching the pattern used by gcta_dsyevr.
-#if defined(GCTA_USE_ACCELERATE)
-extern "C" {
-void dgeqrf_(const gcta_blas_int* m, const gcta_blas_int* n, double* A,
-             const gcta_blas_int* lda, double* tau, double* work,
-             const gcta_blas_int* lwork, gcta_blas_int* info);
-void dorgqr_(const gcta_blas_int* m, const gcta_blas_int* n, const gcta_blas_int* k,
-             double* A, const gcta_blas_int* lda, const double* tau,
-             double* work, const gcta_blas_int* lwork, gcta_blas_int* info);
-void sgeqrf_(const gcta_blas_int* m, const gcta_blas_int* n, float* A,
-             const gcta_blas_int* lda, float* tau, float* work,
-             const gcta_blas_int* lwork, gcta_blas_int* info);
-void sorgqr_(const gcta_blas_int* m, const gcta_blas_int* n, const gcta_blas_int* k,
-             float* A, const gcta_blas_int* lda, const float* tau,
-             float* work, const gcta_blas_int* lwork, gcta_blas_int* info);
-}
-#endif
 
 // Factor A (m x k, column-major, m >= k) in place: on return, the upper
 // k x k triangle of A holds R, the rest holds Householder reflectors, and

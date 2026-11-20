@@ -115,6 +115,15 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
     Eigen::VectorXf Xt_Vi_y(BLOCK);
     Eigen::VectorXf xvx_diag(BLOCK);
 
+    // Unweighted analyses (the common case) skip the per-column w_sqrt multiply.
+    bool unit_weights = true;
+    for (int s = 0; s < n; ++s) {
+        if (w_sqrt[s] != 1.0f) {
+            unit_weights = false;
+            break;
+        }
+    }
+
     int  snp_done = 0;
     int  last_pct = -1;
 
@@ -145,7 +154,7 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
             geno->getGenoFloat(buf, i, X_block.col(i).data(),
                                af, add_af, valid, exIdx[i]);
             if (valid) {
-                X_block.col(i).array() *= w_sqrt.array();
+                if (!unit_weights) X_block.col(i).array() *= w_sqrt.array();
             } else {
                 X_block.col(i).setZero();
             }
@@ -311,9 +320,6 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
     };
 
     const int num_words = (n + 63) / 64;
-    const uintptr_t last_word_mask = (n % 64 == 0)
-        ? ~static_cast<uintptr_t>(0)
-        : ((static_cast<uintptr_t>(1) << (n % 64)) - 1);
 
     auto callback = [&](uintptr_t* buf, std::span<const uint32_t> exIdx) {
         const int bs = static_cast<int>(exIdx.size());
@@ -332,55 +338,33 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                 uint32_t nValidN = 0;
                 int8_t* col_i8 = G_block_i8.data() + static_cast<size_t>(i) * static_cast<size_t>(ldG);
 
+                // Single fused pass over the raw .bed record: int8 column,
+                // exact (c0,c1,c2,c_miss), sum g*vw (+ w2 sums when weighted)
+                // and the sparse missing list -- no re-scan of col_i8, and no
+                // missing-bitmask work at all when the SNP has no missing calls.
+                BedI8Fused fz;
+                fz.vw = vw_ptr;
+                fz.w2 = unit_weights ? nullptr : w2_ptr;
+                fz.miss_list = &snp_miss_samples[i];
                 geno->getGenoInt8_bed(buf, i, col_i8, af, add_af, mu, nValidN,
-                                      miss_buf.data(), valid, exIdx[i]);
+                                      miss_buf.data(), valid, exIdx[i], &fz);
                 valid_v[i]       = static_cast<uint8_t>(valid);
                 af_v[i]          = af;
                 additive_af_v[i] = add_af;
                 mu_v[i]          = static_cast<float>(mu);
-                snp_miss_samples[i].clear();
 
                 if (!valid) {
+                    snp_miss_samples[i].clear();
                     Xt_Vi_y[i]  = 0.0f;
                     x_norm_v[i] = 0.0f;
                     continue;
                 }
 
-                double miss_vw = 0.0;
-                double miss_w2 = 0.0;
-                if (nValidN < static_cast<uint32_t>(n)) {
-                    auto& miss_list = snp_miss_samples[i];
-                    for (int w = 0; w < num_words; ++w) {
-                        uintptr_t word = miss_buf[w];
-                        if (w == num_words - 1) word &= last_word_mask;
-                        while (word != 0) {
-                            const int bit = std::countr_zero(word);
-                            const int s = w * 64 + bit;
-                            miss_list.push_back(s);
-                            miss_vw += static_cast<double>(vw_ptr[s]);
-                            if (!unit_weights) {
-                                miss_w2 += w2_ptr[s];
-                            }
-                            word &= (word - 1);
-                        }
-                    }
-                }
-
+                const double miss_vw = (fz.cmiss != 0) ? fz.miss_vw : 0.0;
+                Xt_Vi_y[i] = static_cast<float>(fz.dot_vw - mu * (S_vw - miss_vw));
                 if (unit_weights) {
-                    double dot_vy  = 0.0;
-                    int64_t sum_g  = 0;
-                    int64_t sum_g2 = 0;
-                    #pragma omp simd reduction(+:dot_vy, sum_g, sum_g2)
-                    for (int s = 0; s < n; ++s) {
-                        const int32_t g = col_i8[s];
-                        dot_vy += static_cast<double>(g) * static_cast<double>(vw_ptr[s]);
-                        sum_g  += g;
-                        sum_g2 += g * g;
-                    }
-                    Xt_Vi_y[i] = static_cast<float>(dot_vy - mu * (S_vw - miss_vw));
-
-                    const int64_t c2 = (sum_g2 - sum_g) / 2;
-                    const int64_t c1 = sum_g - 2 * c2;
+                    const int64_t c2 = static_cast<int64_t>(fz.c2);
+                    const int64_t c1 = static_cast<int64_t>(fz.c1);
                     const int64_t c0 = static_cast<int64_t>(nValidN) - c1 - c2;
                     const double a0 = static_cast<double>(static_cast<float>(-mu));
                     const double a1 = static_cast<double>(static_cast<float>(1.0 - mu));
@@ -390,21 +374,9 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                                           + static_cast<double>(c2) * a2 * a2;
                     x_norm_v[i] = static_cast<float>(x_norm_d);
                 } else {
-                    double dot_vy    = 0.0;
-                    double sum_w2_g  = 0.0;
-                    double sum_w2_g2 = 0.0;
-                    #pragma omp simd reduction(+:dot_vy, sum_w2_g, sum_w2_g2)
-                    for (int s = 0; s < n; ++s) {
-                        const int32_t g = col_i8[s];
-                        const double gd = static_cast<double>(g);
-                        dot_vy += gd * static_cast<double>(vw_ptr[s]);
-                        const double w2_s = w2_ptr[s];
-                        sum_w2_g  += w2_s * gd;
-                        sum_w2_g2 += w2_s * gd * gd;
-                    }
-                    Xt_Vi_y[i] = static_cast<float>(dot_vy - mu * (S_vw - miss_vw));
+                    const double miss_w2 = (fz.cmiss != 0) ? fz.miss_w2 : 0.0;
                     const double x_norm_d =
-                        sum_w2_g2 - 2.0 * mu * sum_w2_g + mu * mu * (S_w2 - miss_w2);
+                        fz.dot2_w2 - 2.0 * mu * fz.dot_w2 + mu * mu * (S_w2 - miss_w2);
                     x_norm_v[i] = static_cast<float>(std::max(0.0, x_norm_d));
                 }
             }

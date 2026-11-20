@@ -972,14 +972,20 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     int num_marker = markerIndex.size();
 
     if (use_int8_grm) {
-        int8_t* const std_geno_i8_base = std::assume_aligned<64>(stdGeno_i8.get());
+        // BED int8 path: counts-only pass (VPOPCNTDQ on Zen 4) to obtain
+        // af / mean / sd / validity over all keepSampleCT samples. The
+        // genotypes themselves are decoded later straight from the raw .bed
+        // records into the K-major GEMM operand (decodeBedI8KMajor), only for
+        // valid markers -- no marker-major stdGeno_i8 staging buffer.
         #pragma omp parallel for schedule(static)
         for(int i = 0; i < num_marker; i++){
             GenoBufItem &item = gbufitems[i];
             item.extractedMarkerIndex = markerIndex[i];
             item.geno_ptr = nullptr;
             item.geno_f32_ptr = nullptr;
-            item.geno_i8_ptr = std_geno_i8_base + static_cast<size_t>(i) * stdGenoLD;
+            item.geno_i8_ptr = nullptr;
+            item.stats_only = true;
+            item.lazy_missing = true;
             geno->getGenoDouble(buf, i, &item);
         }
     } else {
@@ -991,6 +997,8 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             item.geno_ptr = nullptr;
             item.geno_i8_ptr = nullptr;
             item.geno_f32_ptr = std_geno_base + static_cast<size_t>(i) * stdGenoLD;
+            item.stats_only = false;
+            item.lazy_missing = true;   // `missing` only valid when nValidN < keep count
             geno->getGenoDouble(buf, i, &item);
         }
     }
@@ -1009,15 +1017,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     // Otherwise, compact valid columns forward in-place (validIndexBuf[k] >= k).
     if (curNumValidMarkers < num_marker) {
         if (use_int8_grm) {
-            int8_t* const std_geno_i8_base = std::assume_aligned<64>(stdGeno_i8.get());
-            for (int k = 0; k < curNumValidMarkers; ++k) {
-                const int src_idx = validIndexBuf[k];
-                if (src_idx != k) {
-                    std::memcpy(std_geno_i8_base + static_cast<size_t>(k) * stdGenoLD,
-                                std_geno_i8_base + static_cast<size_t>(src_idx) * stdGenoLD,
-                                static_cast<size_t>(grm_bytes_std_geno));
-                }
-            }
+            // Nothing to compact: decodeBedI8KMajor reads validIndexBuf directly.
         } else {
             float* const std_geno_base = std::assume_aligned<64>(stdGeno.get());
             for (int k = 0; k < curNumValidMarkers; ++k) {
@@ -1041,7 +1041,6 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     double* const grm_base = std::assume_aligned<64>(grm.get());
 
     if (use_int8_grm) {
-        const int8_t* const std_geno_i8_base = std::assume_aligned<64>(stdGeno_i8.get());
         int8_t* const kmajor_base = std::assume_aligned<64>(stdGeno_i8_kmajor_.get());
         const int ldK = std::max(64, (curNumValidMarkers + 63) / 64 * 64);
 
@@ -1052,40 +1051,12 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             S_mu2 += mu_m * mu_m;
         }
 
-        // Fuse cache-blocked (64x64) transpose of stdGeno_i8 (grm_n x K, stride stdGenoLD)
-        // into K-contiguous row-major stdGeno_i8_kmajor_ (grm_n x ldK) with per-sample
-        // row-sum accumulation r_raw_[i] = sum_m g_{im} * mu_m.
-        if (curNumValidMarkers > 0) {
-            constexpr int kBlk = 64;
-            #pragma omp parallel for schedule(static)
-            for (int i0 = 0; i0 < grm_n; i0 += kBlk) {
-                const int s_len = std::min(kBlk, grm_n - i0);
-                double r_acc[kBlk] = {0.0};
-                alignas(64) int8_t blk[kBlk][kBlk];
-                for (int m0 = 0; m0 < curNumValidMarkers; m0 += kBlk) {
-                    const int m_len = std::min(kBlk, curNumValidMarkers - m0);
-                    for (int dm = 0; dm < m_len; ++dm) {
-                        const int m = m0 + dm;
-                        const double mu_m = mu_vec_[m];
-                        const int8_t* src_col = std_geno_i8_base + static_cast<size_t>(m) * stdGenoLD + i0;
-                        for (int ds = 0; ds < s_len; ++ds) {
-                            const int8_t g = src_col[ds];
-                            r_acc[ds] += static_cast<double>(g) * mu_m;
-                            blk[ds][dm] = g;
-                        }
-                    }
-                    for (int ds = 0; ds < s_len; ++ds) {
-                        std::memcpy(kmajor_base + static_cast<size_t>(i0 + ds) * ldK + m0,
-                                    blk[ds], static_cast<size_t>(m_len));
-                    }
-                }
-                for (int ds = 0; ds < s_len; ++ds) {
-                    r_raw_[i0 + ds] = r_acc[ds];
-                }
-            }
-        } else {
-            std::fill(r_raw_.begin(), r_raw_.begin() + grm_n, 0.0);
-        }
+        // Fused cache-blocked (64x64) decode of the raw .bed records of the
+        // valid markers straight into K-contiguous row-major stdGeno_i8_kmajor_
+        // (grm_n x ldK) with per-sample row-sum accumulation
+        // r_raw_[i] = sum_m g_{im} * mu_m (same accumulation order as before).
+        geno->decodeBedI8KMajor(buf, validIndexBuf.data(), curNumValidMarkers, grm_n,
+                                kmajor_base, ldK, mu_vec_.data(), r_raw_.data());
 
         bool block_has_missing = false;
         const uint32_t full_keep_ct = static_cast<uint32_t>(index_keep.size());
@@ -1098,6 +1069,37 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
 
         marker_miss_idx_.clear();
         if (block_has_missing) {
+            // Rare path (not taken for imputed data): decode the full int8
+            // column + missing bitmask of each marker with missing calls into a
+            // compact marker-major buffer used by the missing corrections.
+            miss_col_of_.assign(static_cast<size_t>(curNumValidMarkers), -1);
+            std::vector<int> miss_markers;
+            for (int m = 0; m < curNumValidMarkers; ++m) {
+                if (gbufitems[validIndexBuf[m]].nValidN < full_keep_ct) {
+                    miss_col_of_[m] = static_cast<int>(miss_markers.size());
+                    miss_markers.push_back(m);
+                }
+            }
+            const int n_miss_cols = static_cast<int>(miss_markers.size());
+            if (n_miss_cols > stdGeno_i8_cols_) {
+                stdGeno_i8 = make_aligned_uninitialized<int8_t, 64>(
+                    static_cast<size_t>(n_miss_cols) * static_cast<size_t>(stdGenoLD));
+                if (!stdGeno_i8) {
+                    LOGGER.e(0, "can't allocate enough memory for the int8 missing-genotype columns.");
+                }
+                stdGeno_i8_cols_ = n_miss_cols;
+            }
+            int8_t* const miss_cols = stdGeno_i8.get();
+            #pragma omp parallel for schedule(dynamic, 4)
+            for (int j = 0; j < n_miss_cols; ++j) {
+                const int bi = validIndexBuf[miss_markers[j]];
+                GenoBufItem &item = gbufitems[bi];
+                item.stats_only = false;
+                item.lazy_missing = false;
+                item.geno_i8_ptr = miss_cols + static_cast<size_t>(j) * stdGenoLD;
+                geno->getGenoDouble(buf, bi, &item);
+                item.geno_i8_ptr = nullptr;
+            }
             std::memcpy(r_tilde_.data(), r_raw_.data(), static_cast<size_t>(grm_n) * sizeof(double));
             const int num_words = (grm_n + 63) / 64;
             const uintptr_t last_word_mask = (grm_n % 64 == 0)
@@ -1210,7 +1212,8 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                 const int m = sample_miss_m_[idx];
                 const double mu_m = mu_vec_[m];
                 const double neg_mu2 = -mu_m * mu_m;
-                const int8_t* col_m = std_geno_i8_base + static_cast<size_t>(m) * stdGenoLD + row_start;
+                const int8_t* col_m = stdGeno_i8.get()
+                                      + static_cast<size_t>(miss_col_of_[m]) * stdGenoLD + row_start;
                 for (int r = 0; r < len; ++r) {
                     dst_col[r] += static_cast<double>(col_m[r]) * mu_m + neg_mu2;
                 }
@@ -1439,6 +1442,25 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     }
     grm_first_accum = false;  // every later marker block for this buffer accumulates
 
+    // Zero-missing fast path (post-imputation data): every contribution to
+    // sub_miss and N below is popcount(0) == 0, so skip the bit transposes,
+    // popcounts and N_thread passes entirely -- bit-identical result.
+    const uint32_t keep_ct_all = static_cast<uint32_t>(index_keep.size());
+    bool any_missing_in_block = false;
+    for (int k = 0; k < curNumValidMarkers; ++k) {
+        if (gbufitems[validIndexBuf[k]].nValidN < keep_ct_all) {
+            any_missing_in_block = true;
+            break;
+        }
+    }
+    if (!any_missing_in_block) {
+        if(!grm_skip_global_state){
+            finished_marker += num_marker;
+            numValidMarkers += curNumValidMarkers;
+        }
+        return;
+    }
+
     const int markerPerN = sizeof(uintptr_t) * CHAR_BIT;
     const int numNblock = (curNumValidMarkers + markerPerN - 1) / markerPerN;
     const int numNSampleBlock = (grm_n + markerPerN - 1) / markerPerN;
@@ -1461,8 +1483,9 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                 uintptr_t *block_buf = sampleMissBuf.data() + i * blockStride;
                 if (markerPerN == 64) {
                     for(int k = baseMarkerIndex; k < lastValidIndex; k++){
+                        const GenoBufItem &it = gbufitems[validIndexBuf[k]];
                         transposeInput[static_cast<std::size_t>(k - baseMarkerIndex)] =
-                            gbufitems[validIndexBuf[k]].missing[j];
+                            (it.nValidN < keep_ct_all) ? it.missing[j] : 0UL;
                     }
                     for(int k = lastValidIndex; k < markerPerN * (i + 1); k++){
                         transposeInput[static_cast<std::size_t>(k - baseMarkerIndex)] = 0UL;
@@ -1475,7 +1498,9 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                         &block_buf[baseMissIndex], transposeScratch);
                 } else {
                     for(int k = baseMarkerIndex; k < lastValidIndex; k++){
-                        block_buf[baseMissIndex + k - baseMarkerIndex] = gbufitems[validIndexBuf[k]].missing[j];
+                        const GenoBufItem &it = gbufitems[validIndexBuf[k]];
+                        block_buf[baseMissIndex + k - baseMarkerIndex] =
+                            (it.nValidN < keep_ct_all) ? it.missing[j] : 0UL;
                     }
                     for(int k = lastValidIndex; k < markerPerN * (i + 1); k++){
                         block_buf[baseMissIndex + k - baseMarkerIndex] = 0UL;
@@ -1832,10 +1857,10 @@ void GRM::processMakeGRM(bool is_homogametic){
     if (use_int8_grm) {
         grm_bytes_std_geno = static_cast<int>(sizeof(int8_t)) * grm_n;
         this->num_byte_geno = sizeof(int8_t) * static_cast<uint64_t>(geno_block_elems);
-        stdGeno_i8 = make_aligned_uninitialized<int8_t, 64>(geno_block_elems);
-        if (!stdGeno_i8) {
-            LOGGER.e(0, "can't allocate enough memory for the int8 genotype buffer.");
-        }
+        // Marker-major int8 columns are only materialised (lazily, compactly)
+        // for markers with missing calls; the GEMM operand is decoded directly.
+        stdGeno_i8.reset();
+        stdGeno_i8_cols_ = 0;
         const int max_ldK = std::max(64, (nMarkerBlock + 63) / 64 * 64);
         stdGeno_i8_kmajor_ = make_aligned_uninitialized<int8_t, 64>(
             static_cast<size_t>(max_ldK) * static_cast<size_t>(stdGenoLD));
@@ -2038,6 +2063,7 @@ void GRM::processMakeGRM(bool is_homogametic){
     gbufitems.clear();
     stdGeno.reset();
     stdGeno_i8.reset();
+    stdGeno_i8_cols_ = 0;
     stdGeno_i8_kmajor_.reset();
     geno->setGRMMode(false, false);
 }

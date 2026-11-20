@@ -641,6 +641,7 @@ target_sources(GCTAg PRIVATE
         src/Geno.cpp
         src/GenoBackend.cpp
         src/BedBackend.cpp
+        src/bed_simd.cpp
         src/BgenBackend.cpp
         src/PgenBackend.cpp
         src/Logger.cpp
@@ -707,6 +708,10 @@ set_target_properties(GCTAg PROPERTIES
 # Keep CLI11 isolated from unity builds so its headers never interact with
 # legacy main/*.cpp macros or `using namespace std`.
 set_source_files_properties(src/Cli.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+# bed_simd.cpp uses per-function __attribute__((target("avx512..."))) runtime
+# dispatch; keep it out of unity TUs so AVX-512 code paths never mix with
+# (or get attributes/macros from) other sources.
+set_source_files_properties(src/bed_simd.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
 target_compile_definitions(GCTAg PRIVATE
     ${GCTA_BLAS_DEFINES}
@@ -775,6 +780,31 @@ target_link_libraries(GCTAg PRIVATE
     Pgenlib
     Threads::Threads
     ${GCTA_BLAS_LIBS})
+
+# ── Native BED kernel tests / microbenchmark (opt-in, never part of GCTAg) ──
+option(GCTA_BUILD_BED_TESTS "Build native PLINK1 .bed kernel tests and microbenchmark" OFF)
+if(GCTA_BUILD_BED_TESTS)
+    # AVX-512 kernel logic validated through a portable intrinsic emulator
+    # (runs on any host, e.g. Apple Silicon) against the scalar reference.
+    add_executable(test_bed_simd_emu tests/test_bed_simd_emu.cpp src/bed_simd.cpp)
+    target_include_directories(test_bed_simd_emu PRIVATE include)
+    # Bit-for-bit comparison against the PLINK2 PgenReader BED pipeline.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bed_vs_pgen.cpp")
+        add_executable(test_bed_vs_pgen tests/test_bed_vs_pgen.cpp src/bed_simd.cpp)
+        target_include_directories(test_bed_vs_pgen PRIVATE include ${CMAKE_SOURCE_DIR}
+            third_party/plink-ng/2.0/include third_party/plink-ng/2.0/simde)
+        target_link_libraries(test_bed_vs_pgen PRIVATE Pgenlib)
+    endif()
+    add_executable(bench_bed_simd tests/bench_bed_simd.cpp src/bed_simd.cpp)
+    target_include_directories(bench_bed_simd PRIVATE include ${CMAKE_SOURCE_DIR}
+        third_party/plink-ng/2.0/include third_party/plink-ng/2.0/simde)
+    target_link_libraries(bench_bed_simd PRIVATE Pgenlib)
+    foreach(_t test_bed_simd_emu bench_bed_simd)
+        foreach(_arch_flag IN LISTS _gcta_arch_flags)
+            target_compile_options(${_t} PRIVATE $<$<CONFIG:Release>:${_arch_flag}>)
+        endforeach()
+    endforeach()
+endif()
 
 # Remove any duplicate entries added by compiler probes, BLAS detection, and
 # toolchain logic (e.g. BLAS lib dir may match OpenMP dir on some installs).

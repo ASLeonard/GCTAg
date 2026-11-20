@@ -42,6 +42,8 @@
 #include <algorithm>
 #include "third_party/Pgenlib/PgenReader.h"
 #include <numeric>
+#include <array>
+#include <bit>
 
 #ifdef _WIN64
   #include <intrin.h>
@@ -460,25 +462,103 @@ void Geno::getGenoFloat(uintptr_t *buf, int bufIndex, float *dest,
                               valid_out, extractedMarkerIndex);
 }
 
-// BED path: 256×4 float lookup table decoded by GenoarrLookup256x4bx4.
-// The 256-entry table (256 * 4 * 4 B = 4 KB) fits entirely in L1D.
+// ---------------------------------------------------------------------------
+// Native BED helpers (bed_simd): exact replicas of PgenReader's
+// CountHardFreqMissExt / CountHardFreqMissExtX arithmetic, driven by the raw
+// PLINK1 2-bit counts (genocounts[0..3] == Counts{n0, n1, n2, nmiss}).
+// ---------------------------------------------------------------------------
+namespace {
+inline void bed_fill_snpinfo(const bed_simd::Counts &c, uint32_t keepSize, bool f_std, SNPInfo *snpinfo) {
+    const std::array<uint32_t, 4> genocounts = {c.n0, c.n1, c.n2, c.nmiss};
+    snpinfo->N = keepSize - genocounts[3];
+    snpinfo->AlCount = 2 * snpinfo->N;
+    uint32_t dGenoCounts2 = 2 * genocounts[2];
+    uint32_t dosage = genocounts[1] + dGenoCounts2;
+    snpinfo->af = 1.0 * dosage / snpinfo->AlCount;
+    snpinfo->mean = 2.0 * snpinfo->af;
+    if (f_std) snpinfo->std = (dosage + dGenoCounts2 - snpinfo->mean * dosage) / (snpinfo->N - 1);
+    snpinfo->nMissRate = 1.0 * snpinfo->N / keepSize;
+}
+
+inline bool bed_fill_snpinfo_x(const bed_simd::Counts &c, const bed_simd::Counts &c2, uint32_t keepSize,
+                               bool dosageComp, bool f_std, SNPInfo *snpinfo) {
+    const std::array<uint32_t, 4> genocounts = {c.n0, c.n1, c.n2, c.nmiss};
+    const std::array<uint32_t, 4> genocounts2 = {c2.n0, c2.n1, c2.n2, c2.nmiss};
+    bool retVal = true;
+    if (genocounts2[1] != 0) {
+        retVal = false;
+    }
+    snpinfo->N = keepSize - genocounts[3];
+    snpinfo->AlCount = 2 * snpinfo->N - genocounts2[0] - genocounts2[1] - genocounts2[2];
+    snpinfo->nMissRate = 1.0 * snpinfo->N / keepSize;
+    int dGenoCount1Homo = 2 * genocounts[2];
+    double dosage = genocounts[1] + dGenoCount1Homo;
+    double dosage_half = dosage - genocounts2[2] - 0.5 * genocounts2[1];
+
+    snpinfo->af = dosage_half / snpinfo->AlCount;
+    if (dosageComp) {
+        snpinfo->mean = dosage / snpinfo->N;
+        if (f_std) snpinfo->std = (dosage + dGenoCount1Homo - dosage * snpinfo->mean) / (snpinfo->N - 1);
+    } else {
+        snpinfo->mean = dosage_half / snpinfo->N;
+        if (f_std) snpinfo->std = (dosage + dGenoCount1Homo - 0.75 * genocounts2[1] - 3 * genocounts2[2] - dosage_half * snpinfo->mean) / (snpinfo->N - 1);
+    }
+    return retVal;
+}
+
+// Prepare gbuf->missing for a BED decode: returns the bitmask pointer the
+// kernel should (lazily) fill, or nullptr when there is nothing to write.
+inline uintptr_t *bed_prepare_missing(GenoBufItem *gbuf, bool bMakeMiss, uint32_t nmiss,
+                                      int missPtrSize, uint32_t keepSampleCT) {
+    if (!bMakeMiss) return nullptr;
+    if (nmiss == 0) {
+        if (!gbuf->lazy_missing) gbuf->missing.assign(static_cast<std::size_t>(missPtrSize), 0);
+        return nullptr;
+    }
+    gbuf->missing.resize(static_cast<std::size_t>(missPtrSize));
+    // Kernel writes the first ceil(keep/64) words; clear any vector padding words.
+    const std::size_t used = (static_cast<std::size_t>(keepSampleCT) + 63) / 64;
+    for (std::size_t w = used; w < gbuf->missing.size(); ++w) gbuf->missing[w] = 0;
+    return gbuf->missing.data();
+}
+}  // namespace
+
+void Geno::bedSnpInfoFromCounts(const uint8_t *raw, const bed_simd::Counts &c, uint8_t sexChromType,
+                                SNPInfo *snpinfo) const {
+    if (sexChromType != 1) {
+        bed_fill_snpinfo(c, keepSampleCT, f_std, snpinfo);
+        return;
+    }
+    // Mirrors CountHardFreqMissExtX's choice of heterogametic counts.
+    const uint64_t *het = reinterpret_cast<const uint64_t *>(heterogameticMaskPtr);
+    bed_simd::Counts c2;
+    if (rawSampleCT == keepSampleCT) {
+        c2 = (keepSampleCT == keepHeterogameticSampleCT)
+                 ? c
+                 : bed_simd::count(raw, het, rawSampleCT, keepHeterogameticSampleCT);
+    } else if (keepHeterogameticSampleCT != 0) {
+        c2 = bed_simd::count(raw, het, rawSampleCT, keepHeterogameticSampleCT);
+    }
+    bed_fill_snpinfo_x(c, c2, keepSampleCT, iDC == 1, f_std, snpinfo);
+}
+
+bed_simd::Counts Geno::bedSnpInfo(const uint8_t *raw, uint8_t sexChromType, SNPInfo *snpinfo) const {
+    const bed_simd::Counts c = bed_simd::count(raw, bedKeepMask(), rawSampleCT, keepSampleCT);
+    bedSnpInfoFromCounts(raw, c, sexChromType, snpinfo);
+    return c;
+}
+
+// BED path: counts via VPOPCNTDQ/VPTERNLOGQ (or AVX2/NEON/scalar), then a
+// register-table decode (VPERMPS on Zen 4) -- no 4 KiB per-SNP lookup table.
 void Geno::getGenoFloat_bed(uintptr_t *buf, int idx, float *dest,
                              float &af_out, float &additive_af_out,
                              bool &valid_out, uint32_t extractedMarkerIndex) {
     valid_out = false;
 
     SNPInfo snpinfo;
-    uintptr_t *cur_buf = buf + static_cast<std::size_t>(idx) * static_cast<std::size_t>(bedRawGenoBuf1PtrSize);
+    const uint8_t *raw = bedRecord(buf, idx);
     uint8_t sexChromType = markerSexChromTypes[curBufferIndex];
-    bool hasNoHET = true;
-    if (sexChromType != 1) {
-        PgenReader::CountHardFreqMissExt(cur_buf, keepMaskInterPtr, rawSampleCT, keepSampleCT, &snpinfo, f_std);
-    } else {
-        string errmsg;
-        hasNoHET = PgenReader::CountHardFreqMissExtX(cur_buf, keepMaskInterPtr, heterogameticMaskInterPtr,
-                                                     rawSampleCT, keepSampleCT, keepHeterogameticSampleCT,
-                                                     &snpinfo, errmsg, iDC == 1, f_std);
-    }
+    bedSnpInfo(raw, sexChromType, &snpinfo);
 
     double af = snpinfo.af;
     if (bHasPreAF) {
@@ -503,13 +583,9 @@ void Geno::getGenoFloat_bed(uintptr_t *buf, int idx, float *dest,
     additive_af_out = static_cast<float>(af);
     valid_out       = true;
 
-    // Build 256×4 float lookup (QUAD_TABLE256 expands to 1024 floats = 4 KB).
     const GenoCodingSpecF32 spec = buildCodingSpecF32(mu, sd);
-    const float gtable256x4[1024] __attribute__((aligned(16))) =
-        QUAD_TABLE256(spec.a0, spec.a1, spec.a2, spec.na);
-
-    PgenReader::ExtractFloatExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT,
-                                 gtable256x4, dest, /*missOut=*/nullptr);
+    const float table[4] = {spec.a0, spec.a1, spec.a2, spec.na};
+    bed_simd::decode_f32(raw, bedKeepMask(), rawSampleCT, keepSampleCT, table, dest, nullptr);
 
     if (sexChromType == 1) {
         double weight;
@@ -523,10 +599,6 @@ void Geno::getGenoFloat_bed(uintptr_t *buf, int idx, float *dest,
             } else {
                 // Correct centering under heterogametic weight:
                 //   recoded' = recoded * w + (w-1) * rdev * centerValue
-                // Both rdev and centerValue are embedded in spec already, but
-                // spec.{a0,a1,a2,na} are already (raw - center)*rdev.
-                // We need correctWeight = (w-1) * centerValue * rdev.
-                // Recompute via buildCodingSpec to avoid storing center+rdev in F32.
                 const GenoCodingSpec dspec = buildCodingSpec(mu, sd);
                 const float correctWeight = static_cast<float>((weight - 1.0) * dspec.centerValue * dspec.rdev);
                 for (int i = 0; i < keepHeterogameticSampleCT; ++i) {
@@ -539,25 +611,55 @@ void Geno::getGenoFloat_bed(uintptr_t *buf, int idx, float *dest,
     }
 }
 
+// Single fused pass: raw .bed -> int8 {0,1,2,0} + exact counts (+ optional
+// weighted sums / sparse missing indices); the missing bitmask is written
+// only when the marker actually has missing calls.
 void Geno::getGenoInt8_bed(uintptr_t *buf, int idx, int8_t *dest,
                            float &af_out, float &additive_af_out,
                            double &mu_out, uint32_t &nValidN_out,
                            uintptr_t *miss_out, bool &valid_out,
-                           uint32_t extractedMarkerIndex) {
+                           uint32_t extractedMarkerIndex, BedI8Fused *fused) {
     valid_out   = false;
     mu_out      = 0.0;
     nValidN_out = 0;
 
     SNPInfo snpinfo;
-    uintptr_t *cur_buf = buf + static_cast<std::size_t>(idx) * static_cast<std::size_t>(bedRawGenoBuf1PtrSize);
+    const uint8_t *raw = bedRecord(buf, idx);
     uint8_t sexChromType = markerSexChromTypes[curBufferIndex];
-    if (sexChromType != 1) {
-        PgenReader::CountHardFreqMissExt(cur_buf, keepMaskInterPtr, rawSampleCT, keepSampleCT, &snpinfo, f_std);
-    } else {
-        string errmsg;
-        PgenReader::CountHardFreqMissExtX(cur_buf, keepMaskInterPtr, heterogameticMaskInterPtr,
-                                          rawSampleCT, keepSampleCT, keepHeterogameticSampleCT,
-                                          &snpinfo, errmsg, iDC == 1, f_std);
+
+    bed_simd::I8Opts opts;
+    opts.miss_bits = reinterpret_cast<uint64_t *>(miss_out);
+    if (fused) {
+        opts.wf = fused->vw;
+        opts.wd = fused->w2;
+    }
+    const bed_simd::Counts c = bed_simd::decode_i8(raw, bedKeepMask(), rawSampleCT, keepSampleCT, dest, &opts);
+    bedSnpInfoFromCounts(raw, c, sexChromType, &snpinfo);
+
+    if (fused) {
+        fused->c0 = c.n0;
+        fused->c1 = c.n1;
+        fused->c2 = c.n2;
+        fused->cmiss = c.nmiss;
+        fused->dot_vw = opts.wf_dot;
+        fused->miss_vw = opts.wf_miss;
+        fused->dot_w2 = opts.wd_dot;
+        fused->dot2_w2 = opts.wd_dot2;
+        fused->miss_w2 = opts.wd_miss;
+        if (fused->miss_list) {
+            fused->miss_list->clear();
+            if (c.nmiss && miss_out) {
+                fused->miss_list->reserve(c.nmiss);
+                const int num_words = static_cast<int>((keepSampleCT + 63) / 64);
+                for (int w = 0; w < num_words; ++w) {
+                    uintptr_t word = miss_out[w];
+                    while (word != 0) {
+                        fused->miss_list->push_back(w * 64 + std::countr_zero(word));
+                        word &= (word - 1);
+                    }
+                }
+            }
+        }
     }
 
     double af = snpinfo.af;
@@ -579,9 +681,54 @@ void Geno::getGenoInt8_bed(uintptr_t *buf, int idx, int8_t *dest,
     mu_out          = mu;
     nValidN_out     = snpinfo.N;
     valid_out       = true;
+}
 
-    uintptr_t *pmiss = (snpinfo.N < keepSampleCT) ? miss_out : nullptr;
-    PgenReader::ExtractInt8Ext(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, dest, pmiss);
+void Geno::decodeBedI8KMajor(uintptr_t *buf, const int *markerIdx, int K, int n_rows,
+                             int8_t *kmajor, int ldK, const double *mu, double *r_raw) {
+    if (n_rows <= 0) return;
+    if (K <= 0) {
+        std::fill(r_raw, r_raw + n_rows, 0.0);
+        return;
+    }
+    constexpr int kBlk = 64;
+    const uint64_t *keep = bedKeepMask();
+    const int nTiles = (n_rows + kBlk - 1) / kBlk;
+    std::vector<uint32_t> tileRaw(static_cast<std::size_t>(nTiles));
+    for (int t = 0; t < nTiles; ++t) {
+        tileRaw[t] = keep ? sampleKeepIndex[static_cast<std::size_t>(t) * kBlk]
+                          : static_cast<uint32_t>(t * kBlk);
+    }
+    const uint32_t rawCT = rawSampleCT;
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < nTiles; ++t) {
+        const int i0 = t * kBlk;
+        const int s_len = std::min(kBlk, n_rows - i0);
+        alignas(64) int8_t col[kBlk][kBlk];   // [marker][sample]
+        alignas(64) int8_t blk[kBlk][kBlk];   // [sample][marker]
+        double r_acc[kBlk] = {0.0};
+        for (int m0 = 0; m0 < K; m0 += kBlk) {
+            const int m_len = std::min(kBlk, K - m0);
+            for (int dm = 0; dm < m_len; ++dm) {
+                bed_simd::decode_i8_range(bedRecord(buf, markerIdx[m0 + dm]), keep, rawCT,
+                                          tileRaw[t], static_cast<uint32_t>(s_len), col[dm]);
+            }
+            for (int dm = 0; dm < m_len; ++dm) {
+                const double mu_m = mu[m0 + dm];
+                for (int ds = 0; ds < s_len; ++ds) {
+                    const int8_t g = col[dm][ds];
+                    r_acc[ds] += static_cast<double>(g) * mu_m;
+                    blk[ds][dm] = g;
+                }
+            }
+            for (int ds = 0; ds < s_len; ++ds) {
+                std::memcpy(kmajor + static_cast<std::size_t>(i0 + ds) * ldK + m0, blk[ds],
+                            static_cast<std::size_t>(m_len));
+            }
+        }
+        for (int ds = 0; ds < s_len; ++ds) {
+            r_raw[i0 + ds] = r_acc[ds];
+        }
+    }
 }
 
 // PGEN path: decode directly into dest via geno_f32_ptr (no temporary double vector).
@@ -793,18 +940,11 @@ void Geno::getGenoDouble_pgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
     }
 }
 
-//TODO: do we need to adjust here
 void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
     SNPInfo snpinfo;
-    uintptr_t *cur_buf = buf + static_cast<std::size_t>(idx) * static_cast<std::size_t>(bedRawGenoBuf1PtrSize);
+    const uint8_t *raw = bedRecord(buf, idx);
     uint8_t sexChromType = markerSexChromTypes[curBufferIndex];
-    bool hasNoHET = true;
-    if(sexChromType != 1){
-        PgenReader::CountHardFreqMissExt(cur_buf, keepMaskInterPtr, rawSampleCT, keepSampleCT, &snpinfo, f_std);
-    }else{
-        string errmsg;
-        hasNoHET = PgenReader::CountHardFreqMissExtX(cur_buf, keepMaskInterPtr, heterogameticMaskInterPtr, rawSampleCT, keepSampleCT, keepHeterogameticSampleCT, &snpinfo, errmsg, iDC==1, f_std);
-    }
+    const bed_simd::Counts counts = bedSnpInfo(raw, sexChromType, &snpinfo);
     uint32_t curExtractIndex = gbuf->extractedMarkerIndex;
     double af = snpinfo.af;
     if(bHasPreAF){
@@ -838,20 +978,22 @@ void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     gbuf->valid = false;
                     return;
                 }
-                const GenoCodingSpec spec = buildCodingSpec(mu, sd);
-                uintptr_t * pmiss = NULL;
-                if(bMakeMiss){
-                    gbuf->missing.resize(missPtrSize); 
-                    pmiss = gbuf->missing.data();
+                if (gbuf->stats_only) {
+                    return;
                 }
+                const GenoCodingSpec spec = buildCodingSpec(mu, sd);
+                const uint64_t *keep = bedKeepMask();
+                uintptr_t *pmiss = bed_prepare_missing(gbuf, bMakeMiss, counts.nmiss, missPtrSize, keepSampleCT);
+                uint64_t *pmiss64 = reinterpret_cast<uint64_t *>(pmiss);
                 if (gbuf->geno_i8_ptr) {
-                    PgenReader::ExtractInt8Ext(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, gbuf->geno_i8_ptr, pmiss);
+                    bed_simd::I8Opts opts;
+                    opts.miss_bits = pmiss64;
+                    bed_simd::decode_i8(raw, keep, rawSampleCT, keepSampleCT, gbuf->geno_i8_ptr, &opts);
                 } else if (gbuf->geno_f32_ptr) {
                     float *out_f32 = gbuf->geno_f32_ptr;
                     const GenoCodingSpecF32 spec_f32 = buildCodingSpecF32(mu, sd);
-                    const float gtable256x4[1024] __attribute__((aligned(16))) =
-                        QUAD_TABLE256(spec_f32.a0, spec_f32.a1, spec_f32.a2, spec_f32.na);
-                    PgenReader::ExtractFloatExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, gtable256x4, out_f32, pmiss);
+                    const float table[4] = {spec_f32.a0, spec_f32.a1, spec_f32.a2, spec_f32.na};
+                    bed_simd::decode_f32(raw, keep, rawSampleCT, keepSampleCT, table, out_f32, pmiss64);
                     if(sexChromType == 1){
                         double weight;
                         bool needWeight;
@@ -873,14 +1015,13 @@ void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                         }
                     }
                 } else {
-                    const double lookup[32] __attribute__ ((aligned (16))) =
-                        GET_TABLE16(spec.a0, spec.a1, spec.a2, spec.na);
+                    const double table[4] = {spec.a0, spec.a1, spec.a2, spec.na};
                     double *out_geno = gbuf->geno_ptr;
                     if (!out_geno) {
                         gbuf->geno.resize(keepSampleCT);
                         out_geno = gbuf->geno.data();
                     }
-                    PgenReader::ExtractDoubleExt(cur_buf, keepMaskPtr, rawSampleCT, keepSampleCT, lookup, out_geno, pmiss); 
+                    bed_simd::decode_f64(raw, keep, rawSampleCT, keepSampleCT, table, out_geno, pmiss64);
                     if(sexChromType == 1){
                         double weight;
                         bool needWeight;

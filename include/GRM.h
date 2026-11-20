@@ -88,7 +88,9 @@ private:
 
     bool bBLAS;
     AlignedUniquePtr<float, 64> stdGeno;
-    AlignedUniquePtr<int8_t, 64> stdGeno_i8;
+    AlignedUniquePtr<int8_t, 64> stdGeno_i8;   // BED int8: compact columns of markers with missing calls only
+    int stdGeno_i8_cols_ = 0;                  // capacity (columns) of stdGeno_i8
+    std::vector<int> miss_col_of_;             // valid-marker index -> column in stdGeno_i8 (or -1)
     AlignedUniquePtr<int8_t, 64> stdGeno_i8_kmajor_;
     bool use_int8_grm = false;
 

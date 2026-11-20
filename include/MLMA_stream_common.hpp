@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <concepts>
 #include <cstdint>
 #include <cstdio>
@@ -23,6 +24,9 @@
 #include <span>
 #include <string>
 #include <vector>
+#ifdef _OPENMP
+  #include <omp.h>
+#endif
 
 template <typename T, std::ranges::sized_range IndexRange>
     requires std::integral<std::ranges::range_value_t<IndexRange>>
@@ -66,22 +70,32 @@ inline Eigen::MatrixXd compact_sample_rows(const Eigen::MatrixXd& values,
 // Resolve the streaming block width (SNPs per tile) from a memory budget.
 // Accounts for all O(BLOCK) streaming buffers held simultaneously per tile:
 //   - G_block_i8 (~n bytes, 64B-aligned column stride) vs X_block (4*n bytes)
-//   - Backend double-buffered raw 2-bit slots (2 × ceil(max(n, raw_n)/4) ≈ 0.5*raw_n bytes)
+//   - Backend double-buffered raw slots: ~0.5*raw_n (BED), ~5.0*n (PGEN dosage), ~2.0*raw_n (BGEN)
 //   - Woodbury projection scratch UkX_scratch (4 * wb_k bytes when Woodbury active)
 // Per-SNP scalars (Xt_Vi_y, xvx_diag, af_v, valid_v) are O(1) per column.
 // budget_gb <= 0 preserves the previous fixed BLOCK=10000 behavior exactly.
 inline int resolve_mlma_block_size(int n, double budget_gb, bool use_int8_geno = false,
-                                   int raw_n = 0, int wb_k = 0)
+                                   int raw_n = 0, int wb_k = 0,
+                                   const std::string& geno_format = "BED",
+                                   int align_tile = 0)
 {
-    int block = 10000; // Somewhat arbitrary, but balance of peak RSS and throughout. Increasing may help STRSM efficiency but increases memory.
+    int block = 10000; // Somewhat arbitrary, but balance of peak RSS and throughput. Increasing may help STRSM efficiency but increases memory.
     if (budget_gb > 0.0 && n > 0) {
 
       LOGGER << "MLMA streaming memory budget: " << budget_gb << " GB" << std::endl;
       const int raw_eff = std::max(n, raw_n);
+      size_t ldG_est = (static_cast<size_t>(n) + 63) / 64 * 64;
+      if (ldG_est % 4096 == 0) ldG_est += 64;
       const double geno_bytes = use_int8_geno
-          ? static_cast<double>((static_cast<size_t>(n) + 63) / 64 * 64) /* G_block_i8 */
+          ? static_cast<double>(ldG_est) /* G_block_i8 */
           : static_cast<double>(sizeof(float)) * static_cast<double>(n); /* X_block */
-      const double raw_io_bytes = 0.5 * static_cast<double>(raw_eff);
+      double raw_io_bytes = 0.5 * static_cast<double>(raw_eff);
+      if (geno_format == "PGEN") {
+          // 2 double-buffered slots of (2-bit geno + uint16 dosage_main + 1-bit dosage_present) ~ 5.0 * n bytes
+          raw_io_bytes = 5.0 * static_cast<double>(n);
+      } else if (geno_format == "BGEN") {
+          raw_io_bytes = 2.0 * static_cast<double>(raw_eff);
+      }
       const double scratch_bytes = (wb_k > 0)
           ? static_cast<double>(sizeof(float)) * static_cast<double>(wb_k)
           : 0.0;
@@ -90,10 +104,150 @@ inline int resolve_mlma_block_size(int n, double budget_gb, bool use_int8_geno =
 
       const double budget_bytes  = budget_gb * 1e9;
       const double per_snp_bytes = geno_bytes + raw_io_bytes + scratch_bytes;
-      block   =  std::clamp(static_cast<int>(budget_bytes / per_snp_bytes), min_block, max_block);
+      block = std::clamp(static_cast<int>(budget_bytes / per_snp_bytes), min_block, max_block);
+      if (align_tile > 0) {
+          const int step = (block >= align_tile) ? align_tile : min_block;
+          block = std::clamp((block / step) * step, min_block, max_block);
+      }
     }
     LOGGER << "MLMA streaming block size: " << block << " SNPs per tile" << std::endl;
     return block;
+}
+
+// Fast single-line TSV formatter for .mlma output using std::to_chars (general, 6) + memcpy.
+inline void append_mlma_line(std::string& dst,
+                             const std::string& chr,
+                             const std::string& name,
+                             unsigned bp,
+                             const std::string& a1,
+                             const std::string& a2,
+                             bool stat_ok,
+                             double freq,
+                             double beta,
+                             double se,
+                             double pval)
+{
+    char bp_buf[20];
+    const auto bp_res = std::to_chars(bp_buf, bp_buf + sizeof(bp_buf), bp);
+    const size_t bp_len = static_cast<size_t>(bp_res.ptr - bp_buf);
+
+    char stat_buf[144];
+    char* sp = stat_buf;
+    char* const send = stat_buf + sizeof(stat_buf);
+    if (!stat_ok) {
+        static constexpr char kNaTail[] = "NA\tNA\tNA\tNA\n";
+        std::memcpy(sp, kNaTail, sizeof(kNaTail) - 1);
+        sp += sizeof(kNaTail) - 1;
+    } else {
+        auto put_f6g = [&](double v) {
+            auto [ptr, ec] = std::to_chars(sp, send, v, std::chars_format::general, 6);
+            if (ec == std::errc()) {
+                sp = ptr;
+            } else {
+                const int w = std::snprintf(sp, static_cast<size_t>(send - sp), "%.6g", v);
+                if (w > 0) sp += w;
+            }
+        };
+        put_f6g(freq); *sp++ = '\t';
+        put_f6g(beta); *sp++ = '\t';
+        put_f6g(se);   *sp++ = '\t';
+        put_f6g(pval); *sp++ = '\n';
+    }
+    const size_t stat_len = static_cast<size_t>(sp - stat_buf);
+
+    const size_t total_len = chr.size() + name.size() + bp_len + a1.size() + a2.size() + stat_len + 5;
+    if (total_len <= 512) {
+        char line[512];
+        char* p = line;
+        std::memcpy(p, chr.data(), chr.size());   p += chr.size();  *p++ = '\t';
+        std::memcpy(p, name.data(), name.size()); p += name.size(); *p++ = '\t';
+        std::memcpy(p, bp_buf, bp_len);           p += bp_len;      *p++ = '\t';
+        std::memcpy(p, a1.data(), a1.size());     p += a1.size();   *p++ = '\t';
+        std::memcpy(p, a2.data(), a2.size());     p += a2.size();   *p++ = '\t';
+        std::memcpy(p, stat_buf, stat_len);
+        dst.append(line, total_len);
+    } else {
+        dst.reserve(dst.size() + total_len);
+        dst.append(chr);               dst.push_back('\t');
+        dst.append(name);              dst.push_back('\t');
+        dst.append(bp_buf, bp_len);    dst.push_back('\t');
+        dst.append(a1);                dst.push_back('\t');
+        dst.append(a2);                dst.push_back('\t');
+        dst.append(stat_buf, stat_len);
+    }
+}
+
+// Parallel per-SNP stats + TSV formatting into per-thread pre-reserved buffers,
+// appended sequentially in exact [0..bs) SNP order into io_buf and flushed in >= 4 MiB chunks.
+inline void format_and_buffer_mlma_block(int bs,
+                                         std::span<const uint32_t> exIdx,
+                                         Marker* marker,
+                                         const std::vector<uint8_t>& valid_v,
+                                         const std::vector<float>& additive_af_v,
+                                         const Eigen::VectorXf& Xt_Vi_y,
+                                         const Eigen::VectorXf& xvx_diag,
+                                         bool log_pval,
+                                         std::vector<std::string>& thr_buf,
+                                         std::string& io_buf,
+                                         std::ofstream& ofile)
+{
+    if (bs <= 0) return;
+
+    int n_active = 1;
+    #pragma omp parallel
+    {
+        const int tid =
+        #ifdef _OPENMP
+            omp_get_thread_num();
+        #else
+            0;
+        #endif
+        const int nt =
+        #ifdef _OPENMP
+            omp_get_num_threads();
+        #else
+            1;
+        #endif
+        #pragma omp single
+        {
+            n_active = nt;
+        }
+        const int i_beg = static_cast<int>((static_cast<int64_t>(bs) * tid) / nt);
+        const int i_end = static_cast<int>((static_cast<int64_t>(bs) * (tid + 1)) / nt);
+        std::string& buf = thr_buf[static_cast<size_t>(tid)];
+        buf.clear();
+        for (int i = i_beg; i < i_end; ++i) {
+            const uint32_t raw      = marker->getRawIndex(exIdx[static_cast<size_t>(i)]);
+            const std::string& chr  = marker->getRawChr(raw);
+            const std::string& name = marker->getRawName(raw);
+            const unsigned     bp   = static_cast<unsigned>(marker->getRawBp(raw));
+            const std::string& a1   = marker->getRawA1(raw);
+            const std::string& a2   = marker->getRawA2(raw);
+
+            float beta_val = 0.0f, se_val = 0.0f;
+            double pval_val = 0.0;
+            const bool stat_ok = valid_v[static_cast<size_t>(i)] &&
+                mlma_snp_stat(Xt_Vi_y[i], xvx_diag[i], log_pval,
+                              beta_val, se_val, pval_val);
+
+            append_mlma_line(buf, chr, name, bp, a1, a2, stat_ok,
+                             static_cast<double>(additive_af_v[static_cast<size_t>(i)]),
+                             static_cast<double>(beta_val),
+                             static_cast<double>(se_val),
+                             pval_val);
+        }
+    }
+
+    for (int t = 0; t < n_active; ++t) {
+        const std::string& tb = thr_buf[static_cast<size_t>(t)];
+        if (!tb.empty()) {
+            io_buf.append(tb);
+        }
+    }
+    if (io_buf.size() >= (4 << 20)) {
+        ofile.write(io_buf.data(), static_cast<std::streamsize>(io_buf.size()));
+        io_buf.clear();
+    }
 }
 
 template <typename XVXDiagFn>
@@ -112,17 +266,21 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
 
     const int BLOCK = block_size;
     Eigen::MatrixXf X_block(n, BLOCK);
+    gcta_numa_interleave(X_block.data(), static_cast<size_t>(n) * static_cast<size_t>(BLOCK) * sizeof(float));
     Eigen::VectorXf Xt_Vi_y(BLOCK);
     Eigen::VectorXf xvx_diag(BLOCK);
 
     // Unweighted analyses (the common case) skip the per-column w_sqrt multiply.
     bool unit_weights = true;
     for (int s = 0; s < n; ++s) {
-        if (w_sqrt[s] != 1.0f) {
+        if (std::abs(w_sqrt[s] - 1.0f) > 1.0e-7f) {
             unit_weights = false;
             break;
         }
     }
+
+    const float* const vi_y_ptr = Vi_y.data();
+    const float* const w_ptr    = w_sqrt.data();
 
     int  snp_done = 0;
     int  last_pct = -1;
@@ -130,9 +288,22 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
     std::vector<uint8_t> valid_v(BLOCK, 0);
     std::vector<float>   af_v(BLOCK, 0.0f);
     std::vector<float>   additive_af_v(BLOCK, 0.0f);
+    std::vector<float>   x_norm_v(BLOCK, 0.0f);
+
+    const int max_threads =
+    #ifdef _OPENMP
+        std::max(1, omp_get_max_threads());
+    #else
+        1;
+    #endif
+    std::vector<std::string> thr_buf(static_cast<size_t>(max_threads));
+    const size_t per_thr_reserve = std::max<size_t>(
+        64ULL << 10,
+        (static_cast<size_t>(BLOCK) / static_cast<size_t>(max_threads) + 16) * 96);
+    for (auto& tb : thr_buf) tb.reserve(per_thr_reserve);
 
     std::string io_buf;
-    io_buf.reserve(4 << 20);
+    io_buf.reserve(8 << 20);
 
     auto flush_io = [&]() {
         if (!io_buf.empty()) {
@@ -144,60 +315,54 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
     auto callback = [&](uintptr_t* buf, std::span<const uint32_t> exIdx) {
         const int bs = static_cast<int>(exIdx.size());
 
-        // Decode genotypes directly into X_block columns as float.
-        // For BED format this uses bed_simd::decode_f32 (register-table decode).
-        // For PGEN/BGEN it decodes via the double path then casts.
-        #pragma omp parallel for schedule(dynamic, 16)
+        // Decode genotypes directly into X_block columns as float, fusing
+        // Xt_Vi_y and ||X_block.col(i)||^2 while each decoded column is cache-hot.
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < bs; ++i) {
             bool valid = false;
             float af = 0.0f, add_af = 0.0f;
-            geno->getGenoFloat(buf, i, X_block.col(i).data(),
-                               af, add_af, valid, exIdx[i]);
+            float* const x_col = X_block.col(i).data();
+            geno->getGenoFloat(buf, i, x_col, af, add_af, valid, exIdx[i]);
             if (valid) {
-                if (!unit_weights) X_block.col(i).array() *= w_sqrt.array();
+                double dot_vy  = 0.0;
+                double norm_sq = 0.0;
+                if (unit_weights) {
+                    #pragma omp simd reduction(+:dot_vy, norm_sq)
+                    for (int s = 0; s < n; ++s) {
+                        const float xs = x_col[s];
+                        dot_vy  += static_cast<double>(xs) * static_cast<double>(vi_y_ptr[s]);
+                        norm_sq += static_cast<double>(xs) * static_cast<double>(xs);
+                    }
+                } else {
+                    #pragma omp simd reduction(+:dot_vy, norm_sq)
+                    for (int s = 0; s < n; ++s) {
+                        const float xs = x_col[s] * w_ptr[s];
+                        x_col[s] = xs;
+                        dot_vy  += static_cast<double>(xs) * static_cast<double>(vi_y_ptr[s]);
+                        norm_sq += static_cast<double>(xs) * static_cast<double>(xs);
+                    }
+                }
+                Xt_Vi_y[i]  = static_cast<float>(dot_vy);
+                x_norm_v[i] = static_cast<float>(norm_sq);
             } else {
-                X_block.col(i).setZero();
+                std::memset(x_col, 0, static_cast<size_t>(n) * sizeof(float));
+                Xt_Vi_y[i]  = 0.0f;
+                x_norm_v[i] = 0.0f;
             }
             valid_v[i]       = static_cast<uint8_t>(valid);
             af_v[i]          = af;
             additive_af_v[i] = add_af;
         }
 
-        Xt_Vi_y.head(bs).noalias() = X_block.leftCols(bs).transpose() * Vi_y;
-        compute_xvx_diag(X_block, bs, xvx_diag);
-
-        for (int i = 0; i < bs; ++i) {
-            const uint32_t raw      = marker->getRawIndex(exIdx[i]);
-            const std::string& chr  = marker->getRawChr(raw);
-            const std::string& name = marker->getRawName(raw);
-            const unsigned     bp   = static_cast<unsigned>(marker->getRawBp(raw));
-            const std::string& a1   = marker->getRawA1(raw);
-            const std::string& a2   = marker->getRawA2(raw);
-
-            float beta_val = 0.0f, se_val = 0.0f;
-            double pval_val = 0.0;
-            const bool stat_ok = valid_v[i] &&
-                mlma_snp_stat(Xt_Vi_y[i], xvx_diag[i], log_pval,
-                              beta_val, se_val, pval_val);
-
-            if (!stat_ok) {
-                std::format_to(std::back_inserter(io_buf),
-                    "{}\t{}\t{}\t{}\t{}\tNA\tNA\tNA\tNA\n",
-                    chr, name, bp, a1, a2);
-            } else {
-                std::format_to(std::back_inserter(io_buf),
-                    "{}\t{}\t{}\t{}\t{}\t{:.6g}\t{:.6g}\t{:.6g}\t{:.6g}\n",
-                    chr, name, bp, a1, a2,
-                    static_cast<double>(additive_af_v[i]),
-                    static_cast<double>(beta_val),
-                    static_cast<double>(se_val),
-                    pval_val);
-            }
+        if constexpr (std::invocable<XVXDiagFn, Eigen::MatrixXf&, int, Eigen::VectorXf&, const float*>) {
+            compute_xvx_diag(X_block, bs, xvx_diag, x_norm_v.data());
+        } else {
+            compute_xvx_diag(X_block, bs, xvx_diag);
         }
 
-        if (io_buf.size() >= (4 << 20)) {
-            flush_io();
-        }
+        format_and_buffer_mlma_block(bs, exIdx, marker, valid_v, additive_af_v,
+                                     Xt_Vi_y, xvx_diag, log_pval,
+                                     thr_buf, io_buf, ofile);
 
         snp_done += bs;
         const int cur_pct = (total_m > 0)
@@ -214,7 +379,7 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
                      /*bMakeGeno*/   true,
                      /*bGenoCenter*/ true,
                      /*bGenoStd*/    false,
-                     /*bMakeMiss*/   true,
+                     /*bMakeMiss*/   false,
                      {callback});
 
     flush_io();
@@ -224,7 +389,7 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
 // in int8_t (1 byte/sample/SNP instead of 4 bytes/sample/SNP) and applies
 // mean-centering and sparse missing-genotype corrections algebraically.
 // When fast_mlma != FastMlmaMode::Off, pre-quantizes Uk into K-tiled INT8
-// slices and computes U_k^T G_block_i8 directly via s8s8s32 GEMM without
+// slices and computes U_k^T G_block_i8 directly via u8s8s32 GEMM without
 // allocating X_panel_f32 or K x BLOCK UkX_scratch.
 inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                                                     const Eigen::VectorXf& Vi_y,
@@ -241,7 +406,7 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
     const bool use_fast_i8 = (fast_mlma != FastMlmaMode::Off);
     LOGGER << "\nStreaming association tests for " << total_m << " SNPs ("
            << (use_fast_i8
-               ? (std::string("fast-mlma ") + fast_mlma_mode_name(fast_mlma) + " s8s8s32 Woodbury path")
+               ? (std::string("fast-mlma ") + fast_mlma_mode_name(fast_mlma) + " u8s8s32 Woodbury path")
                : std::string("int8 Woodbury path"))
            << ")..." << std::endl;
 
@@ -265,38 +430,115 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
     }
     const double* w2_ptr = unit_weights ? nullptr : w2.data();
 
+    const int max_threads =
+    #ifdef _OPENMP
+        std::max(1, omp_get_max_threads());
+    #else
+        1;
+    #endif
+
     Eigen::VectorXf u_sum;
     QuantizedWoodburyUk q_uk;
     if (use_fast_i8) {
         q_uk = build_quantized_woodbury_uk(wb, w_sqrt, unit_weights, S_w2, fast_mlma);
-        // Free float32 Uk_f immediately after quantization to cut resident memory.
+        // Free float32 Uk_f immediately after quantization to cut resident memory
+        // before allocating AOCL pre-reordered Q buffers.
         const_cast<WoodburyMLMACache&>(wb).Uk_f.resize(0, 0);
+        reorder_quantized_woodbury_uk(q_uk);
+        std::string reord_msg;
+        if (q_uk.total_q_reordered_bytes() > 0) {
+            reord_msg = ", Q_reordered_mem=" + std::format("{:.3f}",
+                static_cast<double>(q_uk.total_q_reordered_bytes()) / (1024.0 * 1024.0 * 1024.0)) + " GiB";
+        }
         LOGGER << "Fast MLMA quantized Uk (" << fast_mlma_mode_name(fast_mlma)
                << "): k=" << q_uk.k
                << ", tiles=" << q_uk.tiles.size()
                << ", Q_mem=" << std::format("{:.3f}", static_cast<double>(q_uk.total_q_bytes()) / (1024.0 * 1024.0 * 1024.0))
-               << " GiB, delta_quant=" << std::format("{:.3e}", q_uk.delta_quant)
+               << " GiB" << reord_msg
+               << ", delta_quant=" << std::format("{:.3e}", q_uk.delta_quant)
                << "." << std::endl;
     } else {
-        u_sum = unit_weights
-            ? wb.Uk_f.cast<double>().rowwise().sum().cast<float>().eval()
-            : (wb.Uk_f.cast<double>() * w_sqrt.cast<double>()).cast<float>().eval();
+        // Compute u_sum = Uk_f * w_sqrt in double precision without materializing
+        // a 40+ GB MatrixXd temporary (which Eigen's Uk_f.cast<double>() * w_sqrt
+        // risks under EIGEN_USE_BLAS).
+        const int k_wb = static_cast<int>(wb.Uk_f.rows());
+        u_sum.resize(k_wb);
+        if (k_wb > 0) {
+            const float* const uk_base = wb.Uk_f.data();
+            const float* const w_ptr   = w_sqrt.data();
+            const size_t k_pad64 = (static_cast<size_t>(k_wb) + 7) / 8 * 8;
+            std::vector<double> thr_sum(static_cast<size_t>(max_threads) * k_pad64, 0.0);
+            int n_act = 1;
+            #pragma omp parallel
+            {
+                const int tid =
+                #ifdef _OPENMP
+                    omp_get_thread_num();
+                #else
+                    0;
+                #endif
+                #pragma omp single
+                {
+                    n_act =
+                    #ifdef _OPENMP
+                        omp_get_num_threads();
+                    #else
+                        1;
+                    #endif
+                }
+                double* const lsum = thr_sum.data() + static_cast<size_t>(tid) * k_pad64;
+                if (unit_weights) {
+                    #pragma omp for schedule(static)
+                    for (int s = 0; s < n; ++s) {
+                        const float* const uk_col = uk_base + static_cast<size_t>(s) * static_cast<size_t>(k_wb);
+                        #pragma omp simd
+                        for (int r = 0; r < k_wb; ++r) {
+                            lsum[r] += static_cast<double>(uk_col[r]);
+                        }
+                    }
+                } else {
+                    #pragma omp for schedule(static)
+                    for (int s = 0; s < n; ++s) {
+                        const float* const uk_col = uk_base + static_cast<size_t>(s) * static_cast<size_t>(k_wb);
+                        const double ws = static_cast<double>(w_ptr[s]);
+                        #pragma omp simd
+                        for (int r = 0; r < k_wb; ++r) {
+                            lsum[r] += static_cast<double>(uk_col[r]) * ws;
+                        }
+                    }
+                }
+            }
+            #pragma omp parallel for schedule(static)
+            for (int r = 0; r < k_wb; ++r) {
+                double acc = 0.0;
+                for (int t = 0; t < n_act; ++t) {
+                    acc += thr_sum[static_cast<size_t>(t) * k_pad64 + static_cast<size_t>(r)];
+                }
+                u_sum[r] = static_cast<float>(acc);
+            }
+        }
     }
 
     const int BLOCK = block_size;
-    // Pad column stride to 64 bytes so each SNP column starts on a fresh cacheline
-    // (matches stdGenoLD in GRM.cpp and avoids false sharing across OMP threads).
-    const int ldG = (n + 63) / 64 * 64;
-    std::vector<int8_t, AlignedAllocator<int8_t, 64>> G_block_i8(
-        static_cast<size_t>(ldG) * static_cast<size_t>(BLOCK), 0);
+    // Pad column stride to 64 bytes (avoiding 4096-byte multiples that cause
+    // Zen 4 L1D cache-set aliasing) and allocate NUMA-interleaved without serial
+    // Core-0 zero-fill so parallel decode first-touches pages cleanly.
+    int ldG = (n + 63) / 64 * 64;
+    if (ldG % 4096 == 0) ldG += 64;
+    const size_t g_block_bytes = static_cast<size_t>(ldG) * static_cast<size_t>(BLOCK);
+    auto G_block_i8 = make_numa_interleaved_uninitialized<int8_t, 64>(g_block_bytes);
+    if (g_block_bytes > 0 && !G_block_i8) {
+        LOGGER.e(0, "Failed to allocate int8 genotype streaming block.");
+    }
     Eigen::VectorXf Xt_Vi_y(BLOCK);
     Eigen::VectorXf xvx_diag(BLOCK);
     Eigen::MatrixXf UkX_scratch;
     std::vector<float> X_panel_f32;
     std::vector<int32_t> P_i32;
     std::vector<float> scratch_A_f32, scratch_B_f32, scratch_C_f32;
+    std::vector<double> ukx_norm_sq(static_cast<size_t>(BLOCK), 0.0);
     if (!use_fast_i8) {
-        UkX_scratch.resize(wb.Uk_f.rows(), BLOCK);
+        UkX_scratch.resize(std::min<Eigen::Index>(wb.Uk_f.rows(), 2048), BLOCK);
     }
 
     int snp_done = 0;
@@ -309,8 +551,14 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
     std::vector<float>   x_norm_v(BLOCK, 0.0f);
     std::vector<std::vector<int>> snp_miss_samples(BLOCK);
 
+    std::vector<std::string> thr_buf(static_cast<size_t>(max_threads));
+    const size_t per_thr_reserve = std::max<size_t>(
+        64ULL << 10,
+        (static_cast<size_t>(BLOCK) / static_cast<size_t>(max_threads) + 16) * 96);
+    for (auto& tb : thr_buf) tb.reserve(per_thr_reserve);
+
     std::string io_buf;
-    io_buf.reserve(4 << 20);
+    io_buf.reserve(8 << 20);
 
     auto flush_io = [&]() {
         if (!io_buf.empty()) {
@@ -319,24 +567,35 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
         }
     };
 
+    // Persistent uninitialized per-thread miss_bits scratch: bed_simd::decode_i8
+    // only writes/zeroes miss_bits when a SNP has missing calls (nmiss > 0), so
+    // post-Beagle 0%-missing runs never fault or memset these pages at all.
     const int num_words = (n + 63) / 64;
+    const size_t miss_words_stride = (static_cast<size_t>(std::max(geno->getMissPtrSize(), num_words)) + 7) / 8 * 8;
+    AlignedRawBuffer<uintptr_t, 64> thr_miss_buf(
+        static_cast<size_t>(max_threads) * miss_words_stride);
 
     auto callback = [&](uintptr_t* buf, std::span<const uint32_t> exIdx) {
         const int bs = static_cast<int>(exIdx.size());
-        const int miss_words_alloc = std::max(geno->getMissPtrSize(), num_words);
+        int block_has_miss = 0;
 
-        #pragma omp parallel
+        #pragma omp parallel reduction(|:block_has_miss)
         {
-            std::vector<uintptr_t, AlignedAllocator<uintptr_t, 32>> miss_buf(
-                static_cast<size_t>(miss_words_alloc), 0);
+            const int tid =
+            #ifdef _OPENMP
+                omp_get_thread_num();
+            #else
+                0;
+            #endif
+            uintptr_t* const miss_ptr = thr_miss_buf.data() + static_cast<size_t>(tid) * miss_words_stride;
 
-            #pragma omp for schedule(dynamic, 16)
+            #pragma omp for schedule(static)
             for (int i = 0; i < bs; ++i) {
                 bool valid = false;
                 float af = 0.0f, add_af = 0.0f;
                 double mu = 0.0;
                 uint32_t nValidN = 0;
-                int8_t* col_i8 = G_block_i8.data() + static_cast<size_t>(i) * static_cast<size_t>(ldG);
+                int8_t* col_i8 = G_block_i8.get() + static_cast<size_t>(i) * static_cast<size_t>(ldG);
 
                 // Single fused pass over the raw .bed record: int8 column,
                 // exact (c0,c1,c2,c_miss), sum g*vw (+ w2 sums when weighted)
@@ -347,7 +606,7 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                 fz.w2 = unit_weights ? nullptr : w2_ptr;
                 fz.miss_list = &snp_miss_samples[i];
                 geno->getGenoInt8_bed(buf, i, col_i8, af, add_af, mu, nValidN,
-                                      miss_buf.data(), valid, exIdx[i], &fz);
+                                      miss_ptr, valid, exIdx[i], &fz);
                 valid_v[i]       = static_cast<uint8_t>(valid);
                 af_v[i]          = af;
                 additive_af_v[i] = add_af;
@@ -355,9 +614,14 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
 
                 if (!valid) {
                     snp_miss_samples[i].clear();
+                    std::memset(col_i8, 0, static_cast<size_t>(n));
                     Xt_Vi_y[i]  = 0.0f;
                     x_norm_v[i] = 0.0f;
                     continue;
+                }
+
+                if (fz.cmiss != 0) {
+                    block_has_miss = 1;
                 }
 
                 const double miss_vw = (fz.cmiss != 0) ? fz.miss_vw : 0.0;
@@ -383,49 +647,22 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
         }
 
         if (use_fast_i8) {
-            woodbury_xvx_diag_block_fast_i8(wb, q_uk, G_block_i8.data(), ldG, bs,
+            woodbury_xvx_diag_block_fast_i8(wb, q_uk, G_block_i8.get(), ldG, bs,
                                             valid_v, mu_v, x_norm_v, snp_miss_samples,
                                             xvx_diag, P_i32,
-                                            scratch_A_f32, scratch_B_f32, scratch_C_f32);
+                                            scratch_A_f32, scratch_B_f32, scratch_C_f32,
+                                            block_has_miss != 0, &ukx_norm_sq);
         } else {
             woodbury_xvx_diag_block_i8(wb, u_sum, w_sqrt, unit_weights,
-                                       G_block_i8.data(), ldG, bs,
+                                       G_block_i8.get(), ldG, bs,
                                        valid_v, mu_v, x_norm_v, snp_miss_samples,
-                                       xvx_diag, UkX_scratch, X_panel_f32);
+                                       xvx_diag, UkX_scratch, X_panel_f32,
+                                       block_has_miss != 0, &ukx_norm_sq);
         }
 
-        for (int i = 0; i < bs; ++i) {
-            const uint32_t raw      = marker->getRawIndex(exIdx[i]);
-            const std::string& chr  = marker->getRawChr(raw);
-            const std::string& name = marker->getRawName(raw);
-            const unsigned     bp   = static_cast<unsigned>(marker->getRawBp(raw));
-            const std::string& a1   = marker->getRawA1(raw);
-            const std::string& a2   = marker->getRawA2(raw);
-
-            float beta_val = 0.0f, se_val = 0.0f;
-            double pval_val = 0.0;
-            const bool stat_ok = valid_v[i] &&
-                mlma_snp_stat(Xt_Vi_y[i], xvx_diag[i], log_pval,
-                              beta_val, se_val, pval_val);
-
-            if (!stat_ok) {
-                std::format_to(std::back_inserter(io_buf),
-                    "{}\t{}\t{}\t{}\t{}\tNA\tNA\tNA\tNA\n",
-                    chr, name, bp, a1, a2);
-            } else {
-                std::format_to(std::back_inserter(io_buf),
-                    "{}\t{}\t{}\t{}\t{}\t{:.6g}\t{:.6g}\t{:.6g}\t{:.6g}\n",
-                    chr, name, bp, a1, a2,
-                    static_cast<double>(additive_af_v[i]),
-                    static_cast<double>(beta_val),
-                    static_cast<double>(se_val),
-                    pval_val);
-            }
-        }
-
-        if (io_buf.size() >= (4 << 20)) {
-            flush_io();
-        }
+        format_and_buffer_mlma_block(bs, exIdx, marker, valid_v, additive_af_v,
+                                     Xt_Vi_y, xvx_diag, log_pval,
+                                     thr_buf, io_buf, ofile);
 
         snp_done += bs;
         const int cur_pct = (total_m > 0)
@@ -442,7 +679,7 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                      /*bMakeGeno*/   true,
                      /*bGenoCenter*/ true,
                      /*bGenoStd*/    false,
-                     /*bMakeMiss*/   true,
+                     /*bMakeMiss*/   false,
                      {callback});
 
     flush_io();
@@ -504,8 +741,13 @@ inline void run_mlma_stream_association(RemlState& state,
         }
     }
     const int raw_n = static_cast<int>(geno->getRawSampleCT());
-    const int wb_k  = (use_wb && fast_mlma == FastMlmaMode::Off) ? static_cast<int>(wb.Uk_f.rows()) : 0;
-    const int BLOCK = resolve_mlma_block_size(n, block_mem_budget_gb, use_int8_wb, raw_n, wb_k);
+    const int wb_k  = (use_wb && fast_mlma == FastMlmaMode::Off)
+        ? (use_int8_wb ? std::min<int>(static_cast<int>(wb.Uk_f.rows()), 2048)
+                       : static_cast<int>(wb.Uk_f.rows()))
+        : 0;
+    const int align_tile = use_int8_wb ? 2048 : 0;
+    const int BLOCK = resolve_mlma_block_size(n, block_mem_budget_gb, use_int8_wb, raw_n, wb_k,
+                                              geno->getGenoFormat(), align_tile);
 
     if (use_int8_wb) {
         run_mlma_stream_association_woodbury_i8(wb, Vi_y, w_sqrt,
@@ -518,9 +760,11 @@ inline void run_mlma_stream_association(RemlState& state,
         ? Eigen::MatrixXf(wb.Uk_f.rows(), BLOCK)
         : Eigen::MatrixXf();
 
-    auto compute_xvx_diag = [&](Eigen::MatrixXf& X_block, int bs, Eigen::VectorXf& xvx_diag) {
+    auto compute_xvx_diag = [&](Eigen::MatrixXf& X_block, int bs,
+                                Eigen::VectorXf& xvx_diag,
+                                const float* precomputed_x_norm) {
         if (use_wb) {
-            woodbury_xvx_diag_block(wb, X_block, bs, xvx_diag, UkX_scratch);
+            woodbury_xvx_diag_block(wb, X_block, bs, xvx_diag, UkX_scratch, precomputed_x_norm);
         } else if (use_llt) {
             cblas_strsm(CblasColMajor, CblasLeft, CblasUpper, CblasTrans, CblasNonUnit,
                         n, bs, 1.0f,

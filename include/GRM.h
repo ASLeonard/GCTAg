@@ -80,7 +80,16 @@ private:
     std::vector<std::pair<int, int>> index_grm_pairs;
 
     AlignedUniquePtr<double, 64> grm;
+    AlignedUniquePtr<int32_t, 64> grm_i32;
     AlignedUniquePtr<uint32_t, 64> N;
+    bool grm_is_i32_ = false;
+    uint32_t grm_tile_i32_markers_ = 0;
+    std::vector<double> R_total_;
+    double S_total_ = 0.0;
+    bool grm_any_missing_seen_ = false;
+    bool n_markers_explicit_ = false;
+    static constexpr uint32_t kMaxInt32Markers = 500000000u;
+
     std::vector<uint32_t> sub_miss; // sample miss in all markers
     int finished_marker = 0;
     uint64_t num_byte_geno = 0;
@@ -103,8 +112,8 @@ private:
     bool cutoff_detail = false;
 
     string grm_file;
-    int num_byte_buffer;
-    uint64_t num_subjects;
+    uint64_t num_byte_buffer = 0;
+    uint64_t num_subjects = 0;
     std::vector<string> grm_ids;
     static constexpr int num_byte_GRM_read = 100 * 1024 * 1024;
     std::vector<uint64_t> byte_part_grms;
@@ -122,16 +131,19 @@ private:
     int grm_n = 0;               // part_keep_indices.second + 1
     int grm_m = 0;               // part_keep_indices.second - part_keep_indices.first + 1
     int grm_s_n = 0;             // grm_n - grm_m
-    int grm_bytes_std_geno = 0;  // sizeof(float) * grm_n
-    int stdGenoLD = 0;           // leading dimension of stdGeno: grm_n rounded up to multiple of 16 (64-byte column alignment)
+    size_t grm_bytes_std_geno = 0;  // sizeof(elem) * grm_n
+    int stdGenoLD = 0;           // leading dimension of stdGeno: max(grm_n, index_keep.size()) rounded up to multiple of 64
 
-    // Pre-allocated scratch buffers reused across calculate_GRM_blas calls
+    // Pre-allocated / lazily-allocated scratch buffers reused across calculate_GRM_blas calls
     std::vector<int> validIndexBuf;
-    std::vector<uintptr_t> sampleMissBuf;
-    std::vector<float> grm_f32_tile_;
-    std::vector<int32_t> grm_i32_tile_;
+    AlignedRawBuffer<uintptr_t, 64> sampleMissBuf{true};
+    AlignedRawBuffer<float, 64> grm_f32_tile_buf_{true};
+    AlignedRawBuffer<int32_t, 64> grm_i32_tile_{true};
+    AlignedRawBuffer<int32_t, 64> grm_i32_diag_scratch_{false};
+    AlignedRawBuffer<int8_t, 64> i8_reordered_B_{false};
     std::vector<float> i8_scratch_A_f32_;
     std::vector<float> i8_scratch_B_f32_;
+    std::vector<float> i8_scratch_C_f32_;
     std::vector<double> mu_vec_;
     std::vector<double> r_raw_;
     std::vector<double> r_tilde_;
@@ -140,13 +152,8 @@ private:
     std::vector<int> sample_miss_offset_;
     std::vector<int> sample_miss_m_;
 
-    // Block-tiled GRM: when grm_tile_size > 0 (set via --GRM-tile-size),
-    // processMakeGRM iterates over grm_tile_size-row tiles.  For each tile
-    // [grm_tile_rs, grm_tile_re) a rectangular grm/N slab of
-    // grm_tile_rows × grm_tile_cols elements is allocated, computed and
-    // written before moving to the next tile.
-    // grm and N are nullptr between tiles.
-    // grm_tile_size == 0 means no tiling (single-pass, original behaviour).
+    // Block-tiled GRM: when grm_tiling_enabled is active (set via --tile-budget),
+    // processMakeGRM iterates over row tiles [grm_tile_rs, grm_tile_re).
     bool grm_tiling_enabled = false;      // true when --GRM-tile-budget is active
     double grm_tile_budget_bytes = 0;   // budget in bytes for the grm+N tile buffer; 0 = disabled
     int  grm_tile_rs    = 0;  // tile row start (global index)
@@ -155,19 +162,22 @@ private:
     int  grm_tile_cols  = 0;  // grm_tile_re (rectangular buffer width)
     // When true, calculate_GRM_blas skips accumulating sub_miss / sd /
     // numValidMarkers / finished_marker.  Set after the first tile so that
-    // subsequent tiles reuse the values computed on the first pass — these
-    // quantities depend only on global genotype state, not on which tile row
-    // range is being processed.
+    // subsequent tiles reuse the values computed on the first pass.
     bool grm_skip_global_state = false;
     bool grm_first_accum = true;
 
+    void ensure_N_allocated();
+    void promote_i32_to_f64();
+
     // Write the current tile's normalised rows to already-open output files.
-    // w_N/grm_block/sparse_buf are caller-owned scratch (sized once by
-    // processMakeGRM to the widest tile, reused across every tile call).
-    void flush_grm_tile(FILE *grm_out, FILE *N_out,
-                        float thresh, bool isSparse, float mtd_weight,
-                        std::vector<float>& w_N,
-                        std::vector<float>& grm_block, std::string& sparse_buf);
+    // packed_grm/packed_N/const_N_buf/sparse_buf are caller-owned scratch reused across tiles.
+    void flush_grm_tile(int grm_fd, int N_fd, FILE *sparse_out,
+                        const std::string& grm_path, const std::string& N_path,
+                        float thresh, bool isSparse, double mtd_weight,
+                        AlignedRawBuffer<float, 64>& packed_grm,
+                        AlignedRawBuffer<float, 64>& packed_N,
+                        std::vector<float>& const_N_buf,
+                        std::string& sparse_buf);
 };
 
 

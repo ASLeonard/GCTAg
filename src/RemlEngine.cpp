@@ -18,6 +18,7 @@
 #include "Matrix.hpp"
 #include "Logger.h"
 #include "cpu.h"
+#include "mem.hpp"
 #include "mlma_woodbury.hpp"
 #include "symmetric_eigendecomp.hpp"
 #include "chunked_grm_matvec.hpp"
@@ -27,6 +28,7 @@
 #include <random>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -47,43 +49,224 @@ using RemlVec = Eigen::VectorXd;
 namespace {
 
 // Multiply upper-triangle-only float32 symmetric matrix K (n x n) by a double
-// vector or matrix, dispatching to float32 BLAS (ssymv/ssymm) without widening K.
+// vector or matrix, dispatching to upper-triangular tiled float32 SGEMM/SSYMV
+// without widening K.
 RemlVec symm_upper_f32_vec(const Eigen::MatrixXf& K, const Eigen::Ref<const RemlVec>& x) {
     const Eigen::VectorXf xf = x.cast<float>();
-    const Eigen::VectorXf yf = K.selfadjointView<Eigen::Upper>() * xf;
-    return yf.cast<double>();
+    const Eigen::MatrixXf yf = gcta_chunked::dense_upper_symm_f32(K, xf, /*use_bf16=*/false);
+    return yf.col(0).cast<double>();
+}
+
+void symm_upper_f32_mat_into(const Eigen::MatrixXf& K,
+                             const Eigen::Ref<const RemlMat>& X,
+                             RemlMat& out) {
+    const Eigen::Index n = K.rows();
+    const Eigen::Index cols = X.cols();
+    out.resize(n, cols);
+    if (n == 0 || cols == 0) return;
+
+    constexpr Eigen::Index kPanel = 256;
+    Eigen::MatrixXf Xf_panel;
+    for (Eigen::Index c0 = 0; c0 < cols; c0 += kPanel) {
+        const Eigen::Index bw = std::min(kPanel, cols - c0);
+        Xf_panel.resize(n, bw);
+        #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(bw) >= 32768)
+        for (Eigen::Index j = 0; j < bw; ++j) {
+            const double* __restrict__ src = X.col(c0 + j).data();
+            float* __restrict__ dst = Xf_panel.col(j).data();
+            #pragma omp simd
+            for (Eigen::Index i = 0; i < n; ++i) dst[i] = static_cast<float>(src[i]);
+        }
+        const Eigen::MatrixXf Yf_panel = gcta_chunked::dense_upper_symm_f32(K, Xf_panel, /*use_bf16=*/false);
+        #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(bw) >= 32768)
+        for (Eigen::Index j = 0; j < bw; ++j) {
+            const float* __restrict__ src = Yf_panel.col(j).data();
+            double* __restrict__ dst = out.col(c0 + j).data();
+            #pragma omp simd
+            for (Eigen::Index i = 0; i < n; ++i) dst[i] = static_cast<double>(src[i]);
+        }
+    }
 }
 
 RemlMat symm_upper_f32_mat(const Eigen::MatrixXf& K, const Eigen::Ref<const RemlMat>& X) {
-    const Eigen::Index n = K.rows();
-    const Eigen::Index cols = X.cols();
-    constexpr Eigen::Index kPanel = 256;
-    if (cols <= kPanel) {
-        const Eigen::MatrixXf Xf = X.cast<float>();
-        const Eigen::MatrixXf Yf = K.selfadjointView<Eigen::Upper>() * Xf;
-        return Yf.cast<double>();
-    }
-    RemlMat out(n, cols);
-    Eigen::MatrixXf Xf_panel;
-    Eigen::MatrixXf Yf_panel;
-    for (Eigen::Index c0 = 0; c0 < cols; c0 += kPanel) {
-        const Eigen::Index bw = std::min(kPanel, cols - c0);
-        Xf_panel = X.middleCols(c0, bw).cast<float>();
-        Yf_panel.noalias() = K.selfadjointView<Eigen::Upper>() * Xf_panel;
-        out.middleCols(c0, bw) = Yf_panel.cast<double>();
-    }
+    RemlMat out;
+    symm_upper_f32_mat_into(K, X, out);
     return out;
 }
 
-// Woodbury helpers — mirrors gcta::woodbury_basis_Kv / woodbury_basis_Viv / woodbury_basis_ViZ
-// but takes ctx by const ref instead of reading this->_ members.
+// Chunked float32-preferred matvec helper matching the dense float32 GRM precision
+// while halving tile bandwidth/memory and running SGEMM instead of DGEMM.
+void chunked_grm_matvec_into(const RemlCtx& ctx,
+                             const Eigen::Ref<const RemlMat>& Z,
+                             RemlMat& out) {
+    const Eigen::Index n = ctx.n;
+    const Eigen::Index cols = Z.cols();
+    out.resize(n, cols);
+    if (n == 0 || cols == 0) return;
 
-RemlVec woodbury_basis_Kv(const RemlCtx& ctx, const RemlVec& v) {
-    RemlVec Ukv = (ctx.Uk.transpose() * v.cast<float>()).cast<double>();
-    Ukv.array() *= (ctx.dk.array() - ctx.lambda_tail);
-    return ctx.lambda_tail * v + (ctx.Uk * Ukv.cast<float>()).cast<double>();
+    if (ctx.grm_tile_reader_f32) {
+        Eigen::MatrixXf Zf(n, cols);
+        #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(cols) >= 32768)
+        for (Eigen::Index j = 0; j < cols; ++j) {
+            const double* __restrict__ src = Z.col(j).data();
+            float* __restrict__ dst = Zf.col(j).data();
+            #pragma omp simd
+            for (Eigen::Index i = 0; i < n; ++i) dst[i] = static_cast<float>(src[i]);
+        }
+        const Eigen::MatrixXf Yf = gcta_chunked::chunked_symmetric_matvec_f32(
+            ctx.grm_tile_reader_f32, ctx.n, ctx.grm_chunk_rows, Zf);
+        #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(cols) >= 32768)
+        for (Eigen::Index j = 0; j < cols; ++j) {
+            const float* __restrict__ src = Yf.col(j).data();
+            double* __restrict__ dst = out.col(j).data();
+            #pragma omp simd
+            for (Eigen::Index i = 0; i < n; ++i) dst[i] = static_cast<double>(src[i]);
+        }
+    } else {
+        out = gcta_chunked::chunked_symmetric_matvec(
+            ctx.grm_tile_reader, ctx.n, ctx.grm_chunk_rows, RemlMat(Z));
+    }
 }
 
+RemlVec chunked_grm_matvec_vec(const RemlCtx& ctx, const Eigen::Ref<const RemlVec>& v) {
+    if (ctx.grm_tile_reader_f32) {
+        const Eigen::VectorXf vf = v.cast<float>();
+        const Eigen::MatrixXf yf = gcta_chunked::chunked_symmetric_matvec_f32(
+            ctx.grm_tile_reader_f32, ctx.n, ctx.grm_chunk_rows, vf);
+        return yf.col(0).cast<double>();
+    }
+    return gcta_chunked::chunked_symmetric_matvec(
+        ctx.grm_tile_reader, ctx.n, ctx.grm_chunk_rows, v);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Spectral-subspace Woodbury REML representation
+//
+// Any vector generated by {K_hat, V^{-1}, P} from {X, y} lies in
+//   span(Uk) (+) span(X_perp, y_perp)
+// where Uk^T Uk = I_k, X_perp = X - Uk*(Uk^T X), y_perp = y - Uk*(Uk^T y):
+//   v = Uk * par + X_perp * alpha + beta * y_perp.
+//
+// Precomputing (UkTX, UkTy, XtX_perp, Xty_perp, yty_perp) ONCE before iter 0
+// allows HE warm-start, calcu_P_impl, calcu_tr_PA_woodbury, ai_reml, em_reml,
+// post-hoc tail correction, and final fixed effects to execute purely in
+// O(k * c^2) (<0.5 ms/iter, 0 Uk scans after iter 0).
+// ──────────────────────────────────────────────────────────────────────────────
+struct WoodburySubspaceVec {
+    RemlVec par;    // k
+    RemlVec alpha;  // X_c
+    double  beta = 0.0;
+};
+
+void ensure_woodbury_subspace_cache(RemlCtx& ctx) {
+    const int k = ctx.woodbury_basis_rank_;
+    const int c = ctx.X_c;
+    const int n = ctx.n;
+    if (ctx.wb_subspace_ready
+        && ctx.UkTX.rows() == k && ctx.UkTX.cols() == c
+        && static_cast<int>(ctx.UkTy.size()) == k
+        && ctx.wb_XtX_perp.rows() == c && ctx.wb_XtX_perp.cols() == c
+        && static_cast<int>(ctx.wb_Xty_perp.size()) == c) {
+        return;
+    }
+
+    // Fused [X, y] projection: 2 GEMMs over Uk once per REML run.
+    Eigen::MatrixXf XY_f(n, c + 1);
+    #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(c) >= 65536)
+    for (int j = 0; j < c; ++j) {
+        const double* __restrict__ src = ctx.X.col(j).data();
+        float* __restrict__ dst = XY_f.col(j).data();
+        #pragma omp simd
+        for (int i = 0; i < n; ++i) dst[i] = static_cast<float>(src[i]);
+    }
+    {
+        const double* __restrict__ src = ctx.y.data();
+        float* __restrict__ dst = XY_f.col(c).data();
+        #pragma omp parallel for schedule(static) if (n >= 65536)
+        for (int i = 0; i < n; ++i) dst[i] = static_cast<float>(src[i]);
+    }
+
+    const Eigen::MatrixXf UkTXY_f = ctx.Uk.transpose() * XY_f;  // k x (c + 1)
+    ctx.UkTX = UkTXY_f.leftCols(c).cast<double>();
+    ctx.UkTy = UkTXY_f.col(c).cast<double>();
+
+    // Explicit perpendicular residuals ensure wb_XtX_perp is PSD even when
+    // covariates (e.g. PCs) lie inside span(Uk).
+    const Eigen::MatrixXf proj_f = ctx.Uk * UkTXY_f;            // n x (c + 1)
+    RemlMat X_perp(n, c);
+    #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(c) >= 65536)
+    for (int j = 0; j < c; ++j) {
+        const double* __restrict__ xcol = ctx.X.col(j).data();
+        const float*  __restrict__ pcol = proj_f.col(j).data();
+        double*       __restrict__ dcol = X_perp.col(j).data();
+        #pragma omp simd
+        for (int i = 0; i < n; ++i) dcol[i] = xcol[i] - static_cast<double>(pcol[i]);
+    }
+    RemlVec y_perp(n);
+    {
+        const double* __restrict__ ycol = ctx.y.data();
+        const float*  __restrict__ pcol = proj_f.col(c).data();
+        double*       __restrict__ dcol = y_perp.data();
+        #pragma omp parallel for schedule(static) if (n >= 65536)
+        for (int i = 0; i < n; ++i) dcol[i] = ycol[i] - static_cast<double>(pcol[i]);
+    }
+
+    ctx.wb_XtX_perp.resize(c, c);
+    ctx.wb_XtX_perp.noalias() = X_perp.transpose() * X_perp;
+    ctx.wb_Xty_perp.resize(c);
+    ctx.wb_Xty_perp.noalias() = X_perp.transpose() * y_perp;
+    ctx.wb_yty_perp = y_perp.squaredNorm();
+    ctx.wb_subspace_ready = true;
+}
+
+double wb_inner(const RemlCtx& ctx, const WoodburySubspaceVec& u, const WoodburySubspaceVec& v) {
+    const double par_dot = u.par.dot(v.par);
+    const double perp_dot =
+        u.alpha.dot(ctx.wb_XtX_perp * v.alpha)
+        + u.beta * ctx.wb_Xty_perp.dot(v.alpha)
+        + v.beta * ctx.wb_Xty_perp.dot(u.alpha)
+        + u.beta * v.beta * ctx.wb_yty_perp;
+    return par_dot + perp_dot;
+}
+
+WoodburySubspaceVec wb_apply_K(const RemlCtx& ctx, const WoodburySubspaceVec& v) {
+    WoodburySubspaceVec out;
+    out.par   = ctx.dk.cwiseProduct(v.par);
+    out.alpha = ctx.lambda_tail * v.alpha;
+    out.beta  = ctx.lambda_tail * v.beta;
+    return out;
+}
+
+WoodburySubspaceVec wb_apply_P(const RemlCtx& ctx, const WoodburySubspaceVec& v) {
+    const double inv_s2 = 1.0 / ctx.sigma2_eff;
+    const RemlVec w_par   = ((1.0 - ctx.ck.array()) * inv_s2).matrix().cwiseProduct(v.par);
+    const RemlVec w_alpha = inv_s2 * v.alpha;
+    const double  w_beta  = inv_s2 * v.beta;
+
+    RemlVec a(ctx.X_c);
+    a.noalias()  = ctx.UkTX.transpose() * w_par;
+    a.noalias() += ctx.wb_XtX_perp * w_alpha;
+    a.noalias() += w_beta * ctx.wb_Xty_perp;
+
+    const RemlVec b_v = ctx.Xt_Vi_X_i.selfadjointView<Eigen::Lower>() * a;
+
+    WoodburySubspaceVec out;
+    out.par = w_par;
+    out.par.noalias() -= ctx.Uk_Vi_X * b_v;
+    out.alpha = w_alpha - inv_s2 * b_v;
+    out.beta  = w_beta;
+    return out;
+}
+
+WoodburySubspaceVec wb_y_vec(const RemlCtx& ctx) {
+    WoodburySubspaceVec yv;
+    yv.par = ctx.UkTy;
+    yv.alpha = RemlVec::Zero(ctx.X_c);
+    yv.beta = 1.0;
+    return yv;
+}
+
+// Woodbury n-vector helpers (retained for any direct non-subspace path)
 RemlMat woodbury_basis_KZ(const RemlCtx& ctx, const RemlMat& Z) {
     RemlMat UkZ = (ctx.Uk.transpose() * Z.cast<float>()).cast<double>();
     UkZ.array().colwise() *= (ctx.dk.array() - ctx.lambda_tail);
@@ -120,19 +303,34 @@ RemlVec applyP_vec(const RemlCtx& ctx, const RemlVec& v) {
     return w;
 }
 
-RemlMat applyP_mat(const RemlCtx& ctx, const RemlMat& Z) {
-    RemlMat W;
+// Implicit P*Z written directly into W (supports &W == &Z when ctx.Vi_use_llt;
+// requires &W != &Z when using dense ctx.Vi). Computes Vi_X^T * Z BEFORE
+// modifying W so in-place LLT solves remain exact with zero extra n x cols temp.
+void applyP_mat_into(const RemlCtx& ctx, const RemlMat& Z, RemlMat& W) {
+    const RemlMat A = ctx.Vi_X.transpose() * Z;
     if (ctx.Vi_use_woodbury_basis) {
         W = woodbury_basis_ViZ(ctx, Z);
     } else if (ctx.Vi_use_llt) {
-        W = Z;
-        ctx.Vi_L.triangularView<Eigen::Upper>().adjoint().solveInPlace(W); // U^T z = v
+        if (&W != &Z) {
+            W.resize(Z.rows(), Z.cols());
+            const size_t col_bytes = static_cast<size_t>(Z.rows()) * sizeof(double);
+            #pragma omp parallel for schedule(static) if (static_cast<size_t>(Z.rows()) * static_cast<size_t>(Z.cols()) >= 32768)
+            for (Eigen::Index j = 0; j < Z.cols(); ++j) {
+                std::memcpy(W.col(j).data(), Z.col(j).data(), col_bytes);
+            }
+        }
+        ctx.Vi_L.triangularView<Eigen::Upper>().adjoint().solveInPlace(W); // U^T z = Z
         ctx.Vi_L.triangularView<Eigen::Upper>().solveInPlace(W);          // U w = z
     } else {
-        W = RemlMat(ctx.Vi.selfadjointView<Eigen::Upper>() * Z);
+        W.resize(Z.rows(), Z.cols());
+        W.noalias() = ctx.Vi.selfadjointView<Eigen::Upper>() * Z;
     }
-    const RemlMat A = ctx.Vi_X.transpose() * Z;
     W.noalias() -= ctx.Vi_X * (ctx.Xt_Vi_X_i.selfadjointView<Eigen::Lower>() * A);
+}
+
+RemlMat applyP_mat(const RemlCtx& ctx, const RemlMat& Z) {
+    RemlMat W;
+    applyP_mat_into(ctx, Z, W);
     return W;
 }
 
@@ -194,8 +392,8 @@ int constrain_varcmp(const RemlCtx& ctx, RemlVec& varcmp) {
     return num;
 }
 
-//Returns true if variance components successfully warm-started via HE, false if not (e.g. single-GRM but priors specified)
-bool init_varcomp(const RemlCtx& ctx,
+// Returns true if variance components successfully warm-started via HE, false if not (e.g. single-GRM but priors specified)
+bool init_varcomp(RemlCtx& ctx,
                   const std::vector<double>& priors_var,
                   const std::vector<double>& priors,
                   RemlVec& varcmp) {
@@ -223,71 +421,112 @@ bool init_varcomp(const RemlCtx& ctx,
     // Single-GRM HE warm-start (applies to both Woodbury and Exact REML when no priors specified)
     if (!ctx.reml_no_HE_start && (int)ctx.r_indx.size() == 2 && priors.empty() && priors_var.empty()) {
         const int n = ctx.n;
-        double trK = 0.0, trK2 = 0.0;
-        RemlMat KX;
-        RemlVec Ky(n);
-
-        // Match REML's fixed-effect projection: for Q = I - X(X'X)^-1X',
-        // solve E[y'QKQy] and E[y'Qy] for the two HE components.
-        const RemlMat XtX = ctx.X.transpose() * ctx.X;
-        Eigen::LDLT<RemlMat> XtX_ldlt(XtX);
         const int dof = n - ctx.X_c;
-        if (XtX_ldlt.info() != Eigen::Success || dof <= 0) return false;
-        const RemlVec y_r = ctx.y - ctx.X * XtX_ldlt.solve(ctx.X.transpose() * ctx.y);
+        if (dof <= 0) return false;
+
+        double trK = 0.0, trK2 = 0.0;
+        RemlMat XtKX, XtK2X;
+        double yKy = 0.0, yy = 0.0;
+        Eigen::LDLT<RemlMat> XtX_ldlt;
 
         if (ctx.Vi_use_woodbury_basis) {
+            // Pure spectral-subspace HE warm-start: O(k * c^2), zero Uk scans after cache build.
+            ensure_woodbury_subspace_cache(ctx);
             const int k = ctx.woodbury_basis_rank_;
             trK  = ctx.dk.sum() + static_cast<double>(n - k) * ctx.lambda_tail;
             trK2 = ctx.dk.squaredNorm()
                  + static_cast<double>(n - k) * (ctx.tail_d_var + ctx.lambda_tail * ctx.lambda_tail);
-            KX   = woodbury_basis_KZ(ctx, ctx.X);
-            Ky   = woodbury_basis_Kv(ctx, y_r);
-        } else if (ctx.grm_chunk_rows > 0) {
-            // Exact GRM, streamed from disk in chunks (or in-memory packed fp16) --
-            // ctx.A is empty by design here, so this must come before (or instead
-            // of) the ctx.A-based branch below.
-            if (ctx.grm_fp16) {
-                trK  = ctx.grm_fp16_trace_K;
-                trK2 = ctx.grm_fp16_trace_K2;
-            } else {
-                trK  = gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, ctx.grm_chunk_rows).sum();
-                trK2 = gcta_chunked::chunked_trace_K_squared(ctx.grm_tile_reader, n, ctx.grm_chunk_rows);
+
+            const RemlMat XtX = ctx.UkTX.transpose() * ctx.UkTX + ctx.wb_XtX_perp;
+            XtX_ldlt.compute(XtX);
+            if (XtX_ldlt.info() != Eigen::Success) return false;
+
+            const RemlVec Xty = ctx.UkTX.transpose() * ctx.UkTy + ctx.wb_Xty_perp;
+            const RemlVec beta_ols = XtX_ldlt.solve(Xty);
+
+            const RemlMat dk_UkTX = ctx.dk.asDiagonal() * ctx.UkTX;
+            XtKX.noalias()  = ctx.UkTX.transpose() * dk_UkTX + ctx.lambda_tail * ctx.wb_XtX_perp;
+            XtK2X.noalias() = dk_UkTX.transpose() * dk_UkTX
+                            + (ctx.lambda_tail * ctx.lambda_tail) * ctx.wb_XtX_perp;
+
+            WoodburySubspaceVec yr_sub;
+            yr_sub.par   = ctx.UkTy - ctx.UkTX * beta_ols;
+            yr_sub.alpha = -beta_ols;
+            yr_sub.beta  = 1.0;
+            const WoodburySubspaceVec Kyr_sub = wb_apply_K(ctx, yr_sub);
+            yKy = wb_inner(ctx, yr_sub, Kyr_sub);
+            yy  = wb_inner(ctx, yr_sub, yr_sub);
+        } else {
+            const RemlMat XtX = ctx.X.transpose() * ctx.X;
+            XtX_ldlt.compute(XtX);
+            if (XtX_ldlt.info() != Eigen::Success) return false;
+            const RemlVec y_r = ctx.y - ctx.X * XtX_ldlt.solve(ctx.X.transpose() * ctx.y);
+
+            RemlMat KX;
+            RemlVec Ky(n);
+            if (ctx.grm_chunk_rows > 0) {
+                // Fused single-pass float32 matvec on [X, y_r] (+ trace_K, trace_K2 when !fp16),
+                // replacing 4 full-file double passes (2 TB at N=500k) with 1 pass in f32!
+                if (ctx.grm_tile_reader_f32) {
+                    Eigen::MatrixXf XY_f(n, ctx.X_c + 1);
+                    XY_f.leftCols(ctx.X_c) = ctx.X.cast<float>();
+                    XY_f.col(ctx.X_c)      = y_r.cast<float>();
+                    double* tr_ptr  = ctx.grm_fp16 ? nullptr : &trK;
+                    double* tr2_ptr = ctx.grm_fp16 ? nullptr : &trK2;
+                    if (ctx.grm_fp16) {
+                        trK  = ctx.grm_fp16_trace_K;
+                        trK2 = ctx.grm_fp16_trace_K2;
+                    }
+                    const Eigen::MatrixXf KXY_f = gcta_chunked::chunked_symmetric_matvec_f32(
+                        ctx.grm_tile_reader_f32, n, ctx.grm_chunk_rows, XY_f, tr_ptr, tr2_ptr);
+                    KX = KXY_f.leftCols(ctx.X_c).cast<double>();
+                    Ky = KXY_f.col(ctx.X_c).cast<double>();
+                } else {
+                    if (ctx.grm_fp16) {
+                        trK  = ctx.grm_fp16_trace_K;
+                        trK2 = ctx.grm_fp16_trace_K2;
+                    } else {
+                        trK  = gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, ctx.grm_chunk_rows).sum();
+                        trK2 = gcta_chunked::chunked_trace_K_squared(ctx.grm_tile_reader, n, ctx.grm_chunk_rows);
+                    }
+                    RemlMat XY(n, ctx.X_c + 1);
+                    XY.leftCols(ctx.X_c) = ctx.X;
+                    XY.col(ctx.X_c)      = y_r;
+                    const RemlMat KXY = gcta_chunked::chunked_symmetric_matvec(
+                        ctx.grm_tile_reader, n, ctx.grm_chunk_rows, XY);
+                    KX = KXY.leftCols(ctx.X_c);
+                    Ky = KXY.col(ctx.X_c);
+                }
+            } else if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
+                const auto& K = ctx.A[ctx.r_indx[0]];
+                trK = K.diagonal().cast<double>().sum();
+                const double diag_sq = K.diagonal().cast<double>().squaredNorm();
+                double off_sq = 0.0;
+                #pragma omp parallel for reduction(+:off_sq) schedule(guided)
+                for (int j = 0; j < n; ++j)
+                    off_sq += K.col(j).head(j).cast<double>().squaredNorm();
+                trK2 = diag_sq + 2.0 * off_sq;
+                // Fused [X, y_r] matvec: one single sweep over dense K instead of two.
+                RemlMat XY(n, ctx.X_c + 1);
+                XY.leftCols(ctx.X_c) = ctx.X;
+                XY.col(ctx.X_c)      = y_r;
+                const RemlMat KXY = symm_upper_f32_mat(K, XY);
+                KX = KXY.leftCols(ctx.X_c);
+                Ky = KXY.col(ctx.X_c);
             }
-            KX   = gcta_chunked::chunked_symmetric_matvec(ctx.grm_tile_reader, n, ctx.grm_chunk_rows, ctx.X);
-            Ky   = gcta_chunked::chunked_symmetric_matvec(ctx.grm_tile_reader, n, ctx.grm_chunk_rows, y_r);
-        } else if (!ctx.A.empty() && ctx.A[ctx.r_indx[0]].size() > 0) {
-            // Full exact GRM K = ctx.A[r_indx[0]]; K is upper-triangle-only
-            // storage (see grm_binary_io.hpp upper_only load path) -- no
-            // valid data below the diagonal.
-            const auto& K = ctx.A[ctx.r_indx[0]];
-            trK  = K.diagonal().cast<double>().sum();
-            // K.squaredNorm() would undercount here: it sums whatever the
-            // full n^2 buffer holds, but only the upper triangle (row<=col)
-            // is valid -- the lower triangle is unfaulted/kernel-zero, not
-            // K's actual values. Reconstruct tr(K^2) = sum(diag^2) +
-            // 2*sum_{r<c} K(r,c)^2 explicitly. Column reads (col(j).head(j)
-            // = K(0..j-1, j), the upper part of column j) are fully
-            // contiguous -- strictly better than a row-based equivalent,
-            // and squaring is order-independent so there's no accuracy
-            // tradeoff either way.
-            double diag_sq = K.diagonal().cast<double>().squaredNorm();
-            double off_sq  = 0.0;
-            #pragma omp parallel for reduction(+:off_sq) schedule(static)
-            for (int j = 0; j < n; ++j)
-                off_sq += K.col(j).head(j).cast<double>().squaredNorm();
-            trK2 = diag_sq + 2.0 * off_sq;
-            KX.noalias() = symm_upper_f32_mat(K, ctx.X);
-            Ky.noalias() = symm_upper_f32_vec(K, y_r);
+            if (trK2 > 0.0) {
+                XtKX.noalias()  = ctx.X.transpose() * KX;
+                XtK2X.noalias() = KX.transpose() * KX;
+                yKy = y_r.dot(Ky);
+                yy  = y_r.squaredNorm();
+            }
         }
+
         if (trK2 > 0.0) {
-            const RemlMat XtKX = ctx.X.transpose() * KX;
-            const RemlMat XtK2X = KX.transpose() * KX;
             const RemlMat B_inv_XtKX = XtX_ldlt.solve(XtKX);
             const double trQK = trK - B_inv_XtKX.trace();
             const double trQKQK = trK2 - 2.0 * XtX_ldlt.solve(XtK2X).trace()
                 + (B_inv_XtKX * B_inv_XtKX).trace();
-            const double yKy = y_r.dot(Ky);
-            const double yy = y_r.squaredNorm();
             const double denom = static_cast<double>(dof) * trQKQK - trQK * trQK;
             const double scale = yy / static_cast<double>(dof);
             if (denom > 1e-10 && std::isfinite(scale) && scale > 0.0) {
@@ -311,72 +550,143 @@ bool init_varcomp(const RemlCtx& ctx,
 
 
 // Fill ctx.Vi (upper triangle + diagonal) with sum_ci varcmp[ci] * A[ci].
-// Caller must have already called ctx.Vi.resize(n, n) and zeroed it.
-// Identity-components (A.size()==0) are added to the diagonal only.
+// Directly assigns entries in parallel (eliminating the single-threaded setZero()
+// sweep and triangular load imbalance).
 void assemble_V_upper(RemlCtx& ctx, const RemlVec& varcmp) {
     const int num_comp = static_cast<int>(ctx.r_indx.size());
-    ctx.Vi.triangularView<Eigen::Upper>().setZero();
-
-    if (ctx.grm_chunk_rows > 0) {
-        // Single-GRM only (enforced where ctx.grm_chunk_rows is set) --
-        // component 0 is the GRM, streamed tile-by-tile via the same
-        // TileReader/chunk_rows already proven correct by
-        // chunked_symmetric_matvec. Everything downstream of this function
-        // (dpotrf, Vi_L, applyP_mat) is completely unchanged: ctx.Vi still
-        // ends up fully dense -- this only changes how its upper triangle
-        // gets filled in, so ctx.A[GRM] never needs to be resident.
-        const double sg2 = varcmp[0];
-        const gcta_chunked::BlockPartition part(ctx.n, ctx.grm_chunk_rows);
-        const int m = part.num_blocks();
-        for (int i = 0; i < m; ++i) {
-            const int rs = part.block_start(i), re = part.block_end(i);
-            for (int j = 0; j <= i; ++j) {
-                const int cs = part.block_start(j), ce = part.block_end(j);
-                const auto tile = ctx.grm_tile_reader(rs, re, cs, ce);  // (re-rs) x (ce-cs) view
-
-                if (i == j) {
-                    // Diagonal block: the tile's own LOWER triangle holds the
-                    // valid data (row >= col) -- fixed by how
-                    // ChunkedGrmReader/grm_binary_io.hpp read the GRM's
-                    // on-disk packed-lower-triangular format.
-                    for (int col = 0; col < re - rs; ++col)
-                        ctx.Vi.col(cs + col).segment(rs, col + 1) +=
-                            sg2 * tile.row(col).head(col + 1).transpose();
-
-                } else {
-                    // Off-diagonal block (i > j): block rows rs..re sit
-                    // strictly below block cols cs..ce, i.e. this tile lives
-                    // in the lower triangle. By symmetry the mirror-image
-                    // block (rows cs..ce, cols rs..re) lives in the upper
-                    // triangle, so write the transposed tile there instead.
-                    ctx.Vi.block(cs, rs, ce - cs, re - rs) += sg2 * tile.transpose();
-                }
-            }
-        }
-    } else {
-        // ctx.A is upper-triangle-only storage, so both the read
-        // (ctx.A[...].col(j).head(j+1)) and the write
-        // (ctx.Vi.col(j).head(j+1)) are now column-contiguous -- zero
-        // stride, directly vectorizable.
-        #pragma omp parallel for schedule(static)
-        for (int j = 0; j < ctx.n; j++) {
-            for (int ci = 0; ci < num_comp; ci++)
-                if (ctx.A[ctx.r_indx[ci]].size() > 0)
-                    ctx.Vi.col(j).head(j + 1) +=
-                        varcmp[ci] * ctx.A[ctx.r_indx[ci]].col(j).head(j + 1).cast<double>();
-        }
+    double id_diag_sum = 0.0;
+    for (int ci = 0; ci < num_comp; ++ci) {
+        if (ctx.grm_chunk_rows > 0 && ci == 0) continue;
+        if (ctx.A[ctx.r_indx[ci]].size() == 0) id_diag_sum += varcmp[ci];
     }
 
-    for (int ci = 0; ci < num_comp; ci++) {
-        if (ctx.grm_chunk_rows > 0 && ci == 0)
-            continue;  // GRM diagonal already added by the streamed tile loop above
-        if (ctx.A[ctx.r_indx[ci]].size() == 0)
-            ctx.Vi.diagonal().array() += varcmp[ci];
+    if (ctx.grm_chunk_rows > 0) {
+        const double sg2 = varcmp[0];
+        const int eff_block = std::min(ctx.n, std::max(1, ctx.grm_chunk_rows));
+        if (ctx.grm_tile_reader_f32 && ctx.grm_tile_reader_f32.has_transposed()) {
+            const std::vector<int> bands = ctx.grm_tile_reader_f32.compute_row_bands(ctx.n, eff_block);
+            const int num_bands = static_cast<int>(bands.size()) - 1;
+            auto sweep = ctx.grm_tile_reader_f32.begin_sweep(bands);
+            for (int b = 0; b < num_bands; ++b) {
+                if (sweep) sweep->acquire(b);
+                const int rs = bands[b], re = bands[b + 1];
+                const int rows_i = re - rs;
+                for (int cs = 0; cs < rs; cs += eff_block) {
+                    const int ce = std::min(cs + eff_block, rs);
+                    const int cols_j = ce - cs;
+                    const auto tile_T = ctx.grm_tile_reader_f32.read_T(rs, re, cs, ce);  // cols_j x rows_i
+                    #pragma omp parallel for schedule(static)
+                    for (int col = 0; col < rows_i; ++col) {
+                        const float* __restrict__ src = tile_T.col(col).data();
+                        double* __restrict__ dst = ctx.Vi.col(rs + col).data() + cs;
+                        #pragma omp simd
+                        for (int r = 0; r < cols_j; ++r) dst[r] = sg2 * static_cast<double>(src[r]);
+                    }
+                }
+                {
+                    const auto tile_T = ctx.grm_tile_reader_f32.read_T(rs, re, rs, re);  // rows_i x rows_i, UPPER valid
+                    #pragma omp parallel for schedule(guided)
+                    for (int col = 0; col < rows_i; ++col) {
+                        const float* __restrict__ src = tile_T.col(col).data();
+                        double* __restrict__ dst = ctx.Vi.col(rs + col).data() + rs;
+                        #pragma omp simd
+                        for (int r = 0; r <= col; ++r) dst[r] = sg2 * static_cast<double>(src[r]);
+                        dst[col] += id_diag_sum;
+                    }
+                }
+                if (sweep) sweep->release(b);
+            }
+        } else {
+            const std::vector<int> bands = ctx.grm_tile_reader.compute_row_bands(ctx.n, eff_block);
+            const int num_bands = static_cast<int>(bands.size()) - 1;
+            auto sweep = ctx.grm_tile_reader.begin_sweep(bands);
+            const bool use_T = ctx.grm_tile_reader.has_transposed();
+            for (int b = 0; b < num_bands; ++b) {
+                if (sweep) sweep->acquire(b);
+                const int rs = bands[b], re = bands[b + 1];
+                const int rows_i = re - rs;
+                for (int cs = 0; cs < rs; cs += eff_block) {
+                    const int ce = std::min(cs + eff_block, rs);
+                    const int cols_j = ce - cs;
+                    if (use_T) {
+                        const auto tile_T = ctx.grm_tile_reader.read_T(rs, re, cs, ce);
+                        #pragma omp parallel for schedule(static)
+                        for (int col = 0; col < rows_i; ++col) {
+                            const double* __restrict__ src = tile_T.col(col).data();
+                            double* __restrict__ dst = ctx.Vi.col(rs + col).data() + cs;
+                            #pragma omp simd
+                            for (int r = 0; r < cols_j; ++r) dst[r] = sg2 * src[r];
+                        }
+                    } else {
+                        const auto tile = ctx.grm_tile_reader(rs, re, cs, ce);
+                        #pragma omp parallel for schedule(static)
+                        for (int col = 0; col < rows_i; ++col) {
+                            ctx.Vi.col(rs + col).segment(cs, cols_j).noalias() =
+                                sg2 * tile.row(col).transpose();
+                        }
+                    }
+                }
+                {
+                    if (use_T) {
+                        const auto tile_T = ctx.grm_tile_reader.read_T(rs, re, rs, re);
+                        #pragma omp parallel for schedule(guided)
+                        for (int col = 0; col < rows_i; ++col) {
+                            const double* __restrict__ src = tile_T.col(col).data();
+                            double* __restrict__ dst = ctx.Vi.col(rs + col).data() + rs;
+                            #pragma omp simd
+                            for (int r = 0; r <= col; ++r) dst[r] = sg2 * src[r];
+                            dst[col] += id_diag_sum;
+                        }
+                    } else {
+                        const auto tile = ctx.grm_tile_reader(rs, re, rs, re);
+                        #pragma omp parallel for schedule(guided)
+                        for (int col = 0; col < rows_i; ++col) {
+                            ctx.Vi.col(rs + col).segment(rs, col + 1).noalias() =
+                                sg2 * tile.row(col).head(col + 1).transpose();
+                            ctx.Vi(rs + col, rs + col) += id_diag_sum;
+                        }
+                    }
+                }
+                if (sweep) sweep->release(b);
+            }
+        }
+        return;
+    }
+
+    // Dense path: assign first non-empty matrix component directly (no serial setZero)
+    // and accumulate remaining components + identity diagonal inside one guided pass.
+    std::vector<int> dense_comps;
+    dense_comps.reserve(static_cast<size_t>(num_comp));
+    for (int ci = 0; ci < num_comp; ++ci) {
+        if (ctx.A[ctx.r_indx[ci]].size() > 0) dense_comps.push_back(ci);
+    }
+
+    #pragma omp parallel for schedule(guided)
+    for (int j = 0; j < ctx.n; ++j) {
+        double* __restrict__ dst = ctx.Vi.col(j).data();
+        if (dense_comps.empty()) {
+            std::memset(dst, 0, static_cast<size_t>(j + 1) * sizeof(double));
+        } else {
+            const int ci0 = dense_comps[0];
+            const double w0 = varcmp[ci0];
+            const float* __restrict__ s0 = ctx.A[ctx.r_indx[ci0]].col(j).data();
+            #pragma omp simd
+            for (int r = 0; r <= j; ++r) dst[r] = w0 * static_cast<double>(s0[r]);
+            for (size_t k = 1; k < dense_comps.size(); ++k) {
+                const int ci = dense_comps[k];
+                const double wk = varcmp[ci];
+                const float* __restrict__ sk = ctx.A[ctx.r_indx[ci]].col(j).data();
+                #pragma omp simd
+                for (int r = 0; r <= j; ++r) dst[r] += wk * static_cast<double>(sk[r]);
+            }
+        }
+        dst[j] += id_diag_sum;
     }
 }
 
 // Returns false if V is not positive-definite and inversion failed.
 bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, bool factorize_only) {
+    (void)iter;
     ctx.Vi_use_llt = false;
 
     if (ctx.Vi_use_woodbury_basis) {
@@ -392,7 +702,7 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
         ctx.ck.resize(k);
         logdet = static_cast<double>(ctx.n - k) * std::log(ctx.sigma2_eff);
         for (int j = 0; j < k; ++j) {
-            const double delta    = std::max(0.0, ctx.dk[j] - ctx.lambda_tail);
+            const double delta     = std::max(0.0, ctx.dk[j] - ctx.lambda_tail);
             const double sig_delta = sg2 * delta;
             ctx.ck[j] = sig_delta / (ctx.sigma2_eff + sig_delta);
             logdet += std::log(ctx.sigma2_eff + sig_delta);
@@ -407,11 +717,18 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
     // Dense path: assemble V (upper triangle)
     if (factorize_only && static_cast<int>(ctx.r_indx.size()) > 1)
         ctx.Vi.swap(ctx.Vi_L);
+    const bool vi_was_empty = (ctx.Vi.rows() != ctx.n || ctx.Vi.cols() != ctx.n);
     ctx.Vi.resize(ctx.n, ctx.n);
+    if (vi_was_empty) {
+        gcta_numa_interleave(ctx.Vi.data(), static_cast<size_t>(ctx.n) * static_cast<size_t>(ctx.n) * sizeof(double));
+    }
 
     if (ctx.r_indx.size() == 1) {
-        ctx.Vi.triangularView<Eigen::Upper>().setZero();
-        ctx.Vi.diagonal() = RemlVec::Constant(ctx.n, 1.0 / prev_varcmp[0]);
+        #pragma omp parallel for schedule(guided)
+        for (int j = 0; j < ctx.n; ++j) {
+            if (j > 0) std::memset(ctx.Vi.col(j).data(), 0, static_cast<size_t>(j) * sizeof(double));
+            ctx.Vi(j, j) = 1.0 / prev_varcmp[0];
+        }
         logdet = ctx.n * std::log(prev_varcmp[0]);
     } else {
         assemble_V_upper(ctx, prev_varcmp);
@@ -426,7 +743,6 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
                 ctx.Vi_use_llt = true;
                 return true;
             }
-            // dpotrf failed: reassemble from scratch (dpotrf may have partially overwritten Vi)
             ctx.Vi.resize(ctx.n, ctx.n);
             assemble_V_upper(ctx, prev_varcmp);
             LOGGER.w(0, "REML: final LLT factorization of V failed at convergence; falling back to dense inverse.");
@@ -444,17 +760,8 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
                 llt_ok = (gcta_dpotri(blas_n_f, ctx.Vi.data(), blas_n_f, 'U') == 0);
             }
             if (llt_ok) {
-                // No mirror here: every downstream consumer of a dense ctx.Vi
-                // (calcu_P_impl's Vi_X and its P construction) reads via
-                // selfadjointView<Eigen::Upper>()/triangularView<Eigen::Upper>(),
-                // exactly what dpotri('U') just populated -- mirroring the
-                // lower triangle here would be a redundant O(n^2/2) copy
-                // every REML iteration. The one consumer that genuinely
-                // needs a fully dense ctx.Vi (the rare X'V^{-1}X-not-PD
-                // fallback in calcu_P_impl) mirrors on demand there instead.
                 return true;
             }
-            // dpotrf/dpotri failed: reassemble for LU fallback
             ctx.Vi.resize(ctx.n, ctx.n);
             assemble_V_upper(ctx, prev_varcmp);
             ctx.Vi.triangularView<Eigen::Lower>() =
@@ -486,23 +793,25 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
 }
 
 double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
-    // Build Vi_X = V^{-1} X
     if (ctx.Vi_use_woodbury_basis) {
-        if (ctx.UkTX.rows() != ctx.woodbury_basis_rank_ || ctx.UkTX.cols() != ctx.X_c)
-            ctx.UkTX.noalias() = (ctx.Uk.transpose() * ctx.X.cast<float>()).cast<double>();
-        if ((int)ctx.UkTy.size() != ctx.woodbury_basis_rank_)
-            ctx.UkTy.noalias() = (ctx.Uk.transpose() * ctx.y.cast<float>()).cast<double>();
-        const RemlMat ck_UkTX = ctx.ck.asDiagonal() * ctx.UkTX;
-        ctx.Vi_X = (ctx.X - (ctx.Uk * ck_UkTX.cast<float>()).cast<double>()) / ctx.sigma2_eff;
-        ctx.Uk_Vi_X = (ctx.UkTX - ck_UkTX) / ctx.sigma2_eff;
+        ensure_woodbury_subspace_cache(ctx);
+        const double inv_s2 = 1.0 / ctx.sigma2_eff;
+        ctx.Uk_Vi_X = ((1.0 - ctx.ck.array()) * inv_s2).matrix().asDiagonal() * ctx.UkTX;
+        ctx.Xt_Vi_X_i.noalias()  = ctx.UkTX.transpose() * ctx.Uk_Vi_X;
+        ctx.Xt_Vi_X_i.noalias() += inv_s2 * ctx.wb_XtX_perp;
+        if (P) {
+            const RemlMat ck_UkTX = ctx.ck.asDiagonal() * ctx.UkTX;
+            ctx.Vi_X = (ctx.X - (ctx.Uk * ck_UkTX.cast<float>()).cast<double>()) * inv_s2;
+        }
     } else if (ctx.Vi_use_llt) {
         ctx.Vi_X = ctx.X;
         ctx.Vi_L.triangularView<Eigen::Upper>().adjoint().solveInPlace(ctx.Vi_X); // U^T z = X
         ctx.Vi_L.triangularView<Eigen::Upper>().solveInPlace(ctx.Vi_X);          // U w = z
+        ctx.Xt_Vi_X_i.noalias() = ctx.X.transpose() * ctx.Vi_X;
     } else {
         ctx.Vi_X.noalias() = ctx.Vi.selfadjointView<Eigen::Upper>() * ctx.X;
+        ctx.Xt_Vi_X_i.noalias() = ctx.X.transpose() * ctx.Vi_X;
     }
-    ctx.Xt_Vi_X_i.noalias() = ctx.X.transpose() * ctx.Vi_X;
 
     double logdet_Xt_Vi_X = 0.0;
     int rank = 0;
@@ -521,14 +830,12 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
         for (int j = 0; j < ctx.woodbury_basis_rank_; ++j)
             Uk_scaled.col(j) *= std::sqrt(ctx.ck[j] / ctx.sigma2_eff);
         ctx.Vi.selfadjointView<Eigen::Upper>().rankUpdate(Uk_scaled, -1.0);
-        // No mirror: P's rank-update below only reads ctx.Vi's upper triangle.
     } else if (ctx.Vi_use_llt) {
         ctx.Vi.swap(ctx.Vi_L);
         gcta_blas_int blas_n_p = static_cast<gcta_blas_int>(ctx.n);
         if (gcta_dpotri(blas_n_p, ctx.Vi.data(), blas_n_p, 'U') != 0)
             LOGGER.e(0, "dpotri failed when materialising V^{-1} for P.");
         ctx.Vi_use_llt = false;
-        // No mirror: P's rank-update below only reads ctx.Vi's upper triangle.
     }
 
     Eigen::LLT<RemlMat> llt(ctx.Xt_Vi_X_i);
@@ -540,10 +847,6 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
         if (ctx.reml_mtd == RemlAlg::Fisher)
             P->triangularView<Eigen::Lower>() = P->transpose();
     } else {
-        // Rare path (X'V^{-1}X not positive definite): the subtraction below
-        // is a plain dense op, not a triangular rank-update, so unlike the
-        // common case above it needs a fully mirrored ctx.Vi. Mirror here,
-        // on demand, rather than paying for it on every iteration above.
         ctx.Vi.triangularView<Eigen::Lower>() = ctx.Vi.transpose();
         RemlMat W;
         W.noalias() = ctx.Vi_X * ctx.Xt_Vi_X_i;
@@ -558,24 +861,23 @@ void calcu_tr_PA_woodbury(const RemlCtx& ctx, RemlVec& tr_PA, RemlVec* tr_PA_cor
     tr_PA.resize(ncomp);
 
     const double sigma2_eff = ctx.sigma2_eff;
+    const double inv_s2     = 1.0 / sigma2_eff;
     const double sg2        = ctx.sg2;
     const double se2        = sigma2_eff - sg2 * ctx.lambda_tail;
     const double lambda_t   = ctx.lambda_tail;
     const int    n          = ctx.n;
     const int    k          = ctx.woodbury_basis_rank_;
     const double sum_ck     = ctx.ck.sum();
-    const double tr_Vinv    = (n - sum_ck) / sigma2_eff;
+    const double tr_Vinv    = (n - sum_ck) * inv_s2;
     const double tr_Vinv_K  = (sg2 > 1e-15)
-        ? (n * lambda_t / sigma2_eff + (se2 / (sg2 * sigma2_eff)) * sum_ck)
+        ? (n * lambda_t * inv_s2 + (se2 / (sg2 * sigma2_eff)) * sum_ck)
         : tr_Vinv * lambda_t;
 
-    const int c = static_cast<int>(ctx.Vi_X.cols());
+    // Spectral-subspace Gram: Vi_X^T Vi_X = Uk_Vi_X^T Uk_Vi_X + inv_s2^2 * XtX_perp (O(k * c^2)).
+    const int c = ctx.X_c;
     RemlMat ViXTViX(c, c);
-    ViXTViX.noalias() = ctx.Vi_X.transpose() * ctx.Vi_X;
-    // trace(A*B) == (A.cwiseProduct(B.transpose())).sum() for any square A,B.
-    // Both Xt_Vi_X_i and ViXTViX are c x c (c = covariate count, typically 1-5);
-    // avoiding the c x c GEMM eliminates BLAS call overhead that would dominate
-    // the actual arithmetic at such small sizes.
+    ViXTViX.noalias()  = ctx.Uk_Vi_X.transpose() * ctx.Uk_Vi_X;
+    ViXTViX.noalias() += (inv_s2 * inv_s2) * ctx.wb_XtX_perp;
     const double tr_corr_I = ctx.Xt_Vi_X_i.cwiseProduct(ViXTViX.transpose()).sum();
 
     tr_PA(ncomp - 1) = tr_Vinv - tr_corr_I;
@@ -588,28 +890,15 @@ void calcu_tr_PA_woodbury(const RemlCtx& ctx, RemlVec& tr_PA, RemlVec* tr_PA_cor
 
     tr_PA(0) = tr_Vinv_K - tr_corr_K;
 
-    // Delta-method (second-order Taylor) correction for tail heterogeneity: the
-    // flat-tail approximation above treats every unretained eigenvalue as exactly
-    // lambda_tail, which is only exact in expectation to first order. tail_d_var
-    // (E[(d-lambda_tail)^2] over the tail) corrects the curvature terms this flat
-    // approximation misses. Mirrors the existing logdet correction in calcu_Vi
-    // (same r = sg2/sigma2_eff, same tail_d_var).
-    //
-    // NOT wired into tr_PA/live REML iteration -- that patching only this half 
-    // of the score while leaving the AImatrix / quadratic score term 
-    // (R, built in ai_reml from APy) uncorrected causes AI-REML to diverge once 
-    // a component hits its clamp (score and curvature stop describing the same 
-    // objective). This output is for a post-hoc, non-iterated correction only.
-    // See compute_woodbury_posthoc_delta, which reuses this output.
     if (tr_PA_corrected) {
         tr_PA_corrected->resize(ncomp);
         double tr_Vinv_c   = tr_Vinv;
         double tr_Vinv_K_c = tr_Vinv_K;
         if (ctx.tail_d_var > 0.0 && n > k) {
-            const double r = sg2 / sigma2_eff;
-            tr_Vinv_c   += static_cast<double>(n - k) * r * r * ctx.tail_d_var / sigma2_eff;
+            const double r = sg2 * inv_s2;
+            tr_Vinv_c   += static_cast<double>(n - k) * r * r * ctx.tail_d_var * inv_s2;
             tr_Vinv_K_c -= static_cast<double>(n - k) * sg2 * se2 * ctx.tail_d_var
-                          / (sigma2_eff * sigma2_eff * sigma2_eff);
+                          * (inv_s2 * inv_s2 * inv_s2);
         }
         (*tr_PA_corrected)(ncomp - 1) = tr_Vinv_c - tr_corr_I;
         (*tr_PA_corrected)(0)         = tr_Vinv_K_c - tr_corr_K;
@@ -655,94 +944,147 @@ void calcu_tr_PA_hutchpp(RemlCtx& ctx, RemlVec& tr_PA, RemlVec& tr_PA_var, int m
     tr_PA.resize(ncomp);
     tr_PA_var.resize(ncomp);
     const int k = std::max(m_probes / 3, 3);
+    const int n = ctx.n;
 
-    // Probe policy:
-    // - reml_hutchpp_fixed_probes=false: redraw every call/iteration.
-    // - reml_hutchpp_fixed_probes=true: keep probes fixed unless dimensions change.
-    const bool need_resize = (ctx.hutchpp_S.rows() != ctx.n || ctx.hutchpp_S.cols() != k);
+    const bool need_resize = (ctx.hutchpp_S.rows() != n || ctx.hutchpp_S.cols() != k);
     if (need_resize) {
-        ctx.hutchpp_S.resize(ctx.n, k);
-        ctx.hutchpp_G.resize(ctx.n, k);
-
-        // Persistent working-set scratch, sized once per (n,k) and reused
-        // across every REML iteration and every component (ci) below --
-        // this call sits in the hottest loop in the engine (once per ci per
-        // AI-REML iteration), and every one of these was previously a fresh
-        // stack RemlMat, i.e. malloc/free churn on each call. QG/MQG are
-        // n x 2k: Q and G are pushed through the PA operator in one fused
-        // call instead of two (see the ci loop below).
-        ctx.hutchpp_qr_scratch.resize(ctx.n, k);
-        ctx.hutchpp_K.resize(ctx.n, k);
-        ctx.hutchpp_Q.resize(ctx.n, k);
-        ctx.hutchpp_QG.resize(ctx.n, 2 * k);
-        ctx.hutchpp_MQG.resize(ctx.n, 2 * k);
+        ctx.hutchpp_S.resize(n, k);
+        ctx.hutchpp_G.resize(n, k);
+        ctx.hutchpp_qr_scratch.resize(n, k);
+        ctx.hutchpp_K.resize(n, k);
+        ctx.hutchpp_Q.resize(n, k);
+        ctx.hutchpp_QG.resize(n, 2 * k);
+        ctx.hutchpp_MQG.resize(n, 2 * k);
         ctx.hutchpp_QtG.resize(k, k);
-        ctx.hutchpp_R.resize(ctx.n, k);
-        ctx.hutchpp_MR.resize(ctx.n, k);
+        ctx.hutchpp_R.resize(n, k);
+        ctx.hutchpp_MR.resize(n, k);
     }
     if (need_resize || !ctx.reml_hutchpp_fixed_probes) {
-        std::uniform_int_distribution<int> coin(0, 1);
-        for (int j = 0; j < k; j++)
-            for (int r = 0; r < ctx.n; r++) {
-                ctx.hutchpp_S(r, j) = coin(gcta_eigh::shared_rng()) ? 1.0 : -1.0;
-                ctx.hutchpp_G(r, j) = coin(gcta_eigh::shared_rng()) ? 1.0 : -1.0;
+        // Parallel Rademacher probe generation: seed per-thread PRNGs serially
+        // from shared_rng(), then extract 32 sign bits per RNG draw in parallel.
+        const int nt = std::min(omp_get_max_threads(), k);
+        std::vector<uint32_t> seeds(static_cast<size_t>(nt));
+        for (int t = 0; t < nt; ++t) seeds[static_cast<size_t>(t)] = static_cast<uint32_t>(gcta_eigh::shared_rng()());
+        #pragma omp parallel num_threads(nt)
+        {
+            const int tid = omp_get_thread_num();
+            std::mt19937 local_rng(seeds[static_cast<size_t>(tid)]);
+            const int cols_per = (k + nt - 1) / nt;
+            const int c_lo = std::min(k, tid * cols_per);
+            const int c_hi = std::min(k, c_lo + cols_per);
+            for (int j = c_lo; j < c_hi; ++j) {
+                double* __restrict__ s_col = ctx.hutchpp_S.col(j).data();
+                double* __restrict__ g_col = ctx.hutchpp_G.col(j).data();
+                int r = 0;
+                while (r < n) {
+                    uint32_t bs = local_rng();
+                    uint32_t bg = local_rng();
+                    const int r_end = std::min(n, r + 32);
+                    for (; r < r_end; ++r, bs >>= 1, bg >>= 1) {
+                        s_col[r] = (bs & 1u) ? 1.0 : -1.0;
+                        g_col[r] = (bg & 1u) ? 1.0 : -1.0;
+                    }
+                }
             }
+        }
     }
 
+    Eigen::MatrixXd chol_qr_ws;
     for (int ci = 0; ci < ncomp; ci++) {
-        const bool is_I = (ctx.A[ctx.r_indx[ci]].size() == 0);
+        const bool is_I = (ctx.A[ctx.r_indx[ci]].size() == 0) && !(ctx.grm_chunk_rows > 0 && ci == 0)
+                          && !(ctx.Vi_use_woodbury_basis && ci == 0);
 
-        auto applyPA_mat = [&](const RemlMat& Z) -> RemlMat {
+        auto applyA_into = [&](const RemlMat& Z, RemlMat& AZ) {
             if (ctx.grm_chunk_rows > 0 && ci == 0) {
-                return applyP_mat(ctx, RemlMat(gcta_chunked::chunked_symmetric_matvec(
-                    ctx.grm_tile_reader, ctx.n, ctx.grm_chunk_rows, Z)));
+                chunked_grm_matvec_into(ctx, Z, AZ);
+            } else if (ctx.Vi_use_woodbury_basis && ci == 0) {
+                AZ = woodbury_basis_KZ(ctx, Z);
+            } else {
+                symm_upper_f32_mat_into(ctx.A[ctx.r_indx[ci]], Z, AZ);
             }
-            if (ctx.Vi_use_woodbury_basis && ci == 0) {
-                return applyP_mat(ctx, woodbury_basis_KZ(ctx, Z));
-            }
-            return is_I ? applyP_mat(ctx, Z)
-                        : applyP_mat(ctx, symm_upper_f32_mat(ctx.A[ctx.r_indx[ci]], Z));
         };
 
-        ctx.hutchpp_K.noalias() = applyPA_mat(ctx.hutchpp_S);
-        // reml_trace_power_iter is 0 in normal operation, so this loop is a
-        // no-op there; left on local temporaries rather than further hoisted
-        // scratch -- revisit if power_iter is ever turned back on.
-        for (int pw = 0; pw < ctx.reml_trace_power_iter; pw++) {
-            Eigen::HouseholderQR<RemlMat> qr_pw(ctx.hutchpp_K);
-            ctx.hutchpp_qr_scratch.setIdentity();
-            ctx.hutchpp_K.noalias() = applyPA_mat(qr_pw.householderQ() * ctx.hutchpp_qr_scratch);
+        // K = (P * A) * S using persistent scratch (zero per-iter heap allocations).
+        if (is_I) {
+            applyP_mat_into(ctx, ctx.hutchpp_S, ctx.hutchpp_K);
+        } else {
+            applyA_into(ctx.hutchpp_S, ctx.hutchpp_Q);
+            applyP_mat_into(ctx, ctx.hutchpp_Q, ctx.hutchpp_K);
         }
-        Eigen::HouseholderQR<RemlMat> qr(ctx.hutchpp_K);
-        ctx.hutchpp_qr_scratch.setIdentity();
-        ctx.hutchpp_Q.noalias() = qr.householderQ() * ctx.hutchpp_qr_scratch;
 
-        // Fused MQ/MG evaluation: applyPA_mat is linear in its argument for
-        // fixed ci, so applyPA_mat([Q G]) == [applyPA_mat(Q) applyPA_mat(G)]
-        // exactly -- no numerical change from the previous two-call form.
-        // One n x 2k call instead of two n x k calls halves the number of
-        // applyP_mat invocations (each pays the Vi_X^T*Z / correction-term
-        // overhead, plus a triangular solve on the LLT path) and gives the
-        // underlying GEMMs double the RHS width to amortize call overhead
-        // against. MQ/MG below are contiguous column-blocks of MQG (same
-        // leading dimension as the parent matrix), so they still dispatch to
-        // BLAS as plain submatrix GEMM operands, not a scalar fallback.
-        ctx.hutchpp_QG.leftCols(k)  = ctx.hutchpp_Q;
-        ctx.hutchpp_QG.rightCols(k) = ctx.hutchpp_G;
-        ctx.hutchpp_MQG.noalias() = applyPA_mat(ctx.hutchpp_QG);
+        // Power iterations + orthonormalization via multi-threaded Level-3 BLAS
+        // CholeskyQR2 (with automatic LAPACK dgeqrf/dorgqr fallback).
+        for (int pw = 0; pw < ctx.reml_trace_power_iter; pw++) {
+            const int info = gcta_cholesky_qr_thin_Q(
+                static_cast<gcta_blas_int>(n), static_cast<gcta_blas_int>(k),
+                ctx.hutchpp_K.data(), static_cast<gcta_blas_int>(n), &chol_qr_ws);
+            if (info != 0)
+                LOGGER.e(0, "calcu_tr_PA_hutchpp: orthogonalization failed (info=" + std::to_string(info) + ").");
+            if (is_I) {
+                applyP_mat_into(ctx, ctx.hutchpp_K, ctx.hutchpp_qr_scratch);
+                ctx.hutchpp_K.swap(ctx.hutchpp_qr_scratch);
+            } else {
+                applyA_into(ctx.hutchpp_K, ctx.hutchpp_Q);
+                applyP_mat_into(ctx, ctx.hutchpp_Q, ctx.hutchpp_K);
+            }
+        }
+        {
+            const int info = gcta_cholesky_qr_thin_Q(
+                static_cast<gcta_blas_int>(n), static_cast<gcta_blas_int>(k),
+                ctx.hutchpp_K.data(), static_cast<gcta_blas_int>(n), &chol_qr_ws);
+            if (info != 0)
+                LOGGER.e(0, "calcu_tr_PA_hutchpp: orthogonalization failed (info=" + std::to_string(info) + ").");
+            ctx.hutchpp_Q.swap(ctx.hutchpp_K);
+        }
+
+        // Fused MQ/MG evaluation: applyPA_mat([Q G]) into persistent MQG without
+        // transient n x 2k heap allocations.
+        {
+            const size_t col_bytes = static_cast<size_t>(n) * sizeof(double);
+            #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(k) >= 32768)
+            for (int j = 0; j < k; ++j) {
+                std::memcpy(ctx.hutchpp_QG.col(j).data(), ctx.hutchpp_Q.col(j).data(), col_bytes);
+                std::memcpy(ctx.hutchpp_QG.col(k + j).data(), ctx.hutchpp_G.col(j).data(), col_bytes);
+            }
+        }
+        if (is_I) {
+            applyP_mat_into(ctx, ctx.hutchpp_QG, ctx.hutchpp_MQG);
+        } else {
+            applyA_into(ctx.hutchpp_QG, ctx.hutchpp_MQG);
+            if (ctx.Vi_use_llt) {
+                applyP_mat_into(ctx, ctx.hutchpp_MQG, ctx.hutchpp_MQG);
+            } else {
+                // QG is no longer needed once A*QG is formed; reuse QG as output buffer and swap.
+                applyP_mat_into(ctx, ctx.hutchpp_MQG, ctx.hutchpp_QG);
+                ctx.hutchpp_MQG.swap(ctx.hutchpp_QG);
+            }
+        }
         const auto MQ = ctx.hutchpp_MQG.leftCols(k);
         const auto MG = ctx.hutchpp_MQG.rightCols(k);
 
-        const double t_lr = ctx.hutchpp_Q.cwiseProduct(MQ).sum();
+        double t_lr = 0.0;
+        #pragma omp parallel for reduction(+:t_lr) schedule(static)
+        for (int j = 0; j < k; ++j) {
+            t_lr += ctx.hutchpp_Q.col(j).dot(MQ.col(j));
+        }
 
         ctx.hutchpp_QtG.noalias() = ctx.hutchpp_Q.transpose() * ctx.hutchpp_G;
-        ctx.hutchpp_R.noalias()  = ctx.hutchpp_G - ctx.hutchpp_Q * ctx.hutchpp_QtG;
-        ctx.hutchpp_MR.noalias() = MG - MQ * ctx.hutchpp_QtG;
+        {
+            const size_t col_bytes = static_cast<size_t>(n) * sizeof(double);
+            #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(k) >= 32768)
+            for (int j = 0; j < k; ++j) {
+                std::memcpy(ctx.hutchpp_R.col(j).data(), ctx.hutchpp_G.col(j).data(), col_bytes);
+                std::memcpy(ctx.hutchpp_MR.col(j).data(), MG.col(j).data(), col_bytes);
+            }
+        }
+        ctx.hutchpp_R.noalias()  -= ctx.hutchpp_Q * ctx.hutchpp_QtG;
+        ctx.hutchpp_MR.noalias() -= MQ * ctx.hutchpp_QtG;
 
-        // per_col(j) is the j-th probe column's contribution to the residual
-        // trace estimate; their mean is the estimate itself (unchanged from
-        // before), their sample variance-of-the-mean is the noise-floor input.
-        const RemlVec per_col = ctx.hutchpp_R.cwiseProduct(ctx.hutchpp_MR).colwise().sum();  // k values
+        RemlVec per_col(k);
+        #pragma omp parallel for schedule(static)
+        for (int j = 0; j < k; ++j) {
+            per_col[j] = ctx.hutchpp_R.col(j).dot(ctx.hutchpp_MR.col(j));
+        }
         const double mean_r = per_col.mean();
         tr_PA(ci) = t_lr + mean_r;
         tr_PA_var(ci) = !ctx.reml_hutchpp_fixed_probes
@@ -756,55 +1098,101 @@ void calcu_tr_PA(const RemlCtx& ctx, const RemlMat& P, RemlVec& tr_PA) {
     tr_PA.resize(m);
     for (int i = 0; i < m; i++) {
         if (ctx.grm_chunk_rows > 0 && i == 0) {
-            // Exact GRM, streamed: tr(P*K) = <P,K>_F (both symmetric), computed
-            // from the same lower-triangular tiles assemble_V_upper reads, using
-            // the same diagonal/2*off-diagonal decomposition the dense branch
-            // below uses -- O(n^2), not a materialised O(n^3) K*P product.
-            // P is upper-triangle-only at this point (mirrors the dense branch).
-            const gcta_chunked::BlockPartition part(ctx.n, ctx.grm_chunk_rows);
-            const int nb = part.num_blocks();
+            const int eff_block = std::min(ctx.n, std::max(1, ctx.grm_chunk_rows));
             double s = 0.0;
-            // Serial, deliberately: ctx.grm_tile_reader is called directly here
-            // (not via a gcta_chunked::* helper), and every other direct caller
-            // in this file (assemble_V_upper's chunked block loop) is serial too
-            // -- the raw reader is presumably a single stateful file/mmap
-            // cursor, not proven safe for concurrent invocation the way the
-            // gcta_chunked:: wrapper functions are.
-            for (int bi = 0; bi < nb; ++bi) {
-                const int rs = part.block_start(bi), re = part.block_end(bi);
-                for (int bj = 0; bj <= bi; ++bj) {
-                    const int cs = part.block_start(bj), ce = part.block_end(bj);
-                    const auto tile = ctx.grm_tile_reader(rs, re, cs, ce);
-                    if (bi == bj) {
-                        for (int col = 0; col < re - rs; ++col) {
-                            s += P(rs + col, rs + col) * tile(col, col);
-                            if (col > 0)
-                                s += 2.0 * P.col(rs + col).segment(rs, col)
-                                            .dot(tile.row(col).head(col).transpose());
+            if (ctx.grm_tile_reader_f32 && ctx.grm_tile_reader_f32.has_transposed()) {
+                const std::vector<int> bands = ctx.grm_tile_reader_f32.compute_row_bands(ctx.n, eff_block);
+                const int nb = static_cast<int>(bands.size()) - 1;
+                auto sweep = ctx.grm_tile_reader_f32.begin_sweep(bands);
+                for (int b = 0; b < nb; ++b) {
+                    if (sweep) sweep->acquire(b);
+                    const int rs = bands[b], re = bands[b + 1];
+                    const int rows_i = re - rs;
+                    for (int cs = 0; cs < rs; cs += eff_block) {
+                        const int ce = std::min(cs + eff_block, rs);
+                        const int cols_j = ce - cs;
+                        const auto tile_T = ctx.grm_tile_reader_f32.read_T(rs, re, cs, ce);
+                        double tile_s = 0.0;
+                        #pragma omp parallel for reduction(+:tile_s) schedule(static)
+                        for (int col = 0; col < rows_i; ++col) {
+                            tile_s += P.col(rs + col).segment(cs, cols_j)
+                                          .dot(tile_T.col(col).cast<double>());
                         }
-                    } else {
-                        // Off-diagonal block: every (row,col) pair here is a
-                        // distinct i<j pair (block bj strictly precedes block
-                        // bi), visited exactly once across the (bi,bj) loop --
-                        // doubled per the symmetric decomposition, same as the
-                        // within-block off-diagonal term above.
-                        s += 2.0 * P.block(cs, rs, ce - cs, re - rs)
-                                    .cwiseProduct(tile.transpose()).sum();
+                        s += 2.0 * tile_s;
                     }
+                    {
+                        const auto tile_T = ctx.grm_tile_reader_f32.read_T(rs, re, rs, re);
+                        double tile_s = 0.0;
+                        #pragma omp parallel for reduction(+:tile_s) schedule(guided)
+                        for (int col = 0; col < rows_i; ++col) {
+                            tile_s += P(rs + col, rs + col) * static_cast<double>(tile_T(col, col));
+                            if (col > 0) {
+                                tile_s += 2.0 * P.col(rs + col).segment(rs, col)
+                                                    .dot(tile_T.col(col).head(col).cast<double>());
+                            }
+                        }
+                        s += tile_s;
+                    }
+                    if (sweep) sweep->release(b);
+                }
+            } else {
+                const std::vector<int> bands = ctx.grm_tile_reader.compute_row_bands(ctx.n, eff_block);
+                const int nb = static_cast<int>(bands.size()) - 1;
+                auto sweep = ctx.grm_tile_reader.begin_sweep(bands);
+                const bool use_T = ctx.grm_tile_reader.has_transposed();
+                for (int b = 0; b < nb; ++b) {
+                    if (sweep) sweep->acquire(b);
+                    const int rs = bands[b], re = bands[b + 1];
+                    const int rows_i = re - rs;
+                    for (int cs = 0; cs < rs; cs += eff_block) {
+                        const int ce = std::min(cs + eff_block, rs);
+                        const int cols_j = ce - cs;
+                        double tile_s = 0.0;
+                        if (use_T) {
+                            const auto tile_T = ctx.grm_tile_reader.read_T(rs, re, cs, ce);
+                            #pragma omp parallel for reduction(+:tile_s) schedule(static)
+                            for (int col = 0; col < rows_i; ++col) {
+                                tile_s += P.col(rs + col).segment(cs, cols_j).dot(tile_T.col(col));
+                            }
+                        } else {
+                            const auto tile = ctx.grm_tile_reader(rs, re, cs, ce);
+                            #pragma omp parallel for reduction(+:tile_s) schedule(static)
+                            for (int col = 0; col < rows_i; ++col) {
+                                tile_s += P.col(rs + col).segment(cs, cols_j).dot(tile.row(col).transpose());
+                            }
+                        }
+                        s += 2.0 * tile_s;
+                    }
+                    {
+                        double tile_s = 0.0;
+                        if (use_T) {
+                            const auto tile_T = ctx.grm_tile_reader.read_T(rs, re, rs, re);
+                            #pragma omp parallel for reduction(+:tile_s) schedule(guided)
+                            for (int col = 0; col < rows_i; ++col) {
+                                tile_s += P(rs + col, rs + col) * tile_T(col, col);
+                                if (col > 0)
+                                    tile_s += 2.0 * P.col(rs + col).segment(rs, col)
+                                                        .dot(tile_T.col(col).head(col));
+                            }
+                        } else {
+                            const auto tile = ctx.grm_tile_reader(rs, re, rs, re);
+                            #pragma omp parallel for reduction(+:tile_s) schedule(guided)
+                            for (int col = 0; col < rows_i; ++col) {
+                                tile_s += P(rs + col, rs + col) * tile(col, col);
+                                if (col > 0)
+                                    tile_s += 2.0 * P.col(rs + col).segment(rs, col)
+                                                        .dot(tile.row(col).head(col).transpose());
+                            }
+                        }
+                        s += tile_s;
+                    }
+                    if (sweep) sweep->release(b);
                 }
             }
             tr_PA(i) = s;
         } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
-            // Identity component: tr(PA) = tr(P). OMP parallel reduction over n
-            // scalar loads has more overhead than gain; let Eigen vectorise it.
             tr_PA(i) = P.diagonal().sum();
         } else {
-            // Ai is upper-triangle-only storage; Ai.col(col).tail(tail) read
-            // rows col+1..n-1 of column col (lower triangle), no longer
-            // valid. By symmetry Ai(col+1..n-1, col) == Ai(col, col+1..n-1)
-            // -- read row col instead. Correctness fix only for now, same
-            // as assemble_V_upper's pre-upper-triangle-swap fix -- not yet
-            // perf-traced against a contiguous-copy alternative.
             const auto& Ai = ctx.A[ctx.r_indx[i]];
             double s = 0.0;
             #pragma omp parallel for reduction(+:s) schedule(guided)
@@ -819,34 +1207,42 @@ void calcu_tr_PA(const RemlCtx& ctx, const RemlMat& P, RemlVec& tr_PA) {
 }
 
 void calcu_Hi(RemlCtx& ctx, RemlMat& P, RemlMat& Hi) {
-    P.triangularView<Eigen::Lower>() = P.transpose();
+    // Cache-blocked 64x64 parallel upper->lower mirror of P.
+    const int n = ctx.n;
+    {
+        constexpr int kMir = 64;
+        double* p_data = P.data();
+        #pragma omp parallel for schedule(guided) if (n >= 256)
+        for (int c0 = 0; c0 < n; c0 += kMir) {
+            const int c1 = std::min(n, c0 + kMir);
+            for (int r0 = c0; r0 < n; r0 += kMir) {
+                const int r1 = std::min(n, r0 + kMir);
+                for (int c = c0; c < c1; ++c) {
+                    const int r_lo = std::max(r0, c + 1);
+                    double* dst_col = p_data + static_cast<size_t>(c) * static_cast<size_t>(n);
+                    for (int r = r_lo; r < r1; ++r) {
+                        dst_col[r] = p_data[c + static_cast<size_t>(r) * static_cast<size_t>(n)];
+                    }
+                }
+            }
+        }
+    }
     const int m = static_cast<int>(ctx.r_indx.size());
 
     std::vector<RemlMat> PA(m);
     for (int i = 0; i < m; i++) {
         if (ctx.Vi_use_woodbury_basis && i == 0) {
-            // P is fully symmetrized above; use plain product for dgemm dispatch
-            // (dsymm is slower than dgemm for rectangular Uk on AOCL/Zen4).
             const RemlMat Uk_d = ctx.Uk.cast<double>();
-            RemlMat PUk(ctx.n, ctx.woodbury_basis_rank_);
+            RemlMat PUk(n, ctx.woodbury_basis_rank_);
             PUk.noalias() = P * Uk_d;
             RemlVec delta_v = ctx.dk.array() - ctx.lambda_tail;
             PA[i] = ctx.lambda_tail * P;
             PA[i].noalias() += PUk * delta_v.asDiagonal() * Uk_d.transpose();
         } else if (ctx.grm_chunk_rows > 0 && i == 0) {
-            // Exact GRM, streamed. P is already fully symmetrized above, so
-            // this is exactly the same chunked matvec used for APy/KX/Ky
-            // elsewhere, just against the whole (now dense) P instead of a
-            // handful of columns -- same O(n^3) cost class as the dense
-            // Ai.selfadjointView*P branch below, just streamed from disk.
-            PA[i] = gcta_chunked::chunked_symmetric_matvec(
-                ctx.grm_tile_reader, ctx.n, ctx.grm_chunk_rows, P);
+            chunked_grm_matvec_into(ctx, P, PA[i]);
         } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
             PA[i].resize(0, 0);
         } else {
-            // ctx.A is upper-triangle only; use symm_upper_f32_mat on A (panelled
-            // float32 ssymm) to avoid reading uninitialised lower-triangle elements
-            // and without widening the n x n matrix A to double.
             PA[i] = symm_upper_f32_mat(ctx.A[ctx.r_indx[i]], P);
         }
     }
@@ -855,11 +1251,21 @@ void calcu_Hi(RemlCtx& ctx, RemlMat& P, RemlMat& Hi) {
         const bool i_id = (PA[i].size() == 0);
         for (int j = 0; j <= i; j++) {
             const bool j_id = (PA[j].size() == 0);
-            double val;
-            if (i_id && j_id)       val = P.squaredNorm();
-            else if (i_id)          val = PA[j].cwiseProduct(P).sum();
-            else if (j_id)          val = PA[i].cwiseProduct(P).sum();
-            else                    val = PA[i].cwiseProduct(PA[j].transpose()).sum();
+            double val = 0.0;
+            if (i_id && j_id) {
+                #pragma omp parallel for reduction(+:val) schedule(static) if (n >= 256)
+                for (int c = 0; c < n; ++c) val += P.col(c).squaredNorm();
+            } else if (i_id) {
+                #pragma omp parallel for reduction(+:val) schedule(static) if (n >= 256)
+                for (int c = 0; c < n; ++c) val += PA[j].col(c).dot(P.col(c));
+            } else if (j_id) {
+                #pragma omp parallel for reduction(+:val) schedule(static) if (n >= 256)
+                for (int c = 0; c < n; ++c) val += PA[i].col(c).dot(P.col(c));
+            } else {
+                // tr((P A_i)(P A_j)) = sum_{r,c} PA_i(r,c) * PA_j(c,r)
+                #pragma omp parallel for reduction(+:val) schedule(static) if (n >= 256)
+                for (int c = 0; c < n; ++c) val += PA[i].col(c).dot(PA[j].row(c).transpose());
+            }
             Hi(i, j) = Hi(j, i) = val;
         }
     }
@@ -874,13 +1280,61 @@ void calcu_Hi(RemlCtx& ctx, RemlMat& P, RemlMat& Hi) {
     }
 }
 
+// Matrix-free inverse Average Information matrix Hi = (0.5 * APy^T P APy)^{-1}
+// for Woodbury (O(k * c^2) in spectral subspace) and Hutch++ (O(N) via applyP_mat)
+// modes, replacing the O(N^2) P_tmp materialisation on EM-REML / --reml-force-converge
+// / non-PD rollback paths (prevents 2 TB dense N x N OOM at N=500k).
+// Note: AI already includes the 0.5 factor (E[AI] = 0.5 * Fisher), so AI^{-1}
+// already matches the SE scaling of 2 * Fisher^{-1} with NO extra factor of 2.
+void compute_ai_Hi_matrix_free(RemlCtx& ctx, const RemlVec& Py, RemlMat& Hi) {
+    const int m = static_cast<int>(ctx.r_indx.size());
+    Hi.resize(m, m);
+
+    if (ctx.Vi_use_woodbury_basis) {
+        ensure_woodbury_subspace_cache(ctx);
+        const WoodburySubspaceVec Py_sub = wb_apply_P(ctx, wb_y_vec(ctx));
+        const WoodburySubspaceVec APy_0  = wb_apply_K(ctx, Py_sub);
+        const WoodburySubspaceVec& APy_1 = Py_sub;
+        const WoodburySubspaceVec PAPy_0 = wb_apply_P(ctx, APy_0);
+        const WoodburySubspaceVec PAPy_1 = wb_apply_P(ctx, APy_1);
+        Hi(0, 0) = 0.5 * wb_inner(ctx, APy_0, PAPy_0);
+        Hi(0, 1) = Hi(1, 0) = 0.5 * wb_inner(ctx, APy_0, PAPy_1);
+        Hi(1, 1) = 0.5 * wb_inner(ctx, APy_1, PAPy_1);
+    } else {
+        RemlMat APy(ctx.n, m);
+        for (int i = 0; i < m; ++i) {
+            if (ctx.grm_chunk_rows > 0 && i == 0)
+                APy.col(i) = chunked_grm_matvec_vec(ctx, Py);
+            else if (ctx.A[ctx.r_indx[i]].size() == 0)
+                APy.col(i) = Py;
+            else
+                APy.col(i) = symm_upper_f32_vec(ctx.A[ctx.r_indx[i]], Py);
+        }
+        const RemlMat PAPy = applyP_mat(ctx, APy);
+        Hi.noalias() = 0.5 * (APy.transpose() * PAPy);
+    }
+
+    if (!inverse_H(ctx, Hi)) {
+        if (ctx.reml_force_converge) {
+            LOGGER.w(0, "the information matrix is not invertible.");
+            ctx.reml_AI_not_invertible = true;
+        } else {
+            LOGGER.e(0, "the information matrix is not invertible.");
+        }
+    }
+}
+
 // Fisher-scoring REML update (legacy reml_equation equivalent).
 // Requires explicit P materialisation; reml_iteration enforces that for mtd==1.
-void reml_equation(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py, RemlVec& varcmp) {
+void reml_equation(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py, RemlVec& varcmp, double& yPy_out) {
     calcu_Hi(ctx, P, Hi);
-    if (ctx.reml_AI_not_invertible) return;
+    if (ctx.reml_AI_not_invertible) {
+        yPy_out = 0.0;
+        return;
+    }
 
     Py.noalias() = P.selfadjointView<Eigen::Lower>() * ctx.y;
+    yPy_out = ctx.y.dot(Py);
 
     const int m = static_cast<int>(ctx.r_indx.size());
     RemlVec R(m);
@@ -898,28 +1352,13 @@ void reml_equation(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py, RemlVec& 
     Hi = 2 * Hi;  // keep same SE convention as legacy path
 }
 
-// (1-alpha) quantile of the null (true-score == 0) distribution of
-// lambda_sq = U'*AI^{-1}*U, given U ~ N(0, diag(var_U)) — the diagonal
-// Hutch++ probe-noise covariance approximation. Under H0, lambda_sq is a
-// weighted sum of independent chi-square(1) variables (a quadratic form in
-// Gaussian noise), with weights = eigenvalues of
-//     B = diag(sqrt(var_U)) * AI^{-1} * diag(sqrt(var_U))
-// an m x m matrix (m = #variance components, so this eigendecomposition is
-// negligible cost regardless of n). Approximated via Satterthwaite/Welch
-// moment matching to a scaled chi-square g*Chi2_h, which matches the true
-// first two moments of the weighted sum exactly:
-//     mean = trace(B),  var = 2*trace(B^2)
-//     g = trace(B^2)/trace(B),  h = trace(B)^2/trace(B^2)
-// Returns 0 when var_U is (numerically) all-zero -- the deterministic
-// exact/Woodbury case, where there is no noise term and the caller's
-// logL-unit floor alone governs convergence.
 double newton_decrement_null_quantile(const RemlMat& Hi, const RemlVec& var_U, double alpha) {
     const RemlVec sqrt_var = var_U.cwiseMax(0.0).cwiseSqrt();
-    if (sqrt_var.squaredNorm() < 1e-300) return 0.0;   // fully deterministic; no noise term
+    if (sqrt_var.squaredNorm() < 1e-300) return 0.0;
     RemlMat B = sqrt_var.asDiagonal() * Hi * sqrt_var.asDiagonal();
-    B = 0.5 * (B + B.transpose());   // guard tiny asymmetry from floating-point roundoff
+    B = 0.5 * (B + B.transpose());
     const double trB  = B.trace();
-    const double trB2 = B.squaredNorm();   // == trace(B*B) for symmetric B
+    const double trB2 = B.squaredNorm();
     if (trB2 < 1e-300) return 0.0;
     const double g = trB2 / trB;
     const double h = trB * trB / trB2;
@@ -927,50 +1366,65 @@ double newton_decrement_null_quantile(const RemlMat& Hi, const RemlVec& var_U, d
     return g * boost::math::quantile(chi2, 1.0 - alpha);
 }
 
-// lambda_sq / var_U are only meaningful on return when this call succeeds
-// (i.e. reml_iteration hasn't already broken out via reml_AI_not_invertible)
-// — see call site.
 void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
              RemlVec& prev_varcmp, RemlVec& varcmp, double dlogL,
              double& lambda_sq, RemlVec& var_U,
-             bool last_step_trustworthy, double& step_scale_out) {
-    const bool use_approx     = ctx.reml_trace_hutchpp;
+             bool last_step_trustworthy, double& step_scale_out,
+             double& yPy_out) {
+    const bool use_approx            = ctx.reml_trace_hutchpp;
     const bool woodbury_basis_active = ctx.Vi_use_woodbury_basis;
-
-    if (use_approx || woodbury_basis_active)
-        Py = applyP_vec(ctx, ctx.y);
-    else
-        Py.noalias() = P.selfadjointView<Eigen::Upper>() * ctx.y;
-
     const int m = static_cast<int>(ctx.r_indx.size());
-    RemlMat APy(ctx.n, m);
-    for (int i = 0; i < m; i++) {
-        if (ctx.grm_chunk_rows > 0 && i == 0)
-            APy.col(i) = gcta_chunked::chunked_symmetric_matvec(
-                ctx.grm_tile_reader, ctx.n, ctx.grm_chunk_rows, Py);
-        else if (woodbury_basis_active && i == 0)
-            APy.col(i) = woodbury_basis_Kv(ctx, Py);
-        else if (ctx.A[ctx.r_indx[i]].size() == 0)
-            APy.col(i) = Py;
-        else
-            APy.col(i) = symm_upper_f32_vec(ctx.A[ctx.r_indx[i]], Py);
-    }
 
     RemlVec R(m);
-    if (use_approx || woodbury_basis_active) {
-        R.noalias() = APy.transpose() * Py;
-        const RemlMat PAPy = applyP_mat(ctx, APy);
-        Hi.noalias() = APy.transpose() * PAPy;
+    if (woodbury_basis_active) {
+        // Spectral-subspace AI-REML: O(k * c^2), zero Uk scans!
+        const WoodburySubspaceVec y_sub  = wb_y_vec(ctx);
+        const WoodburySubspaceVec Py_sub = wb_apply_P(ctx, y_sub);
+        yPy_out = wb_inner(ctx, y_sub, Py_sub);
+
+        const WoodburySubspaceVec APy_0  = wb_apply_K(ctx, Py_sub);
+        const WoodburySubspaceVec& APy_1 = Py_sub;
+        R(0) = wb_inner(ctx, APy_0, Py_sub);
+        R(1) = wb_inner(ctx, APy_1, Py_sub);
+
+        const WoodburySubspaceVec PAPy_0 = wb_apply_P(ctx, APy_0);
+        const WoodburySubspaceVec PAPy_1 = wb_apply_P(ctx, APy_1);
+        Hi.resize(m, m);
+        Hi(0, 0) = 0.5 * wb_inner(ctx, APy_0, PAPy_0);
+        Hi(0, 1) = Hi(1, 0) = 0.5 * wb_inner(ctx, APy_0, PAPy_1);
+        Hi(1, 1) = 0.5 * wb_inner(ctx, APy_1, PAPy_1);
     } else {
-        R.noalias() = APy.transpose() * Py;
-        RemlMat PAPy(ctx.n, m);
-        PAPy.noalias() = P.selfadjointView<Eigen::Upper>() * APy;
-        Hi.noalias() = APy.transpose() * PAPy;
+        if (use_approx)
+            Py = applyP_vec(ctx, ctx.y);
+        else
+            Py.noalias() = P.selfadjointView<Eigen::Upper>() * ctx.y;
+        yPy_out = ctx.y.dot(Py);
+
+        RemlMat APy(ctx.n, m);
+        for (int i = 0; i < m; i++) {
+            if (ctx.grm_chunk_rows > 0 && i == 0)
+                APy.col(i) = chunked_grm_matvec_vec(ctx, Py);
+            else if (ctx.A[ctx.r_indx[i]].size() == 0)
+                APy.col(i) = Py;
+            else
+                APy.col(i) = symm_upper_f32_vec(ctx.A[ctx.r_indx[i]], Py);
+        }
+
+        if (use_approx) {
+            R.noalias() = APy.transpose() * Py;
+            const RemlMat PAPy = applyP_mat(ctx, APy);
+            Hi.noalias() = APy.transpose() * PAPy;
+        } else {
+            R.noalias() = APy.transpose() * Py;
+            RemlMat PAPy(ctx.n, m);
+            PAPy.noalias() = P.selfadjointView<Eigen::Upper>() * APy;
+            Hi.noalias() = APy.transpose() * PAPy;
+        }
+        Hi = 0.5 * Hi;
     }
-    Hi = 0.5 * Hi;
 
     RemlVec tr_PA;
-    RemlVec tr_PA_var = RemlVec::Zero(m);   // deterministic (exact/Woodbury) => 0
+    RemlVec tr_PA_var = RemlVec::Zero(m);
     if (woodbury_basis_active) {
         calcu_tr_PA_woodbury(ctx, tr_PA);
     } else if (use_approx) {
@@ -992,28 +1446,9 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
             LOGGER.e(0, "the information matrix is not invertible.");
         }
     }
-    // Hi is now AI^{-1}. delta = AI^{-1}*U is both the Newton step and,
-    // via lambda_sq = U'*delta, the Newton decrement -- no extra solve.
     RemlVec delta = Hi * R;
     lambda_sq = R.dot(delta);
 
-    // Fraction-to-boundary rule (standard interior-point safeguard, e.g.
-    // Wachter & Biegler / Nocedal & Wright Ch.19; tau=0.995 is the
-    // conventional default, not tuned to any dataset). Applied unconditionally
-    // (both legacy and --reml-ai-robust paths), independent of the trust/
-    // curvature-confidence logic below: this is a geometry constraint, not a
-    // model-confidence one. A raw Newton step that would drive a variance
-    // component negative gets globally rescaled (not clamped component-wise
-    // after the fact) so it lands just short of the boundary instead of
-    // overrunning it and being force-floored by constrain_varcmp. This
-    // matters because a hard-clamped, artificially degenerate point (rather
-    // than wherever Newton's own trajectory would have stopped) produces an
-    // unreliable AI-matrix estimate on the *next* call -- observed directly
-    // on real data: a full step onto a clamped near-zero component was
-    // followed by a step with a genuine logL decrease, costing several
-    // iterations of recovery. This rule is a no-op whenever no component is
-    // within tau of the boundary, which is the overwhelming majority of
-    // steps.
     double fraction_to_boundary_cap = 1.0;
     {
         constexpr double tau = 0.995;
@@ -1025,36 +1460,9 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
         }
     }
 
-    // Step-size damping. Legacy behaviour (default): GCTA's original fixed
-    // 0.316 (~1/sqrt(10)) shrink whenever the *previous* iteration's logL
-    // change exceeded 1.0 -- an undocumented magic constant, and a backward-
-    // looking gate (dlogL says nothing about whether *this* step's local
-    // quadratic model is trustworthy).
-    //
-    // Under --reml-ai-robust: replace it with a continuous damped-Newton
-    // step scaled by the Newton decrement itself (lambda_sq, already computed
-    // above for the robust stopping criterion, reused here rather than
-    // introducing a second unrelated diagnostic). lambda_sq/2 is the predicted
-    // logL improvement from a full step; large lambda_sq means the current
-    // point is far enough from the optimum that the quadratic model backing
-    // Hi shouldn't be trusted at full strength, so the step is shrunk
-    // proportionally to sqrt(target_decrement / lambda_sq) rather than gated
-    // on an unrelated threshold. Converges to a full Newton step (scale -> 1)
-    // as lambda_sq -> 0, matching the legacy scheme's asymptotic behaviour
-    // near convergence while differing (continuously, not via a step
-    // function) far from it.
     double step_scale = 1.0;
     if (dlogL > 1.0) step_scale = 0.316;
     if (ctx.reml_mtd == RemlAlg::AI && ctx.reml_ai_robust) {
-        // last_step_trustworthy: the *previous* iteration's own quadratic
-        // model (lambda_sq/step_scale at the time) predicted a certain logL
-        // gain; if the actual gain came in close to that prediction, Hi has
-        // just been validated as locally trustworthy and this step takes
-        // the full Newton step rather than re-damping from scratch. This is
-        // one bit of memory, not a persistent radius -- no ratchet, no cap,
-        // no expand/shrink schedule. Falls back to exactly the pre-existing
-        // formula (unchanged target_decrement=0.5) whenever the previous
-        // step hasn't (yet) proven itself.
         constexpr double target_decrement = 0.5;
         step_scale = last_step_trustworthy
             ? 1.0
@@ -1063,79 +1471,75 @@ void ai_reml(RemlCtx& ctx, RemlMat& P, RemlMat& Hi, RemlVec& Py,
     step_scale = std::min(step_scale, fraction_to_boundary_cap);
     step_scale_out = step_scale;
 
-    // Var(U_i) = 0.25 * Var(tr_PA_i) since only tr_PA is stochastic (Hutch++).
-    // 0 for exact/Woodbury since tr_PA_var == 0. Left as a vector (not reduced
-    // to trace(AI^{-1}*Var(U)) here) so the caller can build the full
-    // null-distribution weight matrix, not just its trace.
     var_U = 0.25 * tr_PA_var;
     varcmp = prev_varcmp + step_scale * delta;
     if (ctx.reml_print_trajectory)
         LOGGER << "REML iteration: lambda_sq = " << std::to_string(lambda_sq) << ", step scale = " << std::to_string(step_scale) << ", delta = " << delta.transpose() << std::endl;
 }
 
-// tr_PA-only-corrected post-hoc step. No new matvec beyond what a converged
-// AI-REML run already computed -- Hi is reused as-is, R stays the existing
-// flat-tail approximation (woodbury_basis_Kv, O(n*k), no ctx.A needed).
-// Applied as a single step, NOT iterated, NOT secant-refined: iterating or
-// extrapolating this was shown earlier to accelerate rather than converge
-// (growing corrections at successively closer starting points), so this is
-// deliberately just one step from the actual converged point, nothing more.
-RemlVec compute_woodbury_posthoc_delta_simple(RemlCtx& ctx, const RemlMat& Hi, const RemlVec& Py) {
+// tr_PA-only-corrected post-hoc step in spectral subspace (O(k * c), zero Uk scans).
+RemlVec compute_woodbury_posthoc_delta_simple(RemlCtx& ctx, const RemlMat& Hi) {
     const int m = static_cast<int>(ctx.r_indx.size());
 
     RemlVec tr_PA(m), tr_PA_corrected(m);
     calcu_tr_PA_woodbury(ctx, tr_PA, &tr_PA_corrected);
 
+    const WoodburySubspaceVec Py_sub = wb_apply_P(ctx, wb_y_vec(ctx));
+    const WoodburySubspaceVec APy_0  = wb_apply_K(ctx, Py_sub);
     RemlVec R_flat(m);
-    R_flat(0) = Py.dot(woodbury_basis_Kv(ctx, Py));
-    for (int i = 1; i < m; i++) {
-        R_flat(i) = (ctx.A[ctx.r_indx[i]].size() == 0)
-            ? Py.dot(Py)
-            : Py.dot(symm_upper_f32_vec(ctx.A[ctx.r_indx[i]], Py));
-    }
+    R_flat(0) = wb_inner(ctx, APy_0, Py_sub);
+    R_flat(1) = wb_inner(ctx, Py_sub, Py_sub);
 
     const RemlVec U_partial = -0.5 * (tr_PA_corrected - R_flat);
     return Hi * U_partial;
 }
 
 void em_reml(RemlCtx& ctx, RemlMat& P, RemlVec& Py,
-             RemlVec& prev_varcmp, RemlVec& varcmp, double dlogL) {
+             RemlVec& prev_varcmp, RemlVec& varcmp, double dlogL,
+             double& yPy_out) {
     const bool woodbury_basis_active = ctx.Vi_use_woodbury_basis;
-    const bool use_approx     = ctx.reml_trace_hutchpp;
+    const bool use_approx            = ctx.reml_trace_hutchpp;
+    const int m = static_cast<int>(ctx.r_indx.size());
 
     RemlVec tr_PA;
+    RemlVec R(m);
     if (woodbury_basis_active) {
         calcu_tr_PA_woodbury(ctx, tr_PA);
-        Py = applyP_vec(ctx, ctx.y);
-    } else if (use_approx) {
-        const int eff_nprobes = (std::fabs(dlogL) < 1.0)
-            ? ctx.reml_trace_hutchpp_nprobes
-            : std::max(ctx.reml_trace_hutchpp_nprobes / 3, 30);
-        RemlVec tr_PA_var_unused;   // EM-REML has no Newton-decrement consumer
-        calcu_tr_PA_hutchpp(ctx, tr_PA, tr_PA_var_unused, eff_nprobes);
-        Py = applyP_vec(ctx, ctx.y);
+        const WoodburySubspaceVec y_sub  = wb_y_vec(ctx);
+        const WoodburySubspaceVec Py_sub = wb_apply_P(ctx, y_sub);
+        yPy_out = wb_inner(ctx, y_sub, Py_sub);
+        const WoodburySubspaceVec APy_0  = wb_apply_K(ctx, Py_sub);
+        R(0) = wb_inner(ctx, APy_0, Py_sub);
+        R(1) = wb_inner(ctx, Py_sub, Py_sub);
     } else {
-        calcu_tr_PA(ctx, P, tr_PA);
-        Py.noalias() = P.selfadjointView<Eigen::Upper>() * ctx.y;
+        if (use_approx) {
+            const int eff_nprobes = (std::fabs(dlogL) < 1.0)
+                ? ctx.reml_trace_hutchpp_nprobes
+                : std::max(ctx.reml_trace_hutchpp_nprobes / 3, 30);
+            RemlVec tr_PA_var_unused;
+            calcu_tr_PA_hutchpp(ctx, tr_PA, tr_PA_var_unused, eff_nprobes);
+            Py = applyP_vec(ctx, ctx.y);
+        } else {
+            calcu_tr_PA(ctx, P, tr_PA);
+            Py.noalias() = P.selfadjointView<Eigen::Upper>() * ctx.y;
+        }
+        yPy_out = ctx.y.dot(Py);
+
+        if (ctx.reml_tmp_n.size() != ctx.n) ctx.reml_tmp_n.resize(ctx.n);
+        for (int i = 0; i < m; i++) {
+            if (ctx.grm_chunk_rows > 0 && i == 0) {
+                ctx.reml_tmp_n = chunked_grm_matvec_vec(ctx, Py);
+                R(i) = Py.dot(ctx.reml_tmp_n);
+            } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
+                R(i) = Py.squaredNorm();
+            } else {
+                ctx.reml_tmp_n = symm_upper_f32_vec(ctx.A[ctx.r_indx[i]], Py);
+                R(i) = Py.dot(ctx.reml_tmp_n);
+            }
+        }
     }
 
-    const int m = static_cast<int>(ctx.r_indx.size());
-    RemlVec R(m);
-    if (ctx.reml_tmp_n.size() != ctx.n) ctx.reml_tmp_n.resize(ctx.n);
     for (int i = 0; i < m; i++) {
-        if (ctx.grm_chunk_rows > 0 && i == 0) {
-            ctx.reml_tmp_n = gcta_chunked::chunked_symmetric_matvec(
-                ctx.grm_tile_reader, ctx.n, ctx.grm_chunk_rows, Py);
-            R(i) = Py.dot(ctx.reml_tmp_n);
-        } else if (woodbury_basis_active && i == 0) {
-            ctx.reml_tmp_n = woodbury_basis_Kv(ctx, Py);
-            R(i) = Py.dot(ctx.reml_tmp_n);
-        } else if (ctx.A[ctx.r_indx[i]].size() == 0) {
-            R(i) = Py.squaredNorm();
-        } else {
-            ctx.reml_tmp_n = symm_upper_f32_vec(ctx.A[ctx.r_indx[i]], Py);
-            R(i) = Py.dot(ctx.reml_tmp_n);
-        }
         varcmp(i) = prev_varcmp(i) - prev_varcmp(i) * prev_varcmp(i) * (tr_PA(i) - R(i)) / ctx.n;
     }
     if (ctx.reml_print_trajectory)
@@ -1151,48 +1555,22 @@ double reml_iteration(RemlCtx& ctx,
     const RemlAlg reml_mtd_tmp = ctx.reml_mtd;
     double logdet = 0.0, logdet_Xt_Vi_X = 0.0;
     double prev_lgL = -1e20, lgL = -1e20, dlogL = 1000.0;
-    double lambda_sq = 1e300;   // only meaningful when reml_mtd == RemlAlg::AI
-    RemlVec var_U;              // ditto -- Var(U) per component, from Hutch++ probe noise (0 for exact/Woodbury)
+    double lambda_sq = 1e300;
+    RemlVec var_U;
     RemlVec prev_prev_varcmp(varcmp), prev_varcmp(varcmp), varcomp_init(varcmp);
 
-    // One-bit trust state for --reml-ai-robust's step scale (see ai_reml).
-    // rho_threshold=0.75 is the standard trust-region "model was good"
-    // cutoff (Nocedal & Wright), used here as a single yes/no gate rather
-    // than a graduated radius. Unused when reml_ai_robust is off.
-    //
-    // Starts true (optimistic): attempt a full Newton step immediately on
-    // iteration 0 rather than damping-by-default before there is any
-    // evidence damping is needed. Self-correcting -- if iteration 0's full
-    // step disappoints (rho <= rho_threshold, checked below), iteration 1
-    // falls straight back to the damped formula. This does remove all
-    // protection specifically on the single highest-risk step (zero prior
-    // evidence on Hi's trustworthiness) -- validate against a poorly-
-    // conditioned GRM, not just well-behaved data, before relying on this
-    // for production runs.
     constexpr double rho_threshold = 0.75;
     bool last_step_trustworthy = true;
     double step_scale_taken = 1.0;
     bool have_predicted = false;
     double predicted_dlogL = 0.0;
 
-    // ctx.reml_ai_robust_risk is the one number you set: the (Bonferroni,
-    // approximate) probability that ANY iteration across this whole run
-    // falsely declares convergence under H0, treating each iteration's fresh
-    // Hutch++ probe draw as an independent test of "is the true score zero".
-    // Dividing by reml_max_iter turns that into the per-iteration alpha the
-    // test actually consumes -- this is the same alpha as before, just
-    // reparameterised so it doesn't need re-justifying every time
-    // reml_max_iter changes, and so the number you're setting is the
-    // run-level quantity you actually care about rather than an intermediate
-    // one. (Independence across iterations is reasonable here specifically
-    // because fresh probes are redrawn every call -- see calcu_tr_PA_hutchpp
-    // -- but this is still an approximation, not a rigorous sequential test.)
     const double ai_robust_alpha_per_iter =
         ctx.reml_ai_robust_risk / std::max(1, ctx.reml_max_iter);
 
     if (ctx.reml_trace_hutchpp && !ctx.Vi_use_woodbury_basis) {
         LOGGER << "Using Hutch++ stochastic trace estimator with "
-               << ctx.reml_trace_hutchpp_nprobes << " " << (ctx.reml_hutchpp_fixed_probes ? "fixed" : "fresh")  << " probes." << std::endl;
+               << ctx.reml_trace_hutchpp_nprobes << " " << (ctx.reml_hutchpp_fixed_probes ? "fixed" : "fresh") << " probes." << std::endl;
     }
     if (ctx.reml_mtd == RemlAlg::AI && ctx.reml_ai_robust) {
         LOGGER << "Using Newton-decrement convergence criterion (--reml-ai-robust, "
@@ -1202,16 +1580,8 @@ double reml_iteration(RemlCtx& ctx,
     }
 
     bool converged_flag = false;
-    // small_delta_streak/M are only used by the legacy dlogL gate (mtd==1,
-    // mtd==2, and mtd==0 when --reml-ai-robust is off): a single small
-    // dlogL is a weak, uncalibrated signal there (no known false-stop rate),
-    // so repetition is the only cheap way to build confidence. The AI-robust
-    // path below doesn't need this -- the calibrated null-quantile test
-    // already bounds the false-stop probability directly via alpha, so a
-    // single iteration is sufficient by construction (see
-    // newton_decrement_null_quantile for the caveats on that calibration).
     int small_delta_streak = 0;
-    const int M = 1;   // consecutive small deltas required; small, fixed, not data-dependent
+    const int M = 1;
     double best_lgL = 0;
     RemlVec best_varcmp;
     for (iter = 0; iter < ctx.reml_max_iter; iter++) {
@@ -1226,23 +1596,11 @@ double reml_iteration(RemlCtx& ctx,
 
             if (!prior_var_flag) {
                 LOGGER << "Round 0 iteration using ";
-                // Fall back to EM-REML for round 0 whenever the run did NOT
-                // actually start from an HE warm-start point -- either
-                // because the user asked to skip it (--reml-no-he-start) or
-                // because init_varcomp's warm-start preconditions weren't
-                // met (multi-component model, priors supplied, or the HE
-                // regression itself was ill-conditioned/degenerate and
-                // declined to set varcmp). ctx.reml_no_HE_start alone isn't
-                // enough here: it only reflects the user's request, not
-                // whether a warm start was actually applied, and AI-REML's
-                // Newton step from the naive equal-split starting point is
-                // not reliably informative -- EM-REML is robust from any
-                // starting point.
                 if (ctx.reml_no_HE_start || !ctx.he_warm_start_applied) {
-                  ctx.reml_mtd = RemlAlg::EM;
-                  LOGGER << "EM-REML ..." << std::endl;
+                    ctx.reml_mtd = RemlAlg::EM;
+                    LOGGER << "EM-REML ..." << std::endl;
                 } else {
-                  LOGGER << "AI-REML ..." << std::endl;
+                    LOGGER << "AI-REML ..." << std::endl;
                 }
             }
         }
@@ -1257,13 +1615,20 @@ double reml_iteration(RemlCtx& ctx,
         if (!calcu_Vi(ctx, prev_varcmp, logdet, iter, skip_P_this_iter)) {
             LOGGER << "Warning: V matrix is not positive-definite." << std::endl;
             varcmp = prev_prev_varcmp;
-            if (!calcu_Vi(ctx, varcmp, logdet, iter, false))
-                LOGGER.e(0, "V matrix is not positive-definite.");
-            // Rebuild P for Hi computation in break path
-            RemlMat P_tmp(ctx.n, ctx.n);
-            calcu_P_impl(ctx, &P_tmp);
-            calcu_Hi(ctx, P_tmp, Hi);
-            Hi = 2 * Hi;
+            if (skip_P_this_iter) {
+                if (!calcu_Vi(ctx, varcmp, logdet, iter, true))
+                    LOGGER.e(0, "V matrix is not positive-definite.");
+                calcu_P_impl(ctx, nullptr);
+                if (!ctx.Vi_use_woodbury_basis) Py = applyP_vec(ctx, ctx.y);
+                compute_ai_Hi_matrix_free(ctx, Py, Hi);
+            } else {
+                if (!calcu_Vi(ctx, varcmp, logdet, iter, false))
+                    LOGGER.e(0, "V matrix is not positive-definite.");
+                RemlMat P_tmp(ctx.n, ctx.n);
+                calcu_P_impl(ctx, &P_tmp);
+                calcu_Hi(ctx, P_tmp, Hi);
+                Hi = 2 * Hi;
+            }
             break;
         }
 
@@ -1277,17 +1642,16 @@ double reml_iteration(RemlCtx& ctx,
         }
         logdet_Xt_Vi_X = logdet_Xt_Vi_X2;
 
+        double yPy = 0.0;
         if (ctx.reml_mtd == RemlAlg::AI)
             ai_reml(ctx, ctx.P, Hi, Py, prev_varcmp, varcmp, dlogL, lambda_sq, var_U,
-                    last_step_trustworthy, step_scale_taken);
+                    last_step_trustworthy, step_scale_taken, yPy);
         else if (ctx.reml_mtd == RemlAlg::Fisher)
-            reml_equation(ctx, ctx.P, Hi, Py, varcmp);
+            reml_equation(ctx, ctx.P, Hi, Py, varcmp, yPy);
         else if (ctx.reml_mtd == RemlAlg::EM)
-            em_reml(ctx, ctx.P, Py, prev_varcmp, varcmp, dlogL);
-        // mtd 1 (Fisher scoring) requires full P. skip_P_this_iter is false for
-        // mtd 1, so ctx.P is always materialised before reml_equation().
+            em_reml(ctx, ctx.P, Py, prev_varcmp, varcmp, dlogL, yPy);
 
-        lgL = -0.5 * (logdet_Xt_Vi_X + logdet + ctx.y.dot(Py));
+        lgL = -0.5 * (logdet_Xt_Vi_X + logdet + yPy);
 
         if (ctx.reml_force_converge && ctx.reml_AI_not_invertible) break;
 
@@ -1316,28 +1680,17 @@ double reml_iteration(RemlCtx& ctx,
         if ((ctx.reml_force_converge || ctx.reml_no_converge) && prev_lgL > lgL) {
             varcmp = prev_varcmp;
             if (skip_P_this_iter) {
-                RemlMat P_tmp;
-                calcu_P_impl(ctx, &P_tmp);
-                calcu_Hi(ctx, P_tmp, Hi);
+                // Matrix-free 2x2 AI matrix inverse: avoids 2 TB dense N x N P_tmp OOM.
+                compute_ai_Hi_matrix_free(ctx, Py, Hi);
             } else {
                 calcu_Hi(ctx, ctx.P, Hi);
+                Hi = 2 * Hi;
             }
-            Hi = 2 * Hi;
             break;
         }
 
         dlogL = lgL - prev_lgL;
 
-        // Judge the step just taken against its own prediction, for use by
-        // the *next* iteration's ai_reml call. Predicted gain for a step of
-        // size s along the Newton direction is lambda_sq*s*(1-s/2) (from
-        // delta'*AI*delta = delta'*U = lambda_sq, same identity used for the
-        // Newton-decrement convergence test below) -- no extra solve, reuses
-        // quantities ai_reml already computed. iter>0 guard: prev_lgL is
-        // still the -1e20 sentinel at iter==0, so round 0's step has nothing
-        // meaningful to be judged against yet -- last_step_trustworthy keeps
-        // its optimistic initial value through iteration 0 and only starts
-        // being judged from iteration 1 onward.
         const bool ai_robust_active_step = (ctx.reml_mtd == RemlAlg::AI && ctx.reml_ai_robust);
         if (ai_robust_active_step && iter > 0 && have_predicted && predicted_dlogL > 1e-12) {
             const double rho = dlogL / predicted_dlogL;
@@ -1355,32 +1708,6 @@ double reml_iteration(RemlCtx& ctx,
             have_predicted = true;
         }
 
-        // Convergence test. AI-REML (mtd==0) already computes AI^{-1} (Hi) and
-        // the score U every iteration to take its Newton step, so the Newton
-        // decrement lambda_sq = U'*AI^{-1}*U is a free byproduct with a known
-        // closed-form meaning: for a Newton step delta = AI^{-1}*U under
-        // curvature AI, the standard quadratic-approximation identity gives
-        //     logL(theta*) - logL(theta) ~= 0.5 * U'*delta = 0.5 * lambda_sq
-        // i.e. lambda_sq is (twice) the estimated log-likelihood gap remaining
-        // to the optimum -- not an abstract unitless number. That lets the
-        // floor be derived from an interpretable logL-unit tolerance
-        // (ctx.reml_ai_robust_tol, same unit/default as the old absolute
-        // dlogL<1e-4 gate) instead of being picked directly:
-        //     lambda_sq_floor = 2 * reml_ai_robust_tol
-        //
-        // Under Hutch++, newton_decrement_null_quantile(Hi, var_U, alpha)
-        // gives the (1-alpha) quantile of lambda_sq's own null distribution
-        // (Satterthwaite-calibrated, see its docstring) -- so this is a
-        // proper single-iteration hypothesis test with a chosen false-stop
-        // probability, not a mean-comparison needing repetition to trust.
-        // For exact/Woodbury, var_U == 0 so the quantile is 0 and this
-        // reduces to lambda_sq <= lambda_sq_floor.
-        //
-        // Fisher-scoring (mtd==1) and EM-REML (mtd==2) don't materialise AI^{-1}
-        // as part of their update (that's the point of EM), so no equally cheap
-        // curvature estimate is available there; they keep the legacy logL-delta
-        // gate, as does mtd==0 when --reml-ai-robust isn't set (this also
-        // covers the iter==0 EM burn-in step used to pick priors).
         bool like_small;
         const bool ai_robust_active = (ctx.reml_mtd == RemlAlg::AI && ctx.reml_ai_robust);
         if (ai_robust_active) {
@@ -1400,37 +1727,25 @@ double reml_iteration(RemlCtx& ctx,
         }
 
         if (ai_robust_active) {
-            // Single-shot calibrated test -- no repetition needed (see above).
             converged_flag = like_small;
         } else {
-            // Legacy path: require M consecutive small-delta iterations, not
-            // just one. A single small delta can occur by chance -- e.g.
-            // iteration 1 landing close to the prior logL purely because the
-            // starting variance-component guess was already near-optimal,
-            // with no evidence the underlying step itself has converged, and
-            // dlogL carries no calibrated false-stop-rate guarantee the way
-            // lambda_sq's null quantile does. Sustained small deltas are the
-            // fallback signal; costs at most M-1 extra iterations in the rare
-            // false-start case.
             small_delta_streak = like_small ? small_delta_streak + 1 : 0;
             converged_flag = (small_delta_streak >= M);
         }
 
         if (converged_flag) {
-            //varcmp = best_varcmp;   // report best-seen, not last-iterate //Deactivated on purpose without testing, as this would no longer be a "convergence" method.
             if (ctx.Vi_use_woodbury_basis && ctx.reml_mtd == RemlAlg::AI && ctx.woodbury_basis_posthoc_correction) {
-                const RemlVec delta_simple = compute_woodbury_posthoc_delta_simple(ctx, Hi, Py);   // side effect: logs the tr_PA correction
+                const RemlVec delta_simple = compute_woodbury_posthoc_delta_simple(ctx, Hi);
                 LOGGER << "REML: Woodbury post-hoc tail correction: delta = " << delta_simple.transpose() << std::endl;
             }
             if (ctx.reml_mtd == RemlAlg::EM) {
                 if (skip_P_this_iter) {
-                    RemlMat P_tmp;
-                    calcu_P_impl(ctx, &P_tmp);
-                    calcu_Hi(ctx, P_tmp, Hi);
+                    // Matrix-free 2x2 AI matrix inverse: avoids 2 TB dense N x N P_tmp OOM.
+                    compute_ai_Hi_matrix_free(ctx, Py, Hi);
                 } else {
                     calcu_Hi(ctx, ctx.P, Hi);
+                    Hi = 2 * Hi;
                 }
-                Hi = 2 * Hi;
             }
             break;
         }
@@ -1454,12 +1769,12 @@ double reml_iteration(RemlCtx& ctx,
             if (ctx.reml_max_iter > 1) LOGGER.e(0, errmsg.str());
         }
     }
-    // iter is zero-based in the loop; convert to total rounds executed.
     ctx.reml_iterations = std::max(0, iter + 1);
     ctx.P.resize(0, 0);
 
-    // Export final Vi_X and Xt_Vi_X_i to output parameters
-    Vi_X_out    = ctx.Vi_X;
+    if (!ctx.Vi_use_woodbury_basis) {
+        Vi_X_out = ctx.Vi_X;
+    }
     Xt_Vi_X_i_out = ctx.Xt_Vi_X_i;
 
     return lgL;
@@ -1485,13 +1800,12 @@ static int woodbury_initial_k_svd(const RemlCtx& ctx, WoodburyBasisSpec::Kind mo
     const int n = ctx.n;
     switch (mode) {
         case WoodburyBasisSpec::Kind::MP:
-            return std::min({n - 1, k_budget_ceiling, ctx.woodbury_basis_k_init});
         case WoodburyBasisSpec::Kind::EIG:
-            [[fallthrough]];
-        case WoodburyBasisSpec::Kind::VAR: {
-            const int start_guess = std::clamp(n / 20, ctx.woodbury_basis_k_init, ctx.woodbury_basis_k_max > 0 ? ctx.woodbury_basis_k_max : n - 1);
-            return std::min({n - 1, k_budget_ceiling, start_guess});
-        }
+        case WoodburyBasisSpec::Kind::VAR:
+            // Locked expansion (expand_symmetric_eigh) reuses every converged column
+            // across rounds with zero wasted work, so starting EIG/VAR at k_init
+            // avoids jumping straight to n/20 (k_max=25k at N>=500k) on low-rank GRMs.
+            return std::min({n - 1, k_budget_ceiling, ctx.woodbury_basis_k_init});
         case WoodburyBasisSpec::Kind::Fixed:
         default:
             return ctx.woodbury_basis ? ctx.woodbury_basis->fixed_rank : 0;
@@ -1753,7 +2067,9 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     int k_svd_budget_ceiling = n - 1;
     if (grm_chunked && ctx.svd_mem_budget_gb > 0.0) {
         const double budget_bytes = ctx.svd_mem_budget_gb * 1e9;
-        const int max_k_ext = static_cast<int>(budget_bytes / (5.0 * n * sizeof(float)));
+        // Peak live rSVD sketch memory is ~2.2-2.4 * n * k_ext * sizeof(float)
+        // (Q + AQ, with omega freed before power iterations and Q*Z rotated in-place).
+        const int max_k_ext = static_cast<int>(budget_bytes / (2.4 * n * sizeof(float)));
         k_svd_budget_ceiling = std::min(k_svd_budget_ceiling, std::max(20, max_k_ext - 200));
         LOGGER << "--reml-woodbury-basis-mem-budget=" << ctx.svd_mem_budget_gb
                << "GB -> k_svd capped at " << k_svd_budget_ceiling << std::endl;
@@ -1825,7 +2141,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
         // a pure win, not a tradeoff.
         double diag_sq = K_f32.diagonal().cast<double>().squaredNorm();
         double off_sq  = 0.0;
-        #pragma omp parallel for reduction(+:off_sq) schedule(static)
+        #pragma omp parallel for reduction(+:off_sq) schedule(guided)
         for (int j = 0; j < n; ++j)
             off_sq += K_f32.col(j).head(j).cast<double>().squaredNorm();
         trace_K2 = diag_sq + 2.0 * off_sq;
@@ -1851,13 +2167,14 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     double target_mass = (mode == WoodburyBasisSpec::Kind::EIG && have_chunked_traces)
         ? (ctx.woodbury_basis_eigen_mass * trace_K_full) : 0.0;
 
-    auto apply = [&](const Eigen::Ref<const Eigen::MatrixXf>& X) -> Eigen::MatrixXf {
+    auto apply = [&](const Eigen::Ref<const Eigen::MatrixXf>& X, bool exact_fp32) -> Eigen::MatrixXf {
+        const bool use_bf16 = !exact_fp32 && gcta_chunked::default_bf16_sketch();
         if (grm_chunked) {
             if (ctx.grm_tile_reader_f32) {
                 double* tr_ptr  = have_chunked_traces ? nullptr : &trace_K_full;
                 double* tr2_ptr = have_chunked_traces ? nullptr : &trace_K2;
                 Eigen::MatrixXf Y = gcta_chunked::chunked_symmetric_matvec_f32(
-                    ctx.grm_tile_reader_f32, n, grm_chunk_rows, X, tr_ptr, tr2_ptr);
+                    ctx.grm_tile_reader_f32, n, grm_chunk_rows, X, tr_ptr, tr2_ptr, use_bf16);
                 if (!have_chunked_traces) {
                     have_chunked_traces = true;
                     if (mode == WoodburyBasisSpec::Kind::EIG)
@@ -1875,10 +2192,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
             return gcta_chunked::chunked_symmetric_matvec(
                 ctx.grm_tile_reader, n, grm_chunk_rows, X.cast<double>()).cast<float>();
         }
-        // Return-by-value forces full evaluation into a fresh Eigen::MatrixXf
-        // temporary, not an in-place block write, so this is not subject to
-        // the selfadjointView-on-block-target scalar-fallback issue.
-        return K_f32.selfadjointView<Eigen::Upper>() * X;
+        return gcta_chunked::dense_upper_symm_f32(K_f32, X, use_bf16);
     };
 
     Eigen::VectorXd eval_full;
@@ -1901,6 +2215,10 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     if (!ctx.svd_nystrom && mode != WoodburyBasisSpec::Kind::Fixed)
         LOGGER << "Woodbury: rSVD power iterations = " << q_pow
                << "; rank expansions reuse converged Ritz vectors." << std::endl;
+
+    if (ctx.svd_nystrom && ctx.Uk.size() > 0) {
+        ctx.Uk.resize(0, 0);  // Nystrom does not consume warm-start vectors; release immediately
+    }
 
     for (;;) {
         const int oversample = gcta_eigh::recommended_oversample(k_svd);
@@ -1948,11 +2266,20 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                 }
             }
             if (!round_expanded) {
-                auto [omega, Y] = gcta_eigh::build_randomized_sketch<float>(apply, n, k_ext, nullptr);
+                const bool has_warm = (ctx.Uk.rows() == n && ctx.Uk.cols() > 0);
+                if (has_warm) {
+                    const int k_warm = std::min(static_cast<int>(ctx.Uk.cols()), k_ext);
+                    LOGGER << "Woodbury: seeding initial rSVD sketch with " << k_warm
+                           << " warm-start vector(s) (--reml-woodbury-basis-warm-start)." << std::endl;
+                }
+                // Copies ctx.Uk into omega and frees ctx.Uk BEFORE apply(omega) allocates Y.
+                auto [omega, Y] = gcta_eigh::build_randomized_sketch_consume<float>(
+                    apply, n, k_ext, has_warm ? &ctx.Uk : nullptr, /*exact_fp32=*/false);
                 omega.resize(0, 0);
+                const int k_proj = (mode == WoodburyBasisSpec::Kind::Fixed) ? k_svd : k_ext;
                 try {
                     gcta_eigh::EighResultF res =
-                        gcta_eigh::power_iterate_and_project<float>(apply, std::move(Y), k_ext, q_pow);
+                        gcta_eigh::power_iterate_and_project<float>(apply, std::move(Y), k_proj, q_pow);
                     eval_all  = std::move(res.eigenvalues);
                     evec_full = std::move(res.eigenvectors);
                 } catch (const std::exception& e) {
@@ -2054,10 +2381,13 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     th0.resize(0);
     eval_all.resize(0);
 
-    // Release dense/packed GRM K before finalizing/moving Uk unless post-hoc correction needs it.
+    // Release dense/packed/chunked GRM storage and tile readers immediately post-basis.
     if (!ctx.woodbury_basis_posthoc_correction) {
         ctx.A[ctx.r_indx[0]].resize(0, 0);
         if (ctx.grm_fp16_release) ctx.grm_fp16_release();
+        ctx.grm_tile_reader.release();
+        ctx.grm_tile_reader = nullptr;
+        ctx.grm_tile_reader_f32 = nullptr;
     }
 
     int k = finalize_and_log_woodbury_rank(mode, ctx, eval_full, k_svd, k_svd_budget_ceiling, lambda_plus, trace_K_full, trace_K2, eval_res);
@@ -2080,10 +2410,13 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                                     - ctx.lambda_tail * ctx.lambda_tail) : 0.0;
 
     ctx.dk = std::move(eval);
-    evec_full.conservativeResize(Eigen::NoChange, k);
+    if (evec_full.cols() != k) {
+        evec_full.conservativeResize(Eigen::NoChange, k);
+    }
     ctx.Uk = std::move(evec_full);
     ctx.woodbury_basis_rank_ = k;
     ctx.Vi_use_woodbury_basis = true;
+    ctx.wb_subspace_ready = false;
 
     LOGGER << "Woodbury basis: k=" << k
            << ", lambda_tail=" << ctx.lambda_tail
@@ -2135,6 +2468,7 @@ void compute(RemlCtx& ctx,
         if (ctx.Uk.rows() != ctx.n || ctx.Uk.cols() != ctx.woodbury_basis_rank_
                 || ctx.dk.size() != ctx.woodbury_basis_rank_)
             LOGGER.e(0, "--reml-woodbury-reuse: preloaded basis has inconsistent dimensions.");
+        ctx.wb_subspace_ready = false;
         LOGGER << "Woodbury basis reused: k=" << ctx.woodbury_basis_rank_
                << ", lambda_tail=" << ctx.lambda_tail << std::endl;
     } else if (ctx.woodbury_basis.has_value()) {
@@ -2148,22 +2482,24 @@ void compute(RemlCtx& ctx,
             LOGGER.e(0, "--grm-chunked-budget/--grm-fp16 with --reml-trace-hutchpp supports only single-GRM models.");
         ctx.grm_chunk_rows = setup_chunked_grm_stream(ctx, "--reml-trace-hutchpp");
     } else if (ctx.grm_chunked_budget > 0.0 || ctx.grm_fp16) {
-        // Plain exact (non-Hutch++, non-Woodbury) chunked/fp16 GRM. Without this
-        // branch ctx.grm_chunk_rows is never set for this path, so every
-        // downstream "ctx.grm_chunk_rows > 0" gate (ai_reml, em_reml,
-        // calcu_tr_PA, applyP_mat, init_varcomp's HE warm-start, ...) falls
-        // through to the "ctx.A[...].size() == 0" branch instead -- which
-        // silently treats the (empty, because it's streamed, not loaded)
-        // GRM component as an identity/residual term for the entire run.
         if ((int)ctx.r_indx.size() != 2)
             LOGGER.e(0, "--grm-chunked-budget/--grm-fp16 supports only single-GRM models.");
         ctx.grm_chunk_rows = setup_chunked_grm_stream(
             ctx, ctx.grm_fp16 ? "--grm-fp16" : "--grm-chunked-budget");
     }
 
-    RemlMat Vi_X_out(ctx.n, ctx.X_c), Xt_Vi_X_i_out(ctx.X_c, ctx.X_c);
+    // Precompute spectral-subspace cache once before HE warm-start and iter 0.
+    if (ctx.Vi_use_woodbury_basis) {
+        ensure_woodbury_subspace_cache(ctx);
+    }
+
+    RemlMat Vi_X_out, Xt_Vi_X_i_out(ctx.X_c, ctx.X_c);
     RemlMat Hi(ctx.r_indx.size(), ctx.r_indx.size());
-    RemlVec Py(ctx.n);
+    RemlVec Py;
+    if (!ctx.Vi_use_woodbury_basis) {
+        Vi_X_out.resize(ctx.n, ctx.X_c);
+        Py.resize(ctx.n);
+    }
     RemlVec varcmp;
     ctx.he_warm_start_applied = init_varcomp(ctx, priors_var, priors, varcmp);
 
@@ -2172,7 +2508,12 @@ void compute(RemlCtx& ctx,
     ctx.has_logL = true;
 
     // Compute fixed effects: b = (X'V^{-1}X)^{-1} X'V^{-1}y
-    ctx.b = Xt_Vi_X_i_out * (Vi_X_out.transpose() * ctx.y);
+    if (ctx.Vi_use_woodbury_basis) {
+        const RemlVec XtViy = ctx.Uk_Vi_X.transpose() * ctx.UkTy + ctx.wb_Xty_perp / ctx.sigma2_eff;
+        ctx.b = Xt_Vi_X_i_out * XtViy;
+    } else {
+        ctx.b = Xt_Vi_X_i_out * (Vi_X_out.transpose() * ctx.y);
+    }
 
     // Store variance components as a std::vector
     ctx.varcmp.resize(ctx.r_indx.size());
@@ -2238,24 +2579,42 @@ RemlState build_reml_state(RemlCtx& ctx) {
                             .cast<float>();
 
     if (ctx.Vi_use_woodbury_basis) {
-        // WoodburyMLMACache stores Uk_f as k×n (transposed) for GEMM efficiency.
-        // ctx.Uk is n×k — parallel transpose+cast across all cores.
+        // WoodburyMLMACache stores Uk_f as k×n ColMajor for GEMM efficiency.
+        // Cache-block (64x64) the n×k -> k×n float32 transpose to eliminate
+        // 2 MB-stride cache/STLB misses (40-60 s -> ~0.2 s at N=500k, k=20k).
         const Eigen::Index k = ctx.Uk.cols();
         const Eigen::Index n = ctx.Uk.rows();
         rs.wb.Uk_f.resize(k, n);
-        #pragma omp parallel for schedule(static)
-        for (Eigen::Index i = 0; i < n; ++i) {
-            for (Eigen::Index j = 0; j < k; ++j)
-                rs.wb.Uk_f(j, i) = static_cast<float>(ctx.Uk(i, j));
+        gcta_numa_interleave(rs.wb.Uk_f.data(),
+                             static_cast<size_t>(k) * static_cast<size_t>(n) * sizeof(float));
+        constexpr Eigen::Index kBlock = 64;
+        const float* src_base = ctx.Uk.data();
+        float* dst_base = rs.wb.Uk_f.data();
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (Eigen::Index i0 = 0; i0 < n; i0 += kBlock) {
+            for (Eigen::Index j0 = 0; j0 < k; j0 += kBlock) {
+                const Eigen::Index i1 = std::min(n, i0 + kBlock);
+                const Eigen::Index j1 = std::min(k, j0 + kBlock);
+                alignas(64) float tile[kBlock][kBlock + 4];
+                const Eigen::Index ilen = i1 - i0;
+                const Eigen::Index jlen = j1 - j0;
+                for (Eigen::Index j = 0; j < jlen; ++j) {
+                    const float* src_col = src_base + i0 + static_cast<size_t>(j0 + j) * static_cast<size_t>(n);
+                    for (Eigen::Index i = 0; i < ilen; ++i) {
+                        tile[i][j] = src_col[i];
+                    }
+                }
+                for (Eigen::Index i = 0; i < ilen; ++i) {
+                    float* dst_col = dst_base + j0 + static_cast<size_t>(i0 + i) * static_cast<size_t>(k);
+                    std::memcpy(dst_col, tile[i], static_cast<size_t>(jlen) * sizeof(float));
+                }
+            }
         }
-        ctx.Uk.resize(0, 0); //free double buffer immediately -- nothing below reads it again,
-                              //same rationale as the ck/dk frees just below (was previously held
-                              //alive through the ck/dk conversions for no reason; n×k doubles,
-                              //typically the largest buffer in this branch)
+        ctx.Uk.resize(0, 0); // free float32 ctx.Uk immediately now that Uk_f is populated
 
         rs.wb.ck_f.resize(ctx.ck.size());
-        rs.wb.ck_f.noalias() = ctx.ck.cast<float>(); //convert double to float
-        ctx.ck.resize(0); //free double buffer immediately (both are temporarily alive for 1.5x the size of Uk_f)
+        rs.wb.ck_f.noalias() = ctx.ck.cast<float>();
+        ctx.ck.resize(0);
 
         rs.wb.sqrt_ck_f.resize(rs.wb.ck_f.size());
         rs.wb.sqrt_ck_f.noalias() = rs.wb.ck_f.cwiseSqrt();
@@ -2275,6 +2634,8 @@ RemlState build_reml_state(RemlCtx& ctx) {
         rs.is_llt = true;
         const Eigen::Index n = ctx.Vi_L.cols();
         rs.Vi_L_f.resize(ctx.Vi_L.rows(), n);
+        gcta_numa_interleave(rs.Vi_L_f.data(),
+                             static_cast<size_t>(ctx.Vi_L.rows()) * static_cast<size_t>(n) * sizeof(float));
         #pragma omp parallel for schedule(guided)
         for (Eigen::Index j = 0; j < n; ++j) {
             rs.Vi_L_f.col(j).head(j + 1).noalias() =
@@ -2282,17 +2643,14 @@ RemlState build_reml_state(RemlCtx& ctx) {
         }
         ctx.Vi_L.resize(0, 0);
     } else {
-        // reml_diagV_adj fallback: ctx.Vi is already the dense explicit
-        // V^{-1} (computed once, O(n³), inside calcu_Vi). Factor it here —
-        // once — so the streaming code always applies V^{-1} via a
-        // triangular product (TRMM/STRMM) instead of holding a dense matrix
-        // and re-deriving a usable factor from it at association time.
         gcta_blas_int blas_n_bs = static_cast<gcta_blas_int>(ctx.n);
         if (gcta_dpotrf(blas_n_bs, ctx.Vi.data(), blas_n_bs, 'U') != 0)
             LOGGER.e(0, "Vi is not positive definite when building REML state.");
         rs.is_llt = false;
         const Eigen::Index n = static_cast<Eigen::Index>(ctx.n);
         rs.Vi_L_f.resize(n, n);
+        gcta_numa_interleave(rs.Vi_L_f.data(),
+                             static_cast<size_t>(n) * static_cast<size_t>(n) * sizeof(float));
         #pragma omp parallel for schedule(guided)
         for (Eigen::Index j = 0; j < n; ++j) {
             rs.Vi_L_f.col(j).head(j + 1).noalias() =
@@ -2305,6 +2663,7 @@ RemlState build_reml_state(RemlCtx& ctx) {
     // copies are created. The downstream MLMA stream uses only the float state.
     ctx.A.clear();
     if (ctx.grm_fp16_release) ctx.grm_fp16_release();
+    ctx.grm_tile_reader.release();
     ctx.grm_tile_reader = nullptr;
     ctx.grm_tile_reader_f32 = nullptr;
     ctx.grm_N.resize(0, 0);
@@ -2313,6 +2672,10 @@ RemlState build_reml_state(RemlCtx& ctx) {
     ctx.Uk_Vi_X.resize(0, 0);
     ctx.UkTX.resize(0, 0);
     ctx.UkTy.resize(0, 0);
+    ctx.wb_subspace_ready = false;
+    ctx.wb_XtX_perp.resize(0, 0);
+    ctx.wb_Xty_perp.resize(0);
+    ctx.wb_yty_perp = 0.0;
     ctx.hutchpp_S.resize(0, 0);
     ctx.hutchpp_G.resize(0, 0);
     ctx.hutchpp_qr_scratch.resize(0, 0);

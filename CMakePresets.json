@@ -81,6 +81,36 @@
       }
     },
     {
+      "name": "linux-aocl-znver4",
+      "displayName": "Linux (AOCL, Zen 4 AVX-512)",
+      "description": "Release build on Linux targeting AMD Zen 4 (-march=znver4 -mtune=znver4) with AOCL",
+      "inherits": "linux-aocl",
+      "cacheVariables": {
+        "GCTA_MARCH": "znver4",
+        "GCTA_MTUNE": "znver4"
+      }
+    },
+    {
+      "name": "linux-aocc-aocl-znver4",
+      "displayName": "Linux (AOCC >= 6.0 + AOCL + amdalloc, Zen 4 AVX-512)",
+      "description": "Release build with AMD AOCC (aoc/aoc++), AOCL, and bundled libamdalloc.so targeting Zen 4",
+      "inherits": "linux-aocc-aocl",
+      "cacheVariables": {
+        "GCTA_MARCH": "znver4",
+        "GCTA_MTUNE": "znver4"
+      }
+    },
+    {
+      "name": "linux-aocc-aocl-mkl-znver4",
+      "displayName": "Linux (AOCC >= 6.0 + AOCL BLAS + MKL LAPACK + amdalloc, Zen 4 AVX-512)",
+      "description": "Hybrid Zen 4 build pairing AOCL BLAS with MKL multithreaded LAPACK (dsyevd/dsyevr)",
+      "inherits": "linux-aocc-aocl-mkl",
+      "cacheVariables": {
+        "GCTA_MARCH": "znver4",
+        "GCTA_MTUNE": "znver4"
+      }
+    },
+    {
       "name": "linux-mkl",
       "displayName": "Linux (MKL)",
       "description": "Release build on Linux using Intel MKL ($env{MKLROOT})",
@@ -131,6 +161,18 @@
     {
       "name": "linux-aocc-aocl-mkl",
       "configurePreset": "linux-aocc-aocl-mkl"
+    },
+    {
+      "name": "linux-aocl-znver4",
+      "configurePreset": "linux-aocl-znver4"
+    },
+    {
+      "name": "linux-aocc-aocl-znver4",
+      "configurePreset": "linux-aocc-aocl-znver4"
+    },
+    {
+      "name": "linux-aocc-aocl-mkl-znver4",
+      "configurePreset": "linux-aocc-aocl-mkl-znver4"
     },
     {
       "name": "linux-mkl",

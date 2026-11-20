@@ -31,7 +31,7 @@
 // need to interpret it call Geno::getGenoDouble(buf.data(), i, &item).
 // --------------------------------------------------------------------------
 struct GenoBlock {
-    std::vector<uintptr_t, AlignedAllocator<uintptr_t, 64>> buf;  ///< 64-byte aligned packed data
+    AlignedRawBuffer<uintptr_t, 64> buf{/*interleave=*/true}; ///< 64-byte aligned uninitialized packed data
     std::span<const uint32_t> extractIndex; ///< marker extract-indices view for this block
     uint32_t               numMarkers   = 0;
     uint8_t                sexChromType = 0; ///< 0=non-sex, 1=homogametic, 2=heterogametic

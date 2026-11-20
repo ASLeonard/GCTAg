@@ -34,6 +34,7 @@ void GenoBackend::stream(std::span<const uint32_t> extractIndex, Callback callba
     std::exception_ptr ioError;
 
     std::jthread ioThread([&](std::stop_token stopToken) {
+        gcta_restore_initial_affinity();
         try {
             auto producer = makeProducer(extractIndex);
             while (!stopToken.stop_requested()) {

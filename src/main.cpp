@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <format>
 #include <string>
 #include <string_view>
@@ -119,9 +120,10 @@ string compute_log_prefix(const gcta_cli::ParsedCli& parsed, bool& out_was_expli
     return base;
 }
 
-int resolve_threads(const gcta_cli::ParsedCli& parsed, bool& is_threaded) {
+int resolve_threads(const gcta_cli::ParsedCli& parsed, bool& is_threaded, bool& explicit_threads) {
     int thread_num = 1;
     is_threaded = false;
+    explicit_threads = false;
 
     if (const char* env_threads = std::getenv("OMP_NUM_THREADS")) {
         try {
@@ -137,6 +139,7 @@ int resolve_threads(const gcta_cli::ParsedCli& parsed, bool& is_threaded) {
     if (parsed.global.threads.has_value()) {
         thread_num = *parsed.global.threads;
         is_threaded = true;
+        explicit_threads = true;
         return thread_num;
     }
 
@@ -148,6 +151,7 @@ int resolve_threads(const gcta_cli::ParsedCli& parsed, bool& is_threaded) {
                     if (v > 0) {
                         thread_num = v;
                         is_threaded = true;
+                        explicit_threads = true;
                     }
                 } catch (...) {
                 }
@@ -158,13 +162,45 @@ int resolve_threads(const gcta_cli::ParsedCli& parsed, bool& is_threaded) {
     return thread_num;
 }
 
-void configure_threading(int thread_num) {
+void configure_threading(int thread_num, bool explicit_threads) {
+    // Snapshot initial CPU affinity BEFORE any OpenMP runtime initialization
+    // so background I/O threads can restore it instead of inheriting Core-0 binding.
+    gcta_snapshot_initial_affinity();
+
+#if defined(GCTA_USE_AOCL) && !defined(GCTA_LAPACKE_IS_MKL)
+    // Short spin prevents microsecond futex storms between back-to-back
+    // BLIS/AOCL-DLP/OMP regions while still sleeping during disk I/O.
+    // overwrite=0 respects explicit user overrides (e.g. KMP_BLOCKTIME=0).
+    setenv("KMP_BLOCKTIME", "5", 0);
+    setenv("GOMP_SPINCOUNT", "50000", 0);
+#else
     // Make OMP worker threads sleep immediately after a parallel region ends,
     // rather than spin-waiting. Spinning threads consume memory bandwidth and
-    // starve BLAS (MKL/OpenBLAS) calls that follow parallel regions.
+    // starve BLAS (MKL/OpenBLAS/Accelerate) calls that follow parallel regions.
     setenv("KMP_BLOCKTIME", "0", 0);   // 0 = don't override user setting
     setenv("GOMP_SPINCOUNT", "0", 0);
-    setenv("OMP_NUM_THREADS", to_string(thread_num).c_str(), 1);
+#endif
+
+#if defined(__linux__)
+    const char* disable_numa_env = std::getenv("GCTA_DISABLE_NUMA");
+    const bool disable_numa = (disable_numa_env != nullptr && std::strcmp(disable_numa_env, "0") != 0);
+    if (thread_num > 1 && !disable_numa) {
+        // Spread threads evenly across NUMA domains / CCDs to unlock full DDR5
+        // channel bandwidth & L3 capacity; overwrite=0 respects user/Slurm env.
+        setenv("OMP_PROC_BIND", "spread", 0);
+        setenv("OMP_PLACES", "cores", 0);
+    }
+#endif
+
+    const string thread_str = to_string(thread_num);
+    setenv("OMP_NUM_THREADS", thread_str.c_str(), 1);
+#if defined(GCTA_USE_AOCL)
+    const int aocl_overwrite = explicit_threads ? 1 : 0;
+    setenv("BLIS_NUM_THREADS", thread_str.c_str(), aocl_overwrite);
+    setenv("DLP_NUM_THREADS", thread_str.c_str(), aocl_overwrite);
+#else
+    (void)explicit_threads;
+#endif
 #if defined(GCTA_USE_MKL) || defined(GCTA_LAPACKE_IS_MKL)
     // libmkl_rt.so reads MKL_THREADING_LAYER lazily on first call; match the
     // OpenMP runtime linked by this compiler while respecting user overrides.
@@ -237,8 +273,9 @@ int main(int argc, char* argv[]) {
     }
 
     bool is_threaded = false;
-    const int thread_num = resolve_threads(parsed, is_threaded);
-    configure_threading(thread_num);
+    bool explicit_threads = false;
+    const int thread_num = resolve_threads(parsed, is_threaded, explicit_threads);
+    configure_threading(thread_num, explicit_threads);
 
     LOGGER.open(log_prefix + ".log");
     out_ver(true);

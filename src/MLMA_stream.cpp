@@ -31,6 +31,7 @@
  */
 
 
+#include "MLMA.h"
 #include "MLMA_stream_common.hpp"
 #include "Covar.h"
 #include "main/StatFunc.h"
@@ -44,7 +45,6 @@
 
 #include <Eigen/Dense>
 #include <fstream>
-#include <sstream>
 #include <unordered_map>
 #include <string>
 #include <string_view>
@@ -60,6 +60,9 @@
 #include <cstdio>
 #include <cstring>
 #include <cerrno>
+#ifdef _OPENMP
+  #include <omp.h>
+#endif
 
 using std::string;
 using std::to_string;
@@ -208,6 +211,7 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
 
     const RemlPrefix prefix = read_reml_prefix(fd, filename);
     check_reml_samples(fd, prefix, expected_n, expected_id_hash, filename);
+    gcta_fadvise_sequential(fd);
 
     // --- Header (already read and validated above) ---
     const Header& hdr = prefix.hdr;
@@ -229,6 +233,8 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
         st.is_llt = (factor_kind == 0);
 
         st.Vi_L_f.resize(hdr.n, hdr.n);
+        gcta_numa_interleave(st.Vi_L_f.data(),
+                             static_cast<size_t>(hdr.n) * static_cast<size_t>(hdr.n) * sizeof(float));
 
         const size_t tri = static_cast<size_t>(hdr.n) * (hdr.n + 1) / 2;
 
@@ -242,8 +248,7 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
         constexpr size_t kUnpackWindowBytes = 1ULL << 29; // 512 MiB
         LOGGER.i(0, "Reading [" + filename + "]'s packed Vi_L block in " +
                     to_string(kUnpackWindowBytes >> 20) + " MiB windows.");
-        std::vector<char> chunk_buf;
-        chunk_buf.reserve(std::min(kUnpackWindowBytes, tri * sizeof(float)));
+        AlignedRawBuffer<char, 64> chunk_buf(std::min(kUnpackWindowBytes, tri * sizeof(float)));
 
         int32_t j = 0;
         while (j < hdr.n) {
@@ -272,6 +277,7 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
 
             j = j_end;
         }
+        chunk_buf.reset();
 
         if (!no_adj_covar) {
             st.b.resize(hdr.x_c);
@@ -281,6 +287,7 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
         st.varcmp.resize(hdr.num_varcmp);
         read_exact(fd, st.varcmp.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float), filename);
 
+        gcta_fadvise_dontneed(fd);
         close(fd);
         return st;
     }
@@ -305,12 +312,42 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
         (void)tail_d_var;
 
         // Uk is stored k x n, column-major -- byte-identical to Eigen::MatrixXf(k, n)'s
-        // own packed layout (unlike the GOBY block above, no reshape/repack is
-        // needed here: the write side's transpose+cast from ctx.Uk's n x k layout
-        // already produced this exact k x n on-disk shape). Read straight into
-        // Uk.data(); no staging buffer, at any k or n.
+        // packed layout. Stage reads through a 64 MiB buffer and parallel-copy into
+        // NUMA-interleaved Uk so multi-GB pages are faulted across all cores/nodes
+        // instead of pinned to Core 0's NUMA domain by a single-threaded read().
+        const size_t uk_bytes = static_cast<size_t>(k) * static_cast<size_t>(hdr.n) * sizeof(float);
         Eigen::MatrixXf Uk(k, hdr.n);
-        read_exact(fd, Uk.data(), static_cast<size_t>(k) * hdr.n * sizeof(float), filename);
+        gcta_numa_interleave(Uk.data(), uk_bytes);
+        constexpr size_t kStageBytes = 64ULL << 20; // 64 MiB
+        AlignedRawBuffer<char, 64> stage(std::min(kStageBytes, uk_bytes));
+        char* const uk_dst = reinterpret_cast<char*>(Uk.data());
+        size_t done = 0;
+        while (done < uk_bytes) {
+            const size_t chunk = std::min(stage.size(), uk_bytes - done);
+            read_exact(fd, stage.data(), chunk, filename);
+            #pragma omp parallel
+            {
+                const int tid =
+                #ifdef _OPENMP
+                    omp_get_thread_num();
+                #else
+                    0;
+                #endif
+                const int nt =
+                #ifdef _OPENMP
+                    omp_get_num_threads();
+                #else
+                    1;
+                #endif
+                const size_t beg = (chunk * static_cast<size_t>(tid)) / static_cast<size_t>(nt);
+                const size_t end = (chunk * static_cast<size_t>(tid + 1)) / static_cast<size_t>(nt);
+                if (end > beg) {
+                    std::memcpy(uk_dst + done + beg, stage.data() + beg, end - beg);
+                }
+            }
+            done += chunk;
+        }
+        stage.reset();
 
         Eigen::VectorXf dk(k);
         read_exact(fd, dk.data(), static_cast<size_t>(k) * sizeof(float), filename);
@@ -325,6 +362,7 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
         read_exact(fd, vc.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float), filename);
         st.varcmp = vc;
 
+        gcta_fadvise_dontneed(fd);
         close(fd);
 
         const double sg2   = static_cast<double>(vc[0]);
@@ -388,28 +426,45 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
         // Uk_f must be written k×n (see mlma_woodbury.hpp layout convention),
         // transposed relative to ctx.Uk's n×k storage -- readers place these
         // bytes directly into a k×n matrix with no further transpose.
-        // Stream in bounded 512 MiB sample-column chunks so save does not double
-        // peak resident memory alongside ctx.Uk.
+        // Stream in bounded 512 MiB sample-column chunks using a 64x64
+        // cache-blocked transpose (contiguous reads from ctx.Uk and contiguous
+        // writes to uk_chunk) so save does not double peak RSS or thrash TLBs.
         constexpr size_t kUkWriteWindowBytes = 1ULL << 29; // 512 MiB
+        constexpr int32_t kBlk = 64;
         const size_t col_bytes = static_cast<size_t>(k) * sizeof(float);
         const int32_t cols_per_chunk = static_cast<int32_t>(
             std::max<size_t>(1, kUkWriteWindowBytes / std::max<size_t>(1, col_bytes)));
-        std::vector<float> uk_chunk(
+        AlignedRawBuffer<float, 64> uk_chunk(
             static_cast<size_t>(k) * static_cast<size_t>(std::min(ctx.n, cols_per_chunk)));
+        const float* const uk_src = ctx.Uk.data();
+        const size_t n_stride = static_cast<size_t>(ctx.n);
+        const size_t k_stride = static_cast<size_t>(k);
+        const int32_t nj_tiles = (k + kBlk - 1) / kBlk;
         for (int32_t i0 = 0; i0 < ctx.n; i0 += cols_per_chunk) {
             const int32_t i_len = std::min(cols_per_chunk, ctx.n - i0);
+            const int32_t ni_tiles = (i_len + kBlk - 1) / kBlk;
+            const int64_t total_tiles = static_cast<int64_t>(ni_tiles) * static_cast<int64_t>(nj_tiles);
             #pragma omp parallel for schedule(static)
-            for (int32_t di = 0; di < i_len; ++di) {
-                float* dst_col = uk_chunk.data() + static_cast<size_t>(di) * static_cast<size_t>(k);
-                const int32_t sample_idx = i0 + di;
-                for (int32_t j = 0; j < k; ++j) {
-                    dst_col[j] = ctx.Uk(sample_idx, j);
+            for (int64_t t = 0; t < total_tiles; ++t) {
+                const int32_t di0 = static_cast<int32_t>(t / nj_tiles) * kBlk;
+                const int32_t j0  = static_cast<int32_t>(t % nj_tiles) * kBlk;
+                const int32_t di_len = std::min(kBlk, i_len - di0);
+                const int32_t j_len  = std::min(kBlk, k - j0);
+                alignas(64) float tile[kBlk][kBlk];
+                for (int32_t dj = 0; dj < j_len; ++dj) {
+                    const float* src_col = uk_src + static_cast<size_t>(j0 + dj) * n_stride + (i0 + di0);
+                    for (int32_t ddi = 0; ddi < di_len; ++ddi) {
+                        tile[ddi][dj] = src_col[ddi];
+                    }
+                }
+                for (int32_t ddi = 0; ddi < di_len; ++ddi) {
+                    float* dst_col = uk_chunk.data() + static_cast<size_t>(di0 + ddi) * k_stride + j0;
+                    std::memcpy(dst_col, tile[ddi], static_cast<size_t>(j_len) * sizeof(float));
                 }
             }
             write_exact(fd, uk_chunk.data(), static_cast<size_t>(i_len) * col_bytes, filename);
         }
-        uk_chunk.clear();
-        uk_chunk.shrink_to_fit();
+        uk_chunk.reset();
         ctx.Uk.resize(0, 0);
 
         Eigen::VectorXf dk_f = ctx.dk.cast<float>();
@@ -536,6 +591,7 @@ void load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ctx, uint64_t
                     "Woodbury (TUNA) state saved from a --reml-woodbury-basis fit.");
     }
     check_reml_samples(fd, prefix, ctx.n, expected_id_hash, filename);
+    gcta_fadvise_sequential(fd);
 
     int32_t k           = 0;
     double  lambda_tail = 0.0;
@@ -563,19 +619,56 @@ void load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ctx, uint64_t
     }
 
     // Uk is stored k x n (column i = sample i, see writeRemlStateFromCtx).
-    Eigen::MatrixXf Uk_f(k, ctx.n);
-    read_exact(fd, Uk_f.data(), uk_bytes, filename);
+    // Stream in bounded 512 MiB sample chunks and run a 64x64 cache-blocked
+    // transpose directly into NUMA-interleaved ctx.Uk (n x k), halving peak RSS
+    // and eliminating stride-4n TLB thrashing.
+    ctx.Uk.resize(ctx.n, k);
+    gcta_numa_interleave(ctx.Uk.data(), uk_bytes);
+    {
+        constexpr size_t kUkReadWindowBytes = 1ULL << 29; // 512 MiB
+        constexpr int32_t kBlk = 64;
+        const size_t col_bytes = static_cast<size_t>(k) * sizeof(float);
+        const int32_t cols_per_chunk = static_cast<int32_t>(
+            std::max<size_t>(1, kUkReadWindowBytes / std::max<size_t>(1, col_bytes)));
+        AlignedRawBuffer<float, 64> uk_chunk(
+            static_cast<size_t>(k) * static_cast<size_t>(std::min(ctx.n, cols_per_chunk)));
+        float* const uk_dst = ctx.Uk.data();
+        const size_t n_stride = static_cast<size_t>(ctx.n);
+        const size_t k_stride = static_cast<size_t>(k);
+        const int32_t nj_tiles = (k + kBlk - 1) / kBlk;
+
+        for (int32_t i0 = 0; i0 < ctx.n; i0 += cols_per_chunk) {
+            const int32_t i_len = std::min(cols_per_chunk, ctx.n - i0);
+            read_exact(fd, uk_chunk.data(), static_cast<size_t>(i_len) * col_bytes, filename);
+
+            const int32_t ni_tiles = (i_len + kBlk - 1) / kBlk;
+            const int64_t total_tiles = static_cast<int64_t>(ni_tiles) * static_cast<int64_t>(nj_tiles);
+            #pragma omp parallel for schedule(static)
+            for (int64_t t = 0; t < total_tiles; ++t) {
+                const int32_t j0  = static_cast<int32_t>(t / ni_tiles) * kBlk;
+                const int32_t di0 = static_cast<int32_t>(t % ni_tiles) * kBlk;
+                const int32_t di_len = std::min(kBlk, i_len - di0);
+                const int32_t j_len  = std::min(kBlk, k - j0);
+                alignas(64) float tile[kBlk][kBlk];
+                for (int32_t ddi = 0; ddi < di_len; ++ddi) {
+                    const float* src_col = uk_chunk.data() + static_cast<size_t>(di0 + ddi) * k_stride + j0;
+                    for (int32_t dj = 0; dj < j_len; ++dj) {
+                        tile[dj][ddi] = src_col[dj];
+                    }
+                }
+                for (int32_t dj = 0; dj < j_len; ++dj) {
+                    float* dst_col = uk_dst + static_cast<size_t>(j0 + dj) * n_stride + (i0 + di0);
+                    std::memcpy(dst_col, tile[dj], static_cast<size_t>(di_len) * sizeof(float));
+                }
+            }
+        }
+        uk_chunk.reset();
+    }
+
     Eigen::VectorXf dk_f(k);
     read_exact(fd, dk_f.data(), dk_bytes, filename);
+    gcta_fadvise_dontneed(fd);
     close(fd);
-
-    // k x n float -> n x k float; parallel over samples (contiguous reads).
-    ctx.Uk.resize(ctx.n, k);
-    #pragma omp parallel for schedule(static)
-    for (int32_t i = 0; i < ctx.n; ++i)
-        for (int32_t j = 0; j < k; ++j)
-            ctx.Uk(i, j) = Uk_f(j, i);
-    Uk_f.resize(0, 0);
 
     ctx.dk                       = dk_f.cast<double>();
     ctx.lambda_tail              = lambda_tail;
@@ -645,36 +738,104 @@ Eigen::MatrixXf load_pca_warm_start(const string& eigenvec_prefix,
     std::ifstream in(path);
     if (!in) LOGGER.e(0, "--reml-woodbury-basis-warm-start: cannot open [" + path + "].");
 
-    std::unordered_map<string, vector<float>> by_id;
-    by_id.reserve(analysis_ids.size() * 2);
+    const int n = static_cast<int>(analysis_ids.size());
+    std::unordered_map<std::string_view, int> id_to_row;
+    id_to_row.reserve(analysis_ids.size() * 2);
+    for (int i = 0; i < n; ++i) {
+        id_to_row.emplace(analysis_ids[static_cast<size_t>(i)], i);
+    }
 
-    string line, fid, iid;
+    auto is_ws = [](unsigned char ch) noexcept {
+        return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\v' || ch == '\f';
+    };
+    auto next_token = [&](const char*& p, const char* end, std::string_view& tok) noexcept -> bool {
+        while (p < end && is_ws(static_cast<unsigned char>(*p))) ++p;
+        if (p >= end) return false;
+        const char* beg = p;
+        while (p < end && !is_ws(static_cast<unsigned char>(*p))) ++p;
+        tok = std::string_view(beg, static_cast<size_t>(p - beg));
+        return true;
+    };
+
+    Eigen::MatrixXf Uk;
+    std::vector<uint8_t> seen(static_cast<size_t>(n), 0);
+    std::vector<float> row_vals;
+    string line;
+    string key;
     int k = -1;
+
     while (std::getline(in, line)) {
         if (line.empty()) continue;
-        std::istringstream ss(line);
-        if (!(ss >> fid >> iid))
+        const char* p = line.data();
+        const char* const end = p + line.size();
+
+        std::string_view fid, iid;
+        if (!next_token(p, end, fid) || !next_token(p, end, iid))
             LOGGER.e(0, "--reml-woodbury-basis-warm-start: malformed line in [" + path + "].");
-        vector<float> pcs;
-        float v;
-        while (ss >> v) pcs.push_back(v);
-        if (k < 0) k = static_cast<int>(pcs.size());
-        else if (static_cast<int>(pcs.size()) != k)
+
+        row_vals.clear();
+        std::string_view tok;
+        while (next_token(p, end, tok)) {
+            const char* tb = tok.data();
+            const char* const te = tb + tok.size();
+            if (tb < te && *tb == '+') ++tb;
+            double vd = 0.0;
+            auto [ptr, ec] = std::from_chars(tb, te, vd);
+            if (ec == std::errc::result_out_of_range) {
+                char num_tmp[128];
+                const size_t tlen = static_cast<size_t>(te - tb);
+                if (tlen < sizeof(num_tmp)) {
+                    std::memcpy(num_tmp, tb, tlen);
+                    num_tmp[tlen] = '\0';
+                    char* endp = nullptr;
+                    vd = std::strtod(num_tmp, &endp);
+                    if (endp == num_tmp + tlen) {
+                        ec = std::errc();
+                        ptr = te;
+                    }
+                }
+            }
+            if (ec != std::errc() || ptr != te) {
+                LOGGER.e(0, "--reml-woodbury-basis-warm-start: malformed eigenvector value in [" + path + "].");
+            }
+            row_vals.push_back(static_cast<float>(vd));
+        }
+
+        if (k < 0) {
+            k = static_cast<int>(row_vals.size());
+            if (k <= 0)
+                LOGGER.e(0, "--reml-woodbury-basis-warm-start: no eigenvectors read from [" + path + "].");
+            Uk.resize(n, k);
+            gcta_numa_interleave(Uk.data(), static_cast<size_t>(n) * static_cast<size_t>(k) * sizeof(float));
+            row_vals.reserve(static_cast<size_t>(k));
+        } else if (static_cast<int>(row_vals.size()) != k) {
             LOGGER.e(0, "--reml-woodbury-basis-warm-start: inconsistent eigenvector count in [" + path + "].");
-        by_id.emplace(fid + "\t" + iid, std::move(pcs));
+        }
+
+        key.clear();
+        key.reserve(fid.size() + 1 + iid.size());
+        key.append(fid);
+        key.push_back('\t');
+        key.append(iid);
+        const auto it = id_to_row.find(std::string_view(key));
+        if (it != id_to_row.end()) {
+            const int row = it->second;
+            if (!seen[static_cast<size_t>(row)]) {
+                seen[static_cast<size_t>(row)] = 1;
+                for (int j = 0; j < k; ++j) {
+                    Uk(row, j) = row_vals[static_cast<size_t>(j)];
+                }
+            }
+        }
     }
     if (k <= 0)
         LOGGER.e(0, "--reml-woodbury-basis-warm-start: no eigenvectors read from [" + path + "].");
 
-    const int n = static_cast<int>(analysis_ids.size());
-    Eigen::MatrixXf Uk(n, k);
     for (int i = 0; i < n; ++i) {
-        const auto it = by_id.find(analysis_ids[i]);
-        if (it == by_id.end())
-            LOGGER.e(0, "--reml-woodbury-basis-warm-start: individual [" + analysis_ids[i] +
+        if (!seen[static_cast<size_t>(i)])
+            LOGGER.e(0, "--reml-woodbury-basis-warm-start: individual [" + analysis_ids[static_cast<size_t>(i)] +
                         "] not found in [" + path + "]. The warm-start file must come from "
                         "the same sample set (e.g. --pca-approx run on the same --grm).");
-        for (int j = 0; j < k; ++j) Uk(i, j) = it->second[j];
     }
 
     LOGGER.i(0, "Woodbury warm-start: loaded " + to_string(k) + " eigenvector(s) for " +
@@ -906,6 +1067,7 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                                 "GB covers the full GRM (n=" + to_string(n) + ") in a single chunk. "
                                 "Falling back to dense loading instead of paying chunking overhead "
                                 "for no benefit.");
+                    chunked_grm = {};
                     grm_chunked = false;
                 }
             }
@@ -948,6 +1110,10 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                 ctx.grm_chunk_rows_from_budget = chunked_grm.chunk_rows;
                 ctx.grm_tile_reader = std::move(chunked_grm.reader);
                 ctx.grm_tile_reader_f32 = std::move(chunked_grm.reader_f32);
+                // Drop extra shared_ptr ref so ChunkedGrmReader frees as soon as
+                // RemlEngine releases ctx.grm_tile_reader (avoids 10-60 GB leak
+                // persisting through the downstream MLMA streaming scan).
+                chunked_grm.file.reset();
             } else {
                 ctx.A[0] = std::move(G_n);
             }
@@ -1003,6 +1169,8 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                 load_woodbury_basis_into_ctx(r.woodbury_reuse, ctx, id_hash);
 
             reml::compute(ctx, r.priors, r.priors_var, no_constrain);
+            ctx.grm_tile_reader = nullptr;
+            ctx.grm_tile_reader_f32 = nullptr;
 
             LOGGER.i(0, "Inline REML complete. Variance components:");
             for (size_t ci = 0; ci < ctx.varcmp.size(); ++ci)

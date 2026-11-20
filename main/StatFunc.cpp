@@ -25,7 +25,7 @@ namespace {
 // where gamma_q(a, x) would underflow to zero.
 static double log_gamma_q_upper(double a, double x) {
     double q = boost::math::gamma_q(a, x);
-    if (q > 0.0) return std::log(q);
+    if (q > 1e-290) return std::log(q);
     // Asymptotic expansion coefficients: Q(a,x) ~ exp(-x + (a-1)*ln(x) - lgamma(a)) * S
     // where S = 1 + (a-1)/x + (a-1)(a-2)/x^2 + ... (truncate before diverging)
     double log_leading = -x + (a - 1.0) * std::log(x) - std::lgamma(a);
@@ -37,6 +37,24 @@ static double log_gamma_q_upper(double a, double x) {
         s += term;
     }
     return log_leading + std::log(std::abs(s));
+}
+
+// Fast exact df=1 upper-tail chi-squared probability P(chi2_1 >= x) = erfc(sqrt(x/2)),
+// with full double-precision log-space asymptotic tail for x > 676 (|z| > 26).
+static double pchisq_df1_fast(double x, bool log_p) noexcept {
+    constexpr double kHalfLogHalfPi = 0.225791352644727432363097614947441008; // 0.5 * ln(pi / 2)
+    if (!log_p) {
+        return std::erfc(std::sqrt(0.5 * x));
+    }
+    if (x <= 676.0) { // |z| <= 26: erfc(t) >= 4.9e-149, far above DBL_MIN
+        return std::log(std::erfc(std::sqrt(0.5 * x)));
+    }
+    // Asymptotic expansion: ln(erfc(t)) = -t^2 - ln(t*sqrt(pi)) + ln(1 - u + 3u^2 - ...)
+    // where t = sqrt(x/2), t^2 = x/2, u = 1/(2 t^2) = 1/x (< 1/676 => < 1 ULP error).
+    const double u = 1.0 / x;
+    const double s_m1 = u * (-1.0 + u * (3.0 + u * (-15.0 + u * (105.0
+                        + u * (-945.0 + u * (10395.0 + u * (-135135.0 + u * 2027025.0)))))));
+    return -0.5 * x - 0.5 * std::log(x) - kHalfLogHalfPi + std::log1p(s_m1);
 }
 
 } // anonymous namespace
@@ -55,6 +73,9 @@ double StatFunc::F_prob(double df_1, double df_2, double F_value) {
 }
 
 double StatFunc::chi_prob(double df, double chi_sqr_val, bool log_p) {
+    if (df == 1.0 && chi_sqr_val >= 0.0 && std::isfinite(chi_sqr_val)) {
+        return pchisq_df1_fast(chi_sqr_val, log_p);
+    }
     if (log_p) return log_gamma_q_upper(df * 0.5, chi_sqr_val * 0.5);
     return boost::math::cdf(
         boost::math::complement(boost::math::chi_squared(df), chi_sqr_val));

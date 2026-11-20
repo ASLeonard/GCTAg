@@ -529,6 +529,78 @@ static void run_stages(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
     }
 }
 
+static void weight_pass(const int8_t* g, uint32_t n, I8Opts* o) {
+    if (o->wf) {
+        const float* w = o->wf;
+        float64x2_t a0 = vdupq_n_f64(0.0), a1 = vdupq_n_f64(0.0);
+        float64x2_t a2 = vdupq_n_f64(0.0), a3 = vdupq_n_f64(0.0);
+        float64x2_t b0 = vdupq_n_f64(0.0), b1 = vdupq_n_f64(0.0);
+        float64x2_t b2 = vdupq_n_f64(0.0), b3 = vdupq_n_f64(0.0);
+        uint32_t s = 0;
+        for (; s + 16u <= n; s += 16u) {
+            const int8x16_t gv = vld1q_s8(g + s);
+            const int16x8_t lo16 = vmovl_s8(vget_low_s8(gv));
+            const int16x8_t hi16 = vmovl_s8(vget_high_s8(gv));
+            const float32x4_t p0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16))), vld1q_f32(w + s));
+            const float32x4_t p1 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo16)), vld1q_f32(w + s + 4));
+            const float32x4_t p2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16))), vld1q_f32(w + s + 8));
+            const float32x4_t p3 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi16)), vld1q_f32(w + s + 12));
+            a0 = vaddq_f64(a0, vcvt_f64_f32(vget_low_f32(p0)));
+            a1 = vaddq_f64(a1, vcvt_high_f64_f32(p0));
+            a2 = vaddq_f64(a2, vcvt_f64_f32(vget_low_f32(p1)));
+            a3 = vaddq_f64(a3, vcvt_high_f64_f32(p1));
+            b0 = vaddq_f64(b0, vcvt_f64_f32(vget_low_f32(p2)));
+            b1 = vaddq_f64(b1, vcvt_high_f64_f32(p2));
+            b2 = vaddq_f64(b2, vcvt_f64_f32(vget_low_f32(p3)));
+            b3 = vaddq_f64(b3, vcvt_high_f64_f32(p3));
+        }
+        const float64x2_t sum01 = vaddq_f64(vaddq_f64(a0, b0), vaddq_f64(a1, b1));
+        const float64x2_t sum23 = vaddq_f64(vaddq_f64(a2, b2), vaddq_f64(a3, b3));
+        double acc = vaddvq_f64(vaddq_f64(sum01, sum23));
+        for (; s < n; ++s) acc += static_cast<double>(g[s]) * static_cast<double>(w[s]);
+        o->wf_dot = acc;
+    }
+    if (o->wd) {
+        const double* w = o->wd;
+        float64x2_t a1_0 = vdupq_n_f64(0.0), a1_1 = vdupq_n_f64(0.0);
+        float64x2_t a1_2 = vdupq_n_f64(0.0), a1_3 = vdupq_n_f64(0.0);
+        float64x2_t a2_0 = vdupq_n_f64(0.0), a2_1 = vdupq_n_f64(0.0);
+        float64x2_t a2_2 = vdupq_n_f64(0.0), a2_3 = vdupq_n_f64(0.0);
+        uint32_t s = 0;
+        for (; s + 8u <= n; s += 8u) {
+            const int16x8_t g16 = vmovl_s8(vld1_s8(g + s));
+            const int32x4_t g32_0 = vmovl_s16(vget_low_s16(g16));
+            const int32x4_t g32_1 = vmovl_s16(vget_high_s16(g16));
+            const float64x2_t d0 = vcvtq_f64_s64(vmovl_s32(vget_low_s32(g32_0)));
+            const float64x2_t d1 = vcvtq_f64_s64(vmovl_high_s32(g32_0));
+            const float64x2_t d2 = vcvtq_f64_s64(vmovl_s32(vget_low_s32(g32_1)));
+            const float64x2_t d3 = vcvtq_f64_s64(vmovl_high_s32(g32_1));
+            const float64x2_t gw0 = vmulq_f64(d0, vld1q_f64(w + s));
+            const float64x2_t gw1 = vmulq_f64(d1, vld1q_f64(w + s + 2));
+            const float64x2_t gw2 = vmulq_f64(d2, vld1q_f64(w + s + 4));
+            const float64x2_t gw3 = vmulq_f64(d3, vld1q_f64(w + s + 6));
+            a1_0 = vaddq_f64(a1_0, gw0);
+            a1_1 = vaddq_f64(a1_1, gw1);
+            a1_2 = vaddq_f64(a1_2, gw2);
+            a1_3 = vaddq_f64(a1_3, gw3);
+            a2_0 = vfmaq_f64(a2_0, d0, gw0);
+            a2_1 = vfmaq_f64(a2_1, d1, gw1);
+            a2_2 = vfmaq_f64(a2_2, d2, gw2);
+            a2_3 = vfmaq_f64(a2_3, d3, gw3);
+        }
+        double s1 = vaddvq_f64(vaddq_f64(vaddq_f64(a1_0, a1_1), vaddq_f64(a1_2, a1_3)));
+        double s2 = vaddvq_f64(vaddq_f64(vaddq_f64(a2_0, a2_1), vaddq_f64(a2_2, a2_3)));
+        for (; s < n; ++s) {
+            const double gd = static_cast<double>(g[s]);
+            const double gw = gd * w[s];
+            s1 += gw;
+            s2 += gd * gw;
+        }
+        o->wd_dot = s1;
+        o->wd_dot2 = s2;
+    }
+}
+
 static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
                         uint32_t r_begin, uint32_t n_out, int8_t* out, I8Opts* o, bool want_counts) {
     if (keep) {
@@ -543,7 +615,7 @@ static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw
         MissSink sink;
         sink.init(o, n_out);
         if (c.nmiss && sink.active()) miss_pass(raw, keep, n_raw, n_out, &sink);
-        scalar::weight_pass(out, n_out, o);
+        weight_pass(out, n_out, o);
         sink.finish(o);
     }
     return c;

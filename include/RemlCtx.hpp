@@ -14,23 +14,17 @@
  */
 #pragma once
 
+#include "ModeTypes.hpp"
 #include "mlma_woodbury.hpp"
 #include "chunked_grm_matvec.hpp"
 #include <Eigen/Dense>
+#include <optional>
 #include <string>
 #include <vector>
 
 // REML is always double-precision irrespective of SINGLE_PRECISION build flag.
 using RemlMat = Eigen::MatrixXd;
 using RemlVec = Eigen::VectorXd;
-
-enum class WoodburyMode {
-    Off      = 0,
-    Fixed    = 1,
-    MP   = -1, // Marchenko-Pastur bulk edge
-    EIG  = -2, // Eigenvalue spectral mass fraction
-    VAR = -3  // Relative tail variance dispersion ratio
-};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // RemlCtx: input + config + workspace + output
@@ -39,13 +33,6 @@ enum class WoodburyMode {
 // "Workspace" holds the V^{-1} state needed for the subsequent association test.
 // ──────────────────────────────────────────────────────────────────────────────
 struct RemlCtx {
-    WoodburyMode woodbury_mode() const {
-        if (woodbury_basis_rank == -1) return WoodburyMode::MP;
-        if (woodbury_basis_rank == -2) return WoodburyMode::EIG;
-        if (woodbury_basis_rank == -3) return WoodburyMode::VAR;
-        if (woodbury_basis_rank > 0)   return WoodburyMode::Fixed;
-        return WoodburyMode::Off;
-    }
     // ── Input (set by caller before reml::compute()) ──────────────────────────
     int  n     = 0;   // sample size
     int  X_c   = 0;   // columns in design matrix (1 + n_covariates)
@@ -102,12 +89,12 @@ struct RemlCtx {
     double svd_mem_budget_gb = 0.0;
 
     // ── Config (algorithm control) ────────────────────────────────────────────
-    int    reml_mtd                  = 0;     // 0=AI-REML, 1=Fisher, 2=EM-REML
-    int    reml_max_iter             = 100;
-    int    reml_inv_mtd              = 0;     // 0=LLT, 1=LU (for V inversion fallback)
-    double reml_diag_mul             = 0.01;  // diagonal jitter when V is near-singular
-    int    reml_diagV_adj            = 0;     // 0=none, 1=diag jitter, 2=bending
-    int    woodbury_basis_rank             = 0;     // >0 fixed k; -1 MP-k; -2 EIG-k; -3 VAR-k; 0 off
+    RemlAlg  reml_mtd       = RemlAlg::AI;
+    int      reml_max_iter  = 100;
+    int      reml_inv_mtd   = 0;     // 0=LLT, 1=LU (for V inversion fallback)
+    double   reml_diag_mul  = 0.01;  // diagonal jitter when V is near-singular
+    DiagVAdj reml_diagV_adj = DiagVAdj::None;
+    std::optional<WoodburyBasisSpec> woodbury_basis;
     // MP-k: eigenvalues fall off a cliff at the Marchenko-Pastur bulk edge,
     // but the exact crossing point is noisy over a band of eigenvalues near
     // the edge (rSVD tail estimation error + finite-M lambda_plus estimate +

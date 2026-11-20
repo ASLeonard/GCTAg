@@ -57,6 +57,7 @@
 #include <array>
 #include <charconv>
 #include <limits>
+#include <memory>
 #include <cstdio>
 #include <cstring>
 #include <cerrno>
@@ -578,7 +579,7 @@ void load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ctx, uint64_t
     ctx.lambda_tail              = lambda_tail;
     ctx.tail_d_var               = tail_d_var;
     ctx.woodbury_basis_rank_     = k;
-    ctx.woodbury_basis_rank      = k;
+    ctx.woodbury_basis           = WoodburyBasisSpec{WoodburyBasisSpec::Kind::Fixed, k};
     ctx.Vi_use_woodbury_basis    = true;
     ctx.woodbury_basis_preloaded = true;
 
@@ -1090,22 +1091,22 @@ void MLMA::processMain()
         // ---- Pheno / Marker / Geno (Geno re-reads pheno state in loopDouble) ----
         // Pheno alone reads the .fam (sample IDs); Marker/Geno additionally need
         // the .bim/.bed and are skipped entirely in --save-reml-only mode.
-        Pheno*  pheno  = new Pheno();
-        Marker* marker = nullptr;
-        Geno*   geno   = nullptr;
+        Pheno pheno;
+        std::unique_ptr<Marker> marker;
+        std::unique_ptr<Geno>   geno;
         if (!reml_only) {
-            marker = new Marker();
-            geno   = new Geno(pheno, marker);
+            marker = std::make_unique<Marker>();
+            geno   = std::make_unique<Geno>(&pheno, marker.get());
             const string model_name = options.count("model") ? options.at("model") : "additive";
             geno->setGenoCodingModel(model_name);
             LOGGER.i(0, "MLMA_stream genotype model: " + model_name + ".");
         }
 
         // ---- Phenotype ----
-        const uint32_t n_init = pheno->count_keep();
+        const uint32_t n_init = pheno.count_keep();
         vector<string> ids;
         vector<double> phenos_vec;
-        pheno->get_pheno(ids, phenos_vec);
+        pheno.get_pheno(ids, phenos_vec);
         if (ids.size() != n_init)
             LOGGER.e(0, "--MLMA requires --pheno to be specified.");
 
@@ -1122,7 +1123,7 @@ void MLMA::processMain()
             if (has_covar) {
                 LOGGER.i(0, to_string(remain_index.size()) +
                             " overlapping individuals with non-missing covariate data.");
-                pheno->filter_keep_index(remain_index);
+                pheno.filter_keep_index(remain_index);
             } else if (covar.hasCovar()) {
                 LOGGER.e(0, "no overlapping individuals with non-missing covariate data.");
             } else {
@@ -1135,13 +1136,13 @@ void MLMA::processMain()
             phenos_vec = compact_sample_vector(phenos_vec, remain_index);
         }
 
-        const int n = static_cast<int>(pheno->count_keep());
+        const int n = static_cast<int>(pheno.count_keep());
         LOGGER.i(0, "After matching all files, " + to_string(n) +
                     " individuals to be included in --MLMA.");
 
         // Build design matrix X  (n × x_c, column-major)
         if (has_covar) {
-            vector<string> final_ids = pheno->get_id(0, n - 1, "\t");
+            vector<string> final_ids = pheno.get_id(0, n - 1, "\t");
             vector<double> covar_X;
             vector<uint32_t> ck_dummy;
             covar.getCovarX(final_ids, covar_X, ck_dummy);
@@ -1182,7 +1183,7 @@ void MLMA::processMain()
             LOGGER.i(0, "Loading REML state from [" + load_reml_file + "]...");
             LOGGER.ts("load_reml");
             state = readRemlState(load_reml_file, no_adj_covar, n,
-                                  hash_sample_ids(pheno->get_id(0, n - 1, "\t")));
+                                  hash_sample_ids(pheno.get_id(0, n - 1, "\t")));
             LOGGER.i(0, "REML state loaded in " + to_string(LOGGER.tp("load_reml")) + " seconds.");
 
             if (state.n != n)
@@ -1212,7 +1213,7 @@ void MLMA::processMain()
             else
                 LOGGER.i(0, "Running inline REML using GRM [" + grm_pfx + "] ...");
 
-            const vector<string> analysis_ids = pheno->get_id(0, n - 1, "\t");
+            const vector<string> analysis_ids = pheno.get_id(0, n - 1, "\t");
             const uint64_t id_hash = hash_sample_ids(analysis_ids);
             bool grm_chunked = !reuse_basis && options_d.count("grm_chunked_budget") > 0.0;
             const bool grm_fp16 = !reuse_basis && options.count("grm_fp16") > 0;
@@ -1229,20 +1230,32 @@ void MLMA::processMain()
             // committing to a chunked vs. dense load. Also lets the
             // reml_alg/svd_nystrom/etc. validation checks fail fast, ahead of
             // the (potentially expensive) GRM read, instead of after it.
-            const int  woodbury_basis_rank  = options_d.count("woodbury_basis_rank")
+            const int woodbury_basis_rank = options_d.count("woodbury_basis_rank")
                 ? static_cast<int>(options_d.at("woodbury_basis_rank")) : 0;
-            const bool trace_hutchpp   = options.count("trace_hutchpp") > 0;
-            const int  trace_hutchpp_nprobes  = options_d.count("trace_hutchpp_nprobes")
+            std::optional<WoodburyBasisSpec> woodbury_spec;
+            if (woodbury_basis_rank == -1) {
+                woodbury_spec = WoodburyBasisSpec{WoodburyBasisSpec::Kind::MP, 0};
+            } else if (woodbury_basis_rank == -2) {
+                woodbury_spec = WoodburyBasisSpec{WoodburyBasisSpec::Kind::EIG, 0};
+            } else if (woodbury_basis_rank == -3) {
+                woodbury_spec = WoodburyBasisSpec{WoodburyBasisSpec::Kind::VAR, 0};
+            } else if (woodbury_basis_rank > 0) {
+                woodbury_spec = WoodburyBasisSpec{WoodburyBasisSpec::Kind::Fixed, woodbury_basis_rank};
+            }
+            const bool   have_wb                = woodbury_spec.has_value();
+            const bool   is_wb_mp               = have_wb && woodbury_spec->kind == WoodburyBasisSpec::Kind::MP;
+            const bool   trace_hutchpp          = options.count("trace_hutchpp") > 0;
+            const int    trace_hutchpp_nprobes  = options_d.count("trace_hutchpp_nprobes")
                 ? static_cast<int>(options_d.at("trace_hutchpp_nprobes")) : 100;
-            const int  reml_maxit     = options_d.count("reml_maxit")
+            const int    reml_maxit             = options_d.count("reml_maxit")
                 ? static_cast<int>(options_d.at("reml_maxit")) : 100;
-            const int  reml_alg       = options_d.count("reml_alg")
+            const int    reml_alg_raw           = options_d.count("reml_alg")
                 ? static_cast<int>(options_d.at("reml_alg")) : 0;
-            const int  reml_diagV_adj = options_d.count("reml_diagV_adj")
+            const int    reml_diagV_adj_raw     = options_d.count("reml_diagV_adj")
                 ? static_cast<int>(options_d.at("reml_diagV_adj")) : 0;
-            const bool no_constrain   = options.count("no_constrain") > 0;
-            const bool svd_nystrom = options.count("svd_nystrom") > 0;
-            const int svd_power_iter = options_d.count("svd_power_iter")
+            const bool   no_constrain           = options.count("no_constrain") > 0;
+            const bool   svd_nystrom            = options.count("svd_nystrom") > 0;
+            const int    svd_power_iter         = options_d.count("svd_power_iter")
                 ? static_cast<int>(options_d.at("svd_power_iter")) : 3;
             const float  woodbury_basis_eigen_mass  = options_d.count("woodbury_basis_eigen_mass")
                 ? static_cast<float>(options_d.at("woodbury_basis_eigen_mass")) : 0.99f;
@@ -1261,34 +1274,36 @@ void MLMA::processMain()
             const double reml_ai_robust_risk = options_d.count("reml_ai_robust_risk")
                 ? options_d.at("reml_ai_robust_risk") : 0.01;
 
-            if (reml_alg < 0 || reml_alg > 2)
+            if (reml_alg_raw < 0 || reml_alg_raw > 2)
                 LOGGER.e(0, "--reml-alg should be 0, 1 or 2.");
-            if (reml_diagV_adj < 0 || reml_diagV_adj > 2)
+            if (reml_diagV_adj_raw < 0 || reml_diagV_adj_raw > 2)
                 LOGGER.e(0, "--reml-diagV-adj should be 0, 1, or 2.");
-            if ((woodbury_basis_rank != 0 || reuse_basis) && reml_alg == 1)
+            const RemlAlg  reml_alg       = static_cast<RemlAlg>(reml_alg_raw);
+            const DiagVAdj reml_diagV_adj = static_cast<DiagVAdj>(reml_diagV_adj_raw);
+            if ((have_wb || reuse_basis) && reml_alg == RemlAlg::Fisher)
                 LOGGER.e(0, "--reml-woodbury is incompatible with Fisher-scoring REML (--reml-alg 1). Use AI-REML (default) or EM-REML (--reml-alg 2).");
-            if (svd_nystrom && woodbury_basis_rank == 0)
+            if (svd_nystrom && !have_wb)
                 LOGGER.e(0, "--svd-method nystrom requires --reml-woodbury <k|MP|EIG|VAR>.");
-            if ((woodbury_basis_rank != 0 || reuse_basis) && trace_hutchpp)
+            if ((have_wb || reuse_basis) && trace_hutchpp)
                 LOGGER.w(0, "--reml-woodbury-basis/--reml-woodbury-reuse and --reml-trace-hutchpp both given; "
                             "the Woodbury basis provides an exact tr(PA) and takes precedence — "
                             "--reml-trace-hutchpp is ignored.");
 
             int grm_chunk_rows = 0;
             Eigen::MatrixXf G_n;      // left empty when grm_chunked or grm_fp16
-            double m_all = (woodbury_basis_rank == -1) ? 0.0 : -1.0;  // only populated when Woodbury-MP mode is selected
+            double m_all = is_wb_mp ? 0.0 : -1.0;  // only populated when Woodbury-MP mode is selected
             gcta_grm_io::ChunkedGrmHandle chunked_grm;       // only populated when grm_chunked
             gcta_grm_io::PackedGrmFp16Handle fp16_grm;       // only populated when grm_fp16
 
             if (grm_fp16) {
                 fp16_grm = gcta_grm_io::load_packed_grm_fp16(
-                    grm_pfx, analysis_ids, /*need_m_snps=*/(woodbury_basis_rank == -1), "--grm-fp16");
+                    grm_pfx, analysis_ids, /*need_m_snps=*/is_wb_mp, "--grm-fp16");
                 grm_chunk_rows = fp16_grm.chunk_rows;
                 m_all = fp16_grm.m_snps;
             } else if (grm_chunked) {
                 chunked_grm = gcta_grm_io::make_chunked_grm_reader(
                     grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget",
-                    /*need_m_snps=*/(woodbury_basis_rank == -1));
+                    /*need_m_snps=*/is_wb_mp);
                 grm_chunk_rows = chunked_grm.chunk_rows;
                 m_all = chunked_grm.m_snps;
                 if (grm_chunk_rows >= n) {
@@ -1359,7 +1374,7 @@ void MLMA::processMain()
             ctx.reml_inv_mtd             = 0;  // LLT
             ctx.reml_diagV_adj           = reml_diagV_adj;
             ctx.reml_force_dense_vi     = options.count("force_dense_V") > 0;
-            ctx.woodbury_basis_rank            = woodbury_basis_rank;
+            ctx.woodbury_basis           = woodbury_spec;
             ctx.woodbury_basis_edge_margin        = woodbury_basis_edge_margin;
             ctx.woodbury_basis_edge_confirm       = woodbury_basis_edge_confirm;
             ctx.woodbury_basis_EIG_k_buffer  = woodbury_basis_EIG_k_buffer;
@@ -1385,7 +1400,7 @@ void MLMA::processMain()
             ctx.reml_print_trajectory = options.count("reml_print_trajectory") > 0;
 
             if (options.count("woodbury_basis_warm_start")) {
-                if (woodbury_basis_rank == 0)
+                if (!have_wb)
                     LOGGER.w(0, "--reml-woodbury-basis-warm-start given without --reml-woodbury; ignoring.");
                 else if (svd_nystrom)
                     LOGGER.w(0, "--reml-woodbury-basis-warm-start has no effect with --svd-method nystrom "
@@ -1417,9 +1432,6 @@ void MLMA::processMain()
                 LOGGER.i(0, "REML state saved in " + to_string(LOGGER.tp("save_reml")) + " seconds.");
                 LOGGER.i(0, "REML estimation completed. Use --load-reml " + save_reml_file +
                             " to perform association tests.");
-                delete geno;
-                delete marker;
-                delete pheno;
                 continue;
             }
 
@@ -1439,18 +1451,15 @@ void MLMA::processMain()
                   << (log_pval ? "log_p" : "p") << "\n";
 
             Eigen::VectorXf w_sqrt = weighted_pheno
-                ? pheno->get_sqrt_weight_keep()
+                ? pheno.get_sqrt_weight_keep()
                 : Eigen::VectorXf::Ones(n);
-            run_mlma_stream_association(ctx, y_vec, w_sqrt, geno, marker, n, log_pval, ofile,
+            run_mlma_stream_association(ctx, y_vec, w_sqrt, geno.get(), marker.get(), n, log_pval, ofile,
                                         mlma_tile_budget_gb, fast_mlma_mode);
             LOGGER << "\nAssociation results saved to [" << out_file << "]." << std::endl;
             ofile.close();
         }
 
         if (use_inline_ctx) {
-            delete geno;
-            delete marker;
-            delete pheno;
             continue;
         }
 
@@ -1463,15 +1472,11 @@ void MLMA::processMain()
 
         // ---- Stream SNPs ----
         Eigen::VectorXf w_sqrt = weighted_pheno
-            ? pheno->get_sqrt_weight_keep()
+            ? pheno.get_sqrt_weight_keep()
             : Eigen::VectorXf::Ones(n);
-        run_mlma_stream_association(state, y_vec, w_sqrt, geno, marker, n, log_pval, ofile,
+        run_mlma_stream_association(state, y_vec, w_sqrt, geno.get(), marker.get(), n, log_pval, ofile,
                                     mlma_tile_budget_gb, fast_mlma_mode);
         LOGGER << "\nAssociation results saved to [" << out_file << "]." << std::endl;
         ofile.close();
-
-        delete geno;
-        delete marker;
-        delete pheno;
     }
 }

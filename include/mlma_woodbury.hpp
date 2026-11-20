@@ -16,26 +16,10 @@
 #include <cmath>
 #include <cstdint>
 #include <vector>
+#include "ModeTypes.hpp"
 #include "main/StatFunc.h"
 #include "cpu.h"
 #include "mem.hpp"
-
-enum class FastMlmaMode : int {
-    Off = 0,
-    Slice1 = 1,
-    Slice2 = 2,
-    Hybrid = 3
-};
-
-inline const char* fast_mlma_mode_name(FastMlmaMode mode) {
-    switch (mode) {
-        case FastMlmaMode::Slice1: return "1slice";
-        case FastMlmaMode::Slice2: return "2slice";
-        case FastMlmaMode::Hybrid: return "hybrid";
-        case FastMlmaMode::Off:
-        default:                   return "off";
-    }
-}
 
 // ---------------------------------------------------------------------------
 // WoodburyMLMACache

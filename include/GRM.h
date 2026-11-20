@@ -19,6 +19,7 @@
 #ifndef GCTA2_GRM_H
 #define GCTA2_GRM_H
 #include "Geno.h"
+#include <memory>
 #include <string>
 #include <span>
 #include <vector>
@@ -35,11 +36,7 @@ class GRM {
 public:
     GRM(Pheno *pheno, Marker *marker);
     GRM();
-    ~GRM() {
-        posix_mem_free(grm);
-        posix_mem_free(N);
-        if(geno) delete geno;
-    };
+    ~GRM() = default;
 
     void calculate_GRM_blas(uintptr_t* genobuf, std::span<const uint32_t> markerIndex);
     
@@ -64,9 +61,9 @@ public:
     inline static int nMarkerBlock = 1024;
 
 private:
-    Pheno *pheno = NULL;
-    Marker *marker = NULL;
-    Geno *geno = NULL;
+    Pheno *pheno = nullptr;
+    Marker *marker = nullptr;
+    std::unique_ptr<Geno> geno;
     std::vector<uint32_t> index_keep;
     uint32_t part;
     uint32_t num_parts;
@@ -75,16 +72,16 @@ private:
     std::pair<uint32_t, uint32_t> part_keep_indices; //the index in pheno keep index;
     std::vector<std::pair<int, int>> index_grm_pairs;
 
-    double *grm = NULL;
-    uint32_t *N = NULL;
+    AlignedUniquePtr<double, 64> grm;
+    AlignedUniquePtr<uint32_t, 64> N;
     std::vector<uint32_t> sub_miss; // sample miss in all markers
     int finished_marker = 0;
     uint64_t num_byte_geno = 0;
     int num_count_handle = 2;
 
     bool bBLAS;
-    float *stdGeno = NULL;
-    int8_t *stdGeno_i8 = NULL;
+    AlignedUniquePtr<float, 64> stdGeno;
+    AlignedUniquePtr<int8_t, 64> stdGeno_i8;
     bool use_int8_grm = false;
 
     void output_id();
@@ -110,7 +107,7 @@ private:
     std::vector<double> sd;
     uint32_t numValidMarkers = 0;
 
-    GenoBufItem *gbufitems = NULL;
+    std::vector<GenoBufItem> gbufitems;
 
     // Constants derived from part_keep_indices, cached after construction
     int grm_n = 0;               // part_keep_indices.second + 1

@@ -25,9 +25,8 @@
 #include "Pheno.h"
 #include "Marker.h"
 #include "Logger.h"
-#include "GenoBackend.h"     // GenoBlock, GenoBackend, GenoScheduler
+#include "GenoBackend.h"     // GenoBlock, GenoBackend
 #include <functional>
-#include "tables.h"
 
 // Forward declarations for the three concrete backends (needed for friend).
 class BedBackend;
@@ -133,7 +132,6 @@ private:
     Marker* marker;
     FILE* hOut = NULL;
 
-    GBitCountTable g_table;
     vector<double> AFA1;
     
     //vector<uint32_t> countA1A1;

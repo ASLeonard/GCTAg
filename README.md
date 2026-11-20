@@ -42,7 +42,6 @@ x86\_64 and ARM64 on Linux, and Apple Silicon (`arm64`) on modern macOS, are sup
 | [Spectra](https://spectralib.org/) | 1.2.0 |
 | [zstd](https://github.com/facebook/zstd) | 1.5.7 (built as a static library) |
 | [Boost](https://www.boost.org/) | 1.92.0 (`algorithm`, `math`, `crc`, `iostreams`) |
-| [stdexec](https://github.com/NVIDIA/stdexec) | `nvhpc-26.05` |
 | [SQLite](https://www.sqlite.org/) | 3.51.2 amalgamation (only with `-DBGEN_SUPPORT=ON`) |
 
 To use an existing Boost (>= 1.90, with the `iostreams` component) instead of downloading one, pass `-DBoost_DIR=<directory containing BoostConfig.cmake>`.

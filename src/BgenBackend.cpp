@@ -1,28 +1,15 @@
 /*
-   BgenBackend — coroutine-based genotype I/O for Oxford BGEN files.
-
-   Replaces:
-     preGenoDouble_bgen()  → constructor
-     readGeno_bgen()       → stream() coroutine body
-     endGenoDouble_bgen()  → destructor (trivial — no allocated masks)
-
-   BGEN reads are position-based (fseek), so we need open file handles.
-   The handles are opened once per loopDouble call (in the constructor)
-   and closed in the destructor.  The raw compressed blob for each marker
-   is copied into GenoBlock.buf; decompression happens later in
-   Geno::getGenoDouble_bgen() exactly as it did before.
+   BgenBackend — double-buffered genotype I/O for Oxford BGEN files.
 */
 
 #include "GenoBackendFactory.h"
 #include "Geno.h"
 #include "Logger.h"
-
-#include <stdexec/execution.hpp>
-#include <exec/task.hpp>
-#include <exec/static_thread_pool.hpp>
+#include "utils.hpp"
 
 #include <algorithm>
 #include <cstdio>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -30,16 +17,93 @@
 class BgenBackend : public GenoBackend {
 public:
     explicit BgenBackend(Geno &geno);
-    ~BgenBackend() override;
+    ~BgenBackend() override = default;
 
-    exec::task<void> stream(GenoScheduler               io_sched,
-                            GenoScheduler               cpu_sched,
-                            std::vector<uint32_t>       extractIndex,
-                            Callback                    callback) override;
+protected:
+    std::size_t initialBlockCapacity() const override;
+    std::unique_ptr<Producer> makeProducer(std::span<const uint32_t> extractIndex) override;
 
 private:
-    Geno                &g_;
-    std::vector<FILE *>  fileHandles_; ///< one per geno_file
+    class BgenProducer;
+
+    Geno &g_;
+    std::vector<UniqueFile> fileHandles_; ///< one per geno_file
+};
+
+class BgenBackend::BgenProducer final : public GenoBackend::Producer {
+public:
+    BgenProducer(Geno &geno,
+                 const std::vector<UniqueFile> &fileHandles,
+                 std::span<const uint32_t> extractIndex)
+        : g_(geno),
+          fileHandles_(fileHandles),
+          extractIndex_(extractIndex),
+          stride_(g_.bgenRawGenoBuf1PtrSize),
+          markerBlock_(g_.numMarkerBlock) {
+        const std::vector<uint32_t> &rawMarkerIndex = g_.marker->get_extract_index();
+        rawIndices_.resize(extractIndex_.size());
+        std::transform(extractIndex_.begin(), extractIndex_.end(),
+                       rawIndices_.begin(),
+                       [&rawMarkerIndex](std::size_t pos) {
+                           return rawMarkerIndex[pos];
+                       });
+    }
+
+    bool nextBlock(GenoBlock &block) override {
+        const uint32_t numMarker = static_cast<uint32_t>(extractIndex_.size());
+        if (finishedMarker_ >= numMarker) {
+            return false;
+        }
+
+        uint32_t nextSize = g_.marker->getNextSize(
+            rawIndices_, finishedMarker_, markerBlock_,
+            fileIndex_, chrEnds_, sexChromType_);
+        if (nextSize == 0) {
+            return false;
+        }
+
+        block.numMarkers   = nextSize;
+        block.sexChromType = sexChromType_;
+        block.fileIndex    = fileIndex_;
+        const std::size_t requiredElems = static_cast<std::size_t>(stride_) * nextSize;
+        if (block.buf.size() < requiredElems) {
+            block.buf.resize(requiredElems);
+        }
+        block.extractIndex = extractIndex_.subspan(finishedMarker_, nextSize);
+
+        FILE *bgenFile = fileHandles_[fileIndex_].get();
+        for (uint32_t i = 0; i < nextSize; ++i) {
+            int rawIndex = static_cast<int>(rawIndices_[finishedMarker_ + i]);
+
+            uint64_t pos = 0, size = 0;
+            g_.marker->getStartPosSize(rawIndex, pos, size);
+            std::fseek(bgenFile, static_cast<long>(pos), SEEK_SET);
+
+            uintptr_t *dest = block.buf.data()
+                              + static_cast<std::size_t>(i) * stride_;
+            if (std::fread(dest, sizeof(char), size, bgenFile) != size) {
+                int lag_index = rawIndex - g_.baseIndexLookup[fileIndex_];
+                LOGGER.error(0, "can't read {}th SNP in [{}].",
+                             lag_index, g_.geno_files[fileIndex_]);
+            }
+        }
+
+        finishedMarker_ += nextSize;
+        return true;
+    }
+
+private:
+    Geno &g_;
+    const std::vector<UniqueFile> &fileHandles_;
+    std::span<const uint32_t> extractIndex_;
+    std::vector<uint32_t> rawIndices_;
+    int stride_ = 0;
+    int markerBlock_ = 0;
+
+    uint32_t finishedMarker_ = 0;
+    int fileIndex_ = 0;
+    bool chrEnds_ = false;
+    uint8_t sexChromType_ = 0;
 };
 
 // --------------------------------------------------------------------------
@@ -69,92 +133,22 @@ BgenBackend::BgenBackend(Geno &geno) : g_(geno)
     // Open file handles.
     fileHandles_.reserve(g_.geno_files.size());
     for (const auto &path : g_.geno_files) {
-        FILE *f = fopen(path.c_str(), "rb");
-        if (!f)
-            LOGGER.e(0, "BgenBackend: can't open [" + path + "] to read.");
-        fileHandles_.push_back(f);
-    }
-}
-
-// --------------------------------------------------------------------------
-BgenBackend::~BgenBackend()
-{
-    for (FILE *f : fileHandles_)
-        if (f) fclose(f);
-}
-
-// --------------------------------------------------------------------------
-// NOTE: callback is taken by value so it lives in the coroutine frame and
-// remains valid across every co_await suspension point.  Do NOT change to a
-// reference — it would dangle the moment the caller's scope is suspended.
-exec::task<void> BgenBackend::stream(GenoScheduler               io_sched,
-                                     GenoScheduler               cpu_sched,
-                                     std::vector<uint32_t>       extractIndex,
-                                     Callback                    callback)
-try {
-    co_await stdexec::schedule(io_sched);
-
-    const std::vector<uint32_t> &raw_marker_index = g_.marker->get_extract_index();
-    std::vector<uint32_t> rawIndices(extractIndex.size());
-    std::transform(extractIndex.begin(), extractIndex.end(),
-                   rawIndices.begin(),
-                   [&raw_marker_index](std::size_t pos) {
-                       return raw_marker_index[pos];
-                   });
-
-    const uint32_t numMarker   = static_cast<uint32_t>(extractIndex.size());
-    const int      stride      = g_.bgenRawGenoBuf1PtrSize;
-    const int      markerBlock = g_.numMarkerBlock;
-
-    uint32_t finishedMarker = 0;
-    int      fileIndex      = 0;
-    bool     chr_ends       = false;
-    uint8_t  sexChromType        = 0;
-
-    while (finishedMarker < numMarker) {
-        uint32_t nextSize = g_.marker->getNextSize(
-            rawIndices, finishedMarker, markerBlock,
-            fileIndex, chr_ends, sexChromType);
-        if (nextSize == 0) break;
-
-        GenoBlock block;
-        block.numMarkers = nextSize;
-        block.sexChromType   = sexChromType;
-        block.fileIndex  = fileIndex;
-        block.buf.resize(static_cast<std::size_t>(stride) * nextSize);
-        block.extractIndex = std::span<const uint32_t>{
-            extractIndex.data() + finishedMarker,
-            static_cast<std::size_t>(nextSize)};
-
-        FILE *bgenFile = fileHandles_[fileIndex];
-        for (uint32_t i = 0; i < nextSize; ++i) {
-            int rawIndex = static_cast<int>(rawIndices[finishedMarker + i]);
-
-            uint64_t pos, size;
-            g_.marker->getStartPosSize(rawIndex, pos, size);
-            fseek(bgenFile, static_cast<long>(pos), SEEK_SET);
-
-            uintptr_t *dest = block.buf.data()
-                              + static_cast<std::size_t>(i) * stride;
-            if (fread(dest, sizeof(char), size, bgenFile) != size) {
-                int lag_index = rawIndex - g_.baseIndexLookup[fileIndex];
-                LOGGER.e(0, "can't read " + std::to_string(lag_index)
-                            + "th SNP in [" + g_.geno_files[fileIndex] + "].");
-            }
+        UniqueFile f = open_file(path, "rb");
+        if (!f) {
+            LOGGER.error(0, "BgenBackend: can't open [{}] to read.", path);
         }
-
-        co_await stdexec::schedule(cpu_sched);
-        callback(block);
-        co_await stdexec::schedule(io_sched);
-
-        finishedMarker += nextSize;
+        fileHandles_.push_back(std::move(f));
     }
-} catch (...) {
-    // Re-propagate through exec::task's error channel so that
-    // stdexec::sync_wait re-throws on the loopDouble call-site.
-    // RAII: ~BgenBackend() closes all file handles before the exception
-    // surfaces.
-    throw;
+}
+
+std::size_t BgenBackend::initialBlockCapacity() const {
+    const std::size_t maxBlockMarkers =
+        static_cast<std::size_t>(std::max(1, g_.numMarkerBlock));
+    return static_cast<std::size_t>(g_.bgenRawGenoBuf1PtrSize) * maxBlockMarkers;
+}
+
+std::unique_ptr<GenoBackend::Producer> BgenBackend::makeProducer(std::span<const uint32_t> extractIndex) {
+    return std::make_unique<BgenProducer>(g_, fileHandles_, extractIndex);
 }
 
 // --------------------------------------------------------------------------

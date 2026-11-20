@@ -33,7 +33,6 @@
 #include "omp.h"
 #include "GenoBackendFactory.h"
 #include <cstring>
-#include <boost/algorithm/string.hpp>
 #include "OptionIO.h"
 #include "zlib.h"
 #include "zstd.h"
@@ -1269,28 +1268,13 @@ void Geno::loopDouble(const vector<uint32_t> &extractIndex, int numMarkerBuf,
     fileIndexBuf.assign(1, 0);
     curBufferIndex = 0;
 
-    // ── Thread pools ──────────────────────────────────────────────────────
-    //    io_pool  : 1 thread — file handles and PgenReader are not thread-safe.
-    //    cpu_pool : 1 thread — Option A from the coroutine migration plan.
-    //      Callbacks use #pragma omp parallel for internally, so OMP expands
-    //      to omp_get_max_threads() workers inside each block.  The full
-    //      machine is therefore used; cpu_pool only acts as the scheduler
-    //      that launches each OMP region.
-    //
-    //    *** Do NOT raise cpu_pool above 1 without first removing or
-    //        nesting-guarding every OMP pragma in GRM.cpp and FastFAM.cpp.
-    //        Concurrent OMP regions from multiple cpu_pool threads would
-    //        oversubscribe the machine and degrade performance. ***
-    exec::static_thread_pool io_pool{1};
-    exec::static_thread_pool cpu_pool{1};   // OMP handles intra-block parallelism
-
     LOGGER.ts("LOOP_GENO_TOT");
     LOGGER.ts("LOOP_GENO_PRE");
     uint32_t nFinishedMarker = 0;
     const uint32_t nTMarker  = static_cast<uint32_t>(extractIndex.size());
     int pre_block = 0;
 
-    // ── Adapter: GenoBlock → legacy (uintptr_t*, vector<uint32_t>) ───────
+    // ── Adapter: GenoBlock → legacy (uintptr_t*, span<const uint32_t>) ────
     auto blockCallback = [&](GenoBlock &block) {
         markerSexChromTypes[0] = block.sexChromType;
         fileIndexBuf[0]    = block.fileIndex;
@@ -1309,34 +1293,19 @@ void Geno::loopDouble(const vector<uint32_t> &extractIndex, int numMarkerBuf,
                 if (time_p > 300) {
                     LOGGER.ts("LOOP_GENO_PRE");
                     float elapse_time      = LOGGER.tp("LOOP_GENO_TOT");
-                    float finished_percent = (float)nFinishedMarker / nTMarker;
-                    float remain_time      = (1.0f / finished_percent - 1) * elapse_time / 60;
-                    std::ostringstream ss;
-                    ss << std::fixed << std::setprecision(1)
-                       << finished_percent * 100
-                       << "% Estimated time remaining " << remain_time << " min";
-                    LOGGER.i(1, ss.str());
+                    float finished_percent = static_cast<float>(nFinishedMarker) / nTMarker;
+                    float remain_time      = (1.0f / finished_percent - 1.0f) * elapse_time / 60.0f;
+                    LOGGER.info(1, "{:.1f}% Estimated time remaining {:.1f} min",
+                                finished_percent * 100.0f, remain_time);
                 }
             }
         }
     };
 
-    // Backend takes extractIndex by value so block metadata can safely
-    // hold spans/slices without caller lifetime coupling.
-    auto streamExtractIndex = extractIndex;
-
-    // ── Run coroutine pipeline (blocks until all markers processed) ───────
-    stdexec::sync_wait(backend->stream(
-        io_pool.get_scheduler(),
-        cpu_pool.get_scheduler(),
-        std::move(streamExtractIndex),
-        std::move(blockCallback)));
+    backend->stream(extractIndex, blockCallback);
 
     if (showLog) {
-        std::ostringstream ss;
-        ss << std::fixed << std::setprecision(1)
-           << "100% finished in " << LOGGER.tp("LOOP_GENO_TOT") << " sec";
-        LOGGER.i(1, ss.str());
+        LOGGER.info(1, "100% finished in {:.1f} sec", LOGGER.tp("LOOP_GENO_TOT"));
         LOGGER << nFinishedMarker << " SNPs have been processed." << std::endl;
     }
     // backend destructor runs end-logic (masks freed, files closed).
@@ -1859,7 +1828,9 @@ void Geno::processFreq(){
     std::iota(extractIndex.begin(), extractIndex.end(), 0);
     
     vector<function<void (uintptr_t *, std::span<const uint32_t>)>> callBacks;
-    callBacks.push_back(bind(&Geno::freq_func, this, _1, _2));
+    callBacks.emplace_back([this](uintptr_t* buf, std::span<const uint32_t> idx) {
+        freq_func(buf, idx);
+    });
 
     numMarkerOutput = 0;
     loopDouble(extractIndex, nMarker, false, false, false, false, callBacks);
@@ -1912,7 +1883,9 @@ void Geno::processRecodet(){
     std::iota(extractIndex.begin(), extractIndex.end(), 0);
     
     vector<function<void (uintptr_t *, std::span<const uint32_t>)>> callBacks;
-    callBacks.push_back(bind(&Geno::recode_func, this, _1, _2));
+    callBacks.emplace_back([this](uintptr_t* buf, std::span<const uint32_t> idx) {
+        recode_func(buf, idx);
+    });
 
     numMarkerOutput = 0;
     loopDouble(extractIndex, nMarker, true, center, std, saveMiss, callBacks);

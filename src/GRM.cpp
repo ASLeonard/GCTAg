@@ -22,6 +22,7 @@
 #include <Eigen/Dense>
 #include <format>
 #include <limits>
+#include <memory>
 #include <iterator>
 #include <algorithm>
 #include <ranges>
@@ -30,7 +31,6 @@
 #include <cstring>
 #include <numeric>
 #include <unordered_set>
-#include "utils.hpp"
 #include "utils.hpp"
 #include "grm_binary_io.hpp"
 #include <omp.h>
@@ -92,18 +92,17 @@ GRM::GRM(){
         num_subjects = grm_ids.size();
 
         uint64_t num_grm = num_subjects * (num_subjects + 1) / 2;
-        FILE *file = fopen((grm_file + ".grm.bin").c_str(), "rb");
-        if(!file){
-            LOGGER.e(0, "can't open " + grm_file + ".grm.bin");
+        UniqueFile file = open_file(grm_file + ".grm.bin", "rb");
+        if (!file) {
+            LOGGER.error(0, "can't open {}.grm.bin", grm_file);
         }
-        const auto grm_file_size = getFileByteSize(file);
-        if(!grm_file_size){
+        const auto grm_file_size = getFileByteSize(file.get());
+        if (!grm_file_size) {
             LOGGER.e(0, "Failed to read GRM binary size for [" + grm_file + "]: " + std::string(getUtilsErrorMessage(grm_file_size.error())));
         }
-        if(num_grm * 4 != grm_file_size.value()){
+        if (num_grm * 4 != grm_file_size.value()) {
             LOGGER.e(0, "The IDs in GRM and the IDs in the GRM binary file do not match [" + grm_file + "]");
         }
-        fclose(file);
 
         uint64_t num_grm_byte = num_grm * 4;
         uint64_t num_parts = (num_grm_byte + num_byte_GRM_read - 1) / num_byte_GRM_read;
@@ -187,20 +186,20 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
     uint64_t grm_size = (1 + common_id.size()) * common_id.size() / 2;
     uint64_t grm_file_size = grm_size * 4; 
 
-    FILE * h_grm1 = fopen((files[0] + ".grm.bin").c_str(), "rb");
-    FILE * h_grmN1 = fopen((files[0] + ".grm.N.bin").c_str(), "rb");
-    FILE * h_grm2 = fopen((files[1] + ".grm.bin").c_str(), "rb");
-    FILE * h_grmN2 = fopen((files[1] + ".grm.N.bin").c_str(), "rb");
-    if(grm_file_size != getFileSize(h_grm1)){
+    UniqueFile h_grm1  = open_file(files[0] + ".grm.bin", "rb");
+    UniqueFile h_grmN1 = open_file(files[0] + ".grm.N.bin", "rb");
+    UniqueFile h_grm2  = open_file(files[1] + ".grm.bin", "rb");
+    UniqueFile h_grmN2 = open_file(files[1] + ".grm.N.bin", "rb");
+    if (!h_grm1 || grm_file_size != getFileSize(h_grm1.get())) {
         LOGGER.e(0, "The size of [" + files[0] + ".grm.bin] is not correct.");
     }
-    if(grm_file_size != getFileSize(h_grmN1)){
+    if (!h_grmN1 || grm_file_size != getFileSize(h_grmN1.get())) {
         LOGGER.e(0, "The size of [" + files[0] + ".grm.N.bin] is not correct.");
     }
-    if(grm_file_size != getFileSize(h_grm2)){
+    if (!h_grm2 || grm_file_size != getFileSize(h_grm2.get())) {
         LOGGER.e(0, "The size of [" + files[1] + ".grm.bin] is not correct.");
     }
-    if(grm_file_size != getFileSize(h_grmN2)){
+    if (!h_grmN2 || grm_file_size != getFileSize(h_grmN2.get())) {
         LOGGER.e(0, "The size of [" + files[1] + ".grm.N.bin] is not correct.");
     }
 
@@ -215,15 +214,21 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
     int loop_num = (grm_size + itemRead - 1) / itemRead;
     uint64_t remain_item = grm_size % itemRead;
     LOGGER.i(0, "Subtracting GRMs...");
-    FILE *ho_grm = fopen((out_file + ".grm.bin").c_str(), "wb");
-    FILE *ho_grmN = fopen((out_file + ".grm.N.bin").c_str(), "wb");
+    UniqueFile ho_grm  = open_file(out_file + ".grm.bin", "wb");
+    UniqueFile ho_grmN = open_file(out_file + ".grm.N.bin", "wb");
+    if (!ho_grm) {
+        LOGGER.error(0, "can't write to [{}.grm.bin].", out_file);
+    }
+    if (!ho_grmN) {
+        LOGGER.error(0, "can't write to [{}.grm.N.bin].", out_file);
+    }
 
     for(int i = 0; i < loop_num; i++){
         if(i == loop_num - 1 && remain_item != 0) itemRead = remain_item;
-        readBytes(h_grm1, itemRead, buf1.data());
-        readBytes(h_grm2, itemRead, buf2.data());
-        readBytes(h_grmN1, itemRead, bufN1.data());
-        readBytes(h_grmN2, itemRead, bufN2.data());
+        readBytes(h_grm1.get(), itemRead, buf1.data());
+        readBytes(h_grm2.get(), itemRead, buf2.data());
+        readBytes(h_grmN1.get(), itemRead, bufN1.data());
+        readBytes(h_grmN2.get(), itemRead, bufN2.data());
         // On the first chunk, check that file[0] has at least as many markers as file[1].
         // A negative N_diff means the files are in the wrong order (chr GRM listed first).
         if(i == 0 && bufN1[0] < bufN2[0]){
@@ -239,13 +244,15 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
                 ? (float)(((double)buf1[j] * bufN1[j] - (double)buf2[j] * bufN2[j]) / bufN[j])
                 : 0.0f;
         }
-        if(fwrite(buf.data(), sizeof(float), itemRead, ho_grm) != itemRead){
+        if(fwrite(buf.data(), sizeof(float), itemRead, ho_grm.get()) != itemRead){
             LOGGER.e(0, "can't write to [" + out_file + ".grm.bin].");
         }
-        if(fwrite(bufN.data(), sizeof(float), itemRead, ho_grmN) != itemRead){
+        if(fwrite(bufN.data(), sizeof(float), itemRead, ho_grmN.get()) != itemRead){
             LOGGER.e(0, "can't write to [" + out_file + ".grm.N.bin].");
         }
     }
+    ho_grm.reset();
+    ho_grmN.reset();
     LOGGER.i(0, "The subtracted GRM has been written to [" + out_file + ".grm.bin, .grm.N.bin].");
 }
 
@@ -409,13 +416,13 @@ void GRM::unify_grm(string mgrm_file, string out_file){
         uint32_t largest_grm_size = ids[i].size();
         string file_name = files[i] + ".grm.bin";
         string wfile_name = output_fileNames[i] + ".grm.bin";
-        FILE *h_grm = fopen(file_name.c_str(), "rb");
-        if(!h_grm){
+        UniqueFile h_grm = open_file(file_name, "rb");
+        if (!h_grm) {
             LOGGER.e(0, "can't read " + file_name + ".");
         }
 
-        FILE *h_wgrm = fopen(wfile_name.c_str(), "wb");
-        if(!h_wgrm){
+        UniqueFile h_wgrm = open_file(wfile_name, "wb");
+        if (!h_wgrm) {
             LOGGER.e(0, "can't write to " + wfile_name + ".");
         }
 
@@ -432,9 +439,9 @@ void GRM::unify_grm(string mgrm_file, string out_file){
             uint64_t grm_index = p_index[j];
             uint64_t num_grm = grm_index + 1;
             uint64_t byte_start_grm = start_pos[grm_index];
-            fseek(h_grm, byte_start_grm, SEEK_SET);
-            if(fread(buf.data(), sizeof(float), num_grm, h_grm) != num_grm){
-                LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(ftell(h_grm)), ".");
+            fseek(h_grm.get(), byte_start_grm, SEEK_SET);
+            if(fread(buf.data(), sizeof(float), num_grm, h_grm.get()) != num_grm){
+                LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(ftell(h_grm.get())), ".");
             }
             uint64_t size_write = j + 1;
             for(int k = 0; k < size_write; k++){
@@ -445,8 +452,8 @@ void GRM::unify_grm(string mgrm_file, string out_file){
                 }else{
                     //fill the other parts
                     auto bytes_offset = start_pos[cur_index] + grm_index * sizeof(float);
-                    fseek(h_grm, bytes_offset, SEEK_SET); 
-                    if(fread(&grm_value, sizeof(float), 1, h_grm) != 1){
+                    fseek(h_grm.get(), bytes_offset, SEEK_SET); 
+                    if(fread(&grm_value, sizeof(float), 1, h_grm.get()) != 1){
                         LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(bytes_offset), ".");
                     }
                 }
@@ -455,12 +462,12 @@ void GRM::unify_grm(string mgrm_file, string out_file){
             //last element
             //*(wbuf + j) = *(buf + grm_index);
 
-            if(size_write != fwrite(wbuf.data(), sizeof(float), size_write, h_wgrm)){
-                LOGGER.e(0, "error in writing to [" + wfile_name + "], pos: " + std::to_string(ftell(h_wgrm)) + "."); 
+            if(size_write != fwrite(wbuf.data(), sizeof(float), size_write, h_wgrm.get())){
+                LOGGER.e(0, "error in writing to [" + wfile_name + "], pos: " + std::to_string(ftell(h_wgrm.get())) + "."); 
             }
         }
-        fclose(h_grm);
-        fclose(h_wgrm);
+        h_grm.reset();
+        h_wgrm.reset();
         LOGGER.i(0, "GRM has been written to [" + wfile_name + "].");
     }
 
@@ -469,17 +476,19 @@ void GRM::unify_grm(string mgrm_file, string out_file){
 void GRM::prune_fam(float thresh, bool isSparse, float *value){
     LOGGER.i(0, "Pruning the GRM to a sparse matrix with a cutoff of " + to_string(thresh) + "...");
     LOGGER.i(0, "Total number of parts to be processed: " + to_string(index_grm_pairs.size()));
-    FILE *grmFile = fopen((grm_file + ".grm.bin").c_str(), "rb");
+    UniqueFile grmFile = open_file(grm_file + ".grm.bin", "rb");
+    if (!grmFile) LOGGER.error(0, "can't read [{}.grm.bin]", grm_file);
 
     std::ofstream o_id((options["out"] + ".grm.id").c_str());
     if(!o_id) LOGGER.e(0, "can't write to [" + options["out"] + ".grm.id]");
     std::ofstream o_fam;
-    FILE* o_bk;
+    UniqueFile o_bk;
     if(isSparse){
         o_fam.open((options["out"] + ".grm.sp").c_str());
         if(!o_fam) LOGGER.e(0, "can't write to [" + options["out"] + ".grm.sp]");
     }else{
-        o_bk = fopen((options["out"] + ".grm.bin").c_str(), "wb");
+        o_bk = open_file(options["out"] + ".grm.bin", "wb");
+        if (!o_bk) LOGGER.error(0, "can't write to [{}.grm.bin]", options["out"]);
     }
 
     //Save the kept IDs, which may change by --keep and --remove
@@ -505,7 +514,7 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
     float *cur_grm_buf;
     int new_id1 = 0;
     for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
-        if(fread(grm_buf.data(), sizeof(float), byte_part_grms[part_index], grmFile) != byte_part_grms[part_index]){
+        if(fread(grm_buf.data(), sizeof(float), byte_part_grms[part_index], grmFile.get()) != byte_part_grms[part_index]){
             LOGGER.e(0, "Failed to read GRM between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
                         + to_string(index_grm_pairs[part_index].second + 1));
         };
@@ -556,16 +565,14 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
         }
         if(!isSparse){
             int write_items = cur_grm_buf - out_grm_buf.data();
-            if(fwrite(out_grm_buf.data(), sizeof(float), write_items, o_bk) != write_items){
+            if(fwrite(out_grm_buf.data(), sizeof(float), write_items, o_bk.get()) != write_items){
                 LOGGER.e(0, "Failed to write the output"); 
             }
         }
 
     }
-    fclose(grmFile);
-    if(!isSparse){
-        fclose(o_bk);
-    }
+    grmFile.reset();
+    o_bk.reset();
 
     if(isSparse){
         LOGGER.i(0, "Saving the sparse GRM (" + to_string(rm_grm.size()) + " pairs) to [" + options["out"] + ".grm.sp]");
@@ -582,14 +589,17 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
         LOGGER.i(0, "GRM has been saved to [" + options["out"] + ".grm.bin]");
     }
 
-    FILE *NFile = fopen((grm_file + ".grm.N.bin").c_str(), "rb");
-    FILE *ONFile = fopen((options["out"] + ".grm.N.bin").c_str(), "wb");
+    UniqueFile NFile  = open_file(grm_file + ".grm.N.bin", "rb");
+    UniqueFile ONFile = open_file(options["out"] + ".grm.N.bin", "wb");
+    if (!NFile || !ONFile) {
+        LOGGER.error(0, "can't open [{}.grm.N.bin] or [{}.grm.N.bin]", grm_file, options["out"]);
+    }
     std::vector<float> N_buf(num_byte_buffer);
     float *cur_N_pos0;
     std::vector<float> out_N_buf(num_byte_buffer);
     float *cur_N_buf;
     for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
-        if(fread(N_buf.data(), sizeof(float), byte_part_grms[part_index], NFile) != byte_part_grms[part_index]){
+        if(fread(N_buf.data(), sizeof(float), byte_part_grms[part_index], NFile.get()) != byte_part_grms[part_index]){
             LOGGER.w(0, "Reading GRM N failed between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
                         + to_string(index_grm_pairs[part_index].second + 1));
             LOGGER.i(0, "Stop pruning the GRM N");
@@ -614,13 +624,13 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
         }
 
         int write_items = cur_N_buf - out_N_buf.data();
-        if(fwrite(out_N_buf.data(), sizeof(float), write_items, ONFile) != write_items){
+        if(fwrite(out_N_buf.data(), sizeof(float), write_items, ONFile.get()) != write_items){
             LOGGER.e(0, "Failed to write the GRM N"); 
         }
 
     }
-    fclose(ONFile);
-    fclose(NFile);
+    ONFile.reset();
+    NFile.reset();
     LOGGER.i(0, "GRM N has been saved to [" + options["out"] + ".grm.N.bin]");
 }
 
@@ -629,7 +639,8 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
 void GRM::cut_rel(float thresh, bool no_grm){
     LOGGER.i(0, "Pruning the GRM with a cutoff of " + to_string(thresh) + "...");
     LOGGER.i(0, "Total number of parts to be processed: " + to_string(index_grm_pairs.size()));
-    FILE *grmFile = fopen((grm_file + ".grm.bin").c_str(), "rb");
+    UniqueFile grmFile = open_file(grm_file + ".grm.bin", "rb");
+    if (!grmFile) LOGGER.error(0, "can't read [{}.grm.bin]", grm_file);
     // put this first to avoid unwritable disk
     std::ofstream o_keep;
     if(!no_grm){
@@ -658,7 +669,7 @@ void GRM::cut_rel(float thresh, bool no_grm){
     vector<float> rm_grm;
     vector<int> rm_grm_ID1, rm_grm_ID2;
     for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
-        if(fread(grm_buf.data(), sizeof(float), byte_part_grms[part_index], grmFile) != byte_part_grms[part_index]){
+        if(fread(grm_buf.data(), sizeof(float), byte_part_grms[part_index], grmFile.get()) != byte_part_grms[part_index]){
             LOGGER.e(0, "Failed to read GRM between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
                         + to_string(index_grm_pairs[part_index].second + 1));
         };
@@ -747,36 +758,34 @@ void GRM::cut_rel(float thresh, bool no_grm){
     }
 
     if(no_grm) {
-        fclose(grmFile);
         return;
     }
 
     LOGGER.i(0, "Pruning GRM values, total parts " + std::to_string(index_grm_pairs.size()));
-    FILE *grm_out_file = fopen((options["out"] + ".grm.bin").c_str(), "wb");
+    UniqueFile grm_out_file = open_file(options["out"] + ".grm.bin", "wb");
     if(!grm_out_file){
         LOGGER.e(0, "can't open [" + options["out"] + ".grm.bin] to write");
     }
-    fseek(grmFile, 0, SEEK_SET);
-    outBinFile(grmFile, grm_out_file);
-    fclose(grmFile);
-    fclose(grm_out_file);
+    fseek(grmFile.get(), 0, SEEK_SET);
+    outBinFile(grmFile.get(), grm_out_file.get());
+    grmFile.reset();
+    grm_out_file.reset();
     LOGGER.i(2, "GRM values have been saved to [" + options["out"] + ".grm.bin]");
 
     LOGGER.i(0, "Pruning number of SNPs to calculate GRM, total parts " + std::to_string(index_grm_pairs.size()));
-    FILE *NFile = fopen((grm_file + ".grm.N.bin").c_str(), "rb");
+    UniqueFile NFile = open_file(grm_file + ".grm.N.bin", "rb");
     if(!NFile){
         LOGGER.w(2, "There is no [" + grm_file + ".grm.N.bin]");
         return;
     }
-    FILE *N_out_file = fopen((options["out"] + ".grm.N.bin").c_str(), "wb");
+    UniqueFile N_out_file = open_file(options["out"] + ".grm.N.bin", "wb");
     if(!N_out_file){
         LOGGER.w(2, "can't open [" + options["out"] + ".grm.N.bin] to write. Ignore this step");
-        fclose(NFile);
         return;
     }
-    outBinFile(NFile, N_out_file);
-    fclose(NFile);
-    fclose(N_out_file);
+    outBinFile(NFile.get(), N_out_file.get());
+    NFile.reset();
+    N_out_file.reset();
     LOGGER.i(2, "Number of SNPs has been saved to [" + options["out"] + ".grm.N.bin]");
 }
 
@@ -818,7 +827,7 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
     //clock_t begin = t_begin();
     this->pheno = pheno;
     this->marker = marker;
-    this->geno = new Geno(pheno, marker);
+    this->geno = std::make_unique<Geno>(pheno, marker);
     // Pay attention to not reflect the newest changes of keep;
     this->index_keep = pheno->get_index_keep();
     this->part = std::stoi(options["cur_part"]);
@@ -875,9 +884,10 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
         ctor_tiling_enabled = false;
     }
     if(!bBLAS || !ctor_tiling_enabled){
-        int ret_grm = posix_memalign((void **)&grm, 32, fill_grm * sizeof(double));
-        if(ret_grm){
-            LOGGER.e(0, "can't allocate enough memory to store the (parted) GRM: " + to_string(fill_grm*sizeof(double) / 1024.0/1024/1024) + "GB required.");
+        grm = make_aligned_uninitialized<double, 64>(fill_grm);
+        if(!grm){
+            LOGGER.error(0, "can't allocate enough memory to store the (parted) GRM: {:.2f}GB required.",
+                         fill_grm * sizeof(double) / (1024.0 * 1024.0 * 1024.0));
         }
         if(bBLAS){
             // grm here is a dense (grm_m x grm_n) buffer for cblas_dsyrk/dgemm, not the
@@ -889,18 +899,18 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
             // untouched upper triangle. See grm_first_accum.
             grm_first_accum = true;
         } else {
-            memset(grm, 0, fill_grm * sizeof(double));
+            std::memset(grm.get(), 0, fill_grm * sizeof(double));
         }
 
         // N stays packed-triangular size even in bBLAS mode (fill_N was captured
         // before the bBLAS override above), so this memset has no waste to fix.
-        int ret_N = posix_memalign((void **)&N, 64, fill_N * sizeof(uint32_t));
-        if(ret_N){
-            LOGGER.e(0, "can't allocate enough memory to store (parted) N: " + to_string(fill_grm*sizeof(uint32_t) / 1024.0/1024/1024) + "GB required.");
+        N = make_aligned_uninitialized<uint32_t, 64>(fill_N);
+        if(!N){
+            LOGGER.error(0, "can't allocate enough memory to store (parted) N: {:.2f}GB required.",
+                         fill_N * sizeof(uint32_t) / (1024.0 * 1024.0 * 1024.0));
         }
-        memset(N, 0, fill_N * sizeof(uint32_t));
+        std::memset(N.get(), 0, fill_N * sizeof(uint32_t));
     }
-    // grm/N == nullptr for bBLAS; posix_mem_free(nullptr) is a safe no-op.
 
     // +64 pads sub_miss past the last valid index by one full cache line (64 × sizeof(uint32_t) = 256 bytes).
     // This prevents OMP threads from writing to adjacent cache lines when two threads operate on
@@ -983,23 +993,25 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     int num_marker = markerIndex.size();
 
     if (use_int8_grm) {
+        int8_t* const std_geno_i8_base = std::assume_aligned<64>(stdGeno_i8.get());
         #pragma omp parallel for schedule(static)
         for(int i = 0; i < num_marker; i++){
             GenoBufItem &item = gbufitems[i];
             item.extractedMarkerIndex = markerIndex[i];
             item.geno_ptr = nullptr;
             item.geno_f32_ptr = nullptr;
-            item.geno_i8_ptr = stdGeno_i8 + static_cast<size_t>(i) * stdGenoLD;
+            item.geno_i8_ptr = std_geno_i8_base + static_cast<size_t>(i) * stdGenoLD;
             geno->getGenoDouble(buf, i, &item);
         }
     } else {
+        float* const std_geno_base = std::assume_aligned<64>(stdGeno.get());
         #pragma omp parallel for schedule(static)
         for(int i = 0; i < num_marker; i++){
             GenoBufItem &item = gbufitems[i];
             item.extractedMarkerIndex = markerIndex[i];
             item.geno_ptr = nullptr;
             item.geno_i8_ptr = nullptr;
-            item.geno_f32_ptr = stdGeno + static_cast<size_t>(i) * stdGenoLD;
+            item.geno_f32_ptr = std_geno_base + static_cast<size_t>(i) * stdGenoLD;
             geno->getGenoDouble(buf, i, &item);
         }
     }
@@ -1018,20 +1030,22 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     // Otherwise, compact valid columns forward in-place (validIndexBuf[k] >= k).
     if (curNumValidMarkers < num_marker) {
         if (use_int8_grm) {
+            int8_t* const std_geno_i8_base = std::assume_aligned<64>(stdGeno_i8.get());
             for (int k = 0; k < curNumValidMarkers; ++k) {
                 const int src_idx = validIndexBuf[k];
                 if (src_idx != k) {
-                    std::memcpy(stdGeno_i8 + static_cast<size_t>(k) * stdGenoLD,
-                                stdGeno_i8 + static_cast<size_t>(src_idx) * stdGenoLD,
+                    std::memcpy(std_geno_i8_base + static_cast<size_t>(k) * stdGenoLD,
+                                std_geno_i8_base + static_cast<size_t>(src_idx) * stdGenoLD,
                                 static_cast<size_t>(grm_bytes_std_geno));
                 }
             }
         } else {
+            float* const std_geno_base = std::assume_aligned<64>(stdGeno.get());
             for (int k = 0; k < curNumValidMarkers; ++k) {
                 const int src_idx = validIndexBuf[k];
                 if (src_idx != k) {
-                    std::memcpy(stdGeno + static_cast<size_t>(k) * stdGenoLD,
-                                stdGeno + static_cast<size_t>(src_idx) * stdGenoLD,
+                    std::memcpy(std_geno_base + static_cast<size_t>(k) * stdGenoLD,
+                                std_geno_base + static_cast<size_t>(src_idx) * stdGenoLD,
                                 static_cast<size_t>(grm_bytes_std_geno));
                 }
             }
@@ -1045,8 +1059,10 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
 
     constexpr int kTile = 4096;
     const bool first_accum = grm_first_accum;
+    double* const grm_base = std::assume_aligned<64>(grm.get());
 
     if (use_int8_grm) {
+        const int8_t* const std_geno_i8_base = std::assume_aligned<64>(stdGeno_i8.get());
         double S_mu2 = 0.0;
         for (int m = 0; m < curNumValidMarkers; ++m) {
             const double mu_m = gbufitems[validIndexBuf[m]].mean;
@@ -1063,7 +1079,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             std::memset(r_slice, 0, static_cast<size_t>(len) * sizeof(double));
             for (int m = 0; m < curNumValidMarkers; ++m) {
                 const double mu_m = mu_vec_[m];
-                const int8_t* col_m = stdGeno_i8 + static_cast<size_t>(m) * stdGenoLD + i0;
+                const int8_t* col_m = std_geno_i8_base + static_cast<size_t>(m) * stdGenoLD + i0;
                 for (int r = 0; r < len; ++r) {
                     r_slice[r] += static_cast<double>(col_m[r]) * mu_m;
                 }
@@ -1209,7 +1225,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                 const int m = col_miss_m[idx];
                 const double mu_m = mu_vec_[m];
                 const double neg_mu2 = -mu_m * mu_m;
-                const int8_t* col_m = stdGeno_i8 + static_cast<size_t>(m) * stdGenoLD + row_start;
+                const int8_t* col_m = std_geno_i8_base + static_cast<size_t>(m) * stdGenoLD + row_start;
                 for (int r = 0; r < len; ++r) {
                     dst_col[r] += static_cast<double>(col_m[r]) * mu_m + neg_mu2;
                 }
@@ -1223,7 +1239,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
 
             // Step 3: markers missing in rows [row_start, row_start + len)
             for (int m : active_row_miss_markers) {
-                const int8_t g_jm = stdGeno_i8[static_cast<size_t>(m) * stdGenoLD + j];
+                const int8_t g_jm = std_geno_i8_base[static_cast<size_t>(m) * stdGenoLD + j];
                 if (g_jm != 0) {
                     const double corr = mu_vec_[m] * static_cast<double>(g_jm);
                     for (int r_idx = row_miss_b[m]; r_idx < row_miss_e[m]; ++r_idx) {
@@ -1249,8 +1265,8 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                         prepare_row_missing(global_r0, rows);
                         gcta_gemm_s8s8s32_colmajor_nt(
                             rows, cols, K,
-                            stdGeno_i8 + global_r0, stdGenoLD,
-                            stdGeno_i8 + global_c0, stdGenoLD,
+                            std_geno_i8_base + global_r0, stdGenoLD,
+                            std_geno_i8_base + global_c0, stdGenoLD,
                             grm_i32_tile_.data(), rows,
                             i8_scratch_A_f32_, i8_scratch_B_f32_, grm_f32_tile_);
                     }
@@ -1279,7 +1295,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                     prepare_row_missing(global_c0, cols);
                     gcta_syrk_s8s8s32_lower_colmajor_nt(
                         cols, K,
-                        stdGeno_i8 + global_c0, stdGenoLD,
+                        std_geno_i8_base + global_c0, stdGenoLD,
                         grm_i32_tile_.data(), cols,
                         i8_scratch_A_f32_, grm_f32_tile_);
                 }
@@ -1308,23 +1324,24 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         if (grm_tiling_enabled) {
             if (grm_tile_rs > 0) {
                 accum_i8_gemm_to_f64(grm_tile_rs, grm_tile_rows, 0, grm_tile_rs, curNumValidMarkers,
-                                     grm, grm_tile_rows);
+                                     grm_base, grm_tile_rows);
             }
-            double *grm_diag = grm + static_cast<size_t>(grm_tile_rs) * grm_tile_rows;
+            double *grm_diag = grm_base + static_cast<size_t>(grm_tile_rs) * grm_tile_rows;
             accum_i8_syrk_lower_to_f64(grm_tile_rs, grm_tile_rows, curNumValidMarkers,
                                        grm_diag, grm_tile_rows);
         } else if (part_keep_indices.first == 0) {
             accum_i8_syrk_lower_to_f64(0, grm_n, curNumValidMarkers,
-                                       grm, grm_n);
+                                       grm_base, grm_n);
         } else {
             const int row_base = static_cast<int>(part_keep_indices.first);
             accum_i8_gemm_to_f64(row_base, grm_m, 0, grm_s_n, curNumValidMarkers,
-                                 grm, grm_m);
-            double *grm_start = grm + static_cast<uint64_t>(grm_s_n) * grm_m;
+                                 grm_base, grm_m);
+            double *grm_start = grm_base + static_cast<uint64_t>(grm_s_n) * grm_m;
             accum_i8_syrk_lower_to_f64(row_base, grm_m, curNumValidMarkers,
                                        grm_start, grm_m);
         }
     } else {
+        const float* const std_geno_base = std::assume_aligned<64>(stdGeno.get());
         // Mixed-precision BLAS3: run cblas_ssyrk / cblas_sgemm (beta=0.0f) on L3-sized
         // 4096x4096 float32 tiles (grm_f32_tile_), then widen and accumulate into
         // double* grm. On the first accumulation for this grm buffer (grm_first_accum),
@@ -1412,26 +1429,26 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         if(grm_tiling_enabled){
             if(grm_tile_rs > 0){
                 accum_sgemm_to_f64(grm_tile_rows, grm_tile_rs, curNumValidMarkers,
-                                   stdGeno + grm_tile_rs, stdGenoLD,
-                                   stdGeno, stdGenoLD,
-                                   grm, grm_tile_rows);
+                                   std_geno_base + grm_tile_rs, stdGenoLD,
+                                   std_geno_base, stdGenoLD,
+                                   grm_base, grm_tile_rows);
             }
-            double *grm_diag = grm + static_cast<size_t>(grm_tile_rs) * grm_tile_rows;
+            double *grm_diag = grm_base + static_cast<size_t>(grm_tile_rs) * grm_tile_rows;
             accum_ssyrk_lower_to_f64(grm_tile_rows, curNumValidMarkers,
-                                     stdGeno + grm_tile_rs, stdGenoLD,
+                                     std_geno_base + grm_tile_rs, stdGenoLD,
                                      grm_diag, grm_tile_rows);
         } else if(part_keep_indices.first == 0){
             accum_ssyrk_lower_to_f64(grm_n, curNumValidMarkers,
-                                     stdGeno, stdGenoLD,
-                                     grm, grm_n);
+                                     std_geno_base, stdGenoLD,
+                                     grm_base, grm_n);
         }else{
             accum_sgemm_to_f64(grm_m, grm_s_n, curNumValidMarkers,
-                               stdGeno + part_keep_indices.first, stdGenoLD,
-                               stdGeno, stdGenoLD,
-                               grm, grm_m);
-            double *grm_start = grm + (uint64_t)grm_s_n * grm_m;
+                               std_geno_base + part_keep_indices.first, stdGenoLD,
+                               std_geno_base, stdGenoLD,
+                               grm_base, grm_m);
+            double *grm_start = grm_base + (uint64_t)grm_s_n * grm_m;
             accum_ssyrk_lower_to_f64(grm_m, curNumValidMarkers,
-                                     stdGeno + part_keep_indices.first, stdGenoLD,
+                                     std_geno_base + part_keep_indices.first, stdGenoLD,
                                      grm_start, grm_m);
         }
     }
@@ -1515,21 +1532,22 @@ void GRM::deduce_GRM(){
         LOGGER.i(0, "Saving GRM...");
     }
 
-    FILE *grm_out = nullptr, *N_out = nullptr;
+    UniqueFile grm_out;
+    UniqueFile N_out;
     if(isSparse){
-        grm_out = fopen((o_name + ".grm.sp").c_str(), "wb");
+        grm_out = open_file(o_name + ".grm.sp", "wb");
         if(!grm_out){
-            LOGGER.e(0, "can't open " + o_name + ".grm.sp to write");
+            LOGGER.error(0, "can't open {}.grm.sp to write", o_name);
         }
     }else{
-        grm_out = fopen((o_name + ".grm.bin").c_str(), "wb");
-        N_out   = fopen((o_name + ".grm.N.bin").c_str(), "wb");
+        grm_out = open_file(o_name + ".grm.bin", "wb");
+        N_out   = open_file(o_name + ".grm.N.bin", "wb");
         if((!grm_out) || (!N_out)){
-            LOGGER.e(0, "can't open " + o_name + ".grm.bin or .grm.N.bin to write");
+            LOGGER.error(0, "can't open {}.grm.bin or .grm.N.bin to write", o_name);
         }
         // 4 MiB matches a typical Lustre stripe size and avoids sub-stripe metadata ops.
-        setvbuf(grm_out, nullptr, _IOFBF, 4 << 20);
-        setvbuf(N_out,   nullptr, _IOFBF, 4 << 20);
+        setvbuf(grm_out.get(), nullptr, _IOFBF, 4 << 20);
+        setvbuf(N_out.get(),   nullptr, _IOFBF, 4 << 20);
     }
 
     float mtd_weight = 1.0f;
@@ -1553,11 +1571,11 @@ void GRM::deduce_GRM(){
     std::vector<float> w_N;
     std::vector<float> grm_block;
     std::string sparse_buf;
-    flush_grm_tile(grm_out, N_out, thresh, isSparse, mtd_weight,
+    flush_grm_tile(grm_out.get(), N_out.get(), thresh, isSparse, mtd_weight,
                    w_N, grm_block, sparse_buf);
 
-    if(grm_out) fclose(grm_out);
-    if(N_out)   fclose(N_out);
+    grm_out.reset();
+    N_out.reset();
     if(!isSparse){
         LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.bin]");
         LOGGER.i(0, "Number of SNPs in each pair of individuals has been saved in the file [" + o_name + ".grm.N.bin]");
@@ -1593,13 +1611,16 @@ void GRM::flush_grm_tile(FILE *grm_out, FILE *N_out,
     if(isSparse) sparse_buf.reserve(std::max(sparse_buf.capacity(),
         static_cast<size_t>(BLAS_OUT_BLOCK) * tile_cols / 20 * 25));
 
+    const double* const grm_base = std::assume_aligned<64>(grm.get());
+    const uint32_t* const N_base = std::assume_aligned<64>(N.get());
+
     const auto get_N_row = [&](int pair1) -> const uint32_t* {
         if (grm_tiling_enabled) {
-            return N + static_cast<size_t>(pair1 - tile_rs) * tile_cols;
+            return N_base + static_cast<size_t>(pair1 - tile_rs) * tile_cols;
         }
         const size_t start_pos = static_cast<size_t>(pair1 + 1 + tile_rs) *
                                  static_cast<size_t>(pair1 - tile_rs) / 2;
-        return N + start_pos;
+        return N_base + start_pos;
     };
 
     for(int block_start = tile_rs; block_start < tile_re; block_start += BLAS_OUT_BLOCK){
@@ -1612,7 +1633,7 @@ void GRM::flush_grm_tile(FILE *grm_out, FILE *N_out,
         //    needed lower-triangle entries (pair2 <= pair1, i.e. c <= block_start + r).
         #pragma omp parallel for schedule(static)
         for(int c = 0; c < block_cols; ++c){
-            const double *col_src = grm + static_cast<size_t>(c) * tile_rows + local_block_start;
+            const double *col_src = grm_base + static_cast<size_t>(c) * tile_rows + local_block_start;
             const int r_start = std::max(0, c - block_start);
             for(int r = r_start; r < block_rows; ++r){
                 grm_block[static_cast<size_t>(r) * block_cols + c] = static_cast<float>(col_src[r]);
@@ -1669,7 +1690,7 @@ void GRM::flush_grm_tile(FILE *grm_out, FILE *N_out,
 //
 //   grm_tiling_enabled  (tiled path):
 //     N is a RECTANGULAR buffer of shape (grm_tile_rows × grm_tile_cols), allocated in
-//     processMakeGRM with posix_memalign and zeroed per tile.
+//     processMakeGRM with make_aligned_uninitialized and zeroed per tile.
 //     Index: N[(pair1 - grm_tile_rs) * grm_tile_cols + pair2]
 //     pair2 ranges over [0, pair1] (lower triangle), but the stride is grm_tile_cols
 //     (full width), not the triangular row length.  flush_grm_tile reads it the same way.
@@ -1684,9 +1705,10 @@ void GRM::flush_grm_tile(FILE *grm_out, FILE *N_out,
 // when grm_tiling_enabled; the non-tiled path is the fallback otherwise.
 // If the two code paths are ever merged, this layout difference must be resolved first.
 void GRM::N_thread(int grm_index_from, int grm_index_to, const uintptr_t* cur_cmask){
+    uint32_t* const N_base = std::assume_aligned<64>(N.get());
     if(grm_tiling_enabled){
         // Rectangular N layout: N[(pair1 - grm_tile_rs) * grm_tile_cols + pair2]
-        uint32_t *po_N_row = N + static_cast<size_t>(grm_index_from - grm_tile_rs) * grm_tile_cols;
+        uint32_t *po_N_row = N_base + static_cast<size_t>(grm_index_from - grm_tile_rs) * grm_tile_cols;
         const uintptr_t *p_cmask1 = cur_cmask + grm_index_from;
         for(int index_pair1 = grm_index_from; index_pair1 != grm_index_to + 1;
                 index_pair1++, po_N_row += grm_tile_cols){
@@ -1720,7 +1742,7 @@ void GRM::N_thread(int grm_index_from, int grm_index_to, const uintptr_t* cur_cm
 
     uint64_t startPos = ((uint64_t)grm_index_from + 1 + part_keep_indices.first) * (grm_index_from - part_keep_indices.first) / 2;
 
-    uint32_t *po_N_start = N + startPos;
+    uint32_t *po_N_start = N_base + startPos;
     //for(int cur_block = 0; cur_block != Constants::NUM_MARKER_READ / num_cmask_block; cur_block++){
     //uint64_t *cur_cmask = cmask_buf + cur_block * index_keep.size();
     uint32_t *po_N = po_N_start;
@@ -2125,7 +2147,7 @@ int GRM::registerOption(map<string, vector<string>>& options_in) {
 }
 
 void GRM::processMakeGRM(bool is_homogametic){
-    gbufitems = new GenoBufItem[nMarkerBlock];
+    gbufitems.assign(nMarkerBlock, GenoBufItem{});
     {
         const int markerPerN = static_cast<int>(sizeof(uintptr_t) * CHAR_BIT);
         const int numNSampleBlock = (grm_n + markerPerN - 1) / markerPerN;
@@ -2136,11 +2158,12 @@ void GRM::processMakeGRM(bool is_homogametic){
                    && (geno->getGenoFormat() == "BED")
                    && (std::getenv("GCTA_DISABLE_INT8_GRM") == nullptr);
     const int max_tile_dim = std::min(4096, std::max(1, grm_n));
+    const size_t geno_block_elems = static_cast<size_t>(nMarkerBlock) * stdGenoLD;
     if (use_int8_grm) {
         grm_bytes_std_geno = static_cast<int>(sizeof(int8_t)) * grm_n;
-        this->num_byte_geno = sizeof(int8_t) * static_cast<uint64_t>(nMarkerBlock) * stdGenoLD;
-        int ret = posix_memalign((void **)&stdGeno_i8, 64, num_byte_geno);
-        if (ret != 0) {
+        this->num_byte_geno = sizeof(int8_t) * static_cast<uint64_t>(geno_block_elems);
+        stdGeno_i8 = make_aligned_uninitialized<int8_t, 64>(geno_block_elems);
+        if (!stdGeno_i8) {
             LOGGER.e(0, "can't allocate enough memory for the int8 genotype buffer.");
         }
         grm_i32_tile_.resize(static_cast<size_t>(max_tile_dim) * max_tile_dim);
@@ -2150,9 +2173,9 @@ void GRM::processMakeGRM(bool is_homogametic){
         marker_miss_offset_.resize(nMarkerBlock + 1);
     } else {
         grm_bytes_std_geno = static_cast<int>(sizeof(float)) * grm_n;
-        this->num_byte_geno = sizeof(float) * static_cast<uint64_t>(nMarkerBlock) * stdGenoLD;
-        int ret = posix_memalign((void **)&stdGeno, 64, num_byte_geno);
-        if (ret != 0) {
+        this->num_byte_geno = sizeof(float) * static_cast<uint64_t>(geno_block_elems);
+        stdGeno = make_aligned_uninitialized<float, 64>(geno_block_elems);
+        if (!stdGeno) {
             LOGGER.e(0, "can't allocate enough memory for the genotype buffer.");
         }
         grm_f32_tile_.resize(static_cast<size_t>(max_tile_dim) * max_tile_dim);
@@ -2185,9 +2208,8 @@ void GRM::processMakeGRM(bool is_homogametic){
         const int full_re = static_cast<int>(part_keep_indices.second) + 1;
         const double budget_elems = grm_tile_budget_bytes / 12.0;
         if(grm_tile_budget_covers_whole(full_rs, full_re, budget_elems)){
-            LOGGER.i(0, "--GRM-tile-budget ("
-                        + to_string(grm_tile_budget_bytes / (1024.0*1024.0*1024.0)).substr(0, 6)
-                        + " GB) covers the whole GRM in one tile; using the dense path instead.");
+            LOGGER.info(0, "--GRM-tile-budget ({:.3f} GB) covers the whole GRM in one tile; using the dense path instead.",
+                        grm_tile_budget_bytes / (1024.0 * 1024.0 * 1024.0));
             grm_tiling_enabled = false;
         }
     }
@@ -2208,18 +2230,19 @@ void GRM::processMakeGRM(bool is_homogametic){
             LOGGER.i(0, "Computing tiled GRM...");
         }
 
-        FILE *grm_out = nullptr, *N_out = nullptr;
+        UniqueFile grm_out;
+        UniqueFile N_out;
         if(isSparse){
-            grm_out = fopen((o_name + ".grm.sp").c_str(), "wb");
-            if(!grm_out) LOGGER.e(0, "can't open " + o_name + ".grm.sp to write");
+            grm_out = open_file(o_name + ".grm.sp", "wb");
+            if(!grm_out) LOGGER.error(0, "can't open {}.grm.sp to write", o_name);
         } else {
-            grm_out = fopen((o_name + ".grm.bin").c_str(), "wb");
-            N_out   = fopen((o_name + ".grm.N.bin").c_str(), "wb");
+            grm_out = open_file(o_name + ".grm.bin", "wb");
+            N_out   = open_file(o_name + ".grm.N.bin", "wb");
             if(!grm_out || !N_out)
-                LOGGER.e(0, "can't open " + o_name + ".grm.bin or .grm.N.bin to write");
+                LOGGER.error(0, "can't open {}.grm.bin or .grm.N.bin to write", o_name);
             // 4 MiB matches a typical Lustre stripe size and avoids sub-stripe metadata ops.
-            setvbuf(grm_out, nullptr, _IOFBF, 4 << 20);
-            setvbuf(N_out,   nullptr, _IOFBF, 4 << 20);
+            setvbuf(grm_out.get(), nullptr, _IOFBF, 4 << 20);
+            setvbuf(N_out.get(),   nullptr, _IOFBF, 4 << 20);
         }
 
         const int num_thread = omp_get_max_threads();
@@ -2237,21 +2260,19 @@ void GRM::processMakeGRM(bool is_homogametic){
             const int re = solve_tile_budget_end(rs, full_re, budget_elems);
             if(re <= rs){
                 const uint64_t need_bytes = static_cast<uint64_t>(rs + 1) * 12ULL;
-                LOGGER.e(0, "--GRM-tile-budget is too small: the next row (sample offset "
-                            + to_string(rs) + ") alone needs "
-                            + to_string(need_bytes / (1024.0*1024.0*1024.0)).substr(0, 6)
-                            + " GB for its GRM+N row, but the budget is only "
-                            + to_string(grm_tile_budget_bytes / (1024.0*1024.0*1024.0)).substr(0, 6)
-                            + " GB. Increase --GRM-tile-budget.");
+                LOGGER.error(0, "--GRM-tile-budget is too small: the next row (sample offset {}) alone needs {:.3f} GB for its GRM+N row, but the budget is only {:.3f} GB. Increase --GRM-tile-budget.",
+                             rs,
+                             need_bytes / (1024.0 * 1024.0 * 1024.0),
+                             grm_tile_budget_bytes / (1024.0 * 1024.0 * 1024.0));
             }
             tile_ranges.push_back({rs, re});
             rs = re;
         }
-        LOGGER.i(0, "Block-tiled GRM (memory budget "
-                    + to_string(grm_tile_budget_bytes / (1024.0*1024.0*1024.0)).substr(0, 6)
-                    + " GB): " + to_string(tile_ranges.size()) + " tile(s), rows/tile ranging "
-                    + to_string(tile_ranges.front().second - tile_ranges.front().first) + "-"
-                    + to_string(tile_ranges.back().second - tile_ranges.back().first) + ".");
+        LOGGER.info(0, "Block-tiled GRM (memory budget {:.3f} GB): {} tile(s), rows/tile ranging {}-{}.",
+                    grm_tile_budget_bytes / (1024.0 * 1024.0 * 1024.0),
+                    tile_ranges.size(),
+                    tile_ranges.front().second - tile_ranges.front().first,
+                    tile_ranges.back().second - tile_ranges.back().first);
 
         // flush_grm_tile's output-formatting scratch, sized once to the final
         // (widest) tile -- tile_ranges is monotonically widening in `re`, so
@@ -2279,24 +2300,25 @@ void GRM::processMakeGRM(bool is_homogametic){
 
             // Fresh, exactly-sized allocation for this tile only
             const size_t tile_rect_elems = static_cast<size_t>(grm_tile_rows) * grm_tile_cols;
-            if(posix_memalign((void**)&grm, 64, tile_rect_elems * sizeof(double)) != 0)
+            grm = make_aligned_uninitialized<double, 64>(tile_rect_elems);
+            if(!grm)
                 LOGGER.e(0, "Can't allocate GRM tile buffer.");
-            if(posix_memalign((void**)&N, 64, tile_rect_elems * sizeof(uint32_t)) != 0)
+            N = make_aligned_uninitialized<uint32_t, 64>(tile_rect_elems);
+            if(!N)
                 LOGGER.e(0, "Can't allocate N tile buffer.");
 
             const double drs = tile_rs, dre = tile_re;
             const size_t tile_elems = static_cast<size_t>((dre * (dre + 1.0) - drs * (drs + 1.0)) / 2.0);
             const double tile_gb    = tile_elems * 12.0 / (1024.0 * 1024.0 * 1024.0);
-            LOGGER.i(0, "  Tile rows " + to_string(tile_rs) + "-" + to_string(tile_re - 1)
-                        + " (" + to_string(tile_gb).substr(0, 4) + " GB grm+N)");
+            LOGGER.info(0, "  Tile rows {}-{} ({:.2f} GB grm+N)", tile_rs, tile_re - 1, tile_gb);
 
             grm_first_accum = true;
 
             for(int r = 0; r < grm_tile_rows; r++){
                 const int pair1 = tile_rs + r;               // global row index
                 const int valid_cols = pair1 + 1;             // N_thread writes cols [0, pair1]
-                memset(N + static_cast<size_t>(r) * grm_tile_cols, 0,
-                       static_cast<size_t>(valid_cols) * sizeof(uint32_t));
+                std::memset(N.get() + static_cast<size_t>(r) * grm_tile_cols, 0,
+                            static_cast<size_t>(valid_cols) * sizeof(uint32_t));
             }
 
             index_grm_pairs.clear();
@@ -2319,15 +2341,15 @@ void GRM::processMakeGRM(bool is_homogametic){
                 if(weight > 0.0f) mtd_weight = static_cast<float>(numValidMarkers) / weight;
             }
 
-            flush_grm_tile(grm_out, N_out, thresh, isSparse, mtd_weight,
+            flush_grm_tile(grm_out.get(), N_out.get(), thresh, isSparse, mtd_weight,
                            flush_w_N, flush_grm_block, flush_sparse_buf);
 
-            posix_mem_free(grm); grm = nullptr;
-            posix_mem_free(N);   N   = nullptr;
+            grm.reset();
+            N.reset();
         }
 
-        if(grm_out) fclose(grm_out);
-        if(N_out)   fclose(N_out);
+        grm_out.reset();
+        N_out.reset();
         LOGGER << "  Used " << numValidMarkers << " valid SNPs." << std::endl;
         if(!isSparse){
             LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.bin]");
@@ -2343,9 +2365,9 @@ void GRM::processMakeGRM(bool is_homogametic){
         deduce_GRM();
     }
 
-    delete[] gbufitems;
-    if (stdGeno) { posix_mem_free(stdGeno); stdGeno = nullptr; }
-    if (stdGeno_i8) { posix_mem_free(stdGeno_i8); stdGeno_i8 = nullptr; }
+    gbufitems.clear();
+    stdGeno.reset();
+    stdGeno_i8.reset();
     geno->setGRMMode(false, false);
 }
 

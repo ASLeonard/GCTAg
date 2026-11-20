@@ -1,31 +1,14 @@
 /*
-   PgenBackend — coroutine-based genotype I/O for PLINK PGEN files.
-
-   This is the PROPER implementation.  Previously PGEN was silently
-   aliased to the BED code path (preGenoDouble_bed / readGeno_bed /
-   getGenoDouble_bed), which meant the PGEN-specific dosage buffer
-   layout was never set up and readGeno_pgen / getGenoDouble_pgen were
-   dead code.
-
-   Replaces:
-     preGenoDouble_pgen()  → constructor
-     readGeno_pgen()       → stream() coroutine body (uses ReadDosage)
-     endGenoDouble_pgen()  → destructor (trivial)
-
-   Processing (getGenoDouble_pgen) is unchanged and remains in Geno.cpp.
+   PgenBackend — double-buffered genotype I/O for PLINK PGEN files.
 */
 
 #include "GenoBackendFactory.h"
 #include "Geno.h"
 #include "Logger.h"
-#include "mem.hpp"
 #include "third_party/Pgenlib/PgenReader.h"
 
-#include <stdexec/execution.hpp>
-#include <exec/task.hpp>
-#include <exec/static_thread_pool.hpp>
-
 #include <algorithm>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -35,13 +18,96 @@ public:
     explicit PgenBackend(Geno &geno);
     ~PgenBackend() override = default;
 
-    exec::task<void> stream(GenoScheduler               io_sched,
-                            GenoScheduler               cpu_sched,
-                            std::vector<uint32_t>       extractIndex,
-                            Callback                    callback) override;
+protected:
+    std::size_t initialBlockCapacity() const override;
+    std::unique_ptr<Producer> makeProducer(std::span<const uint32_t> extractIndex) override;
+
+private:
+    class PgenProducer;
+
+    Geno &g_;
+};
+
+class PgenBackend::PgenProducer final : public GenoBackend::Producer {
+public:
+    PgenProducer(Geno &geno, std::span<const uint32_t> extractIndex)
+        : g_(geno),
+          extractIndex_(extractIndex),
+          stride_(g_.pgenGenoBuf1PtrSize),
+          markerBlock_(g_.numMarkerBlock) {
+        const std::vector<uint32_t> &rawMarkerIndex = g_.marker->get_extract_index();
+        rawIndices_.resize(extractIndex_.size());
+        std::transform(extractIndex_.begin(), extractIndex_.end(),
+                       rawIndices_.begin(),
+                       [&rawMarkerIndex](std::size_t pos) {
+                           return rawMarkerIndex[pos];
+                       });
+    }
+
+    bool nextBlock(GenoBlock &block) override {
+        const uint32_t numMarker = static_cast<uint32_t>(extractIndex_.size());
+        if (finishedMarker_ >= numMarker) {
+            return false;
+        }
+
+        uint32_t nextSize = g_.marker->getNextSize(
+            rawIndices_, finishedMarker_, markerBlock_,
+            fileIndex_, chrEnds_, sexChromType_);
+        if (nextSize == 0) {
+            return false;
+        }
+
+        block.numMarkers   = nextSize;
+        block.sexChromType = sexChromType_;
+        block.fileIndex    = fileIndex_;
+        const std::size_t requiredElems = static_cast<std::size_t>(stride_) * nextSize;
+        if (block.buf.size() < requiredElems) {
+            block.buf.resize(requiredElems);
+        }
+        block.extractIndex = extractIndex_.subspan(finishedMarker_, nextSize);
+
+        if (preFileIndex_ != fileIndex_) {
+            reader_.Load(g_.geno_files[fileIndex_],
+                         &g_.rawCountSamples[fileIndex_],
+                         &g_.rawCountSNPs[fileIndex_],
+                         g_.sampleKeepIndex);
+            preFileIndex_ = fileIndex_;
+        }
+
+        for (uint32_t i = 0; i < nextSize; ++i) {
+            int rawIndex  = static_cast<int>(rawIndices_[finishedMarker_ + i]);
+            int lag_index = rawIndex - g_.baseIndexLookup[fileIndex_];
+            int al_idx    = 1;
+            uintptr_t* slot =
+                block.buf.data() + static_cast<std::size_t>(i) * stride_;
+            DosageBuf dbuf = DosageBuf::from(
+                slot,
+                g_.pgenGenoPtrSize,
+                g_.pgenDosagePresentPtrSize,
+                g_.pgenDosageMainPtrSize);
+            reader_.ReadDosage(dbuf, lag_index, al_idx);
+            // Legacy getGenoDouble_pgen() still reads dosage_ct from the last
+            // uintptr_t of each flat marker slot.
+            slot[stride_ - 1] = static_cast<uintptr_t>(dbuf.dosage_ct);
+        }
+
+        finishedMarker_ += nextSize;
+        return true;
+    }
 
 private:
     Geno &g_;
+    std::span<const uint32_t> extractIndex_;
+    std::vector<uint32_t> rawIndices_;
+    int stride_ = 0;
+    int markerBlock_ = 0;
+
+    uint32_t finishedMarker_ = 0;
+    int preFileIndex_ = -1;
+    int fileIndex_ = 0;
+    bool chrEnds_ = false;
+    uint8_t sexChromType_ = 0;
+    PgenReader reader_;
 };
 
 // --------------------------------------------------------------------------
@@ -75,89 +141,16 @@ PgenBackend::PgenBackend(Geno &geno) : g_(geno)
             (static_cast<std::size_t>(g_.pgenGenoPtrSize)
              + g_.pgenDosageMainPtrSize
              + g_.pgenDosagePresentPtrSize + 1 + 63) / 64 * 64);
-    // No asyncBuf64 created — the coroutine frame is the buffer.
 }
 
-// --------------------------------------------------------------------------
-// NOTE: callback is taken by value so it lives in the coroutine frame and
-// remains valid across every co_await suspension point.  Do NOT change to a
-// reference — it would dangle the moment the caller's scope is suspended.
-exec::task<void> PgenBackend::stream(GenoScheduler               io_sched,
-                                     GenoScheduler               cpu_sched,
-                                     std::vector<uint32_t>       extractIndex,
-                                     Callback                    callback)
-try {
-    co_await stdexec::schedule(io_sched);
+std::size_t PgenBackend::initialBlockCapacity() const {
+    const std::size_t maxBlockMarkers =
+        static_cast<std::size_t>(std::max(1, g_.numMarkerBlock));
+    return static_cast<std::size_t>(g_.pgenGenoBuf1PtrSize) * maxBlockMarkers;
+}
 
-    const std::vector<uint32_t> &raw_marker_index = g_.marker->get_extract_index();
-    std::vector<uint32_t> rawIndices(extractIndex.size());
-    std::transform(extractIndex.begin(), extractIndex.end(),
-                   rawIndices.begin(),
-                   [&raw_marker_index](std::size_t pos) {
-                       return raw_marker_index[pos];
-                   });
-
-    const uint32_t numMarker   = static_cast<uint32_t>(extractIndex.size());
-    const int      stride      = g_.pgenGenoBuf1PtrSize;
-    const int      markerBlock = g_.numMarkerBlock;
-
-    uint32_t   finishedMarker = 0;
-    int        preFileIndex   = -1;
-    int        fileIndex      = 0;
-    bool       chr_ends       = false;
-    uint8_t    sexChromType        = 0;
-    PgenReader reader;
-
-    while (finishedMarker < numMarker) {
-        uint32_t nextSize = g_.marker->getNextSize(
-            rawIndices, finishedMarker, markerBlock,
-            fileIndex, chr_ends, sexChromType);
-        if (nextSize == 0) break;
-
-        GenoBlock block;
-        block.numMarkers = nextSize;
-        block.sexChromType   = sexChromType;
-        block.fileIndex  = fileIndex;
-        block.buf.resize(static_cast<std::size_t>(stride) * nextSize);
-        block.extractIndex = std::span<const uint32_t>{
-            extractIndex.data() + finishedMarker,
-            static_cast<std::size_t>(nextSize)};
-
-        if (preFileIndex != fileIndex) {
-            reader.Load(g_.geno_files[fileIndex],
-                        &g_.rawCountSamples[fileIndex],
-                        &g_.rawCountSNPs[fileIndex],
-                        g_.sampleKeepIndex);
-            preFileIndex = fileIndex;
-        }
-
-        for (uint32_t i = 0; i < nextSize; ++i) {
-            int rawIndex  = static_cast<int>(rawIndices[finishedMarker + i]);
-            int lag_index = rawIndex - g_.baseIndexLookup[fileIndex];
-            int al_idx    = 1;
-            uintptr_t* slot =
-                block.buf.data() + static_cast<std::size_t>(i) * stride;
-            DosageBuf dbuf = DosageBuf::from(
-                slot,
-                g_.pgenGenoPtrSize,
-                g_.pgenDosagePresentPtrSize,
-                g_.pgenDosageMainPtrSize);
-            reader.ReadDosage(dbuf, lag_index, al_idx);
-            // Legacy getGenoDouble_pgen() still reads dosage_ct from the last
-            // uintptr_t of each flat marker slot.
-            slot[stride - 1] = static_cast<uintptr_t>(dbuf.dosage_ct);
-        }
-
-        co_await stdexec::schedule(cpu_sched);
-        callback(block);
-        co_await stdexec::schedule(io_sched);
-
-        finishedMarker += nextSize;
-    }
-} catch (...) {
-    // Re-propagate through exec::task's error channel so that
-    // stdexec::sync_wait re-throws on the loopDouble call-site.
-    throw;
+std::unique_ptr<GenoBackend::Producer> PgenBackend::makeProducer(std::span<const uint32_t> extractIndex) {
+    return std::make_unique<PgenProducer>(g_, extractIndex);
 }
 
 // --------------------------------------------------------------------------

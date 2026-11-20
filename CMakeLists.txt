@@ -373,12 +373,6 @@ if(BGEN_SUPPORT)
         EXCLUDE_FROM_ALL)
 endif()
 
-FetchContent_Declare(
-    stdexec
-    URL https://github.com/NVIDIA/stdexec/archive/refs/tags/nvhpc-26.05.tar.gz
-    SYSTEM
-    EXCLUDE_FROM_ALL)
-
 # Always use the system shared zlib — it is a base system library with a stable
 # ABI (libz.so.1 since 1997) and is always present on HPC clusters. This avoids
 # the CMAKE_SKIP_INSTALL_RULES / alias dance required by a fetched static zlib.
@@ -418,7 +412,6 @@ set(CMAKE_SKIP_INSTALL_RULES OFF)
 if(BGEN_SUPPORT)
     FetchContent_MakeAvailable(sqlite)
 endif()
-FetchContent_MakeAvailable(stdexec)
 
 # If the user supplied a Boost_DIR, prefer that over fetching Boost.
 if(Boost_DIR)
@@ -635,6 +628,7 @@ target_sources(GCTAg PRIVATE
         src/RemlEngine.cpp
         src/GRM.cpp
         src/Geno.cpp
+        src/GenoBackend.cpp
         src/BedBackend.cpp
         src/BgenBackend.cpp
         src/PgenBackend.cpp
@@ -646,7 +640,6 @@ target_sources(GCTAg PRIVATE
         src/StatLib.cpp
         src/ThreadPool.cpp
         src/mem.cpp
-        src/tables.cpp
         src/utils.cpp
         # main/ legacy module
         main/CommFunc.cpp
@@ -762,7 +755,6 @@ target_link_libraries(GCTAg PRIVATE
     ZLIB::ZLIB
     Eigen3::Eigen
     Spectra
-    STDEXEC::stdexec
     libzstd_static
     $<$<BOOL:${GCTA_USE_JEMALLOC}>:${GCTA_JEMALLOC_LIB}>
     OpenMP::OpenMP_CXX

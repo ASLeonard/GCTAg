@@ -1316,9 +1316,13 @@ double reml_iteration(RemlCtx& ctx,
 
         if ((ctx.reml_force_converge || ctx.reml_no_converge) && prev_lgL > lgL) {
             varcmp = prev_varcmp;
-            RemlMat P_tmp;
-            calcu_P_impl(ctx, &P_tmp);
-            calcu_Hi(ctx, P_tmp, Hi);
+            if (skip_P_this_iter) {
+                RemlMat P_tmp;
+                calcu_P_impl(ctx, &P_tmp);
+                calcu_Hi(ctx, P_tmp, Hi);
+            } else {
+                calcu_Hi(ctx, ctx.P, Hi);
+            }
             Hi = 2 * Hi;
             break;
         }
@@ -1420,9 +1424,13 @@ double reml_iteration(RemlCtx& ctx,
                 LOGGER << "REML: Woodbury post-hoc tail correction: delta = " << delta_simple.transpose() << std::endl;
             }
             if (ctx.reml_mtd == 2) {
-                RemlMat P_tmp;
-                calcu_P_impl(ctx, &P_tmp);
-                calcu_Hi(ctx, P_tmp, Hi);
+                if (skip_P_this_iter) {
+                    RemlMat P_tmp;
+                    calcu_P_impl(ctx, &P_tmp);
+                    calcu_Hi(ctx, P_tmp, Hi);
+                } else {
+                    calcu_Hi(ctx, ctx.P, Hi);
+                }
                 Hi = 2 * Hi;
             }
             break;

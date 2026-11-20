@@ -1036,12 +1036,15 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         }
     }
 
-    constexpr int kTile = 4096;
+    constexpr int kTile = 8192;
     const bool first_accum = grm_first_accum;
     double* const grm_base = std::assume_aligned<64>(grm.get());
 
     if (use_int8_grm) {
         const int8_t* const std_geno_i8_base = std::assume_aligned<64>(stdGeno_i8.get());
+        int8_t* const kmajor_base = std::assume_aligned<64>(stdGeno_i8_kmajor_.get());
+        const int ldK = std::max(64, (curNumValidMarkers + 63) / 64 * 64);
+
         double S_mu2 = 0.0;
         for (int m = 0; m < curNumValidMarkers; ++m) {
             const double mu_m = gbufitems[validIndexBuf[m]].mean;
@@ -1049,20 +1052,39 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             S_mu2 += mu_m * mu_m;
         }
 
-        // Compute per-sample row sums r_raw_[i] = sum_m g_{im} * mu_m in parallel.
-        constexpr int kRowChunk = 1024;
-        #pragma omp parallel for schedule(static)
-        for (int i0 = 0; i0 < grm_n; i0 += kRowChunk) {
-            const int len = std::min(kRowChunk, grm_n - i0);
-            double* r_slice = r_raw_.data() + i0;
-            std::memset(r_slice, 0, static_cast<size_t>(len) * sizeof(double));
-            for (int m = 0; m < curNumValidMarkers; ++m) {
-                const double mu_m = mu_vec_[m];
-                const int8_t* col_m = std_geno_i8_base + static_cast<size_t>(m) * stdGenoLD + i0;
-                for (int r = 0; r < len; ++r) {
-                    r_slice[r] += static_cast<double>(col_m[r]) * mu_m;
+        // Fuse cache-blocked (64x64) transpose of stdGeno_i8 (grm_n x K, stride stdGenoLD)
+        // into K-contiguous row-major stdGeno_i8_kmajor_ (grm_n x ldK) with per-sample
+        // row-sum accumulation r_raw_[i] = sum_m g_{im} * mu_m.
+        if (curNumValidMarkers > 0) {
+            constexpr int kBlk = 64;
+            #pragma omp parallel for schedule(static)
+            for (int i0 = 0; i0 < grm_n; i0 += kBlk) {
+                const int s_len = std::min(kBlk, grm_n - i0);
+                double r_acc[kBlk] = {0.0};
+                alignas(64) int8_t blk[kBlk][kBlk];
+                for (int m0 = 0; m0 < curNumValidMarkers; m0 += kBlk) {
+                    const int m_len = std::min(kBlk, curNumValidMarkers - m0);
+                    for (int dm = 0; dm < m_len; ++dm) {
+                        const int m = m0 + dm;
+                        const double mu_m = mu_vec_[m];
+                        const int8_t* src_col = std_geno_i8_base + static_cast<size_t>(m) * stdGenoLD + i0;
+                        for (int ds = 0; ds < s_len; ++ds) {
+                            const int8_t g = src_col[ds];
+                            r_acc[ds] += static_cast<double>(g) * mu_m;
+                            blk[ds][dm] = g;
+                        }
+                    }
+                    for (int ds = 0; ds < s_len; ++ds) {
+                        std::memcpy(kmajor_base + static_cast<size_t>(i0 + ds) * ldK + m0,
+                                    blk[ds], static_cast<size_t>(m_len));
+                    }
+                }
+                for (int ds = 0; ds < s_len; ++ds) {
+                    r_raw_[i0 + ds] = r_acc[ds];
                 }
             }
+        } else {
+            std::fill(r_raw_.begin(), r_raw_.begin() + grm_n, 0.0);
         }
 
         bool block_has_missing = false;
@@ -1103,6 +1125,27 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             }
             if (marker_miss_idx_.empty()) {
                 block_has_missing = false;
+            } else {
+                // Build global per-sample missing-marker CSR once per marker block
+                // instead of binary-searching marker_miss_idx_ on every column tile.
+                std::fill(sample_miss_offset_.begin(), sample_miss_offset_.begin() + grm_n + 1, 0);
+                for (int s : marker_miss_idx_) {
+                    sample_miss_offset_[s + 1]++;
+                }
+                for (int s = 0; s < grm_n; ++s) {
+                    sample_miss_offset_[s + 1] += sample_miss_offset_[s];
+                }
+                sample_miss_m_.resize(sample_miss_offset_[grm_n]);
+                std::vector<int> write_pos(sample_miss_offset_.begin(),
+                                           sample_miss_offset_.begin() + grm_n);
+                for (int m = 0; m < curNumValidMarkers; ++m) {
+                    const int mb = marker_miss_offset_[m];
+                    const int me = marker_miss_offset_[m + 1];
+                    for (int idx = mb; idx < me; ++idx) {
+                        const int s = marker_miss_idx_[idx];
+                        sample_miss_m_[write_pos[s]++] = m;
+                    }
+                }
             }
         }
         const double* r_row_vec = block_has_missing ? r_tilde_.data() : r_raw_.data();
@@ -1110,55 +1153,15 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         std::vector<int> row_miss_b;
         std::vector<int> row_miss_e;
         std::vector<int> active_row_miss_markers;
-        std::vector<int> col_miss_offset;
-        std::vector<int> col_miss_m;
         if (block_has_missing) {
             row_miss_b.resize(curNumValidMarkers);
             row_miss_e.resize(curNumValidMarkers);
             active_row_miss_markers.reserve(curNumValidMarkers);
         }
 
-        auto prepare_col_missing = [&](int global_c0, int cols) {
-            if (!block_has_missing) return;
-            col_miss_offset.assign(cols + 1, 0);
-            for (int m = 0; m < curNumValidMarkers; ++m) {
-                const int mb = marker_miss_offset_[m];
-                const int me = marker_miss_offset_[m + 1];
-                if (mb == me) continue;
-                const auto it_b = std::lower_bound(marker_miss_idx_.begin() + mb,
-                                                   marker_miss_idx_.begin() + me,
-                                                   global_c0);
-                const auto it_e = std::lower_bound(it_b,
-                                                   marker_miss_idx_.begin() + me,
-                                                   global_c0 + cols);
-                for (auto it = it_b; it != it_e; ++it) {
-                    col_miss_offset[(*it - global_c0) + 1]++;
-                }
-            }
-            for (int c = 0; c < cols; ++c) {
-                col_miss_offset[c + 1] += col_miss_offset[c];
-            }
-            col_miss_m.resize(col_miss_offset[cols]);
-            std::vector<int> write_pos(col_miss_offset.begin(), col_miss_offset.begin() + cols);
-            for (int m = 0; m < curNumValidMarkers; ++m) {
-                const int mb = marker_miss_offset_[m];
-                const int me = marker_miss_offset_[m + 1];
-                if (mb == me) continue;
-                const auto it_b = std::lower_bound(marker_miss_idx_.begin() + mb,
-                                                   marker_miss_idx_.begin() + me,
-                                                   global_c0);
-                const auto it_e = std::lower_bound(it_b,
-                                                   marker_miss_idx_.begin() + me,
-                                                   global_c0 + cols);
-                for (auto it = it_b; it != it_e; ++it) {
-                    col_miss_m[write_pos[*it - global_c0]++] = m;
-                }
-            }
-        };
-
         auto prepare_row_missing = [&](int global_r0, int rows) {
             if (!block_has_missing) return;
-            active_row_miss_markers.clear();
+            #pragma omp parallel for schedule(static) if (curNumValidMarkers >= 256)
             for (int m = 0; m < curNumValidMarkers; ++m) {
                 const int mb = marker_miss_offset_[m];
                 const int me = marker_miss_offset_[m + 1];
@@ -1176,13 +1179,16 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                     global_r0 + rows) - marker_miss_idx_.begin());
                 row_miss_b[m] = b;
                 row_miss_e[m] = e;
-                if (b < e) {
+            }
+            active_row_miss_markers.clear();
+            for (int m = 0; m < curNumValidMarkers; ++m) {
+                if (row_miss_b[m] < row_miss_e[m]) {
                     active_row_miss_markers.push_back(m);
                 }
             }
         };
 
-        auto accum_col_with_centering = [&](int c, int j, int row_start, int len,
+        auto accum_col_with_centering = [&](int j, int row_start, int len,
                                             const int32_t* src_col, double* dst_col) {
             const double r_j_plus_S = S_mu2 - r_raw_[j];
             const double* r_row_slice = r_row_vec + row_start;
@@ -1197,11 +1203,11 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             }
             if (!block_has_missing) return;
 
-            // Step 2: markers missing in column j
-            const int cm_b = col_miss_offset[c];
-            const int cm_e = col_miss_offset[c + 1];
+            // Step 2: markers missing in column j (indexed directly from block-level CSR)
+            const int cm_b = sample_miss_offset_[j];
+            const int cm_e = sample_miss_offset_[j + 1];
             for (int idx = cm_b; idx < cm_e; ++idx) {
-                const int m = col_miss_m[idx];
+                const int m = sample_miss_m_[idx];
                 const double mu_m = mu_vec_[m];
                 const double neg_mu2 = -mu_m * mu_m;
                 const int8_t* col_m = std_geno_i8_base + static_cast<size_t>(m) * stdGenoLD + row_start;
@@ -1217,8 +1223,10 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             }
 
             // Step 3: markers missing in rows [row_start, row_start + len)
+            // Read sample j's markers from L1-contiguous kmajor row.
+            const int8_t* row_j_kmajor = kmajor_base + static_cast<size_t>(j) * ldK;
             for (int m : active_row_miss_markers) {
-                const int8_t g_jm = std_geno_i8_base[static_cast<size_t>(m) * stdGenoLD + j];
+                const int8_t g_jm = row_j_kmajor[m];
                 if (g_jm != 0) {
                     const double corr = mu_vec_[m] * static_cast<double>(g_jm);
                     for (int r_idx = row_miss_b[m]; r_idx < row_miss_e[m]; ++r_idx) {
@@ -1236,16 +1244,15 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             for (int c0 = 0; c0 < N_cols; c0 += kTile) {
                 const int cols = std::min(kTile, N_cols - c0);
                 const int global_c0 = col_base + c0;
-                if (K > 0) prepare_col_missing(global_c0, cols);
                 for (int r0 = 0; r0 < M; r0 += kTile) {
                     const int rows = std::min(kTile, M - r0);
                     const int global_r0 = row_base + r0;
                     if (K > 0) {
                         prepare_row_missing(global_r0, rows);
-                        gcta_gemm_s8s8s32_colmajor_nt(
+                        gcta_gemm_s8s8s32_kmajor_nt(
                             rows, cols, K,
-                            std_geno_i8_base + global_r0, stdGenoLD,
-                            std_geno_i8_base + global_c0, stdGenoLD,
+                            kmajor_base + static_cast<size_t>(global_r0) * ldK, ldK,
+                            kmajor_base + static_cast<size_t>(global_c0) * ldK,
                             grm_i32_tile_.data(), rows,
                             i8_scratch_A_f32_, i8_scratch_B_f32_, grm_f32_tile_);
                     }
@@ -1258,7 +1265,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                             continue;
                         }
                         const int32_t* src_col = grm_i32_tile_.data() + static_cast<size_t>(c) * rows;
-                        accum_col_with_centering(c, global_c0 + c, global_r0, rows, src_col, dst_col);
+                        accum_col_with_centering(global_c0 + c, global_r0, rows, src_col, dst_col);
                     }
                 }
             }
@@ -1270,11 +1277,10 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                 const int cols = std::min(kTile, N_dim - c0);
                 const int global_c0 = base + c0;
                 if (K > 0) {
-                    prepare_col_missing(global_c0, cols);
                     prepare_row_missing(global_c0, cols);
-                    gcta_syrk_s8s8s32_lower_colmajor_nt(
+                    gcta_syrk_s8s8s32_lower_kmajor_nt(
                         cols, K,
-                        std_geno_i8_base + global_c0, stdGenoLD,
+                        kmajor_base + static_cast<size_t>(global_c0) * ldK, ldK,
                         grm_i32_tile_.data(), cols,
                         i8_scratch_A_f32_, grm_f32_tile_);
                 }
@@ -1289,7 +1295,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                     }
                     const int32_t* src_col = grm_i32_tile_.data() + c + static_cast<size_t>(c) * cols;
                     const int j = global_c0 + c;
-                    accum_col_with_centering(c, j, j, len, src_col, dst_col);
+                    accum_col_with_centering(j, j, len, src_col, dst_col);
                 }
                 const int rem_rows = N_dim - (c0 + cols);
                 if (rem_rows > 0) {
@@ -1821,7 +1827,7 @@ void GRM::processMakeGRM(bool is_homogametic){
     use_int8_grm = bBLAS && isMtd && !isDominance && !is_homogametic
                    && (geno->getGenoFormat() == "BED")
                    && (std::getenv("GCTA_DISABLE_INT8_GRM") == nullptr);
-    const int max_tile_dim = std::min(4096, std::max(1, grm_n));
+    const int max_tile_dim = std::min(8192, std::max(1, grm_n));
     const size_t geno_block_elems = static_cast<size_t>(nMarkerBlock) * stdGenoLD;
     if (use_int8_grm) {
         grm_bytes_std_geno = static_cast<int>(sizeof(int8_t)) * grm_n;
@@ -1830,11 +1836,18 @@ void GRM::processMakeGRM(bool is_homogametic){
         if (!stdGeno_i8) {
             LOGGER.e(0, "can't allocate enough memory for the int8 genotype buffer.");
         }
+        const int max_ldK = std::max(64, (nMarkerBlock + 63) / 64 * 64);
+        stdGeno_i8_kmajor_ = make_aligned_uninitialized<int8_t, 64>(
+            static_cast<size_t>(max_ldK) * static_cast<size_t>(stdGenoLD));
+        if (!stdGeno_i8_kmajor_) {
+            LOGGER.e(0, "can't allocate enough memory for the transposed int8 genotype buffer.");
+        }
         grm_i32_tile_.resize(static_cast<size_t>(max_tile_dim) * max_tile_dim);
         mu_vec_.resize(nMarkerBlock);
         r_raw_.resize(grm_n);
         r_tilde_.resize(grm_n);
         marker_miss_offset_.resize(nMarkerBlock + 1);
+        sample_miss_offset_.resize(static_cast<size_t>(grm_n) + 1);
     } else {
         grm_bytes_std_geno = static_cast<int>(sizeof(float)) * grm_n;
         this->num_byte_geno = sizeof(float) * static_cast<uint64_t>(geno_block_elems);
@@ -2025,6 +2038,7 @@ void GRM::processMakeGRM(bool is_homogametic){
     gbufitems.clear();
     stdGeno.reset();
     stdGeno_i8.reset();
+    stdGeno_i8_kmajor_.reset();
     geno->setGRMMode(false, false);
 }
 

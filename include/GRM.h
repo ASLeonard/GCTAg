@@ -89,6 +89,7 @@ private:
     bool bBLAS;
     AlignedUniquePtr<float, 64> stdGeno;
     AlignedUniquePtr<int8_t, 64> stdGeno_i8;
+    AlignedUniquePtr<int8_t, 64> stdGeno_i8_kmajor_;
     bool use_int8_grm = false;
 
     void output_id();
@@ -134,6 +135,8 @@ private:
     std::vector<double> r_tilde_;
     std::vector<int> marker_miss_offset_;
     std::vector<int> marker_miss_idx_;
+    std::vector<int> sample_miss_offset_;
+    std::vector<int> sample_miss_m_;
 
     // Block-tiled GRM: when grm_tile_size > 0 (set via --GRM-tile-size),
     // processMakeGRM iterates over grm_tile_size-row tiles.  For each tile

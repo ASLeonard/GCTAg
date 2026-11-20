@@ -16,6 +16,10 @@
 #include <cmath>
 #include <cstdint>
 #include <vector>
+#if defined(__linux__) || defined(__APPLE__)
+  #include <sys/mman.h>
+  #include <unistd.h>
+#endif
 #include "ModeTypes.hpp"
 #include "main/StatFunc.h"
 #include "cpu.h"
@@ -246,7 +250,8 @@ struct QuantizedWoodburyTile {
     int r_count = 0;
     int q_rows = 0;       // is_2slice ? 2 * r_count : r_count
     bool is_2slice = true;
-    std::vector<int8_t, AlignedAllocator<int8_t, 64>> Q;  // q_rows x n, col-major
+    AlignedUniquePtr<int8_t, 64> Q;                       // q_rows x n, col-major
+    size_t q_bytes = 0;
     std::vector<double> alpha_hi;                         // r_count
     std::vector<double> alpha_lo;                         // is_2slice ? r_count : 0
     std::vector<double> u_sum_q;                          // r_count
@@ -261,7 +266,7 @@ struct QuantizedWoodburyUk {
 
     size_t total_q_bytes() const {
         size_t total = 0;
-        for (const auto& t : tiles) total += t.Q.size();
+        for (const auto& t : tiles) total += t.q_bytes;
         return total;
     }
 };
@@ -296,7 +301,11 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk(
             t.r_count = std::min(kTileMax, end - r0);
             t.is_2slice = is_2slice;
             t.q_rows = is_2slice ? 2 * t.r_count : t.r_count;
-            t.Q.resize(static_cast<size_t>(t.q_rows) * static_cast<size_t>(n), 0);
+            t.q_bytes = static_cast<size_t>(t.q_rows) * static_cast<size_t>(n);
+            t.Q = make_aligned_uninitialized<int8_t, 64>(t.q_bytes);
+            if (t.q_bytes > 0 && !t.Q) {
+                LOGGER.e(0, "Failed to allocate quantized Woodbury Q tile.");
+            }
             t.alpha_hi.assign(t.r_count, 0.0);
             if (is_2slice) t.alpha_lo.assign(t.r_count, 0.0);
             t.u_sum_q.assign(t.r_count, 0.0);
@@ -309,17 +318,26 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk(
     const float* uk_base = wb.Uk_f.data();
     const float* sqrt_ck_ptr = wb.sqrt_ck_f.data();
     const float* w_ptr = w_sqrt.data();
-    double total_eps_sq = 0.0;
 
     auto clamp_i8 = [](double x) -> int8_t {
         const long long v = std::llround(x);
         return static_cast<int8_t>(std::clamp<long long>(v, -127, 127));
     };
 
-    for (auto& tile : out.tiles) {
+    const size_t num_tiles = out.tiles.size();
+    std::vector<std::vector<double>> tile_inv_hi(num_tiles);
+    std::vector<std::vector<double>> tile_inv_lo(num_tiles);
+    std::vector<std::vector<int64_t>> tile_sum_hi(num_tiles);
+    std::vector<std::vector<int64_t>> tile_sum_lo(num_tiles);
+
+    // Phase 1: compute per-row quantization scales alpha_hi / alpha_lo across
+    // wb.Uk_f without faulting any pages of tile.Q yet.
+    for (size_t ti = 0; ti < num_tiles; ++ti) {
+        auto& tile = out.tiles[ti];
         const int r0 = tile.r_begin;
         const int rc = tile.r_count;
-        const int qr = tile.q_rows;
+        tile_sum_hi[ti].assign(rc, 0);
+        if (tile.is_2slice) tile_sum_lo[ti].assign(rc, 0);
 
         std::vector<double> max_abs_hi(rc, 0.0);
         #pragma omp parallel
@@ -344,47 +362,16 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk(
             }
         }
 
-        std::vector<double> inv_hi(rc, 0.0);
+        tile_inv_hi[ti].assign(rc, 0.0);
         for (int rl = 0; rl < rc; ++rl) {
             if (max_abs_hi[rl] > 0.0) {
                 tile.alpha_hi[rl] = max_abs_hi[rl] / 127.0;
-                inv_hi[rl] = 1.0 / tile.alpha_hi[rl];
+                tile_inv_hi[ti][rl] = 1.0 / tile.alpha_hi[rl];
             }
         }
 
-        if (!tile.is_2slice) {
-            std::vector<int64_t> sum_q_hi(rc, 0);
-            double tile_eps_sq = 0.0;
-            #pragma omp parallel
-            {
-                std::vector<int64_t> local_sum(rc, 0);
-                double local_eps = 0.0;
-                #pragma omp for schedule(static)
-                for (int s = 0; s < n; ++s) {
-                    const float* uk_col = uk_base + static_cast<size_t>(s) * static_cast<size_t>(k) + r0;
-                    int8_t* q_col = tile.Q.data() + static_cast<size_t>(s) * static_cast<size_t>(qr);
-                    const double ws = unit_weights ? 1.0 : static_cast<double>(w_ptr[s]);
-                    for (int rl = 0; rl < rc; ++rl) {
-                        const double v = static_cast<double>(sqrt_ck_ptr[r0 + rl])
-                                       * static_cast<double>(uk_col[rl]) * ws;
-                        const int8_t qh = (inv_hi[rl] > 0.0) ? clamp_i8(v * inv_hi[rl]) : 0;
-                        q_col[rl] = qh;
-                        local_sum[rl] += static_cast<int64_t>(qh);
-                        const double eps = v - tile.alpha_hi[rl] * static_cast<double>(qh);
-                        local_eps += eps * eps;
-                    }
-                }
-                #pragma omp critical
-                {
-                    for (int rl = 0; rl < rc; ++rl) sum_q_hi[rl] += local_sum[rl];
-                    tile_eps_sq += local_eps;
-                }
-            }
-            for (int rl = 0; rl < rc; ++rl) {
-                tile.u_sum_q[rl] = tile.alpha_hi[rl] * static_cast<double>(sum_q_hi[rl]);
-            }
-            total_eps_sq += tile_eps_sq;
-        } else {
+        if (tile.is_2slice) {
+            const double* inv_hi_ptr = tile_inv_hi[ti].data();
             std::vector<double> max_abs_lo(rc, 0.0);
             #pragma omp parallel
             {
@@ -392,13 +379,11 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk(
                 #pragma omp for schedule(static)
                 for (int s = 0; s < n; ++s) {
                     const float* uk_col = uk_base + static_cast<size_t>(s) * static_cast<size_t>(k) + r0;
-                    int8_t* q_col = tile.Q.data() + static_cast<size_t>(s) * static_cast<size_t>(qr);
                     const double ws = unit_weights ? 1.0 : static_cast<double>(w_ptr[s]);
                     for (int rl = 0; rl < rc; ++rl) {
                         const double v = static_cast<double>(sqrt_ck_ptr[r0 + rl])
                                        * static_cast<double>(uk_col[rl]) * ws;
-                        const int8_t qh = (inv_hi[rl] > 0.0) ? clamp_i8(v * inv_hi[rl]) : 0;
-                        q_col[2 * rl] = qh;
+                        const int8_t qh = (inv_hi_ptr[rl] > 0.0) ? clamp_i8(v * inv_hi_ptr[rl]) : 0;
                         const double rem = v - tile.alpha_hi[rl] * static_cast<double>(qh);
                         const double ar = std::fabs(rem);
                         if (ar > local_max[rl]) local_max[rl] = ar;
@@ -412,52 +397,123 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk(
                 }
             }
 
-            std::vector<double> inv_lo(rc, 0.0);
+            tile_inv_lo[ti].assign(rc, 0.0);
             for (int rl = 0; rl < rc; ++rl) {
                 if (max_abs_lo[rl] > 0.0) {
                     tile.alpha_lo[rl] = max_abs_lo[rl] / 127.0;
-                    inv_lo[rl] = 1.0 / tile.alpha_lo[rl];
+                    tile_inv_lo[ti][rl] = 1.0 / tile.alpha_lo[rl];
                 }
             }
+        }
+    }
 
-            std::vector<int64_t> sum_q_hi(rc, 0), sum_q_lo(rc, 0);
+    // Phase 2: quantize wb.Uk_f into tile.Q in sample slabs while progressively
+    // returning completed wb.Uk_f OS pages, avoiding simultaneous full Uk_f + Q residency.
+    constexpr int kReleaseSlab = 4096;
+    double total_eps_sq = 0.0;
+    for (int s0 = 0; s0 < n; s0 += kReleaseSlab) {
+        const int s_end = std::min(n, s0 + kReleaseSlab);
+        for (size_t ti = 0; ti < num_tiles; ++ti) {
+            auto& tile = out.tiles[ti];
+            const int r0 = tile.r_begin;
+            const int rc = tile.r_count;
+            const int qr = tile.q_rows;
+            int8_t* const q_base = tile.Q.get();
+            const double* inv_hi_ptr = tile_inv_hi[ti].data();
+            auto& sum_hi = tile_sum_hi[ti];
             double tile_eps_sq = 0.0;
-            #pragma omp parallel
-            {
-                std::vector<int64_t> local_hi(rc, 0), local_lo(rc, 0);
-                double local_eps = 0.0;
-                #pragma omp for schedule(static)
-                for (int s = 0; s < n; ++s) {
-                    const float* uk_col = uk_base + static_cast<size_t>(s) * static_cast<size_t>(k) + r0;
-                    int8_t* q_col = tile.Q.data() + static_cast<size_t>(s) * static_cast<size_t>(qr);
-                    const double ws = unit_weights ? 1.0 : static_cast<double>(w_ptr[s]);
-                    for (int rl = 0; rl < rc; ++rl) {
-                        const double v = static_cast<double>(sqrt_ck_ptr[r0 + rl])
-                                       * static_cast<double>(uk_col[rl]) * ws;
-                        const int8_t qh = q_col[2 * rl];
-                        const double rem = v - tile.alpha_hi[rl] * static_cast<double>(qh);
-                        const int8_t ql = (inv_lo[rl] > 0.0) ? clamp_i8(rem * inv_lo[rl]) : 0;
-                        q_col[2 * rl + 1] = ql;
-                        local_hi[rl] += static_cast<int64_t>(qh);
-                        local_lo[rl] += static_cast<int64_t>(ql);
-                        const double eps = rem - tile.alpha_lo[rl] * static_cast<double>(ql);
-                        local_eps += eps * eps;
-                    }
-                }
-                #pragma omp critical
+
+            if (!tile.is_2slice) {
+                #pragma omp parallel reduction(+:tile_eps_sq)
                 {
-                    for (int rl = 0; rl < rc; ++rl) {
-                        sum_q_hi[rl] += local_hi[rl];
-                        sum_q_lo[rl] += local_lo[rl];
+                    std::vector<int64_t> local_sum(rc, 0);
+                    #pragma omp for schedule(static)
+                    for (int s = s0; s < s_end; ++s) {
+                        const float* uk_col = uk_base + static_cast<size_t>(s) * static_cast<size_t>(k) + r0;
+                        int8_t* q_col = q_base + static_cast<size_t>(s) * static_cast<size_t>(qr);
+                        const double ws = unit_weights ? 1.0 : static_cast<double>(w_ptr[s]);
+                        for (int rl = 0; rl < rc; ++rl) {
+                            const double v = static_cast<double>(sqrt_ck_ptr[r0 + rl])
+                                           * static_cast<double>(uk_col[rl]) * ws;
+                            const int8_t qh = (inv_hi_ptr[rl] > 0.0) ? clamp_i8(v * inv_hi_ptr[rl]) : 0;
+                            q_col[rl] = qh;
+                            local_sum[rl] += static_cast<int64_t>(qh);
+                            const double eps = v - tile.alpha_hi[rl] * static_cast<double>(qh);
+                            tile_eps_sq += eps * eps;
+                        }
                     }
-                    tile_eps_sq += local_eps;
+                    #pragma omp critical
+                    {
+                        for (int rl = 0; rl < rc; ++rl) sum_hi[rl] += local_sum[rl];
+                    }
                 }
-            }
-            for (int rl = 0; rl < rc; ++rl) {
-                tile.u_sum_q[rl] = tile.alpha_hi[rl] * static_cast<double>(sum_q_hi[rl])
-                                 + tile.alpha_lo[rl] * static_cast<double>(sum_q_lo[rl]);
+            } else {
+                const double* inv_lo_ptr = tile_inv_lo[ti].data();
+                auto& sum_lo = tile_sum_lo[ti];
+                #pragma omp parallel reduction(+:tile_eps_sq)
+                {
+                    std::vector<int64_t> local_hi(rc, 0), local_lo(rc, 0);
+                    #pragma omp for schedule(static)
+                    for (int s = s0; s < s_end; ++s) {
+                        const float* uk_col = uk_base + static_cast<size_t>(s) * static_cast<size_t>(k) + r0;
+                        int8_t* q_col = q_base + static_cast<size_t>(s) * static_cast<size_t>(qr);
+                        const double ws = unit_weights ? 1.0 : static_cast<double>(w_ptr[s]);
+                        for (int rl = 0; rl < rc; ++rl) {
+                            const double v = static_cast<double>(sqrt_ck_ptr[r0 + rl])
+                                           * static_cast<double>(uk_col[rl]) * ws;
+                            const int8_t qh = (inv_hi_ptr[rl] > 0.0) ? clamp_i8(v * inv_hi_ptr[rl]) : 0;
+                            const double rem = v - tile.alpha_hi[rl] * static_cast<double>(qh);
+                            const int8_t ql = (inv_lo_ptr[rl] > 0.0) ? clamp_i8(rem * inv_lo_ptr[rl]) : 0;
+                            q_col[2 * rl] = qh;
+                            q_col[2 * rl + 1] = ql;
+                            local_hi[rl] += static_cast<int64_t>(qh);
+                            local_lo[rl] += static_cast<int64_t>(ql);
+                            const double eps = rem - tile.alpha_lo[rl] * static_cast<double>(ql);
+                            tile_eps_sq += eps * eps;
+                        }
+                    }
+                    #pragma omp critical
+                    {
+                        for (int rl = 0; rl < rc; ++rl) {
+                            sum_hi[rl] += local_hi[rl];
+                            sum_lo[rl] += local_lo[rl];
+                        }
+                    }
+                }
             }
             total_eps_sq += tile_eps_sq;
+        }
+
+        #if defined(__linux__) || defined(__APPLE__)
+        const uintptr_t col_start_addr = reinterpret_cast<uintptr_t>(uk_base + static_cast<size_t>(s0) * static_cast<size_t>(k));
+        const uintptr_t col_end_addr   = reinterpret_cast<uintptr_t>(uk_base + static_cast<size_t>(s_end) * static_cast<size_t>(k));
+        const uintptr_t page_sz = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+        if (page_sz > 0) {
+            const uintptr_t page_beg = (col_start_addr + page_sz - 1) & ~(page_sz - 1);
+            const uintptr_t page_end = (s_end == n) ? (col_end_addr & ~(page_sz - 1)) : (col_end_addr & ~(page_sz - 1));
+            if (page_end > page_beg) {
+            #if defined(__linux__)
+                ::madvise(reinterpret_cast<void*>(page_beg), page_end - page_beg, MADV_DONTNEED);
+            #elif defined(__APPLE__)
+                ::madvise(reinterpret_cast<void*>(page_beg), page_end - page_beg, MADV_FREE);
+            #endif
+            }
+        }
+        #endif
+    }
+
+    for (size_t ti = 0; ti < num_tiles; ++ti) {
+        auto& tile = out.tiles[ti];
+        const int rc = tile.r_count;
+        if (!tile.is_2slice) {
+            for (int rl = 0; rl < rc; ++rl) {
+                tile.u_sum_q[rl] = tile.alpha_hi[rl] * static_cast<double>(tile_sum_hi[ti][rl]);
+            }
+        } else {
+            for (int rl = 0; rl < rc; ++rl) {
+                tile.u_sum_q[rl] = tile.alpha_hi[rl] * static_cast<double>(tile_sum_hi[ti][rl])
+                                 + tile.alpha_lo[rl] * static_cast<double>(tile_sum_lo[ti][rl]);
+            }
         }
     }
 
@@ -484,14 +540,20 @@ inline void woodbury_xvx_diag_block_fast_i8(
 {
     if (bs <= 0) return;
     const int n = q_uk.n;
+#if GCTA_HAS_AOCL_S8_GEMM
+    const int kSampleTile = std::min(n, 8388608);
+    constexpr int kSnpTile = 2048;
+#else
     constexpr int kSampleTile = 8192;
     constexpr int kSnpTile = 1024;
+#endif
 
     std::vector<double> ukx_norm_sq(bs, 0.0);
 
     for (const auto& tile : q_uk.tiles) {
         const int qr = tile.q_rows;
         const int rc = tile.r_count;
+        const int8_t* const q_base = tile.Q.get();
         const int max_cols = std::min(bs, kSnpTile);
         const size_t need_p = static_cast<size_t>(qr) * static_cast<size_t>(max_cols);
         if (P_i32.size() < need_p) P_i32.resize(need_p);
@@ -505,7 +567,7 @@ inline void woodbury_xvx_diag_block_fast_i8(
                     static_cast<gcta_blas_int>(qr),
                     static_cast<gcta_blas_int>(cols),
                     static_cast<gcta_blas_int>(rows),
-                    tile.Q.data() + static_cast<size_t>(s0) * static_cast<size_t>(qr),
+                    q_base + static_cast<size_t>(s0) * static_cast<size_t>(qr),
                     static_cast<gcta_blas_int>(qr),
                     G_block_i8 + static_cast<size_t>(j0) * static_cast<size_t>(ldG) + s0,
                     static_cast<gcta_blas_int>(ldG),
@@ -532,7 +594,7 @@ inline void woodbury_xvx_diag_block_fast_i8(
                     if (has_miss) {
                         std::fill(miss_acc.begin(), miss_acc.end(), 0);
                         for (int s : miss_list) {
-                            const int8_t* q_col = tile.Q.data() + static_cast<size_t>(s) * static_cast<size_t>(qr);
+                            const int8_t* q_col = q_base + static_cast<size_t>(s) * static_cast<size_t>(qr);
                             for (int q = 0; q < qr; ++q) {
                                 miss_acc[q] += static_cast<int64_t>(q_col[q]);
                             }

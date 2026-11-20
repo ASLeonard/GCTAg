@@ -388,17 +388,29 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
         // Uk_f must be written k×n (see mlma_woodbury.hpp layout convention),
         // transposed relative to ctx.Uk's n×k storage -- readers place these
         // bytes directly into a k×n matrix with no further transpose.
-        // Parallel manual transpose+cast (not ctx.Uk.transpose().cast<float>(),
-        // which Eigen evaluates single-threaded) so large Uk blocks use all cores.
-        Eigen::MatrixXf Uk_f(k, ctx.n);
-        #pragma omp parallel for schedule(static)
-        for (int32_t i = 0; i < ctx.n; ++i) {
-            for (int32_t j = 0; j < k; ++j)
-                Uk_f(j, i) = ctx.Uk(i, j);
+        // Stream in bounded 512 MiB sample-column chunks so save does not double
+        // peak resident memory alongside ctx.Uk.
+        constexpr size_t kUkWriteWindowBytes = 1ULL << 29; // 512 MiB
+        const size_t col_bytes = static_cast<size_t>(k) * sizeof(float);
+        const int32_t cols_per_chunk = static_cast<int32_t>(
+            std::max<size_t>(1, kUkWriteWindowBytes / std::max<size_t>(1, col_bytes)));
+        std::vector<float> uk_chunk(
+            static_cast<size_t>(k) * static_cast<size_t>(std::min(ctx.n, cols_per_chunk)));
+        for (int32_t i0 = 0; i0 < ctx.n; i0 += cols_per_chunk) {
+            const int32_t i_len = std::min(cols_per_chunk, ctx.n - i0);
+            #pragma omp parallel for schedule(static)
+            for (int32_t di = 0; di < i_len; ++di) {
+                float* dst_col = uk_chunk.data() + static_cast<size_t>(di) * static_cast<size_t>(k);
+                const int32_t sample_idx = i0 + di;
+                for (int32_t j = 0; j < k; ++j) {
+                    dst_col[j] = ctx.Uk(sample_idx, j);
+                }
+            }
+            write_exact(fd, uk_chunk.data(), static_cast<size_t>(i_len) * col_bytes, filename);
         }
+        uk_chunk.clear();
+        uk_chunk.shrink_to_fit();
         ctx.Uk.resize(0, 0);
-        write_exact(fd, Uk_f.data(), static_cast<size_t>(ctx.n) * k * sizeof(float), filename);
-        Uk_f.resize(0, 0);
 
         Eigen::VectorXf dk_f = ctx.dk.cast<float>();
         write_exact(fd, dk_f.data(), static_cast<size_t>(k) * sizeof(float), filename);

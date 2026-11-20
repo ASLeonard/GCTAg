@@ -142,7 +142,7 @@ cmake --build build/Release
 
 The executable is written to `build/Release/GCTAg`.
 
-Release builds use `-O3` with `-march=native` (`-mcpu=native` on macOS), so **the binary is only guaranteed to run on the CPU generation it was built on**. On a cluster, build on the same node type you will run on.
+On Linux x86\_64, Release builds default to `-march=x86-64-v3` (AVX2/FMA/F16C/BMI2, runnable on older HPC login nodes as well as compute nodes), while the linked BLAS/LAPACK library (AOCL, MKL, or OpenBLAS) dynamically dispatches Zen 4 AVX-512/VNNI/BF16 kernels at runtime. The `linux-aocl` / `linux-aocc-aocl*` presets also set `-DGCTA_MTUNE=znver4`. Override with `-DGCTA_MARCH=znver4` or `-DGCTA_MARCH=native` if you only ever run on one node architecture; macOS Release builds default to `-mcpu=native`.
 
 ### Install (optional)
 
@@ -150,12 +150,14 @@ Release builds use `-O3` with `-march=native` (`-mcpu=native` on macOS), so **th
 cmake --install build/Release --prefix /path/to/prefix
 ```
 
-This installs `bin/GCTAg`. On Linux it also installs the desktop entry and icons.
+This installs `bin/GCTAg`.
 
 ### Optional build settings
 
 | CMake option | Default | Description |
 |---|---|---|
+| `GCTA_MARCH` | `x86-64-v3` (Linux x86\_64), `native` (macOS/other) | Target CPU ISA for Release builds (`-march=` on Linux, `-mcpu=` on macOS, or `OFF` for generic). |
+| `GCTA_MTUNE` | empty (`znver4` in `linux-aocl*` presets) | Optional `-mtune=` target in Release builds without emitting newer ISA instructions. |
 | `BGEN_SUPPORT` | `OFF` | Enable BGEN input (SQLite is downloaded automatically). |
 | `USE_JEMALLOC` | empty | Path to the `libjemalloc.so` or `libamdalloc.so` **file** (or `ON` when compiling with AOCC to auto-link its bundled `libamdalloc.so`). Links jemalloc/amdalloc with `thp:never` to avoid Linux transparent-huge-page over-allocation on very large triangular allocations such as the GRM. |
 | `GCTA_ENABLE_IPO` | `ON` | Link-time optimisation in Release builds. Set `OFF` to reduce link time and memory use. |

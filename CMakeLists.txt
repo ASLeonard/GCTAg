@@ -283,6 +283,38 @@ option(BGEN_SUPPORT "Enable BGEN file format support (requires SQLite)" OFF)
 set(USE_JEMALLOC "" CACHE STRING
     "Path to libjemalloc.so / libamdalloc.so (or ON/amdalloc with AOCC to auto-select bundled libamdalloc.so). Links with thp:never to avoid Linux THP over-allocation on large triangular allocations.")
 
+if(APPLE)
+    set(_gcta_default_march "native")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    set(_gcta_default_march "x86-64-v3")
+else()
+    set(_gcta_default_march "native")
+endif()
+set(GCTA_MARCH "${_gcta_default_march}" CACHE STRING
+    "Target CPU architecture for Release builds (-march=<val> on Linux, -mcpu=<val> on macOS; e.g. x86-64-v3, znver4, native, or OFF).")
+set(GCTA_MTUNE "" CACHE STRING
+    "Optional CPU tuning for Release builds (-mtune=<val>, e.g. znver4; empty/OFF disables).")
+
+set(_gcta_arch_flags "")
+set(_gcta_arch_desc "")
+string(TOUPPER "${GCTA_MARCH}" _gcta_march_upper)
+if(NOT _gcta_march_upper MATCHES "^(|OFF|NONE|FALSE)$")
+    if(APPLE)
+        list(APPEND _gcta_arch_flags "-mcpu=${GCTA_MARCH}")
+    else()
+        list(APPEND _gcta_arch_flags "-march=${GCTA_MARCH}")
+    endif()
+    set(_gcta_arch_desc "${GCTA_MARCH}")
+else()
+    set(_gcta_arch_desc "generic")
+endif()
+
+string(TOUPPER "${GCTA_MTUNE}" _gcta_mtune_upper)
+if(NOT _gcta_mtune_upper MATCHES "^(|OFF|NONE|FALSE)$")
+    list(APPEND _gcta_arch_flags "-mtune=${GCTA_MTUNE}")
+    set(_gcta_arch_desc "${_gcta_arch_desc} (tune=${GCTA_MTUNE})")
+endif()
+
 
 # Initialize plink-ng submodule if needed
 if(EXISTS "${CMAKE_SOURCE_DIR}/.git" AND NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/plink-ng/2.0/include/pgenlib_ffi_support.h")
@@ -675,12 +707,14 @@ target_compile_definitions(GCTAg PRIVATE
     ${GCTA_BLAS_DEFINES}
     GCTA_BLAS_BACKEND_STR="${GCTA_BLAS_PROVIDER}"
     GCTA_BLAS_VERSION_STR="${GCTA_BLAS_VERSION}"
+    GCTA_TARGET_ARCH_STR="${_gcta_arch_desc}"
     $<$<BOOL:${GCTA_USE_JEMALLOC}>:GCTA_USE_JEMALLOC>
     $<$<BOOL:${BGEN_SUPPORT}>:BGEN_SUPPORT>)
 
-target_compile_options(GCTAg PRIVATE
-    -pipe
-    $<$<CONFIG:Release>:$<IF:$<BOOL:${APPLE}>,-mcpu=native,-march=native>>)
+target_compile_options(GCTAg PRIVATE -pipe)
+foreach(_arch_flag IN LISTS _gcta_arch_flags)
+    target_compile_options(GCTAg PRIVATE $<$<CONFIG:Release>:${_arch_flag}>)
+endforeach()
 
 # Both GCC (GNU ld) and Clang (lld or GNU ld) default to DT_RUNPATH (--enable-new-dtags),
 # which searches LD_LIBRARY_PATH before RPATH and breaks HPC libstdc++/BLAS pinning.
@@ -717,8 +751,9 @@ target_sources(Pgenlib PRIVATE
 # headers such as GenoBackendFactory.h.
 set_target_properties(Pgenlib PROPERTIES UNITY_BUILD OFF)
 target_include_directories(Pgenlib PUBLIC "${CMAKE_SOURCE_DIR}/third_party/plink-ng/2.0/include")
-target_compile_options(Pgenlib PRIVATE
-    $<$<CONFIG:Release>:$<IF:$<BOOL:${APPLE}>,-mcpu=native,-march=native>>)
+foreach(_arch_flag IN LISTS _gcta_arch_flags)
+    target_compile_options(Pgenlib PRIVATE $<$<CONFIG:Release>:${_arch_flag}>)
+endforeach()
 
 
 target_link_libraries(GCTAg PRIVATE
@@ -771,6 +806,7 @@ message(STATUS "==========================================")
 message(STATUS "GCTAg Build Configuration Summary")
 message(STATUS "==========================================")
 message(STATUS "  Build type:        ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Target arch/tune:  ${_gcta_arch_desc}")
 message(STATUS "  BLAS/LAPACK:       ${GCTA_BLAS_PROVIDER} (${GCTA_BLAS_VERSION})")
 if(GCTA_LAPACKE_LIBRARY)
     message(STATUS "  LAPACKE library:   ${GCTA_LAPACKE_LIBRARY}")

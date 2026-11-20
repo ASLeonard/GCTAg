@@ -74,6 +74,9 @@ void out_ver(bool flag_outFile){
 #endif
         log(0, outstring.str(), "");
     }
+#ifdef GCTA_TARGET_ARCH_STR
+    log(0, std::string("* Target arch: ") + GCTA_TARGET_ARCH_STR, "");
+#endif
 #ifdef GCTA_BLAS_BACKEND_STR
     {
         std::string blas_line = std::string("* BLAS/LAPACK: ") + GCTA_BLAS_BACKEND_STR;

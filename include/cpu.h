@@ -1090,6 +1090,89 @@ inline void gcta_gemm_s8s8s32_kmajor_nt(
         scratch_A_f32, scratch_B_f32, scratch_C_f32);
 }
 
+// Query byte size required to pre-reorder transposed row-major A_kmajor(rows x K, ldK)
+// as the static Matrix-B operand (trans='t', shape K x rows after transpose) for
+// gcta_gemm_u8s8s32_kmajor_nt_beta_reordered (e.g., GRM r0-outer strip pre-packing).
+// Returns 0 when !GCTA_HAS_AOCL_S8_GEMM.
+inline size_t gcta_u8s8s32_reorder_bt_size(gcta_blas_int rows, gcta_blas_int K) {
+#if GCTA_HAS_AOCL_S8_GEMM
+    if (rows <= 0 || K <= 0) return 0;
+    return gcta_cpu_detail::call_aocl_get_reorder_buf_size(
+        &aocl_get_reorder_buf_size_u8s8s32os32, 'r', 't', 'b', K, rows);
+#else
+    (void)rows;
+    (void)K;
+    return 0;
+#endif
+}
+
+// Pack transposed row-major A_kmajor(rows x K, stride ldK >= K) into dst_reordered
+// (allocated to >= gcta_u8s8s32_reorder_bt_size(rows, K) bytes) for repeated
+// gcta_gemm_u8s8s32_kmajor_nt_beta_reordered calls. No-op when !GCTA_HAS_AOCL_S8_GEMM.
+inline void gcta_u8s8s32_reorder_bt(
+    gcta_blas_int rows, gcta_blas_int K,
+    const int8_t* A_kmajor, gcta_blas_int ldK,
+    int8_t* dst_reordered)
+{
+#if GCTA_HAS_AOCL_S8_GEMM
+    if (rows <= 0 || K <= 0 || A_kmajor == nullptr || dst_reordered == nullptr) return;
+    gcta_cpu_detail::call_aocl_reorder(
+        &aocl_reorder_u8s8s32os32, 'r', 't', 'b',
+        A_kmajor, dst_reordered, K, rows, ldK);
+#else
+    (void)rows;
+    (void)K;
+    (void)A_kmajor;
+    (void)ldK;
+    (void)dst_reordered;
+#endif
+}
+
+// Compute C(rows x cols, col-major, ldc) =
+//   beta * C + A_kmajor(rows x K, ldK) * B_kmajor(cols x K, ldK)^T
+// using pre-reordered A_reordered (from gcta_u8s8s32_reorder_bt) when GCTA_HAS_AOCL_S8_GEMM
+// and A_reordered != nullptr; otherwise falls back to gcta_gemm_u8s8s32_kmajor_nt_beta
+// with A_fallback_kmajor. Note: AOCL-DLP validates ldb against transb before inspecting
+// mem_format_b='r', so transb='t' and ldb=ldK match the reorder call ('r','t','b',K,rows,ldK).
+inline void gcta_gemm_u8s8s32_kmajor_nt_beta_reordered(
+    gcta_blas_int rows, gcta_blas_int cols, gcta_blas_int K,
+    const int8_t* A_reordered, const int8_t* A_fallback_kmajor, gcta_blas_int ldK,
+    const int8_t* B_kmajor,
+    int32_t* C, gcta_blas_int ldc,
+    int32_t beta,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_B_f32,
+    std::vector<float>& scratch_C_f32)
+{
+    if (rows <= 0 || cols <= 0 || K <= 0) return;
+#if GCTA_HAS_AOCL_S8_GEMM
+    if (A_reordered != nullptr) {
+        (void)A_fallback_kmajor;
+        (void)scratch_A_f32;
+        (void)scratch_B_f32;
+        (void)scratch_C_f32;
+        aocl_gemm_u8s8s32os32('r', 'n', 't',
+                              cols, rows, K,
+                              1,
+                              reinterpret_cast<const uint8_t*>(B_kmajor), ldK, 'n',
+                              A_reordered, ldK, 'r',
+                              beta,
+                              C, ldc,
+                              nullptr);
+        return;
+    }
+#else
+    (void)A_reordered;
+#endif
+    gcta_gemm_u8s8s32_kmajor_nt_beta(
+        rows, cols, K,
+        A_fallback_kmajor, ldK,
+        B_kmajor,
+        C, ldc,
+        beta,
+        scratch_A_f32, scratch_B_f32, scratch_C_f32);
+}
+
 // Compute the lower triangle of C(cols x cols, column-major, leading dim ldc) =
 //   beta * C + A_kmajor(cols x K, ldK) * A_kmajor(cols x K, ldK)^T
 // where A_kmajor stores K markers contiguously per sample in {0, 1, 2}.

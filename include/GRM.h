@@ -18,8 +18,10 @@
 
 #ifndef GCTA2_GRM_H
 #define GCTA2_GRM_H
+#include "Cli.hpp"
 #include "Geno.h"
 #include <memory>
+#include <optional>
 #include <string>
 #include <span>
 #include <vector>
@@ -34,8 +36,9 @@ using std::pair;
 
 class GRM {
 public:
-    GRM(Pheno *pheno, Marker *marker);
-    GRM();
+    GRM(Pheno *pheno, Marker *marker, const gcta_cli::GrmMakeOptions& opts, const std::string& out_prefix);
+    GRM(const std::string& grm_prefix, const std::string& keep_file, const std::string& remove_file,
+        const std::string& out_prefix, bool cutoff_detail = false);
     ~GRM() = default;
 
     void calculate_GRM_blas(uintptr_t* genobuf, std::span<const uint32_t> markerIndex);
@@ -45,8 +48,12 @@ public:
     vector<uint32_t> divide_parts(uint32_t from, uint32_t to, uint32_t num_parts);
     vector<uint32_t> divide_parts_mem(uint32_t n_sample, uint32_t num_parts);
 
-    static int registerOption(map<string, vector<string>>& options_in);
-    static void processMain();
+    static void runMake(const gcta_cli::GrmMakeOptions& opts, const std::string& out_prefix);
+    static void runMerge(const gcta_cli::GrmMergeOptions& opts, const std::string& out_prefix);
+    static void runPrune(const gcta_cli::GrmPruneOptions& opts, const std::string& out_prefix);
+    static void runSparse(const gcta_cli::GrmSparseOptions& opts, const std::string& out_prefix);
+    static void runSubtract(const gcta_cli::GrmCombineOptions& opts, const std::string& out_prefix);
+    static void runUnify(const gcta_cli::GrmCombineOptions& opts, const std::string& out_prefix);
     void processMakeGRM(bool is_homogametic = false);
     void processMakeGRMX();
 
@@ -87,11 +94,10 @@ private:
     void output_id();
 
     string o_name;
-
-    static map<string, string> options;
-    static map<string, double> options_d;
-    static map<string, bool> options_b;
-    static std::vector<string> processFunctions;
+    std::string keep_file;
+    std::string remove_file;
+    std::optional<float> sparse_cutoff;
+    bool cutoff_detail = false;
 
     string grm_file;
     int num_byte_buffer;

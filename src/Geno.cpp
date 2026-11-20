@@ -107,71 +107,90 @@ const uintptr_t k1LU = (uintptr_t)1;
 using std::thread;
 using std::to_string;
 
-map<string, string> Geno::options;
-map<string, double> Geno::options_d;
-vector<string> Geno::processFunctions;
-
-Geno::Geno(Pheno* pheno, Marker* marker) {
+Geno::Geno(Pheno* pheno,
+           Marker* marker,
+           const gcta_cli::GenoInputOptions& geno_opts,
+           const gcta_cli::MarkerFilterOptions& marker_filter,
+           const std::string& out_prefix)
+    : out_prefix_(out_prefix),
+      opt_min_maf(marker_filter.maf.value_or(0.0)),
+      opt_max_maf(marker_filter.max_maf.value_or(0.5)),
+      opt_geno_rate(marker_filter.geno.value_or(1.0)),
+      opt_info_score(marker_filter.info.value_or(0.0)),
+      opt_dos_dc(marker_filter.dc.value_or(-1.0)),
+      opt_hard_call_thresh(marker_filter.hard_call_thresh.value_or(0.9)),
+      opt_dosage_call(marker_filter.dosage_call) {
     geno_files.clear();
     int num_geno = 0;
-    if(options.find("geno_file") != options.end()){
+    if (!geno_opts.bfile.empty()) {
+        const string f = geno_opts.bfile + ".bed";
+        requireFileReadable("--bfile", f);
         genoFormat = "BED";
-        geno_files.push_back(options["geno_file"]);
+        geno_files.push_back(f);
         num_geno++;
         hasInfo = false;
     }
 
-    if(options.find("m_file") != options.end()){
+    if (!geno_opts.mbfile.empty()) {
         genoFormat = "BED";
-        boost::split(geno_files, options["m_file"], boost::is_any_of("\t "));
-        //std::transform(geno_files.begin(), geno_files.end(), geno_files.begin(), [](string r){return r + ".bed";});
+        geno_files = expandFileList(geno_opts.mbfile, ".bed");
         num_geno++;
         hasInfo = false;
     }
 
-    if(options.find("pgen_file") != options.end()){
+    if (!geno_opts.pfile.empty()) {
+        const string f = geno_opts.pfile + ".pgen";
+        requireFileReadable("--pfile", f);
         genoFormat = "PGEN";
-        geno_files.push_back(options["pgen_file"]);
-        boost::split(geno_files, options["pgen_file"], boost::is_any_of("\t "));
+        geno_files.push_back(f);
         num_geno++;
         hasInfo = false;
     }
 
-    if(options.find("mpgen_file") != options.end()){
+    if (!geno_opts.bpfile.empty()) {
+        const string f = geno_opts.bpfile + ".pgen";
+        requireFileReadable("--bpfile", f);
         genoFormat = "PGEN";
-        boost::split(geno_files, options["mpgen_file"], boost::is_any_of("\t "));
+        geno_files.push_back(f);
         num_geno++;
         hasInfo = false;
     }
 
-    if(options.find("bgen_file") != options.end()){
+    if (!geno_opts.mpfile.empty()) {
+        genoFormat = "PGEN";
+        geno_files = expandFileList(geno_opts.mpfile, ".pgen");
+        num_geno++;
+        hasInfo = false;
+    }
+
+    if (!geno_opts.mbpfile.empty()) {
+        genoFormat = "PGEN";
+        geno_files = expandFileList(geno_opts.mbpfile, ".pgen");
+        num_geno++;
+        hasInfo = false;
+    }
+
+    if (!geno_opts.bgen.empty()) {
+        requireFileReadable("--bgen", geno_opts.bgen);
         genoFormat = "BGEN";
-        geno_files.push_back(options["bgen_file"]);
+        geno_files.push_back(geno_opts.bgen);
         num_geno++;
         hasInfo = true;
     }
 
-    if(options.find("mbgen_file") != options.end()){
+    if (!geno_opts.mbgen.empty()) {
         genoFormat = "BGEN";
-        boost::split(geno_files, options["mbgen_file"], boost::is_any_of("\t "));
+        geno_files = expandFileList(geno_opts.mbgen, ".bgen");
         num_geno++;
         hasInfo = true;
     }
 
-    if(num_geno == 0){
+    if (num_geno == 0) {
         LOGGER.e(0, "no genotype file is specified");
     }
 
-    //open and check genotype files
-
     this->pheno = pheno;
     this->marker = marker;
-
-    //this->sampleKeepIndex = pheno->get_index_keep();
-
-    //register format handlers
-
-
 
     // Resolve the unpacking function once so getGenoDouble() is a direct
     // member-function call on every marker, not a hash-map lookup.
@@ -184,47 +203,48 @@ Geno::Geno(Pheno* pheno, Marker* marker) {
     else if (genoFormat == "PGEN") getGenoFloatFunc = &Geno::getGenoFloat_pgen;
     else if (genoFormat == "BGEN") getGenoFloatFunc = &Geno::getGenoFloat_bgen;
 
-    string alleleFileName = "";
-    if(options.find("update_freq_file") != options.end()){
-        alleleFileName = options["update_freq_file"];
+    string alleleFileName;
+    if (!geno_opts.update_freq.empty()) {
+        requireFileReadable("--update-freq", geno_opts.update_freq);
+        alleleFileName = geno_opts.update_freq;
     }
 
-    setMAF(options_d["min_maf"]);
-    setMaxMAF(options_d["max_maf"]);
-    setFilterInfo(options_d["info_score"]);
-    setFilterMiss(1.0 - options_d["geno_rate"]);
+    setMAF(opt_min_maf);
+    setMaxMAF(opt_max_maf);
+    setFilterInfo(opt_info_score);
+    setFilterMiss(1.0 - opt_geno_rate);
 
     string filterprompt = "Threshold to filter variants:";
     bool outFilterPrompt = false;
-    if(options_d["min_maf"] != 0.0){
-        filterprompt += " MAF > " + to_string(options_d["min_maf"]);
+    if (opt_min_maf != 0.0) {
+        filterprompt += " MAF > " + to_string(opt_min_maf);
         outFilterPrompt = true;
     }
-    if(options_d["max_maf"] != 0.5){
-        filterprompt += string(outFilterPrompt ? "," : "") + " MAF < " + to_string(options_d["max_maf"]);
+    if (opt_max_maf != 0.5) {
+        filterprompt += string(outFilterPrompt ? "," : "") + " MAF < " + to_string(opt_max_maf);
         outFilterPrompt = true;
     }
-    if(options_d["info_score"] != 0.0){
-        filterprompt += string(outFilterPrompt ? "," : "") + " imputation INFO score > " + to_string(options_d["info_score"]);
+    if (opt_info_score != 0.0) {
+        filterprompt += string(outFilterPrompt ? "," : "") + " imputation INFO score > " + to_string(opt_info_score);
         outFilterPrompt = true;
     }
 
-    if(options_d["geno_rate"] != 1.0){
-        filterprompt += string(outFilterPrompt ? "," : "") + " missingness rate < " + to_string(options_d["geno_rate"]);
+    if (opt_geno_rate != 1.0) {
+        filterprompt += string(outFilterPrompt ? "," : "") + " missingness rate < " + to_string(opt_geno_rate);
         outFilterPrompt = true;
     }
-    if(outFilterPrompt){
+    if (outFilterPrompt) {
         LOGGER << filterprompt << "." << std::endl;
     }
-    if(options_d["dos_dc"] == 1.0){
+    if (opt_dos_dc == 1.0) {
         iGRMdc = 1;
         iDC = 1;
         LOGGER << "Switch to the full dosage compensation mode." << std::endl;
-    }else if(options_d["dos_dc"] == 0.0){
+    } else if (opt_dos_dc == 0.0) {
         iGRMdc = 0;
         iDC = 0;
         LOGGER << "Switch to the no dosage compensation mode." << std::endl;
-    }else{
+    } else {
         // default equal variance mode for grm
         iGRMdc = -1;
         // compensation mode for x
@@ -232,13 +252,6 @@ Geno::Geno(Pheno* pheno, Marker* marker) {
     }
 
     init_AF(alleleFileName);
-
-    //olds
-    //init_AsyncBuffer();
-
-    //num_keep_sample = 0;
-    //init_keep();
-    //olds;
 }
 
 Geno::~Geno(){
@@ -248,20 +261,11 @@ uint32_t Geno::getTotalMarker(){
     return total_markers;
 }
 
-void Geno::setSexMode(){
-    std::map<string, vector<string>> t_option;
-    t_option["--chr-homogametic"] = {};
-    t_option["--filter-sex"] = {}; 
-    Pheno::registerOption(t_option);
-    Marker::registerOption(t_option);
-    Geno::registerOption(t_option);
-}
-
 
 //
 //true:  filtered; false: not necessary to filter
 bool Geno::filterMAF(){
-    if((options_d["min_maf"] != 0.0) || (options_d["max_maf"] != 0.5)){
+    if((opt_min_maf != 0.0) || (opt_max_maf != 0.5)){
         LOGGER.i(0, "Computing allele frequencies...");
 
         int N = static_cast<int>(marker->count_extract());
@@ -293,8 +297,8 @@ bool Geno::filterMAF(){
         min_maf = sv_min; max_maf = sv_max; dFilterMiss = sv_miss;
 
         // Apply MAF filter
-        double min_maf_eps = options_d["min_maf"] * (1.0 - Constants::SMALL_EPSILON);
-        double max_maf_eps = options_d["max_maf"] * (1.0 + Constants::SMALL_EPSILON);
+        double min_maf_eps = opt_min_maf * (1.0 - Constants::SMALL_EPSILON);
+        double max_maf_eps = opt_max_maf * (1.0 + Constants::SMALL_EPSILON);
         LOGGER.d(0, "min_maf: " + to_string(min_maf_eps) + " max_maf: " + to_string(max_maf_eps));
         vector<uint32_t> extract_index;
         double cur_AF;
@@ -415,15 +419,11 @@ void Geno::setGRMMode(bool grm, bool dominace){
     }
 }
 
-void Geno::setGenoCodingModel(const string& model_name){
-    if (model_name == "additive") {
-        genoCodingModel = GenoCodingModel::ADDITIVE;
-    } else if (model_name == "dominance") {
-        genoCodingModel = GenoCodingModel::DOMINANCE;
-    } else if (model_name == "nonadditive") {
-        genoCodingModel = GenoCodingModel::NONADDITIVE;
-    } else {
-        LOGGER.e(0, "Unknown genotype model '" + model_name + "'. Expected additive, nonadditive, or dominance.");
+void Geno::setGenoCodingModel(gcta_cli::GenoModel model){
+    switch (model) {
+        case gcta_cli::GenoModel::Additive:    genoCodingModel = GenoCodingModel::ADDITIVE; break;
+        case gcta_cli::GenoModel::Dominance:   genoCodingModel = GenoCodingModel::DOMINANCE; break;
+        case gcta_cli::GenoModel::NonAdditive: genoCodingModel = GenoCodingModel::NONADDITIVE; break;
     }
 }
 
@@ -1339,7 +1339,7 @@ void Geno::bgen2bed(const vector<uint32_t> &raw_marker_index){
     LOGGER << "samples: " << num_raw_sample << ", keep_sample: " << index_keep.size() << std::endl;
     LOGGER << "Markers: " << num_markers << std::endl;
 
-    FILE * h_bgen = fopen(options["bgen_file"].c_str(), "rb");
+    FILE * h_bgen = fopen(geno_files[0].c_str(), "rb");
     /*
     std::ofstream infos("exmaple.txt");
     infos << "index\traw_index\tpos\tLen_comp\tLen_decomp" << std::endl;
@@ -1414,8 +1414,8 @@ void Geno::bgen2bed(const vector<uint32_t> &raw_marker_index){
         uint32_t base_value = (1 << bits_prob) - 1;
 
         uint8_t *buf_ptr = (uint8_t *)buf;
-        if(options.find("dosage_call") == options.end()){
-            uint32_t cut_value = ceil(base_value * options_d["hard_call_thresh"]);
+        if(!opt_dosage_call){
+            uint32_t cut_value = ceil(base_value * opt_hard_call_thresh);
             for(uint32_t i = 0; i < num_keep_sample; i++){
                 uint32_t item_byte = i >> 2;
                 uint32_t move_byte = (i & 3) << 1;
@@ -1539,10 +1539,10 @@ void Geno::bgen2bed(const vector<uint32_t> &raw_marker_index){
 // https://github.com/chrchang/plink-ng
 
 void Geno::save_bed(uint64_t *buf, int num_marker){
-    static string err_string = "can't write to [" + options["out"] + ".bed].";
+    static string err_string = "can't write to [" + out_prefix_ + ".bed].";
     static bool inited = false;
     if(!inited){
-        hOut = fopen((options["out"] + ".bed").c_str(), "wb");
+        hOut = fopen((out_prefix_ + ".bed").c_str(), "wb");
         if(hOut == NULL){
             LOGGER.e(0, err_string);
         }
@@ -1617,198 +1617,8 @@ void Geno::setFilterMiss(double val){
     this->dFilterMiss = val;
 }
 
-
-void Geno::addOneFileOption(string key_store, string append_string, string key_name,
-                                     map<string, vector<string>> options_in) {
-    if(options_in.find(key_name) != options_in.end()){
-        if(options_in[key_name].size() == 1){
-            options[key_store] = options_in[key_name][0] + append_string;
-        }else if(options_in[key_name].size() > 1){
-            options[key_store] = options_in[key_name][0] + append_string;
-            LOGGER.w(0, "Geno: multiple " + key_name + ", use the first one only" );
-        }else{
-            LOGGER.e(0, "no " + key_name + " parameter found");
-        }
-        std::ifstream f(options[key_store].c_str());
-        if(!f.good()){
-            LOGGER.e(0, key_name + " " + options[key_store] + " not found");
-        }
-        f.close();
-    }
-}
-
-int Geno::registerOption(map<string, vector<string>>& options_in) {
-    int return_value = 0;
-    addOneFileOption("geno_file", ".bed", "--bfile", options_in);
-    addOneFileOption("bgen_file", "", "--bgen", options_in);
-    addOneFileOption("pgen_file", ".pgen", "--pfile", options_in);
-    addOneFileOption("pgen_file", ".pgen", "--bpfile", options_in);
-
-    addMFileListsOption("m_file", ".bed", "--mbfile", options_in, options);
-    addMFileListsOption("mbgen_file", ".bgen", "--mbgen", options_in, options);
-    addMFileListsOption("mpgen_file", ".pgen", "--mbpfile", options_in, options);
-    addMFileListsOption("mpgen_file", ".pgen", "--mpfile", options_in, options);
-
-    options_d["min_maf"] = 0.0;
-    options_d["max_maf"] = 0.5;
-    if(options_in.find("--maf") != options_in.end()){
-        auto option = options_in["--maf"];
-        if(option.size() == 1){
-            try{
-                options_d["min_maf"] = std::stod(option[0]);
-            }catch(std::invalid_argument&){
-                LOGGER.e(0, "invalid value for --maf");
-            }
-            if(options_d["min_maf"]<0.0 || options_d["max_maf"]>0.5){
-                LOGGER.e(0, "value specified for--maf can't be smaller than 0 or larger than 0.5");
-            }else if(options_d["min_maf"] == 0.0){
-                options_in["--nofilter"] = {};
-            }
-
-        }else{
-            LOGGER.e(0, "GCTA does not support multiple values for --maf currently");
-        }
-        options_in.erase("--maf");
-    }
-
-     if(options_in.find("--max-maf") != options_in.end()){
-        auto option = options_in["--max-maf"];
-        if(option.size() == 1){
-            try{
-                options_d["max_maf"] = std::stod(option[0]);
-           }catch(std::invalid_argument&){
-                LOGGER.e(0, "invalid value for --maf");
-           }
-           if(options_d["max_maf"] < 0.0 || options_d["max_maf"] > 0.5){
-               LOGGER.e(0, "the value specified for --max-maf can't be smaller than 0 or larger than 0.5");
-           }
-        }else{
-            LOGGER.e(0, " GCTA does not support multiple values for --maf currently ");
-        }
-        options_in.erase("--max-maf");
-    }
-
-    if(options_d["min_maf"] > options_d["max_maf"]){
-        LOGGER.e(0, "value specified for --max-maf can't be smaller than that for --min-maf");
-    }
-
-
-    addOneValOption<double>("geno_rate", "--geno", options_in, options_d, 1.0, 0.0, 1.0);
-    if(options_in.find("--geno") != options_in.end()){
-        if(options_d["geno_rate"] == 0.0){
-            options_in["--nofilter"] = {};
-        }
-    }
-
-    addOneValOption<double>("info_score", "--info", options_in, options_d, 0.0, 0.0, 1.0);
-    addOneValOption<double>("dos_dc", "--dc", options_in, options_d, -1.0, -1.0, 1.0);
-
-
-
-    options_d["hard_call_thresh"] = 0.9;
-    string flag = "--hard-call-thresh";
-    if(options_in.find(flag) != options_in.end()){
-        auto option = options_in[flag];
-        if(options.size() == 1){
-            try{
-                options_d["hard_call_thresh"] = std::stod(option[0]);
-            }catch(std::invalid_argument&){
-                LOGGER.e(0, "invalid value in " + flag);
-            }
-        }else{
-            LOGGER.e(0, " GCTA does not support multiple values for " + flag + " currently.");
-        }
-        options_in.erase(flag);
-    }
-
-    flag = "--dosage-call";
-    if(options_in.find(flag) != options_in.end()){
-        options["dosage_call"] = "true";
-        options_in.erase(flag);
-    }
-
-    if(options_in.find("--freq") != options_in.end()){
-        processFunctions.push_back("freq");
-        if(options_in["--freq"].size() != 0){
-            LOGGER.w(0, "--freq should not be followed by any parameter, if you want to calculate the allele frequencies in founders only, "
-                    "please specify by --founders option");
-        }
-        options_in.erase("--freq");
-
-        options["out"] = options_in["--out"][0];
-
-        return_value++;
-    }
-
-    if(options_in.find("--freqx") != options_in.end()){
-        processFunctions.push_back("freqx");
-        if(options_in["--freqx"].size() != 0){
-            LOGGER.w(0, "--freq should not be followed by any other parameter, if you want to calculate the allele frequencies in founders only, "
-                    "please specify by --founders option");
-        }
-        options_in.erase("--freqx");
-
-        options["out"] = options_in["--out"][0];
-
-        return_value++;
-    }
-
-    if(options_in.find("--make-bed") != options_in.end()){
-        if(options.find("bgen_file") == options.end()){
-            processFunctions.push_back("make_bed");
-        }else{
-            processFunctions.push_back("make_bed_bgen");
-        } 
-
-        options_in.erase("--make-bed");
-        options["out"] = options_in["--out"][0];
-
-        return_value++;
-    }
-
-    if(options_in.find("--recodet") != options_in.end()){
-        processFunctions.push_back("recodet");
-        options["recode_method"] = "nomiss";
-        if(options_in["--recodet"].size() > 0){
-            string cop = options_in["--recodet"][0];
-            vector<string> ops = {"nomiss", "raw", "std"};
-            if(std::find(ops.begin(), ops.end(), cop) != ops.end()){
-                options["recode_method"] = cop;
-            }else{
-                LOGGER.e(0, "can't recognize recode method: " + options_in["--recodet"][0]);
-            }
-        }
-        options_in.erase("--recodet");
-        options["out"] = options_in["--out"][0];
-        return_value++;
-    }
-
-
-    addOneFileOption("update_freq_file", "", "--update-freq", options_in);
-
-    if(options_in.find("--filter-sex") != options_in.end()){
-        options["sex"] = "yes";
-    }
-
-    if(options_in.find("--sum-geno-x") != options_in.end()){
-        processFunctions.push_back("sum_geno_homogametic");
-        options["sex"] = "yes";
-        std::map<string, vector<string>> t_option;
-        t_option["--chr-homogametic"] = {};
-        t_option["--filter-sex"] = {};
-        Pheno::registerOption(t_option);
-        Marker::registerOption(t_option);
-        options["out"] = options_in["--out"][0];
-        return_value++;
-    }
-
-
-
-    return return_value;
-}
-
 void Geno::processFreq(){
-    string name_out = options["out"] + ".frq";
+    string name_out = out_prefix_ + ".frq";
     int buf_size = 23068672;
     osBuf.resize(buf_size);
     osOut.rdbuf()->pubsetbuf(&osBuf[0], buf_size);
@@ -1841,7 +1651,7 @@ void Geno::processFreq(){
 }
 
 void Geno::processRecodet(){
-    string name_out = options["out"] + ".xmat";
+    string name_out = out_prefix_ + ".xmat";
     int buf_size = 23068672;
     osBuf.resize(buf_size);
     osOut.rdbuf()->pubsetbuf(&osBuf[0], buf_size);
@@ -1864,15 +1674,15 @@ void Geno::processRecodet(){
 
     int nMarker = 128;
     bool center, std, saveMiss;
-    if(options["recode_method"] == "std"){
+    if(recode_method_ == "std"){
         center = true;
         std = true;
         saveMiss = false;
-    }else if(options["recode_method"] == "nomiss"){
+    }else if(recode_method_ == "nomiss"){
         center = false;
         std = false;
         saveMiss = false;
-    }else if(options["recode_method"] == "raw"){
+    }else if(recode_method_ == "raw"){
         center = false;
         std = false;
         saveMiss = true;
@@ -1988,7 +1798,7 @@ void Geno::recode_func(uintptr_t* genobuf, std::span<const uint32_t> markerIndex
 // ─────────────────────────────────────────────────────────────────────────────
 void Geno::processMakeBed() {
     LOGGER.i(0, "Making PLINK binary PED files...");
-    const string filename = options["out"];
+    const string filename = out_prefix_;
 
     // ── Pass 1: collect valid extract-list indices ────────────────────────
     const int N = static_cast<int>(marker->count_extract());
@@ -2069,7 +1879,7 @@ void Geno::make_bed_func(uintptr_t* genobuf, std::span<const uint32_t> markerInd
         }
 
         if (fwrite(bedBuf.data(), 1u, bytesPerMarker, hOut) != bytesPerMarker) {
-            LOGGER.e(0, "write error to [" + options["out"] + ".bed].");
+            LOGGER.e(0, "write error to [" + out_prefix_ + ".bed].");
         }
         ++numMarkerOutput;
     }
@@ -2082,7 +1892,7 @@ void Geno::make_bed_func(uintptr_t* genobuf, std::span<const uint32_t> markerInd
 // ─────────────────────────────────────────────────────────────────────────────
 void Geno::processSumGenoHomogametic() {
     LOGGER.i(0, "Computing per-sample genotype sums on homogametic chromosomes...");
-    const string outFile = options["out"] + ".sum_geno_x.txt";
+    const string outFile = out_prefix_ + ".sum_geno_x.txt";
 
     const uint32_t nSample = pheno->count_keep();
     sumGenoHomogametic.assign(nSample, 0.0);
@@ -2146,50 +1956,6 @@ void Geno::sum_geno_homogametic_func(uintptr_t* genobuf, std::span<const uint32_
         for (int j = 0; j < nS; j++) {
             sumGenoHomogametic   [j] += localSum[t][j];
             nValidGenoHomogametic[j] += localN  [t][j];
-        }
-    }
-}
-
-void Geno::processMain() {
-    for(auto &process_function : processFunctions){
-        if(process_function == "freq"){
-            Pheno pheno;
-            Marker marker;
-            Geno geno(&pheno, &marker);
-            geno.processFreq();
-        }
-
-        if(process_function == "recodet"){
-            Pheno pheno;
-            Marker marker;
-            Geno geno(&pheno, &marker);
-            geno.processRecodet();
-        }
-
-        if(process_function == "make_bed"){
-            Pheno pheno;
-            Marker marker;
-            Geno geno(&pheno, &marker);
-            geno.processMakeBed();
-        }
-
-        if(process_function == "make_bed_bgen"){
-            Pheno pheno;
-            Marker marker;
-            Geno geno(&pheno, &marker);
-            string filename = options["out"];
-            pheno.save_pheno(filename + ".fam");
-            marker.save_marker(filename + ".bim");
-            LOGGER.i(0, "Converting bgen to PLINK binary PED format [" + filename + ".bed]...");
-            geno.bgen2bed(marker.get_extract_index());
-            LOGGER.i(0, "Genotype has been saved.");
-        }
-
-        if(process_function == "sum_geno_homogametic"){
-            Pheno pheno;
-            Marker marker;
-            Geno geno(&pheno, &marker);
-            geno.processSumGenoHomogametic();
         }
     }
 }

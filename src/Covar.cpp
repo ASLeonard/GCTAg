@@ -27,7 +27,6 @@
 #include "utils.hpp"
 #include "StatLib.h"
 
-map<string, string> Covar::options;
 using std::to_string;
 
 bool common_3vector(vector<string> **idListP, vector<vector<double>> **valueP,
@@ -137,50 +136,29 @@ bool common_3vector(vector<string> **idListP, vector<vector<double>> **valueP,
 
 
 
-Covar::Covar(){
+Covar::Covar(const gcta_cli::PhenoCovarOptions& opts) {
     vector<string> samples_qcovar, samples_covar, samples_rcovar, samples_envir;
     vector<vector<double>> qcovar, covar, rcovar, envir;
 
-    if(options.find("qcovar") != options.end()){
-        string filename = options["qcovar"];
-        LOGGER.i(0, "Reading quantitative covariates from [" + filename + "].");
-        read_covar(filename, samples_qcovar, &qcovar, NULL, NULL);  
-        if(hasVectorDuplicate(samples_qcovar)){
+    if (!opts.qcovar.empty()) {
+        requireFileReadable("--qcovar", opts.qcovar);
+        LOGGER.i(0, "Reading quantitative covariates from [" + opts.qcovar + "].");
+        read_covar(opts.qcovar, samples_qcovar, &qcovar, nullptr, nullptr, opts.covar_maxlevel);
+        if (hasVectorDuplicate(samples_qcovar)) {
             LOGGER.e(0, "duplicated FID+IID in the covariate file.");
         }
         LOGGER.i(0, to_string(qcovar.size()) + " covariates of " + to_string(samples_qcovar.size()) + " samples to be included.");
     }
 
-    if(options.find("covar") != options.end()){
-        string filename = options["covar"];
-        LOGGER.i(0, "Reading discrete covariates from [" + filename + "].");
-        read_covar(filename, samples_covar, &covar, &labels_covar, NULL);  
-        if(hasVectorDuplicate(samples_covar)){
+    if (!opts.covar.empty()) {
+        requireFileReadable("--covar", opts.covar);
+        LOGGER.i(0, "Reading discrete covariates from [" + opts.covar + "].");
+        read_covar(opts.covar, samples_covar, &covar, &labels_covar, nullptr, opts.covar_maxlevel);
+        if (hasVectorDuplicate(samples_covar)) {
             LOGGER.e(0, "duplicated FID+IID in the covariate file.");
         }
         LOGGER.i(0, to_string(covar.size()) + " covariates of " + to_string(samples_covar.size()) + " samples to be included.");
- 
     }
-
-    if(options.find("rcovar") != options.end()){
-        string filename = options["rcovar"];
-        LOGGER.i(0, "Reading ranked covariates from [" + filename + "].");
-        read_covar(filename, samples_rcovar, &rcovar, &labels_rcovar, NULL);  
-        if(hasVectorDuplicate(samples_rcovar)){
-            LOGGER.e(0, "duplicated FID+IID in the covariate file.");
-        }
-        LOGGER.i(0, to_string(rcovar.size()) +  " covariates of " + to_string(samples_rcovar.size()) + " samples to be included.");
-    }
-
-    if(options.find("envir") != options.end()){
-      string filename = options["envir"];
-      LOGGER.i(0, "Reading environment variable from [" + filename + "].");
-      read_covar(filename, samples_envir, &envir, NULL, NULL);  
-      if(hasVectorDuplicate(samples_envir)){
-        LOGGER.e(0, "environment variable can't have duplicate FID+IID.");
-      }
-      LOGGER.i(0, to_string(envir.size()) +  " environment variable of " + to_string(samples_envir.size()) + " samples to be included.");
-    } 
 
     this->rcovar.resize(rcovar.size());
     this->covar.resize(covar.size());
@@ -668,7 +646,7 @@ bool Covar::getEnvirX(const vector<string> &sampleIDs, vector<double> &X, vector
   return true;
 }
 
-void Covar::read_covar(string filename, vector<string>& sub_list, vector<vector<double>>* covar, vector<map<string, int>>* labels, vector<int>* keep_row_p){
+void Covar::read_covar(string filename, vector<string>& sub_list, vector<vector<double>>* covar, vector<map<string, int>>* labels, vector<int>* keep_row_p, int max_level){
     string err_string = "[" + filename + "].";
     std::ifstream hcovar(filename.c_str());
     if(!hcovar.good()){
@@ -738,7 +716,7 @@ void Covar::read_covar(string filename, vector<string>& sub_list, vector<vector<
         }
     }
 
-    int n_item = atoi(options["covar_maxlevel"].c_str());
+    int n_item = max_level;
 
     while(std::getline(hcovar, line)){
         line_number++;
@@ -797,61 +775,6 @@ void Covar::read_covar(string filename, vector<string>& sub_list, vector<vector<
             }
         }
     }
-}
-
-int Covar::registerOption(map<string, vector<string>>& options_in){
-    addOneFileOption("qcovar", "", "--qcovar", options_in, options);
-    addOneFileOption("covar", "", "--covar", options_in, options);
-    addOneFileOption("rcovar", "", "--rcovar", options_in, options);
-    addOneFileOption("envir", "", "--envir", options_in, options); 
-
-    string op = "--covar-maxlevel";
-    options["covar_maxlevel"] = "33";
-    if(options_in.find(op) != options_in.end()){
-        auto options_tmp = options_in[op];
-        if(options_tmp.size() >= 1){
-            options["covar_maxlevel"] = options_tmp[0];
-        }
-    }
-
-    if(options_in.find("--test-covar") != options_in.end()){
-        string filename = options_in["--test-covar"][0];
-        vector<string> samples;
-        Covar::read_covar(filename, samples);
-        LOGGER << "template: " << samples.size() << std::endl;
-
-        Covar covar;
-        vector<double> X;
-        vector<uint32_t> sample_index;
-        covar.getCovarXRaw(samples, X, sample_index);
-        LOGGER<< "samples " << sample_index.size() << std::endl;
-        LOGGER << "X size: " << X.size() << std::endl;
-
-        for(int j = 0; j < X.size() / sample_index.size(); j++){
-            for(int i = 0; i < sample_index.size(); i++){
-                LOGGER << X[i + j * sample_index.size()] << " ";
-            }
-            LOGGER << std::endl;
-        }
-
-        covar.getCovarX(samples, X, sample_index);
-        LOGGER<< "samples " << sample_index.size() << std::endl;
-        LOGGER << "X size: " << X.size() << std::endl;
-
-        for(int j = 0; j < X.size() / sample_index.size(); j++){
-            for(int i = 0; i < sample_index.size(); i++){
-                LOGGER << X[i + j * sample_index.size()] << " ";
-            }
-            LOGGER << std::endl;
-        }
-
-    }
-
-    return 0;
-}
-
-void Covar::processMain(){
-    LOGGER.e(0, "no main function in covariate yet.");
 }
 
 

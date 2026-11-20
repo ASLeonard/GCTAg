@@ -20,6 +20,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include "Cli.hpp"
 #include "Pheno.h"
 
 using std::map;
@@ -28,7 +29,7 @@ using std::string;
 
 class Covar{
 public:
-    Covar();
+    explicit Covar(const gcta_cli::PhenoCovarOptions& opts);
     bool getCommonSampleIndex(const vector<string> &sampleIDs, vector<uint32_t> &keep_index, vector<uint32_t> &covar_index);
     bool hasCovar();
     bool hasEnvir();  
@@ -38,12 +39,9 @@ public:
     bool setCovarMapping(bool is_rcovar, vector<vector<string>> *map_order = NULL);
     const vector<string>& getSampleID() const;
 
-    static int registerOption(map<string, vector<string>>& options_in);
-    static void processMain();
-    static void read_covar(string filename, vector<string>& sub_list, vector<vector<double>>* covar = NULL, vector<map<string, int>>* labels = NULL, vector<int>* keep_row_p = NULL);
+    static void read_covar(string filename, vector<string>& sub_list, vector<vector<double>>* covar = NULL, vector<map<string, int>>* labels = NULL, vector<int>* keep_row_p = NULL, int max_level = 33);
 
 private:
-    static map<string, string> options;
     vector<string> sample_id;
     vector<map<string,int>> labels_covar;
     vector<map<string,int>> labels_rcovar;

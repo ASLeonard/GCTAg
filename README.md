@@ -9,6 +9,7 @@
 ## Contents
 
 - [Building GCTAg](#building-gctag)
+- [Usage](#usage)
 - [Documentation](#documentation)
 - [Citation](#citation)
 - [About GCTA](#about-gcta)
@@ -42,6 +43,7 @@ x86\_64 and ARM64 on Linux, and Apple Silicon (`arm64`) on modern macOS, are sup
 | [Spectra](https://spectralib.org/) | 1.2.0 |
 | [zstd](https://github.com/facebook/zstd) | 1.5.7 (built as a static library) |
 | [Boost](https://www.boost.org/) | 1.92.0 (`algorithm`, `math`, `crc`, `iostreams`) |
+| [CLI11](https://github.com/CLIUtils/CLI11) | 2.7.2 |
 | [SQLite](https://www.sqlite.org/) | 3.51.2 amalgamation (only with `-DBGEN_SUPPORT=ON`) |
 
 To use an existing Boost (>= 1.90, with the `iostreams` component) instead of downloading one, pass `-DBoost_DIR=<directory containing BoostConfig.cmake>`.
@@ -199,6 +201,24 @@ cmake -DCMAKE_BUILD_TYPE=Release \
 | `plink-ng submodule is missing` | Run `git submodule update --init --recursive`. |
 | `AppleClang is not supported` | Use Homebrew LLVM (`brew install llvm`) or GCC (`brew install gcc`), or run `cmake --preset macos` / `macos-gcc`. |
 | `unable to find library -lstdc++` / `could not locate libstdc++.so` | With AOCC/Clang on Linux, load a GCC module (`module load gcc/...`) so `g++` is on `$PATH`, or pass `-DGCTA_GCC_TOOLCHAIN=/path/to/gcc-prefix`. |
+
+## Usage
+
+`GCTAg` uses subcommands so each workflow validates only its own flags and provides focused `--help` output:
+
+```sh
+GCTAg --help
+GCTAg --version
+GCTAg <subcommand> --help
+```
+
+| Subcommand | Purpose |
+|---|---|
+| `grm {make,merge,prune,sparse,subtract,unify}` | Compute and manipulate GRMs |
+| `pca` | Principal component analysis (exact, Lanczos, or rSVD) |
+| `reml` | Fit V2 REML variance components and save `<out>.reml` |
+| `mlma` | Streaming mixed linear model association (one-step or `--load-reml`) |
+| `legacy <v1 flags...>` | Passthrough to unchanged GCTA v1 workflows (`--cojo-*`, `--gsmr`, `--reml-bivar`, `--mlma-loco`, etc.) |
 
 ## Documentation
 

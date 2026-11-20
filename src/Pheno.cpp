@@ -33,7 +33,6 @@
 
 using std::to_string;
 
-map<string, string> Pheno::options;
 int8_t Pheno::heterogametic_sex_code = 1;
 int8_t Pheno::homogametic_sex_code = 2;
 
@@ -111,73 +110,84 @@ void Pheno::loadSexCodeMappingFromFile(const string& file_path){
     }
 }
 
-Pheno::Pheno() {
-    if(options.find("m_file") != options.end()){
+Pheno::Pheno(const gcta_cli::GenoInputOptions& geno,
+             const gcta_cli::SampleFilterOptions& sample_filter,
+             const gcta_cli::PhenoCovarOptions* pheno_covar,
+             bool filter_sex_flag) {
+    heterogametic_sex_code = 1;
+    homogametic_sex_code = 2;
+    if (!sample_filter.sex_chr_file.empty()) {
+        loadSexCodeMappingFromFile(sample_filter.sex_chr_file);
     }
-            
-    bool has_pheno = false;    
 
-    if(options.find("pheno_file") != options.end()){
-        this->read_fam(options["pheno_file"]);
+    bool has_pheno = false;
+
+    const string fam_file = !geno.fam.empty() ? geno.fam
+        : (!geno.bfile.empty() ? geno.bfile + ".fam"
+        : (!geno.bpfile.empty() ? geno.bpfile + ".fam" : ""));
+    if (!fam_file.empty()) {
+        requireFileReadable(geno.fam.empty() ? "--bfile/--bpfile" : "--fam", fam_file);
+        this->read_fam(fam_file);
         has_pheno = true;
     }
 
-    if(options.find("sample_file") != options.end()){
+    if (!geno.sample.empty()) {
+        requireFileReadable("--sample", geno.sample);
+        this->read_sample(geno.sample);
         has_pheno = true;
-        this->read_sample(options["sample_file"]);
     }
 
-    if(options.find("psam_file") != options.end()){
+    if (!geno.pfile.empty()) {
+        const string psam_file = geno.pfile + ".psam";
+        requireFileReadable("--pfile", psam_file);
+        read_psam(psam_file);
         has_pheno = true;
-        read_psam(options["psam_file"]);
     }
 
-    if(options.find("mpsam_file") != options.end()){
+    if (!geno.mpfile.empty()) {
+        read_checkMPSample(expandFileList(geno.mpfile, ".psam"));
         has_pheno = true;
-        string mpsam_file = options["mpsam_file"]; 
-        read_checkMPSample(mpsam_file);
     }
 
-    if(options.find("mpheno_file") != options.end()){
+    if (!geno.mbfile.empty()) {
+        read_checkMPSample(expandFileList(geno.mbfile, ".fam"));
         has_pheno = true;
-        string mpsam_file = options["mpheno_file"]; 
-        read_checkMPSample(mpsam_file);
     }
 
-    if(!has_pheno){
+    if (!geno.mbpfile.empty()) {
+        read_checkMPSample(expandFileList(geno.mbpfile, ".fam"));
+        has_pheno = true;
+    }
+
+    if (!has_pheno) {
         LOGGER.e(0, "no phenotype file found.");
     }
 
-    if(options.find("keep_file") != options.end()){
-        vector<string> keep_subjects = read_sublist(options["keep_file"]);
-        LOGGER << "Get " << keep_subjects.size() << " samples from list [" << options["keep_file"] << "]." << std::endl;
-        set_keep(keep_subjects, mark, index_keep,  true);
+    if (!sample_filter.keep.empty()) {
+        requireFileReadable("--keep", sample_filter.keep);
+        vector<string> keep_subjects = read_sublist(sample_filter.keep);
+        LOGGER << "Get " << keep_subjects.size() << " samples from list [" << sample_filter.keep << "]." << std::endl;
+        set_keep(keep_subjects, mark, index_keep, true);
     }
 
-    if(options.find("remove_file") != options.end()){
-        vector<string> remove_subjects = read_sublist(options["remove_file"]);
-        LOGGER << "Get " << remove_subjects.size() << " samples from list [" << options["remove_file"] << "]." << std::endl;
+    if (!sample_filter.remove.empty()) {
+        requireFileReadable("--remove", sample_filter.remove);
+        vector<string> remove_subjects = read_sublist(sample_filter.remove);
+        LOGGER << "Get " << remove_subjects.size() << " samples from list [" << sample_filter.remove << "]." << std::endl;
         set_keep(remove_subjects, mark, index_keep, false);
     }
 
-    if(options.find("qpheno_file") != options.end()){
+    if (pheno_covar != nullptr && !pheno_covar->pheno.empty()) {
+        requireFileReadable("--pheno", pheno_covar->pheno);
         vector<vector<double>> phenos;
-        LOGGER.i(0, "Reading phenotype data from [" + options["qpheno_file"] + "]...");
-        vector<string> pheno_subjects = read_sublist(options["qpheno_file"], &phenos);
-        if(hasVectorDuplicate(pheno_subjects)){
+        LOGGER.i(0, "Reading phenotype data from [" + pheno_covar->pheno + "]...");
+        vector<string> pheno_subjects = read_sublist(pheno_covar->pheno, &phenos);
+        if (hasVectorDuplicate(pheno_subjects)) {
             LOGGER.e(0, " duplicated IDs found in the phenotype data.");
         }
 
-        int cur_pheno = 1;
-        if(options.find("mpheno") != options.end()){
-            try{
-                cur_pheno = std::stoi(options["mpheno"]);
-            }catch(std::invalid_argument&){
-                LOGGER.e(0, "non-numberic value specified for –mpheno.");
-            }
-        }
-
-        if(cur_pheno <= 0 || cur_pheno > (int)phenos.size()){
+        int cur_pheno = pheno_covar->mpheno.value_or(1);
+        if (cur_pheno <= 0 || cur_pheno > static_cast<int>(phenos.size())) {
             LOGGER.e(0, "the value specified for --mpheno can't be less than 0 or larger than the total number of columns in .pheno file.");
         }
 
@@ -186,9 +196,9 @@ Pheno::Pheno() {
 
         // phenos is 0-indexed over data columns (col 0 = first data col after FID/IID).
         // Weight is expected in the column immediately after the selected pheno column.
-        if(options.find("weighted_phenotypes") != options.end()){
+        if (pheno_covar->weighted_phenotypes) {
             int weight_col = cur_pheno + 1;
-            if(weight_col < (int)phenos.size()){
+            if (weight_col < static_cast<int>(phenos.size())) {
                 update_weight(pheno_subjects, phenos[weight_col]);
                 LOGGER.i(0, "Sample weights detected in phenotype file.");
             }
@@ -197,11 +207,12 @@ Pheno::Pheno() {
         LOGGER.i(0, to_string(index_keep.size()) + " overlapping individuals with non-missing data to be included from the phenotype file.");
     }
 
-    if(options.find("sex_file") != options.end()){
+    if (!geno.update_sex.empty()) {
+        requireFileReadable("--update-sex", geno.update_sex);
         vector<vector<double>> phenos;
-        LOGGER.i(0, "Reading gender information from [" + options["sex_file"] + "]...");
-        vector<string> subjects = read_sublist(options["sex_file"], &phenos);
-        if(hasVectorDuplicate(subjects)){
+        LOGGER.i(0, "Reading gender information from [" + geno.update_sex + "]...");
+        vector<string> subjects = read_sublist(geno.update_sex, &phenos);
+        if (hasVectorDuplicate(subjects)) {
             LOGGER.e(0, "duplicated IDs in the gender information.");
         }
         vector<double> sex_info = phenos[0];
@@ -209,7 +220,7 @@ Pheno::Pheno() {
         LOGGER.i(0, to_string(index_keep.size()) + " individuals with valid sex information to be included from the phenotype file.");
     }
 
-    if(options.find("filter_sex") != options.end()){
+    if (filter_sex_flag) {
         filter_sex();
     }
 
@@ -395,9 +406,7 @@ vector<string> Pheno::read_sublist(string sublist_file, vector<vector<double>> *
     return subject_list;
 }
 
-void Pheno::read_checkMPSample(string m_file){
-    vector<string> mfiles;
-    boost::split(mfiles, m_file, boost::is_any_of("\t "));
+void Pheno::read_checkMPSample(const vector<string>& mfiles){
     if(mfiles.size() > 0){
         read_psam(mfiles[0]);
     }
@@ -1043,68 +1052,4 @@ void Pheno::getMaskBitHeterogametic(uint64_t *maskp){
         uint32_t cur_offset = keep_item % 64;
         maskp[cur_qword] |= k1LU << cur_offset;
     }
-}
-
-
-int Pheno::registerOption(map<string, vector<string>>& options_in){
-    heterogametic_sex_code = 1;
-    homogametic_sex_code = 2;
-    if(options_in.find("--sex-chr-file") != options_in.end()){
-        if(options_in["--sex-chr-file"].size() == 1){
-            loadSexCodeMappingFromFile(options_in["--sex-chr-file"][0]);
-        }else{
-            LOGGER.e(0, "multiple values in --sex-chr-file are not supported currently");
-        }
-    }
-
-    addOneFileOption("pheno_file", ".fam", "--bfile", options_in, options);
-    addOneFileOption("pheno_file", "", "--fam", options_in, options);
-    options_in.erase("--fam");
-    addOneFileOption("sample_file", "", "--sample", options_in, options);
-    // options_in.erase("--sample");
-
-
-    addOneFileOption("pheno_file", ".fam", "--bpfile", options_in, options);
-    addOneFileOption("psam_file", ".psam", "--pfile", options_in, options);
-
-    addMFileListsOption("mpheno_file", ".fam", "--mbfile", options_in, options);
-    addMFileListsOption("mpsam_file", ".psam", "--mpfile", options_in, options);
-    addMFileListsOption("mpheno_file", ".fam", "--mbpfile", options_in, options);
-
-
-    addOneFileOption("keep_file", "", "--keep", options_in, options);
-    //options_in.erase("--keep");
-    addOneFileOption("remove_file", "", "--remove", options_in,options);
-    //options_in.erase("--remove"); // also may use in the GRM
-    
-    addOneFileOption("sex_file", "", "--update-sex", options_in, options);
-
-    if(options_in.find("--pheno") != options_in.end()){
-        addOneFileOption("qpheno_file", "", "--pheno", options_in, options);
-        options_in.erase("--pheno");
-    }
-
-    if(options_in.find("--mpheno") != options_in.end()){
-        if(options.find("qpheno_file") == options.end()){
-            LOGGER.e(0, "--mpheno only works with --pheno");
-        }
-        options["mpheno"] = options_in["--mpheno"][0];
-        options_in.erase("--mpheno");
-    }
-
-    if(options_in.find("--filter-sex") != options_in.end()){
-        options["filter_sex"] = "yes";
-    }
-
-    if(options_in.find("--weighted-phenotypes") != options_in.end()){
-        options["weighted_phenotypes"] = "yes";
-    }
-
-
-    // no main
-    return 0;
-}
-
-void Pheno::processMain(){
-    LOGGER.e(0, "phenotype has no main process this time.");
 }

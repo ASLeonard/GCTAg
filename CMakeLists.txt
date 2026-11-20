@@ -373,6 +373,12 @@ if(BGEN_SUPPORT)
         EXCLUDE_FROM_ALL)
 endif()
 
+FetchContent_Declare(
+    cli11
+    URL https://github.com/CLIUtils/CLI11/archive/refs/tags/v2.7.2.tar.gz
+    SYSTEM
+    EXCLUDE_FROM_ALL)
+
 # Always use the system shared zlib — it is a base system library with a stable
 # ABI (libz.so.1 since 1997) and is always present on HPC clusters. This avoids
 # the CMAKE_SKIP_INSTALL_RULES / alias dance required by a fetched static zlib.
@@ -385,18 +391,23 @@ block()
     set(ZSTD_BUILD_STATIC   ON)
     set(SPECTRA_BUILD_TESTS OFF)
     set(BUILD_TESTING       OFF)
+    set(CLI11_BUILD_TESTS    OFF)
+    set(CLI11_BUILD_EXAMPLES OFF)
+    set(CLI11_BUILD_DOCS     OFF)
+    set(CLI11_INSTALL        OFF)
+    set(CLI11_PRECOMPILED    OFF)
     set(BOOST_IOSTREAMS_ENABLE_ZLIB  ON  CACHE BOOL "" FORCE)
     set(BOOST_IOSTREAMS_ENABLE_BZIP2 OFF CACHE BOOL "" FORCE)
     set(BOOST_IOSTREAMS_ENABLE_LZMA  OFF CACHE BOOL "" FORCE)
     set(BOOST_IOSTREAMS_ENABLE_ZSTD  OFF CACHE BOOL "" FORCE)
     if(Boost_DIR)
-        FetchContent_MakeAvailable(zstd)
+        FetchContent_MakeAvailable(zstd cli11)
     else()
         # These vars are only meaningful to Boost's own CMake build system
         set(BOOST_ENABLE_CMAKE ON)
         set(BOOST_ENABLE_COMPATIBILITY_TARGETS ON)
         set(BOOST_INCLUDE_LIBRARIES "algorithm;math;crc;iostreams")
-        FetchContent_MakeAvailable(zstd Boost)
+        FetchContent_MakeAvailable(zstd Boost cli11)
     endif()
 endblock()
 
@@ -620,9 +631,9 @@ add_executable(GCTAg)
 target_sources(GCTAg PRIVATE
             # entry point
         src/main.cpp
-        # src/ module
+        src/Cli.cpp
+        # src/ module (FastFAM.cpp and LD.cpp temporarily omitted while V2 CLI focuses on grm/pca/reml/mlma)
         src/Covar.cpp
-        src/FastFAM.cpp
         src/MLMA_stream.cpp
         src/pca_stream.cpp
         src/RemlEngine.cpp
@@ -632,13 +643,11 @@ target_sources(GCTAg PRIVATE
         src/BedBackend.cpp
         src/BgenBackend.cpp
         src/PgenBackend.cpp
-        src/LD.cpp
         src/Logger.cpp
         src/Marker.cpp
         src/OptionIO.cpp
         src/Pheno.cpp
         src/StatLib.cpp
-        src/ThreadPool.cpp
         src/mem.cpp
         src/utils.cpp
         # main/ legacy module
@@ -695,6 +704,9 @@ endif()
 set_target_properties(GCTAg PROPERTIES
     UNITY_BUILD                   ${GCTA_UNITY_BUILD}
     INTERPROCEDURAL_OPTIMIZATION  ${GCTA_IPO_ENABLED})
+# Keep CLI11 isolated from unity builds so its headers never interact with
+# legacy main/*.cpp macros or `using namespace std`.
+set_source_files_properties(src/Cli.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
 target_compile_definitions(GCTAg PRIVATE
     ${GCTA_BLAS_DEFINES}
@@ -755,6 +767,7 @@ target_link_libraries(GCTAg PRIVATE
     ZLIB::ZLIB
     Eigen3::Eigen
     Spectra
+    CLI11::CLI11
     libzstd_static
     $<$<BOOL:${GCTA_USE_JEMALLOC}>:${GCTA_JEMALLOC_LIB}>
     OpenMP::OpenMP_CXX

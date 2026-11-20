@@ -20,14 +20,13 @@
 #include <string>
 #include <vector>
 
-namespace bed_simd { namespace detail {
-#include "../src/bed_simd_internal.hpp"
-}}  // namespace bed_simd::detail
-
-#include "avx512_emu.hpp"   // global-namespace intrinsic emulation
+#include "avx512_emu.hpp"   // intrinsic emulation (namespace avx512_emu)
 
 #define BED_T512
 namespace bed_simd { namespace detail {
+#include "../src/bed_simd_internal.hpp"
+// using-declarations: hide any global x86 intrinsics of the same names.
+AVX512_EMU_IMPORT;
 #include "../src/bed_simd_avx512.inc"
 }}  // namespace bed_simd::detail
 #undef BED_T512

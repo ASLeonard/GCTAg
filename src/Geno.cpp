@@ -628,6 +628,12 @@ void Geno::getGenoInt8_bed(uintptr_t *buf, int idx, int8_t *dest,
     uint8_t sexChromType = markerSexChromTypes[curBufferIndex];
 
     bed_simd::I8Opts opts;
+    // miss_list needs a bitmask even if the caller passed no miss_out.
+    thread_local std::vector<uintptr_t> local_miss;
+    if (!miss_out && fused && fused->miss_list) {
+        local_miss.resize((static_cast<std::size_t>(keepSampleCT) + 63) / 64);
+        miss_out = local_miss.data();
+    }
     opts.miss_bits = reinterpret_cast<uint64_t *>(miss_out);
     if (fused) {
         opts.wf = fused->vw;

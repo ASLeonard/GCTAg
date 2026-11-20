@@ -1055,7 +1055,9 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         // valid markers straight into K-contiguous row-major stdGeno_i8_kmajor_
         // (grm_n x ldK) with per-sample row-sum accumulation
         // r_raw_[i] = sum_m g_{im} * mu_m (same accumulation order as before).
-        geno->decodeBedI8KMajor(buf, validIndexBuf.data(), curNumValidMarkers, grm_n,
+        // In tiled mode the GEMM/SYRK only touch rows < grm_tile_re.
+        const int decode_rows = grm_tiling_enabled ? std::min(grm_n, grm_tile_re) : grm_n;
+        geno->decodeBedI8KMajor(buf, validIndexBuf.data(), curNumValidMarkers, decode_rows,
                                 kmajor_base, ldK, mu_vec_.data(), r_raw_.data());
 
         bool block_has_missing = false;

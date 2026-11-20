@@ -145,7 +145,7 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
         const int bs = static_cast<int>(exIdx.size());
 
         // Decode genotypes directly into X_block columns as float.
-        // For BED format this uses GenoarrLookup256x4bx4 (SIMD, 4 KB L1 table).
+        // For BED format this uses bed_simd::decode_f32 (register-table decode).
         // For PGEN/BGEN it decodes via the double path then casts.
         #pragma omp parallel for schedule(dynamic, 16)
         for (int i = 0; i < bs; ++i) {

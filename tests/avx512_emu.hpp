@@ -3,21 +3,173 @@
 // src/bed_simd_avx512.inc (exact Intel SDM semantics), so the kernel logic can
 // be validated bit-for-bit on non-x86 hosts (e.g. Apple Silicon).
 //
-// Everything lives in the global namespace (the .inc refers to intrinsics
-// unqualified).  Never include this together with <immintrin.h>.
+// Everything lives in namespace avx512_emu.  Because the .inc refers to the
+// intrinsics unqualified, import them into the namespace that includes the .inc
+// with AVX512_EMU_IMPORT (a list of using-declarations).  Those hide any
+// same-named global x86 intrinsics/types (e.g. <emmintrin.h> pulled in by
+// libstdc++'s <random> under -msse3, or a real <immintrin.h> under
+// -march=znver4), so this header is safe to use on any host / -march.
 // Masked loads/stores touch only the selected elements (ASan-clean).
 // -----------------------------------------------------------------------------
 #ifndef GCTA_AVX512_EMU_HPP
 #define GCTA_AVX512_EMU_HPP
 
-#if defined(__x86_64__) && defined(__AVX512F__)
-#  error "avx512_emu.hpp must not be used together with real AVX-512 intrinsics"
-#endif
-
 #include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+
+// Intrinsics that x86 headers may define as function-like macros
+// (e.g. clang's _mm_srli_si128, _mm512_cmpeq_epi8_mask).
+#ifdef _mm256_maskz_loadu_epi8
+#  undef _mm256_maskz_loadu_epi8
+#endif
+#ifdef _mm512_add_epi64
+#  undef _mm512_add_epi64
+#endif
+#ifdef _mm512_add_pd
+#  undef _mm512_add_pd
+#endif
+#ifdef _mm512_and_si512
+#  undef _mm512_and_si512
+#endif
+#ifdef _mm512_broadcast_i32x4
+#  undef _mm512_broadcast_i32x4
+#endif
+#ifdef _mm512_castps512_ps256
+#  undef _mm512_castps512_ps256
+#endif
+#ifdef _mm512_cmpeq_epi8_mask
+#  undef _mm512_cmpeq_epi8_mask
+#endif
+#ifdef _mm512_cvtepu8_epi16
+#  undef _mm512_cvtepu8_epi16
+#endif
+#ifdef _mm512_cvtepu8_epi32
+#  undef _mm512_cvtepu8_epi32
+#endif
+#ifdef _mm512_cvtepu8_epi64
+#  undef _mm512_cvtepu8_epi64
+#endif
+#ifdef _mm512_cvtps_pd
+#  undef _mm512_cvtps_pd
+#endif
+#ifdef _mm512_extractf32x8_ps
+#  undef _mm512_extractf32x8_ps
+#endif
+#ifdef _mm512_extracti32x4_epi32
+#  undef _mm512_extracti32x4_epi32
+#endif
+#ifdef _mm512_fmadd_pd
+#  undef _mm512_fmadd_pd
+#endif
+#ifdef _mm512_load_pd
+#  undef _mm512_load_pd
+#endif
+#ifdef _mm512_load_ps
+#  undef _mm512_load_ps
+#endif
+#ifdef _mm512_load_si512
+#  undef _mm512_load_si512
+#endif
+#ifdef _mm512_mask_add_ps
+#  undef _mm512_mask_add_ps
+#endif
+#ifdef _mm512_mask_storeu_epi8
+#  undef _mm512_mask_storeu_epi8
+#endif
+#ifdef _mm512_mask_storeu_pd
+#  undef _mm512_mask_storeu_pd
+#endif
+#ifdef _mm512_mask_storeu_ps
+#  undef _mm512_mask_storeu_ps
+#endif
+#ifdef _mm512_maskz_compress_epi8
+#  undef _mm512_maskz_compress_epi8
+#endif
+#ifdef _mm512_maskz_loadu_epi8
+#  undef _mm512_maskz_loadu_epi8
+#endif
+#ifdef _mm512_maskz_loadu_pd
+#  undef _mm512_maskz_loadu_pd
+#endif
+#ifdef _mm512_maskz_loadu_ps
+#  undef _mm512_maskz_loadu_ps
+#endif
+#ifdef _mm512_maskz_mov_pd
+#  undef _mm512_maskz_mov_pd
+#endif
+#ifdef _mm512_multishift_epi64_epi8
+#  undef _mm512_multishift_epi64_epi8
+#endif
+#ifdef _mm512_or_si512
+#  undef _mm512_or_si512
+#endif
+#ifdef _mm512_permutexvar_epi8
+#  undef _mm512_permutexvar_epi8
+#endif
+#ifdef _mm512_permutexvar_pd
+#  undef _mm512_permutexvar_pd
+#endif
+#ifdef _mm512_permutexvar_ps
+#  undef _mm512_permutexvar_ps
+#endif
+#ifdef _mm512_popcnt_epi64
+#  undef _mm512_popcnt_epi64
+#endif
+#ifdef _mm512_reduce_add_epi64
+#  undef _mm512_reduce_add_epi64
+#endif
+#ifdef _mm512_reduce_add_pd
+#  undef _mm512_reduce_add_pd
+#endif
+#ifdef _mm512_set1_epi16
+#  undef _mm512_set1_epi16
+#endif
+#ifdef _mm512_set1_epi8
+#  undef _mm512_set1_epi8
+#endif
+#ifdef _mm512_set1_pd
+#  undef _mm512_set1_pd
+#endif
+#ifdef _mm512_setzero_pd
+#  undef _mm512_setzero_pd
+#endif
+#ifdef _mm512_setzero_si512
+#  undef _mm512_setzero_si512
+#endif
+#ifdef _mm512_shuffle_epi8
+#  undef _mm512_shuffle_epi8
+#endif
+#ifdef _mm512_slli_epi16
+#  undef _mm512_slli_epi16
+#endif
+#ifdef _mm512_srli_epi64
+#  undef _mm512_srli_epi64
+#endif
+#ifdef _mm512_ternarylogic_epi64
+#  undef _mm512_ternarylogic_epi64
+#endif
+#ifdef _mm512_testn_epi8_mask
+#  undef _mm512_testn_epi8_mask
+#endif
+#ifdef _mm512_zextsi128_si512
+#  undef _mm512_zextsi128_si512
+#endif
+#ifdef _mm_loadu_si128
+#  undef _mm_loadu_si128
+#endif
+#ifdef _mm_maskz_loadu_epi8
+#  undef _mm_maskz_loadu_epi8
+#endif
+#ifdef _mm_srli_si128
+#  undef _mm_srli_si128
+#endif
+#ifdef _pdep_u64
+#  undef _pdep_u64
+#endif
+
+namespace avx512_emu {
 
 struct __m128i { alignas(16) uint8_t b[16]; };
 struct __m256i { alignas(32) uint8_t b[32]; };
@@ -30,7 +182,7 @@ typedef uint16_t __mmask16;
 typedef uint32_t __mmask32;
 typedef uint64_t __mmask64;
 
-namespace avx512_emu {
+namespace detail {
 template <class T, class V> inline T lane(const V& v, int i) {
     T x; std::memcpy(&x, reinterpret_cast<const uint8_t*>(&v) + i * sizeof(T), sizeof(T)); return x;
 }
@@ -41,7 +193,7 @@ inline void check_align64(const void* p) {
     assert((reinterpret_cast<uintptr_t>(p) & 63u) == 0 && "aligned 512-bit load on unaligned address");
     (void)p;
 }
-}  // namespace avx512_emu
+}  // namespace detail
 
 // ---- 128 / 256-bit ----------------------------------------------------------
 inline __m128i _mm_loadu_si128(const __m128i* p) { __m128i r; std::memcpy(r.b, p, 16); return r; }
@@ -65,10 +217,10 @@ inline __m256i _mm256_maskz_loadu_epi8(__mmask32 k, const void* p) {
 inline __m512i _mm512_setzero_si512() { return __m512i{}; }
 inline __m512i _mm512_set1_epi8(char v) { __m512i r; std::memset(r.b, (uint8_t)v, 64); return r; }
 inline __m512i _mm512_set1_epi16(short v) {
-    __m512i r; for (int i = 0; i < 32; ++i) avx512_emu::set_lane<uint16_t>(r, i, (uint16_t)v); return r;
+    __m512i r; for (int i = 0; i < 32; ++i) detail::set_lane<uint16_t>(r, i, (uint16_t)v); return r;
 }
 inline __m512i _mm512_load_si512(const void* p) {
-    avx512_emu::check_align64(p); __m512i r; std::memcpy(r.b, p, 64); return r;
+    detail::check_align64(p); __m512i r; std::memcpy(r.b, p, 64); return r;
 }
 inline __m512i _mm512_maskz_loadu_epi8(__mmask64 k, const void* p) {
     __m512i r{}; const uint8_t* s = static_cast<const uint8_t*>(p);
@@ -98,7 +250,7 @@ inline __m512i _mm512_permutexvar_epi8(__m512i idx, __m512i a) {
 inline __m512i _mm512_multishift_epi64_epi8(__m512i a, __m512i b) {
     __m512i r;
     for (int q = 0; q < 8; ++q) {
-        const uint64_t src = avx512_emu::lane<uint64_t>(b, q);
+        const uint64_t src = detail::lane<uint64_t>(b, q);
         for (int j = 0; j < 8; ++j) {
             const unsigned ctl = a.b[8 * q + j] & 63u;
             uint8_t v = 0;
@@ -130,27 +282,27 @@ inline __m512i _mm512_maskz_compress_epi8(__mmask64 k, __m512i a) {
     return r;
 }
 inline __m512i _mm512_cvtepu8_epi16(__m256i a) {
-    __m512i r; for (int i = 0; i < 32; ++i) avx512_emu::set_lane<uint16_t>(r, i, a.b[i]); return r;
+    __m512i r; for (int i = 0; i < 32; ++i) detail::set_lane<uint16_t>(r, i, a.b[i]); return r;
 }
 inline __m512i _mm512_cvtepu8_epi32(__m128i a) {
-    __m512i r; for (int i = 0; i < 16; ++i) avx512_emu::set_lane<uint32_t>(r, i, a.b[i]); return r;
+    __m512i r; for (int i = 0; i < 16; ++i) detail::set_lane<uint32_t>(r, i, a.b[i]); return r;
 }
 inline __m512i _mm512_cvtepu8_epi64(__m128i a) {
-    __m512i r; for (int i = 0; i < 8; ++i) avx512_emu::set_lane<uint64_t>(r, i, a.b[i]); return r;
+    __m512i r; for (int i = 0; i < 8; ++i) detail::set_lane<uint64_t>(r, i, a.b[i]); return r;
 }
 inline __m512i _mm512_slli_epi16(__m512i a, unsigned int imm) {
     __m512i r;
     for (int i = 0; i < 32; ++i) {
-        const uint16_t x = avx512_emu::lane<uint16_t>(a, i);
-        avx512_emu::set_lane<uint16_t>(r, i, imm > 15 ? (uint16_t)0 : (uint16_t)(x << imm));
+        const uint16_t x = detail::lane<uint16_t>(a, i);
+        detail::set_lane<uint16_t>(r, i, imm > 15 ? (uint16_t)0 : (uint16_t)(x << imm));
     }
     return r;
 }
 inline __m512i _mm512_srli_epi64(__m512i a, unsigned int imm) {
     __m512i r;
     for (int i = 0; i < 8; ++i) {
-        const uint64_t x = avx512_emu::lane<uint64_t>(a, i);
-        avx512_emu::set_lane<uint64_t>(r, i, imm > 63 ? 0ull : (x >> imm));
+        const uint64_t x = detail::lane<uint64_t>(a, i);
+        detail::set_lane<uint64_t>(r, i, imm > 63 ? 0ull : (x >> imm));
     }
     return r;
 }
@@ -158,36 +310,36 @@ inline __m512i _mm512_srli_epi64(__m512i a, unsigned int imm) {
 inline __m512i _mm512_ternarylogic_epi64(__m512i a, __m512i b, __m512i c, int imm) {
     __m512i r;
     for (int q = 0; q < 8; ++q) {
-        const uint64_t A = avx512_emu::lane<uint64_t>(a, q), B = avx512_emu::lane<uint64_t>(b, q),
-                       C = avx512_emu::lane<uint64_t>(c, q);
+        const uint64_t A = detail::lane<uint64_t>(a, q), B = detail::lane<uint64_t>(b, q),
+                       C = detail::lane<uint64_t>(c, q);
         uint64_t x = 0;
         for (int t = 0; t < 8; ++t) {
             if (!((imm >> t) & 1)) continue;
             x |= ((t & 4) ? A : ~A) & ((t & 2) ? B : ~B) & ((t & 1) ? C : ~C);
         }
-        avx512_emu::set_lane<uint64_t>(r, q, x);
+        detail::set_lane<uint64_t>(r, q, x);
     }
     return r;
 }
 inline __m512i _mm512_popcnt_epi64(__m512i a) {
     __m512i r;
     for (int q = 0; q < 8; ++q)
-        avx512_emu::set_lane<uint64_t>(r, q, (uint64_t)__builtin_popcountll(avx512_emu::lane<uint64_t>(a, q)));
+        detail::set_lane<uint64_t>(r, q, (uint64_t)__builtin_popcountll(detail::lane<uint64_t>(a, q)));
     return r;
 }
 inline __m512i _mm512_add_epi64(__m512i a, __m512i b) {
     __m512i r;
     for (int q = 0; q < 8; ++q)
-        avx512_emu::set_lane<uint64_t>(r, q, avx512_emu::lane<uint64_t>(a, q) + avx512_emu::lane<uint64_t>(b, q));
+        detail::set_lane<uint64_t>(r, q, detail::lane<uint64_t>(a, q) + detail::lane<uint64_t>(b, q));
     return r;
 }
 inline long long _mm512_reduce_add_epi64(__m512i a) {
-    uint64_t s = 0; for (int q = 0; q < 8; ++q) s += avx512_emu::lane<uint64_t>(a, q); return (long long)s;
+    uint64_t s = 0; for (int q = 0; q < 8; ++q) s += detail::lane<uint64_t>(a, q); return (long long)s;
 }
 
 // ---- 512-bit float / double -------------------------------------------------
-inline __m512 _mm512_load_ps(const void* p) { avx512_emu::check_align64(p); __m512 r; std::memcpy(r.f, p, 64); return r; }
-inline __m512d _mm512_load_pd(const void* p) { avx512_emu::check_align64(p); __m512d r; std::memcpy(r.d, p, 64); return r; }
+inline __m512 _mm512_load_ps(const void* p) { detail::check_align64(p); __m512 r; std::memcpy(r.f, p, 64); return r; }
+inline __m512d _mm512_load_pd(const void* p) { detail::check_align64(p); __m512d r; std::memcpy(r.d, p, 64); return r; }
 inline __m512 _mm512_maskz_loadu_ps(__mmask16 k, const void* p) {
     __m512 r{}; const float* s = static_cast<const float*>(p);
     for (int i = 0; i < 16; ++i) if ((k >> i) & 1u) std::memcpy(&r.f[i], s + i, 4);
@@ -209,12 +361,12 @@ inline void _mm512_mask_storeu_pd(void* p, __mmask8 k, __m512d a) {
 // VPERMPS / VPERMPD (bit-exact copies)
 inline __m512 _mm512_permutexvar_ps(__m512i idx, __m512 a) {
     __m512 r;
-    for (int i = 0; i < 16; ++i) std::memcpy(&r.f[i], &a.f[avx512_emu::lane<uint32_t>(idx, i) & 15u], 4);
+    for (int i = 0; i < 16; ++i) std::memcpy(&r.f[i], &a.f[detail::lane<uint32_t>(idx, i) & 15u], 4);
     return r;
 }
 inline __m512d _mm512_permutexvar_pd(__m512i idx, __m512d a) {
     __m512d r;
-    for (int i = 0; i < 8; ++i) std::memcpy(&r.d[i], &a.d[avx512_emu::lane<uint64_t>(idx, i) & 7u], 8);
+    for (int i = 0; i < 8; ++i) std::memcpy(&r.d[i], &a.d[detail::lane<uint64_t>(idx, i) & 7u], 8);
     return r;
 }
 inline __m512 _mm512_mask_add_ps(__m512 src, __mmask16 k, __m512 a, __m512 b) {
@@ -250,5 +402,70 @@ inline uint64_t _pdep_u64(uint64_t src, uint64_t mask) {
     }
     return r;
 }
+
+}  // namespace avx512_emu
+
+// Import every emulated type / intrinsic into the current namespace.
+#define AVX512_EMU_IMPORT \
+    using ::avx512_emu::__m128i; \
+    using ::avx512_emu::__m256i; \
+    using ::avx512_emu::__m512i; \
+    using ::avx512_emu::__m256; \
+    using ::avx512_emu::__m512; \
+    using ::avx512_emu::__m512d; \
+    using ::avx512_emu::__mmask8; \
+    using ::avx512_emu::__mmask16; \
+    using ::avx512_emu::__mmask32; \
+    using ::avx512_emu::__mmask64; \
+    using ::avx512_emu::_mm256_maskz_loadu_epi8; \
+    using ::avx512_emu::_mm512_add_epi64; \
+    using ::avx512_emu::_mm512_add_pd; \
+    using ::avx512_emu::_mm512_and_si512; \
+    using ::avx512_emu::_mm512_broadcast_i32x4; \
+    using ::avx512_emu::_mm512_castps512_ps256; \
+    using ::avx512_emu::_mm512_cmpeq_epi8_mask; \
+    using ::avx512_emu::_mm512_cvtepu8_epi16; \
+    using ::avx512_emu::_mm512_cvtepu8_epi32; \
+    using ::avx512_emu::_mm512_cvtepu8_epi64; \
+    using ::avx512_emu::_mm512_cvtps_pd; \
+    using ::avx512_emu::_mm512_extractf32x8_ps; \
+    using ::avx512_emu::_mm512_extracti32x4_epi32; \
+    using ::avx512_emu::_mm512_fmadd_pd; \
+    using ::avx512_emu::_mm512_load_pd; \
+    using ::avx512_emu::_mm512_load_ps; \
+    using ::avx512_emu::_mm512_load_si512; \
+    using ::avx512_emu::_mm512_mask_add_ps; \
+    using ::avx512_emu::_mm512_mask_storeu_epi8; \
+    using ::avx512_emu::_mm512_mask_storeu_pd; \
+    using ::avx512_emu::_mm512_mask_storeu_ps; \
+    using ::avx512_emu::_mm512_maskz_compress_epi8; \
+    using ::avx512_emu::_mm512_maskz_loadu_epi8; \
+    using ::avx512_emu::_mm512_maskz_loadu_pd; \
+    using ::avx512_emu::_mm512_maskz_loadu_ps; \
+    using ::avx512_emu::_mm512_maskz_mov_pd; \
+    using ::avx512_emu::_mm512_multishift_epi64_epi8; \
+    using ::avx512_emu::_mm512_or_si512; \
+    using ::avx512_emu::_mm512_permutexvar_epi8; \
+    using ::avx512_emu::_mm512_permutexvar_pd; \
+    using ::avx512_emu::_mm512_permutexvar_ps; \
+    using ::avx512_emu::_mm512_popcnt_epi64; \
+    using ::avx512_emu::_mm512_reduce_add_epi64; \
+    using ::avx512_emu::_mm512_reduce_add_pd; \
+    using ::avx512_emu::_mm512_set1_epi16; \
+    using ::avx512_emu::_mm512_set1_epi8; \
+    using ::avx512_emu::_mm512_set1_pd; \
+    using ::avx512_emu::_mm512_setzero_pd; \
+    using ::avx512_emu::_mm512_setzero_si512; \
+    using ::avx512_emu::_mm512_shuffle_epi8; \
+    using ::avx512_emu::_mm512_slli_epi16; \
+    using ::avx512_emu::_mm512_srli_epi64; \
+    using ::avx512_emu::_mm512_ternarylogic_epi64; \
+    using ::avx512_emu::_mm512_testn_epi8_mask; \
+    using ::avx512_emu::_mm512_zextsi128_si512; \
+    using ::avx512_emu::_mm_loadu_si128; \
+    using ::avx512_emu::_mm_maskz_loadu_epi8; \
+    using ::avx512_emu::_mm_srli_si128; \
+    using ::avx512_emu::_pdep_u64; \
+    static_assert(true, "")
 
 #endif  // GCTA_AVX512_EMU_HPP

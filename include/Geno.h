@@ -276,7 +276,7 @@ private:
     void getGenoDouble_pgen(uintptr_t *buf, int idx, GenoBufItem* gbuf);
 
     // Float-native decode helpers: write directly into a caller-supplied float*.
-    // getGenoFloat_bed: uses the 256×4 float lookup table (GenoarrLookup256x4bx4).
+    // getGenoFloat_bed: bed_simd register-table decode (VPERMPS on AVX-512).
     // getGenoFloat_pgen / getGenoFloat_bgen: share the frequency/filter logic
     //   of their double counterparts, then cast the dosage array to float.
     void getGenoFloat_bed(uintptr_t *buf, int idx, float *dest,

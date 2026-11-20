@@ -24,6 +24,7 @@
   #include <sys/mman.h>
   #include <unistd.h>
 #endif
+#include "Logger.h"
 #include "ModeTypes.hpp"
 #include "main/StatFunc.h"
 #include "cpu.h"

@@ -31,6 +31,7 @@
  */
 
 
+#include "MLMA.h"
 #include "MLMA_stream_common.hpp"
 #include "Covar.h"
 #include "main/StatFunc.h"

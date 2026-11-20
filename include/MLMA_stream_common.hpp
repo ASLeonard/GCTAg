@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Eigen/Dense>
+
 #include "Geno.h"
 #include "Marker.h"
 #include "Logger.h"
@@ -7,8 +9,6 @@
 #include "cpu.h"
 #include "mem.hpp"
 #include "mlma_woodbury.hpp"
-
-#include <Eigen/Dense>
 
 #include <algorithm>
 #include <bit>
@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <fstream>
 #include <ranges>
 #include <type_traits>

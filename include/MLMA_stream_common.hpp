@@ -267,7 +267,6 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
 
     const int BLOCK = block_size;
     Eigen::MatrixXf X_block(n, BLOCK);
-    gcta_numa_interleave(X_block.data(), static_cast<size_t>(n) * static_cast<size_t>(BLOCK) * sizeof(float));
     Eigen::VectorXf Xt_Vi_y(BLOCK);
     Eigen::VectorXf xvx_diag(BLOCK);
 
@@ -522,12 +521,12 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
 
     const int BLOCK = block_size;
     // Pad column stride to 64 bytes (avoiding 4096-byte multiples that cause
-    // Zen 4 L1D cache-set aliasing) and allocate NUMA-interleaved without serial
-    // Core-0 zero-fill so parallel decode first-touches pages cleanly.
+    // Zen 4 L1D cache-set aliasing) and allocate uninitialized without serial
+    // zero-fill so parallel decode first-touches pages cleanly.
     int ldG = (n + 63) / 64 * 64;
     if (ldG % 4096 == 0) ldG += 64;
     const size_t g_block_bytes = static_cast<size_t>(ldG) * static_cast<size_t>(BLOCK);
-    auto G_block_i8 = make_numa_interleaved_uninitialized<int8_t, 64>(g_block_bytes);
+    auto G_block_i8 = make_aligned_uninitialized<int8_t, 64>(g_block_bytes);
     if (g_block_bytes > 0 && !G_block_i8) {
         LOGGER.e(0, "Failed to allocate int8 genotype streaming block.");
     }

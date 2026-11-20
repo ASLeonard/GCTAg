@@ -717,11 +717,7 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
     // Dense path: assemble V (upper triangle)
     if (factorize_only && static_cast<int>(ctx.r_indx.size()) > 1)
         ctx.Vi.swap(ctx.Vi_L);
-    const bool vi_was_empty = (ctx.Vi.rows() != ctx.n || ctx.Vi.cols() != ctx.n);
     ctx.Vi.resize(ctx.n, ctx.n);
-    if (vi_was_empty) {
-        gcta_numa_interleave(ctx.Vi.data(), static_cast<size_t>(ctx.n) * static_cast<size_t>(ctx.n) * sizeof(double));
-    }
 
     if (ctx.r_indx.size() == 1) {
         #pragma omp parallel for schedule(guided)
@@ -2585,8 +2581,6 @@ RemlState build_reml_state(RemlCtx& ctx) {
         const Eigen::Index k = ctx.Uk.cols();
         const Eigen::Index n = ctx.Uk.rows();
         rs.wb.Uk_f.resize(k, n);
-        gcta_numa_interleave(rs.wb.Uk_f.data(),
-                             static_cast<size_t>(k) * static_cast<size_t>(n) * sizeof(float));
         constexpr Eigen::Index kBlock = 64;
         const float* src_base = ctx.Uk.data();
         float* dst_base = rs.wb.Uk_f.data();
@@ -2634,8 +2628,6 @@ RemlState build_reml_state(RemlCtx& ctx) {
         rs.is_llt = true;
         const Eigen::Index n = ctx.Vi_L.cols();
         rs.Vi_L_f.resize(ctx.Vi_L.rows(), n);
-        gcta_numa_interleave(rs.Vi_L_f.data(),
-                             static_cast<size_t>(ctx.Vi_L.rows()) * static_cast<size_t>(n) * sizeof(float));
         #pragma omp parallel for schedule(guided)
         for (Eigen::Index j = 0; j < n; ++j) {
             rs.Vi_L_f.col(j).head(j + 1).noalias() =
@@ -2649,8 +2641,6 @@ RemlState build_reml_state(RemlCtx& ctx) {
         rs.is_llt = false;
         const Eigen::Index n = static_cast<Eigen::Index>(ctx.n);
         rs.Vi_L_f.resize(n, n);
-        gcta_numa_interleave(rs.Vi_L_f.data(),
-                             static_cast<size_t>(n) * static_cast<size_t>(n) * sizeof(float));
         #pragma omp parallel for schedule(guided)
         for (Eigen::Index j = 0; j < n; ++j) {
             rs.Vi_L_f.col(j).head(j + 1).noalias() =

@@ -288,7 +288,6 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
             static_cast<uint64_t>(st.st_size) != grm_file_size) {
             LOGGER.e(0, "The size of [" + path + "] is not correct.");
         }
-        gcta_fadvise_sequential(ufd.get());
     };
     check_fd_size(fd_grm1,  p_grm1);
     check_fd_size(fd_grmN1, p_grmN1);
@@ -297,10 +296,10 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
 
     constexpr uint64_t kChunkElems = 26214400ULL; // 100 MiB per buffer
     const uint64_t alloc_elems = std::min(grm_size, kChunkElems);
-    AlignedRawBuffer<float, 64> buf1(alloc_elems, /*interleave=*/true);
-    AlignedRawBuffer<float, 64> buf2(alloc_elems, /*interleave=*/true);
-    AlignedRawBuffer<float, 64> bufN1(alloc_elems, /*interleave=*/true);
-    AlignedRawBuffer<float, 64> bufN2(alloc_elems, /*interleave=*/true);
+    AlignedRawBuffer<float, 64> buf1(alloc_elems);
+    AlignedRawBuffer<float, 64> buf2(alloc_elems);
+    AlignedRawBuffer<float, 64> bufN1(alloc_elems);
+    AlignedRawBuffer<float, 64> bufN2(alloc_elems);
 
     const uint64_t loop_num = (grm_size + kChunkElems - 1ULL) / kChunkElems;
     const uint64_t remain_item = grm_size % kChunkElems;
@@ -381,12 +380,6 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
             LOGGER.e(0, "can't write to [" + po_grmN + "]: " + std::string(std::strerror(err_wn)));
         }
     }
-    gcta_fadvise_dontneed(fd_grm1.get());
-    gcta_fadvise_dontneed(fd_grmN1.get());
-    gcta_fadvise_dontneed(fd_grm2.get());
-    gcta_fadvise_dontneed(fd_grmN2.get());
-    gcta_fadvise_dontneed(fdo_grm.get());
-    gcta_fadvise_dontneed(fdo_grmN.get());
     fdo_grm.reset();
     fdo_grmN.reset();
     LOGGER.i(0, "The subtracted GRM has been written to [" + out_file + ".grm.bin, .grm.N.bin].");
@@ -1083,7 +1076,7 @@ void GRM::ensure_N_allocated() {
     if (N) return;
     if (grm_tiling_enabled) {
         const size_t tile_rect_elems = static_cast<size_t>(grm_tile_rows) * static_cast<size_t>(grm_tile_cols);
-        N = make_numa_interleaved_uninitialized<uint32_t, 64>(tile_rect_elems);
+        N = make_aligned_uninitialized<uint32_t, 64>(tile_rect_elems);
         if (!N) {
             LOGGER.error(0, "Can't allocate N tile buffer: {:.2f}GB required.",
                          tile_rect_elems * sizeof(uint32_t) / (1024.0 * 1024.0 * 1024.0));
@@ -1101,7 +1094,7 @@ void GRM::ensure_N_allocated() {
         }
     } else {
         const uint64_t fill_N = (num_grm + num_count_handle - 1) / num_count_handle * num_count_handle;
-        N = make_numa_interleaved_uninitialized<uint32_t, 64>(fill_N);
+        N = make_aligned_uninitialized<uint32_t, 64>(fill_N);
         if (!N) {
             LOGGER.error(0, "can't allocate enough memory to store (parted) N: {:.2f}GB required.",
                          fill_N * sizeof(uint32_t) / (1024.0 * 1024.0 * 1024.0));
@@ -1128,13 +1121,13 @@ void GRM::promote_i32_to_f64() {
     if (grm_first_accum) {
         // Nothing accumulated into grm_i32 yet: free it first so peak RSS stays bounded.
         grm_i32.reset();
-        grm = make_numa_interleaved_uninitialized<double, 64>(tile_rect_elems);
+        grm = make_aligned_uninitialized<double, 64>(tile_rect_elems);
         if (!grm) {
             LOGGER.error(0, "can't allocate enough memory to promote GRM buffer to double: {:.2f}GB required.",
                          tile_rect_elems * sizeof(double) / (1024.0 * 1024.0 * 1024.0));
         }
     } else {
-        grm = make_numa_interleaved_uninitialized<double, 64>(tile_rect_elems);
+        grm = make_aligned_uninitialized<double, 64>(tile_rect_elems);
         if (!grm) {
             LOGGER.error(0, "can't allocate enough memory to promote GRM buffer to double: {:.2f}GB required.",
                          tile_rect_elems * sizeof(double) / (1024.0 * 1024.0 * 1024.0));
@@ -1887,8 +1880,8 @@ void GRM::deduce_GRM(){
     grm_tile_rows = grm_m;
     grm_tile_cols = grm_n;
 
-    AlignedRawBuffer<float, 64> packed_grm{true};
-    AlignedRawBuffer<float, 64> packed_N{true};
+    AlignedRawBuffer<float, 64> packed_grm;
+    AlignedRawBuffer<float, 64> packed_N;
     std::vector<float> const_N_buf;
     std::string sparse_buf;
     flush_grm_tile(grm_fd.get(), N_fd.get(), sparse_out.get(), grm_path, N_path,
@@ -1969,8 +1962,6 @@ void GRM::flush_grm_tile(int grm_fd, int N_fd, FILE *sparse_out,
             }
             if (!ok_grm) LOGGER.e(0, "write() failed on [" + grm_path + "]: " + std::string(std::strerror(err_grm)));
             if (!ok_N)   LOGGER.e(0, "write() failed on [" + N_path   + "]: " + std::string(std::strerror(err_N)));
-            gcta_fadvise_dontneed(grm_fd, 0, 0);
-            gcta_fadvise_dontneed(N_fd, 0, 0);
         } else if (0.0f >= thresh) {
             for (int pair1 = tile_rs; pair1 < tile_re; ++pair1) {
                 sparse_buf.clear();
@@ -2250,11 +2241,6 @@ void GRM::flush_grm_tile(int grm_fd, int N_fd, FILE *sparse_out,
             }
         }
     }
-
-    if (!isSparse) {
-        gcta_fadvise_dontneed(grm_fd, 0, 0);
-        gcta_fadvise_dontneed(N_fd, 0, 0);
-    }
 }
 
 
@@ -2434,7 +2420,7 @@ void GRM::processMakeGRM(bool is_homogametic){
         const int max_ldK = std::max(64, (eff_block_cap + 63) / 64 * 64);
         const size_t kmajor_elems = static_cast<size_t>(max_ldK) * static_cast<size_t>(grm_n);
         this->num_byte_geno = sizeof(int8_t) * static_cast<uint64_t>(kmajor_elems);
-        stdGeno_i8_kmajor_ = make_numa_interleaved_uninitialized<int8_t, 64>(kmajor_elems);
+        stdGeno_i8_kmajor_ = make_aligned_uninitialized<int8_t, 64>(kmajor_elems);
         if (!stdGeno_i8_kmajor_) {
             LOGGER.e(0, "can't allocate enough memory for the transposed int8 genotype buffer.");
         }
@@ -2447,7 +2433,7 @@ void GRM::processMakeGRM(bool is_homogametic){
     } else {
         grm_bytes_std_geno = sizeof(float) * static_cast<size_t>(grm_n);
         this->num_byte_geno = sizeof(float) * static_cast<uint64_t>(geno_block_elems);
-        stdGeno = make_numa_interleaved_uninitialized<float, 64>(geno_block_elems);
+        stdGeno = make_aligned_uninitialized<float, 64>(geno_block_elems);
         if (!stdGeno) {
             LOGGER.e(0, "can't allocate enough memory for the genotype buffer.");
         }
@@ -2542,8 +2528,8 @@ void GRM::processMakeGRM(bool is_homogametic){
                         est_ranges.back().second - est_ranges.back().first);
         }
 
-        AlignedRawBuffer<float, 64> flush_packed_grm{true};
-        AlignedRawBuffer<float, 64> flush_packed_N{true};
+        AlignedRawBuffer<float, 64> flush_packed_grm;
+        AlignedRawBuffer<float, 64> flush_packed_N;
         std::vector<float> flush_const_N;
         std::string flush_sparse_buf;
 
@@ -2589,14 +2575,14 @@ void GRM::processMakeGRM(bool is_homogametic){
             N.reset(); // always lazy!
 
             if (start_i32) {
-                grm_i32 = make_numa_interleaved_uninitialized<int32_t, 64>(tile_rect_elems);
+                grm_i32 = make_aligned_uninitialized<int32_t, 64>(tile_rect_elems);
                 if (!grm_i32) LOGGER.e(0, "Can't allocate int32 GRM tile buffer.");
                 grm_is_i32_ = true;
                 grm_tile_i32_markers_ = 0;
                 R_total_.assign(static_cast<size_t>(grm_tile_cols), 0.0);
                 S_total_ = 0.0;
             } else {
-                grm = make_numa_interleaved_uninitialized<double, 64>(tile_rect_elems);
+                grm = make_aligned_uninitialized<double, 64>(tile_rect_elems);
                 if (!grm) LOGGER.e(0, "Can't allocate GRM tile buffer.");
                 grm_is_i32_ = false;
             }
@@ -2663,7 +2649,7 @@ void GRM::processMakeGRM(bool is_homogametic){
         N.reset(); // always lazy!
 
         if (allow_i32_mode) {
-            grm_i32 = make_numa_interleaved_uninitialized<int32_t, 64>(dense_rect_elems);
+            grm_i32 = make_aligned_uninitialized<int32_t, 64>(dense_rect_elems);
             if (!grm_i32) {
                 LOGGER.error(0, "can't allocate enough memory to store the (parted) int32 GRM: {:.2f}GB required.",
                              dense_rect_elems * sizeof(int32_t) / (1024.0 * 1024.0 * 1024.0));
@@ -2673,7 +2659,7 @@ void GRM::processMakeGRM(bool is_homogametic){
             R_total_.assign(static_cast<size_t>(grm_n), 0.0);
             S_total_ = 0.0;
         } else {
-            grm = make_numa_interleaved_uninitialized<double, 64>(dense_rect_elems);
+            grm = make_aligned_uninitialized<double, 64>(dense_rect_elems);
             if (!grm) {
                 LOGGER.error(0, "can't allocate enough memory to store the (parted) GRM: {:.2f}GB required.",
                              dense_rect_elems * sizeof(double) / (1024.0 * 1024.0 * 1024.0));

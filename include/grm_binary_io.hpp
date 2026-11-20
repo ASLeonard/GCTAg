@@ -204,10 +204,8 @@ inline void read_grm_binary(const std::string& prefix,
                         to_string(n) + ".");
         }
     }
-    gcta_fadvise_sequential(fd);
 
     G.resize(n, n);
-    gcta_numa_interleave(G.data(), static_cast<size_t>(n) * static_cast<size_t>(n) * sizeof(Scalar));
 
     const bool want_traces = (trace_K_out != nullptr || trace_K2_out != nullptr);
     double tr_K = 0.0;
@@ -260,12 +258,8 @@ inline void read_grm_binary(const std::string& prefix,
                 }
             }
         }
-        gcta_fadvise_dontneed(fd,
-                              static_cast<off_t>(row_base_cursor * sizeof(float)),
-                              static_cast<off_t>(elems_this_chunk * sizeof(float)));
         row_cursor = row_end;
     }
-    gcta_fadvise_dontneed(fd);
     ::close(fd);
     if (trace_K_out)  *trace_K_out  = tr_K;
     if (trace_K2_out) *trace_K2_out = tr_K2;
@@ -330,7 +324,6 @@ public:
             ::close(fd_);
             LOGGER.e(0, "unexpected size in [" + path + "].");
         }
-        gcta_fadvise_sequential(fd_);
 
         kp_is_identity_ = true;
         bool kp_is_monotonic = true;
@@ -358,7 +351,6 @@ public:
 
     ~ChunkedGrmReader() {
         if (fd_ != -1) {
-            gcta_fadvise_dontneed(fd_);
             ::close(fd_);
         }
     }
@@ -411,9 +403,8 @@ public:
     }
 
     // Double-buffered async band prefetcher for streaming sweeps.
-    // Spawns one std::jthread (restoring initial process affinity so it never
-    // competes with pinned OpenMP worker threads) that prefetches band b+1 into
-    // slot (b+1)&1 while the caller computes tiles on band b in slot b&1.
+    // Spawns one std::jthread that prefetches band b+1 into slot (b+1)&1
+    // while the caller computes tiles on band b in slot b&1.
     class BandSweepSession final : public gcta_chunked::TileSweep {
     public:
         BandSweepSession(const ChunkedGrmReader& reader, const std::vector<int>& bands)
@@ -422,7 +413,6 @@ public:
               num_bands_(static_cast<int>(bands.size()) - 1)
         {
             io_thread_ = std::jthread([this](std::stop_token st) {
-                gcta_restore_initial_affinity();
                 try {
                     for (int b = 0; b < num_bands_ && !st.stop_requested(); ++b) {
                         const int slot = b & 1;
@@ -528,7 +518,6 @@ public:
         }
 
         if (split < n) {
-            gcta_fadvise_random(fd_);
             const int n_io_threads = std::min(omp_get_max_threads(), 16);
             bool failed = false;
             #pragma omp parallel for schedule(static) num_threads(n_io_threads)
@@ -547,7 +536,6 @@ public:
                     failed = true;
                 }
             }
-            gcta_fadvise_sequential(fd_);
             if (failed)
                 LOGGER.e(0, "pread() failed while reading diagonal of [" + path_ + "].");
         }
@@ -874,7 +862,6 @@ inline double read_grm_N_mean(const std::string& prefix, int n_grm) {
     }
 
     if (!read_failed && c_end < n_grm) {
-        gcta_fadvise_random(nfd);
         const int n_io_threads = std::min(omp_get_max_threads(), 16);
         #pragma omp parallel for reduction(+:sum) schedule(static) num_threads(n_io_threads)
         for (int i = c_end; i < n_grm; ++i) {
@@ -893,7 +880,6 @@ inline double read_grm_N_mean(const std::string& prefix, int n_grm) {
             }
         }
     }
-    gcta_fadvise_dontneed(nfd);
     ::close(nfd);
 
     if (read_failed) {
@@ -1288,7 +1274,6 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
                         to_string(n_grm) + ".");
         }
     }
-    gcta_fadvise_sequential(fd);
 
     const size_t tri_n = static_cast<size_t>(n) * (n + 1) / 2;
     const double packed_gb = static_cast<double>(tri_n * sizeof(GrmFp16)) / 1e9;
@@ -1296,9 +1281,8 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
                 to_string(packed_gb) + " GB for n=" + to_string(n) +
                 ", 4x smaller than dense float32) ...");
 
-    // Uninitialized NUMA-interleaved allocation: eliminates single-threaded Core-0
-    // zero-fill of 250 GB-1 TB and spreads pages evenly across all NUMA nodes.
-    AlignedUniquePtr<GrmFp16, 64> packed = make_numa_interleaved_uninitialized<GrmFp16, 64>(tri_n);
+    // Uninitialized allocation with parallel first-touch eliminates single-threaded zero-fill.
+    AlignedUniquePtr<GrmFp16, 64> packed = make_aligned_uninitialized<GrmFp16, 64>(tri_n);
     if (tri_n > 0 && !packed) {
         ::close(fd);
         LOGGER.e(0, caller_flag + ": failed to allocate " + to_string(packed_gb) +
@@ -1408,12 +1392,8 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
             }
             j_cursor = j_end;
         }
-        gcta_fadvise_dontneed(fd,
-                              static_cast<off_t>(row_base_cursor * sizeof(float)),
-                              static_cast<off_t>(elems_this_chunk * sizeof(float)));
         row_cursor = row_end;
     }
-    gcta_fadvise_dontneed(fd);
     ::close(fd);
     chunk_buf.reset();
 
@@ -1536,10 +1516,8 @@ inline void load_and_subset_grm_upper(
                             to_string(n_grm) + ".");
             }
         }
-        gcta_fadvise_sequential(fd);
 
         G_out.resize(n, n);
-        gcta_numa_interleave(G_out.data(), static_cast<size_t>(n) * static_cast<size_t>(n) * sizeof(Scalar));
 
         double tr_K = 0.0;
         double tr_K2 = 0.0;
@@ -1638,12 +1616,8 @@ inline void load_and_subset_grm_upper(
                 }
                 j_cursor = j_end;
             }
-            gcta_fadvise_dontneed(fd,
-                                  static_cast<off_t>(row_base_cursor * sizeof(float)),
-                                  static_cast<off_t>(elems_this_chunk * sizeof(float)));
             row_cursor = row_end;
         }
-        gcta_fadvise_dontneed(fd);
         ::close(fd);
         if (trace_K_out)  *trace_K_out  = tr_K;
         if (trace_K2_out) *trace_K2_out = tr_K2;
@@ -1660,7 +1634,6 @@ inline void load_and_subset_grm_upper(
     Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> G_full;
     read_grm_binary(grm_prefix, grm_ids, G_full, m_snps_out, /*upper_only=*/true, grm_read_chunk_bytes);
     G_out.resize(n, n);
-    gcta_numa_interleave(G_out.data(), static_cast<size_t>(n) * static_cast<size_t>(n) * sizeof(Scalar));
     double tr_K = 0.0;
     double tr_K2 = 0.0;
     #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
@@ -1751,7 +1724,6 @@ inline void merge_grms(
             ::close(of.fd);
             LOGGER.e(0, "unexpected size in [" + path + "].");
         }
-        gcta_fadvise_sequential(of.fd);
         return of;
     };
 
@@ -1792,12 +1764,6 @@ inline void merge_grms(
                            bytes_this_chunk, val_files[f].path);
                 read_exact(n_files[f].fd, n_block_bufs[f].data(),
                            bytes_this_chunk, n_files[f].path);
-                gcta_fadvise_dontneed(val_files[f].fd,
-                                      static_cast<off_t>(offset * sizeof(float)),
-                                      static_cast<off_t>(bytes_this_chunk));
-                gcta_fadvise_dontneed(n_files[f].fd,
-                                      static_cast<off_t>(offset * sizeof(float)),
-                                      static_cast<off_t>(bytes_this_chunk));
             } catch (const std::exception& e) {
                 #pragma omp critical
                 {
@@ -1865,13 +1831,11 @@ inline void merge_grms(
             LOGGER.e(0, "merge_grms: " + write_error);
     }
 
-    gcta_fadvise_dontneed(out_bin_fd);
-    gcta_fadvise_dontneed(out_n_fd);
     ::close(out_bin_fd);
     ::close(out_n_fd);
 
-    for (auto& f : val_files) { gcta_fadvise_dontneed(f.fd); ::close(f.fd); }
-    for (auto& f : n_files)   { gcta_fadvise_dontneed(f.fd); ::close(f.fd); }
+    for (auto& f : val_files) { ::close(f.fd); }
+    for (auto& f : n_files)   { ::close(f.fd); }
 
     {
         const std::string id_src_path = prefixes[0] + ".grm.id";

@@ -335,7 +335,6 @@ build_randomized_sketch(
 {
     using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
     Mat omega(n, k_ext);
-    gcta_numa_interleave(omega.data(), static_cast<size_t>(n) * static_cast<size_t>(k_ext) * sizeof(Scalar));
     if (warm_start && warm_start->rows() == n && warm_start->cols() > 0) {
         const int k_copy = std::min(static_cast<int>(warm_start->cols()), k_ext);
         #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(k_copy) >= 65536)
@@ -366,7 +365,6 @@ build_randomized_sketch_consume(
 {
     using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
     Mat omega(n, k_ext);
-    gcta_numa_interleave(omega.data(), static_cast<size_t>(n) * static_cast<size_t>(k_ext) * sizeof(Scalar));
     if (warm_start && warm_start->rows() == n && warm_start->cols() > 0) {
         const int k_copy = std::min(static_cast<int>(warm_start->cols()), k_ext);
         #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(k_copy) >= 65536)
@@ -484,7 +482,6 @@ EighResultT<Scalar> expand_symmetric_eigh(
 
     // First product: m random columns plus one probe column z = V0 g.
     Mat Y(n, m + 1);
-    gcta_numa_interleave(Y.data(), static_cast<size_t>(n) * static_cast<size_t>(m + 1) * sizeof(Scalar));
     fill_standard_normal(Y.leftCols(m));
     Eigen::VectorXd g(k0);
     {
@@ -570,8 +567,6 @@ EighResultT<Scalar> expand_symmetric_eigh(
     EighResultT<Scalar> result;
     result.eigenvalues = w.head(k_target);
     result.eigenvectors.resize(n, k_target);
-    gcta_numa_interleave(result.eigenvectors.data(),
-                         static_cast<size_t>(n) * static_cast<size_t>(k_target) * sizeof(Scalar));
     result.eigenvectors.noalias()  = V0 * Z_top;
     result.eigenvectors.noalias() += Q1 * Z_bot;
     return result;

@@ -199,7 +199,6 @@ inline void parallel_zero_matrix(Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dy
     const Eigen::Index cols = M.cols();
     if (rows <= 0 || cols <= 0) return;
     const size_t total_elems = static_cast<size_t>(rows) * static_cast<size_t>(cols);
-    gcta_numa_interleave(M.data(), total_elems * sizeof(Scalar));
     const size_t col_bytes = static_cast<size_t>(rows) * sizeof(Scalar);
     #pragma omp parallel for schedule(static) if (total_elems >= 65536)
     for (Eigen::Index c = 0; c < cols; ++c) {
@@ -319,7 +318,7 @@ inline Eigen::MatrixXf dense_upper_symm_f32(
     // BF16 tiled path
     detail::parallel_zero_matrix(Y);
 
-    AlignedRawBuffer<uint16_t, 64> X_bf16(/*interleave=*/true);
+    AlignedRawBuffer<uint16_t, 64> X_bf16;
     X_bf16.resize(static_cast<size_t>(n) * static_cast<size_t>(cols));
     detail::convert_colmajor_f32_to_bf16(
         X_ptr, ldX, X_bf16.data(),
@@ -500,7 +499,7 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
     const gcta_blas_int ldX = static_cast<gcta_blas_int>(X.outerStride());
     const gcta_blas_int ldY = static_cast<gcta_blas_int>(n);
 
-    AlignedRawBuffer<uint16_t, 64> X_bf16(/*interleave=*/true);
+    AlignedRawBuffer<uint16_t, 64> X_bf16;
     AlignedRawBuffer<uint16_t, 64> T_bf16;
     if (use_bf16) {
         X_bf16.resize(static_cast<size_t>(n) * static_cast<size_t>(cols));

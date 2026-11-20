@@ -86,7 +86,7 @@ private:
     int fd_ = -1;
 };
 
-UniqueFd open_bed_fd(const std::string& fname, bool sequential_hint) {
+UniqueFd open_bed_fd(const std::string& fname) {
     const int fd = ::open(fname.c_str(), O_RDONLY
 #ifdef O_CLOEXEC
                                              | O_CLOEXEC
@@ -95,15 +95,7 @@ UniqueFd open_bed_fd(const std::string& fname, bool sequential_hint) {
     if (fd < 0) {
         LOGGER.e(0, "BedBackend: can't open [" + fname + "]: " + errno_str());
     }
-    UniqueFd ufd(fd);
-    if (sequential_hint) {
-#if defined(__linux__) && defined(POSIX_FADV_SEQUENTIAL)
-        (void)::posix_fadvise(ufd.get(), 0, 0, POSIX_FADV_SEQUENTIAL);
-#elif defined(__APPLE__) && defined(F_RDAHEAD)
-        (void)::fcntl(ufd.get(), F_RDAHEAD, 1);
-#endif
-    }
-    return ufd;
+    return UniqueFd(fd);
 }
 
 // pread() the full [off, off + len) range, retrying on EINTR / short reads.
@@ -245,7 +237,7 @@ public:
         const std::string &fname = g_.geno_files[static_cast<std::size_t>(fileIndex_)];
         if (curFileIndex_ != fileIndex_) {
             curFd_.reset();
-            curFd_ = open_bed_fd(fname, /*sequential_hint=*/true);
+            curFd_ = open_bed_fd(fname);
             curFileIndex_ = fileIndex_;
         }
         const int fd = curFd_.get();
@@ -354,7 +346,7 @@ BedBackend::BedBackend(Geno &geno) : g_(geno)
         // Open, validate magic + exact size, and close immediately via RAII so
         // --mbfile can hold more files than RLIMIT_NOFILE without leaking fds.
         const std::string &fname = g_.geno_files[i];
-        UniqueFd fd = open_bed_fd(fname, /*sequential_hint=*/false);
+        UniqueFd fd = open_bed_fd(fname);
 
         unsigned char magic[3] = {0, 0, 0};
         pread_full(fd.get(), magic, 3, 0, fname);

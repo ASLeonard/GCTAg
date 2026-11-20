@@ -31,7 +31,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <cstring>
 #include <format>
 #include <string>
 #include <string_view>
@@ -163,10 +162,6 @@ int resolve_threads(const gcta_cli::ParsedCli& parsed, bool& is_threaded, bool& 
 }
 
 void configure_threading(int thread_num, bool explicit_threads) {
-    // Snapshot initial CPU affinity BEFORE any OpenMP runtime initialization
-    // so background I/O threads can restore it instead of inheriting Core-0 binding.
-    gcta_snapshot_initial_affinity();
-
 #if defined(GCTA_USE_AOCL) && !defined(GCTA_LAPACKE_IS_MKL)
     // Short spin prevents microsecond futex storms between back-to-back
     // BLIS/AOCL-DLP/OMP regions while still sleeping during disk I/O.
@@ -179,17 +174,6 @@ void configure_threading(int thread_num, bool explicit_threads) {
     // starve BLAS (MKL/OpenBLAS/Accelerate) calls that follow parallel regions.
     setenv("KMP_BLOCKTIME", "0", 0);   // 0 = don't override user setting
     setenv("GOMP_SPINCOUNT", "0", 0);
-#endif
-
-#if defined(__linux__)
-    const char* disable_numa_env = std::getenv("GCTA_DISABLE_NUMA");
-    const bool disable_numa = (disable_numa_env != nullptr && std::strcmp(disable_numa_env, "0") != 0);
-    if (thread_num > 1 && !disable_numa) {
-        // Spread threads evenly across NUMA domains / CCDs to unlock full DDR5
-        // channel bandwidth & L3 capacity; overwrite=0 respects user/Slurm env.
-        setenv("OMP_PROC_BIND", "spread", 0);
-        setenv("OMP_PLACES", "cores", 0);
-    }
 #endif
 
     const string thread_str = to_string(thread_num);

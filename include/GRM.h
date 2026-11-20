@@ -136,11 +136,11 @@ private:
 
     // Pre-allocated / lazily-allocated scratch buffers reused across calculate_GRM_blas calls
     std::vector<int> validIndexBuf;
-    AlignedRawBuffer<uintptr_t, 64> sampleMissBuf{true};
-    AlignedRawBuffer<float, 64> grm_f32_tile_buf_{true};
-    AlignedRawBuffer<int32_t, 64> grm_i32_tile_{true};
-    AlignedRawBuffer<int32_t, 64> grm_i32_diag_scratch_{false};
-    AlignedRawBuffer<int8_t, 64> i8_reordered_B_{false};
+    AlignedRawBuffer<uintptr_t, 64> sampleMissBuf;
+    AlignedRawBuffer<float, 64> grm_f32_tile_buf_;
+    AlignedRawBuffer<int32_t, 64> grm_i32_tile_;
+    AlignedRawBuffer<int32_t, 64> grm_i32_diag_scratch_;
+    AlignedRawBuffer<int8_t, 64> i8_reordered_B_;
     std::vector<float> i8_scratch_A_f32_;
     std::vector<float> i8_scratch_B_f32_;
     std::vector<float> i8_scratch_C_f32_;

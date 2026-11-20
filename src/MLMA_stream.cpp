@@ -211,7 +211,6 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
 
     const RemlPrefix prefix = read_reml_prefix(fd, filename);
     check_reml_samples(fd, prefix, expected_n, expected_id_hash, filename);
-    gcta_fadvise_sequential(fd);
 
     // --- Header (already read and validated above) ---
     const Header& hdr = prefix.hdr;
@@ -233,8 +232,6 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
         st.is_llt = (factor_kind == 0);
 
         st.Vi_L_f.resize(hdr.n, hdr.n);
-        gcta_numa_interleave(st.Vi_L_f.data(),
-                             static_cast<size_t>(hdr.n) * static_cast<size_t>(hdr.n) * sizeof(float));
 
         const size_t tri = static_cast<size_t>(hdr.n) * (hdr.n + 1) / 2;
 
@@ -287,7 +284,6 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
         st.varcmp.resize(hdr.num_varcmp);
         read_exact(fd, st.varcmp.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float), filename);
 
-        gcta_fadvise_dontneed(fd);
         close(fd);
         return st;
     }
@@ -313,11 +309,10 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
 
         // Uk is stored k x n, column-major -- byte-identical to Eigen::MatrixXf(k, n)'s
         // packed layout. Stage reads through a 64 MiB buffer and parallel-copy into
-        // NUMA-interleaved Uk so multi-GB pages are faulted across all cores/nodes
-        // instead of pinned to Core 0's NUMA domain by a single-threaded read().
+        // Uk so multi-GB pages are first-touched in parallel rather than pinned by
+        // a single-threaded read().
         const size_t uk_bytes = static_cast<size_t>(k) * static_cast<size_t>(hdr.n) * sizeof(float);
         Eigen::MatrixXf Uk(k, hdr.n);
-        gcta_numa_interleave(Uk.data(), uk_bytes);
         constexpr size_t kStageBytes = 64ULL << 20; // 64 MiB
         AlignedRawBuffer<char, 64> stage(std::min(kStageBytes, uk_bytes));
         char* const uk_dst = reinterpret_cast<char*>(Uk.data());
@@ -362,7 +357,6 @@ RemlState readRemlState(const std::string& filename, bool no_adj_covar,
         read_exact(fd, vc.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float), filename);
         st.varcmp = vc;
 
-        gcta_fadvise_dontneed(fd);
         close(fd);
 
         const double sg2   = static_cast<double>(vc[0]);
@@ -591,7 +585,6 @@ void load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ctx, uint64_t
                     "Woodbury (TUNA) state saved from a --reml-woodbury-basis fit.");
     }
     check_reml_samples(fd, prefix, ctx.n, expected_id_hash, filename);
-    gcta_fadvise_sequential(fd);
 
     int32_t k           = 0;
     double  lambda_tail = 0.0;
@@ -620,10 +613,9 @@ void load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ctx, uint64_t
 
     // Uk is stored k x n (column i = sample i, see writeRemlStateFromCtx).
     // Stream in bounded 512 MiB sample chunks and run a 64x64 cache-blocked
-    // transpose directly into NUMA-interleaved ctx.Uk (n x k), halving peak RSS
-    // and eliminating stride-4n TLB thrashing.
+    // transpose directly into ctx.Uk (n x k), halving peak RSS and eliminating
+    // stride-4n TLB thrashing while first-touching pages in parallel.
     ctx.Uk.resize(ctx.n, k);
-    gcta_numa_interleave(ctx.Uk.data(), uk_bytes);
     {
         constexpr size_t kUkReadWindowBytes = 1ULL << 29; // 512 MiB
         constexpr int32_t kBlk = 64;
@@ -667,7 +659,6 @@ void load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ctx, uint64_t
 
     Eigen::VectorXf dk_f(k);
     read_exact(fd, dk_f.data(), dk_bytes, filename);
-    gcta_fadvise_dontneed(fd);
     close(fd);
 
     ctx.dk                       = dk_f.cast<double>();
@@ -806,7 +797,6 @@ Eigen::MatrixXf load_pca_warm_start(const string& eigenvec_prefix,
             if (k <= 0)
                 LOGGER.e(0, "--reml-woodbury-basis-warm-start: no eigenvectors read from [" + path + "].");
             Uk.resize(n, k);
-            gcta_numa_interleave(Uk.data(), static_cast<size_t>(n) * static_cast<size_t>(k) * sizeof(float));
             row_vals.reserve(static_cast<size_t>(k));
         } else if (static_cast<int>(row_vals.size()) != k) {
             LOGGER.e(0, "--reml-woodbury-basis-warm-start: inconsistent eigenvector count in [" + path + "].");

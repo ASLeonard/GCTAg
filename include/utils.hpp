@@ -436,11 +436,6 @@ public:
         if (::fstat(fd_, &st) == 0 && st.st_size > 0) {
             file_size_ = static_cast<uint64_t>(st.st_size);
         }
-#if defined(__linux__) && defined(POSIX_FADV_SEQUENTIAL)
-        (void)::posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
-#elif defined(__APPLE__) && defined(F_RDAHEAD)
-        (void)::fcntl(fd_, F_RDAHEAD, 1);
-#endif
         const size_t init_cap = (file_size_ > 0)
             ? std::min<size_t>(kChunkSize, static_cast<size_t>(file_size_) + 4096)
             : kChunkSize;

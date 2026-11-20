@@ -308,7 +308,7 @@ struct QuantizedWoodburyTile {
     int r_count = 0;
     int q_rows = 0;       // is_2slice ? 2 * r_count : r_count (always <= 4096)
     bool is_2slice = true;
-    AlignedUniquePtr<int8_t, 64> Q;                       // q_rows x n, col-major (NUMA-interleaved)
+    AlignedUniquePtr<int8_t, 64> Q;                       // q_rows x n, col-major
     size_t q_bytes = 0;
     AlignedUniquePtr<int8_t, 64> Q_reordered;             // AOCL pre-reordered B buffer (null if unused)
     size_t q_reordered_bytes = 0;
@@ -350,7 +350,7 @@ inline void reorder_quantized_woodbury_uk(QuantizedWoodburyUk& q_uk)
             static_cast<gcta_blas_int>(tile.q_rows),
             static_cast<gcta_blas_int>(q_uk.n));
         if (sz == 0) continue;
-        tile.Q_reordered = make_numa_interleaved_uninitialized<int8_t, 64>(sz);
+        tile.Q_reordered = make_aligned_uninitialized<int8_t, 64>(sz);
         if (!tile.Q_reordered) {
             LOGGER.w(0, "Failed to allocate pre-reordered Q tile; falling back to unpacked Q.");
             continue;
@@ -398,7 +398,7 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk(
             t.is_2slice = is_2slice;
             t.q_rows = is_2slice ? 2 * t.r_count : t.r_count;
             t.q_bytes = static_cast<size_t>(t.q_rows) * static_cast<size_t>(n);
-            t.Q = make_numa_interleaved_uninitialized<int8_t, 64>(t.q_bytes);
+            t.Q = make_aligned_uninitialized<int8_t, 64>(t.q_bytes);
             if (t.q_bytes > 0 && !t.Q) {
                 LOGGER.e(0, "Failed to allocate quantized Woodbury Q tile.");
             }

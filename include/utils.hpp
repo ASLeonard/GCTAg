@@ -18,6 +18,7 @@
 #pragma once
 #include <bit>
 #include <expected>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -29,6 +30,17 @@
 #include <sstream>
 #include <cstdint>
 #include <limits>
+
+struct FileCloser {
+    void operator()(FILE* f) const noexcept {
+        if (f) std::fclose(f);
+    }
+};
+using UniqueFile = std::unique_ptr<FILE, FileCloser>;
+
+[[nodiscard]] inline UniqueFile open_file(const std::string& path, const char* mode) noexcept {
+    return UniqueFile{std::fopen(path.c_str(), mode)};
+}
 
 enum class UtilsError {
     EmptyInput,

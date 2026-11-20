@@ -22,7 +22,6 @@
 #include <algorithm>
 #include <numeric>
 #include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/join.hpp>
 #include "utils.hpp"
 #include "OptionIO.h"
 #include <memory>

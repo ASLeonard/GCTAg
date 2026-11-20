@@ -26,9 +26,11 @@
 #include "FastFAM.h"
 #include "LD.h"
 #include <functional>
+#include <format>
 #include <map>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <chrono>
 #include <algorithm>
 #include "main/option.h"
@@ -43,37 +45,30 @@
 //#include "acat.hpp" //add by fanghl 20210303
 //#define ACAT_MODULE
 
-using std::bind;
 using std::map;
 using std::to_string;
-using std::function;
-using std::placeholders::_1;
-using std::placeholders::_2;
-using std::placeholders::_3;
 
-void out_ver(bool flag_outFile){
-    function<void (int, const string&, const string&)> log;
-    if(flag_outFile){
-        log = bind(&Logger::l, LOGGER_P, _1, _2, _3);
-    }else{
-        log = bind(&Logger::m, LOGGER_P, _1, _2, _3);
-    }
+void out_ver(bool flag_outFile) {
+    auto log = [flag_outFile](int level, std::string_view msg, std::string_view title = {}) {
+        if (flag_outFile) {
+            LOGGER.l(level, msg, title);
+        } else {
+            LOGGER.m(level, msg, title);
+        }
+    };
 
-    log(0, "*******************************************************************", "");
-    log(0, "* Genome-wide Complex Trait Analysis -- Agricuture (GCTAg)", "");
-    log(0, std::string("* ") + std::string(GCTA_VERSION) + std::string(" ") + "(" + getOSName() + ")", "");
-    {
-        std::ostringstream outstring;
-        outstring << "* Built at " << __DATE__ << " " << __TIME__;
+    log(0, "*******************************************************************");
+    log(0, "* Genome-wide Complex Trait Analysis -- Agriculture (GCTAg)");
+    log(0, std::format("* {} ({})", GCTA_VERSION, getOSName()));
 #if defined(__clang__)
-        outstring << ", by Clang " << __clang_major__ << "." << __clang_minor__ << "." << __clang_patchlevel__;
+    log(0, std::format("* Built at {} {}, by Clang {}.{}.{}",
+                       __DATE__, __TIME__, __clang_major__, __clang_minor__, __clang_patchlevel__));
 #elif defined(__GNUC__)
-        outstring << ", by GCC " << __GNUC__ << "." << __GNUC_MINOR__;
-#elif defined(_MSC_VER)
-        outstring << ", by MSVC " << _MSC_VER;
+    log(0, std::format("* Built at {} {}, by GCC {}.{}",
+                       __DATE__, __TIME__, __GNUC__, __GNUC_MINOR__));
+#else
+    log(0, std::format("* Built at {} {}", __DATE__, __TIME__));
 #endif
-        log(0, outstring.str(), "");
-    }
 #ifdef GCTA_TARGET_ARCH_STR
     log(0, std::string("* Target arch: ") + GCTA_TARGET_ARCH_STR, "");
 #endif
@@ -274,23 +269,17 @@ int main(int argc, char *argv[]){
     // rather than spin-waiting. Spinning threads consume memory bandwidth and
     // starve BLAS (MKL/OpenBLAS) calls that follow parallel regions.
     // KMP_BLOCKTIME covers Intel OMP (MKL); GOMP_SPINCOUNT covers GCC libgomp.
-    #ifdef _WIN32
-        _putenv_s("OMP_NUM_THREADS", to_string(thread_num).c_str());
-        _putenv_s("KMP_BLOCKTIME", "0");
-        _putenv_s("GOMP_SPINCOUNT", "0");
-    #elif defined __linux__ || defined __APPLE__
-        setenv("KMP_BLOCKTIME", "0", 0);   // 0 = don't override user setting
-        setenv("GOMP_SPINCOUNT", "0", 0);
-        setenv("OMP_NUM_THREADS", to_string(thread_num).c_str(), 1);
-        #if defined(GCTA_USE_MKL) || defined(GCTA_LAPACKE_IS_MKL)
-            // libmkl_rt.so reads MKL_THREADING_LAYER lazily on first call; match the
-            // OpenMP runtime linked by this compiler (INTEL uses LLVM libomp/libiomp5;
-            // GNU uses libgomp) while respecting an explicit user override (0).
-            #if defined(__clang__)
-                setenv("MKL_THREADING_LAYER", "INTEL", 0);
-            #elif defined(__GNUC__)
-                setenv("MKL_THREADING_LAYER", "GNU", 0);
-            #endif
+    setenv("KMP_BLOCKTIME", "0", 0);   // 0 = don't override user setting
+    setenv("GOMP_SPINCOUNT", "0", 0);
+    setenv("OMP_NUM_THREADS", to_string(thread_num).c_str(), 1);
+    #if defined(GCTA_USE_MKL) || defined(GCTA_LAPACKE_IS_MKL)
+        // libmkl_rt.so reads MKL_THREADING_LAYER lazily on first call; match the
+        // OpenMP runtime linked by this compiler (INTEL uses LLVM libomp/libiomp5;
+        // GNU uses libgomp) while respecting an explicit user override (0).
+        #if defined(__clang__)
+            setenv("MKL_THREADING_LAYER", "INTEL", 0);
+        #elif defined(__GNUC__)
+            setenv("MKL_THREADING_LAYER", "GNU", 0);
         #endif
     #endif
     omp_set_num_threads(thread_num);

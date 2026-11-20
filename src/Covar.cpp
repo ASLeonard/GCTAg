@@ -19,8 +19,9 @@
 #include "OptionIO.h"
 #include <fstream>
 #include <boost/algorithm/string.hpp>
-#include <boost/lexical_cast.hpp>
 #include <algorithm>
+#include <charconv>
+#include <cmath>
 #include <ranges>
 #include <numeric>
 #include "utils.hpp"
@@ -776,10 +777,12 @@ void Covar::read_covar(string filename, vector<string>& sub_list, vector<vector<
                         (*label_p)[temp_string] = temp_item;
                     }
                 }else{
-                    try{
-                        temp_item = boost::lexical_cast<double>(temp_string);
-                    }catch(const boost::bad_lexical_cast &e){
-                        LOGGER.e(0, "line " + to_string(line_number) + " contains non-numeric values in " + err_string);
+                    const char* first = temp_string.data();
+                    const char* last  = first + temp_string.size();
+                    if (first < last && *first == '+') ++first;
+                    auto [ptr, ec] = std::from_chars(first, last, temp_item);
+                    if (ec != std::errc{} || ptr != last || !std::isfinite(temp_item)) {
+                        LOGGER.error(0, "line {} contains non-numeric values in {}", line_number, err_string);
                     }
                 }
                 covar_temp[col_index] = temp_item;

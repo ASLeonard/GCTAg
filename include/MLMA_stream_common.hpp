@@ -12,46 +12,54 @@
 
 #include <algorithm>
 #include <bit>
+#include <concepts>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <ranges>
 #include <type_traits>
 #include <span>
 #include <string>
 #include <vector>
 
-template <typename T, typename IndexT,
-          typename = std::enable_if_t<std::is_integral_v<IndexT>>>
+template <typename T, std::ranges::sized_range IndexRange>
+    requires std::integral<std::ranges::range_value_t<IndexRange>>
 inline std::vector<T> compact_sample_vector(const std::vector<T>& values,
-                                            const std::vector<IndexT>& keep)
+                                            const IndexRange& keep)
 {
     std::vector<T> compacted;
-    compacted.reserve(keep.size());
-    for (IndexT index : keep) compacted.push_back(values[static_cast<size_t>(index)]);
+    compacted.reserve(std::ranges::size(keep));
+    for (const auto index : keep) {
+        compacted.push_back(values[static_cast<size_t>(index)]);
+    }
     return compacted;
 }
 
-template <typename IndexT,
-          typename = std::enable_if_t<std::is_integral_v<IndexT>>>
+template <std::ranges::sized_range IndexRange>
+    requires std::integral<std::ranges::range_value_t<IndexRange>>
 inline Eigen::VectorXd compact_sample_vector(const Eigen::VectorXd& values,
-                                             const std::vector<IndexT>& keep)
+                                             const IndexRange& keep)
 {
-    Eigen::VectorXd compacted(keep.size());
-    for (size_t i = 0; i < keep.size(); ++i)
-        compacted[static_cast<Eigen::Index>(i)] = values[static_cast<Eigen::Index>(keep[i])];
+    Eigen::VectorXd compacted(std::ranges::size(keep));
+    Eigen::Index dst = 0;
+    for (const auto index : keep) {
+        compacted[dst++] = values[static_cast<Eigen::Index>(index)];
+    }
     return compacted;
 }
 
-template <typename IndexT,
-          typename = std::enable_if_t<std::is_integral_v<IndexT>>>
+template <std::ranges::sized_range IndexRange>
+    requires std::integral<std::ranges::range_value_t<IndexRange>>
 inline Eigen::MatrixXd compact_sample_rows(const Eigen::MatrixXd& values,
-                                           const std::vector<IndexT>& keep)
+                                           const IndexRange& keep)
 {
-    Eigen::MatrixXd compacted(keep.size(), values.cols());
-    for (size_t i = 0; i < keep.size(); ++i)
-        compacted.row(static_cast<Eigen::Index>(i)) = values.row(static_cast<Eigen::Index>(keep[i]));
+    Eigen::MatrixXd compacted(std::ranges::size(keep), values.cols());
+    Eigen::Index dst = 0;
+    for (const auto index : keep) {
+        compacted.row(dst++) = values.row(static_cast<Eigen::Index>(index));
+    }
     return compacted;
 }
 

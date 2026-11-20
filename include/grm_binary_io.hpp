@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -718,8 +719,7 @@ inline float   fp16_to_f32(GrmFp16 h) noexcept { return static_cast<float>(h); }
 #else
 using GrmFp16 = uint16_t;
 inline GrmFp16 f32_to_fp16(float x) noexcept {
-    uint32_t u = 0;
-    std::memcpy(&u, &x, sizeof(u));
+    const uint32_t u = std::bit_cast<uint32_t>(x);
     const uint32_t sign = (u >> 16) & 0x8000u;
     const int32_t  exp  = static_cast<int32_t>((u >> 23) & 0xFFu) - 127 + 15;
     uint32_t       mant = u & 0x007FFFFFu;
@@ -760,9 +760,7 @@ inline float fp16_to_f32(GrmFp16 h) noexcept {
     } else {
         u = sign | ((exp + 127 - 15) << 23) | (mant << 13);
     }
-    float out = 0.0f;
-    std::memcpy(&out, &u, sizeof(out));
-    return out;
+    return std::bit_cast<float>(u);
 }
 #endif
 

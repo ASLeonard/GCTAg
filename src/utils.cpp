@@ -26,9 +26,7 @@
 #include <sstream>
 #include <string>
 
-#if defined(__unix__) || defined(__APPLE__)
 #include <unistd.h>
-#endif
 
 std::string_view getUtilsErrorMessage(UtilsError error){
     switch(error){
@@ -47,11 +45,6 @@ std::string_view getUtilsErrorMessage(UtilsError error){
 std::string getHostName(){
     std::string computerName;
 
-#if defined(WIN32) || defined(_WIN32) || defined(_WIN64)
-    if (const char *temp = std::getenv("COMPUTERNAME"); temp != nullptr) {
-        computerName = temp;
-    }
-#else
     if (const char *temp = std::getenv("HOSTNAME"); temp != nullptr) {
         computerName = temp;
     } else {
@@ -60,14 +53,11 @@ std::string getHostName(){
             computerName = buffer.data();
         }
     }
-#endif
     return computerName;
 }
 
 std::string getOSName(){
-    #ifdef _WIN64
-    return "Windows";
-    #elif __linux__
+    #ifdef __linux__
     return "Linux";
     #elif __APPLE__ || __MACH__
     return "Mac";
@@ -96,11 +86,7 @@ std::string getLocalTime(){
     auto now = std::chrono::system_clock::now();
     auto now_c = std::chrono::system_clock::to_time_t(now);
     std::tm local_tm{};
-#if defined(_WIN32)
-    localtime_s(&local_tm, &now_c);
-#else
     localtime_r(&now_c, &local_tm);
-#endif
     std::ostringstream oss;
     oss << std::put_time(&local_tm, "%T %Z on %a %b %d %Y");
     return oss.str();
@@ -139,17 +125,6 @@ std::expected<uint64_t, UtilsError> getFileByteSize(FILE * file) {
         return std::unexpected(UtilsError::NullFileHandle);
     }
 
-#if defined(_WIN32)
-    if(_fseeki64(file, 0, SEEK_END) != 0){
-        return std::unexpected(UtilsError::FileSeekFailed);
-    }
-    const auto end_pos = _ftelli64(file);
-    std::rewind(file);
-    if(end_pos < 0){
-        return std::unexpected(UtilsError::FileTellFailed);
-    }
-    return static_cast<uint64_t>(end_pos);
-#else
     if(fseeko(file, 0, SEEK_END) != 0){
         return std::unexpected(UtilsError::FileSeekFailed);
     }
@@ -159,7 +134,6 @@ std::expected<uint64_t, UtilsError> getFileByteSize(FILE * file) {
         return std::unexpected(UtilsError::FileTellFailed);
     }
     return static_cast<uint64_t>(end_pos);
-#endif
 }
 
 

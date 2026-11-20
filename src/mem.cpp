@@ -187,10 +187,10 @@ void gcta_numa_interleave(void* ptr, std::size_t bytes) noexcept {
     if (::syscall(SYS_mbind,
                   reinterpret_cast<void*>(aligned_start),
                   aligned_len,
-                  static_cast<int>(MPOL_INTERLEAVE),
+                  static_cast<unsigned long>(MPOL_INTERLEAVE),
                   st.nodemask,
                   st.maxnode,
-                  0U) == 0) {
+                  0UL) == 0) {
         static std::once_flag log_once;
         std::call_once(log_once, [&st]() {
             try {

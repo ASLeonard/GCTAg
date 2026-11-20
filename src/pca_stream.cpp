@@ -1,6 +1,7 @@
 #include "grm_binary_io.hpp"
 #include "chunked_grm_matvec.hpp"
 #include "PCA_stream.h"
+#include "Pheno.h"
 #include "symmetric_eigendecomp.hpp"
 #include <cpu.h>
 #include <mem.hpp>
@@ -329,10 +330,16 @@ void PCAStream::run(const gcta_cli::PcaOptions& opts, const std::string& out_pre
         }
 
         const int active_threads = std::min(max_threads, std::max(1, (rows_c + 15) / 16));
+        for (int t = 0; t < active_threads; ++t) {
+            thread_bufs[static_cast<size_t>(t)].clear();
+        }
+        int actual_nt = 1;
         #pragma omp parallel num_threads(active_threads)
         {
             const int tid = omp_get_thread_num();
             const int nt  = omp_get_num_threads();
+            #pragma omp single nowait
+            { actual_nt = nt; }
             const int r_lo = (rows_c * tid) / nt;
             const int r_hi = (rows_c * (tid + 1)) / nt;
             string& local = thread_bufs[static_cast<size_t>(tid)];
@@ -383,7 +390,7 @@ void PCAStream::run(const gcta_cli::PcaOptions& opts, const std::string& out_pre
             }
         }
 
-        for (int t = 0; t < active_threads; ++t) {
+        for (int t = 0; t < actual_nt; ++t) {
             const string& local = thread_bufs[static_cast<size_t>(t)];
             if (!local.empty()) {
                 o_evec.write(local.data(), static_cast<std::streamsize>(local.size()));

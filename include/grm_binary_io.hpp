@@ -26,6 +26,7 @@
 
 #include "chunked_grm_matvec.hpp"
 #include "mem.hpp"
+#include "Pheno.h"
 
 namespace gcta_grm_io {
 

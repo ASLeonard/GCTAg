@@ -283,6 +283,38 @@ option(BGEN_SUPPORT "Enable BGEN file format support (requires SQLite)" OFF)
 set(USE_JEMALLOC "" CACHE STRING
     "Path to libjemalloc.so / libamdalloc.so (or ON/amdalloc with AOCC to auto-select bundled libamdalloc.so). Links with thp:never to avoid Linux THP over-allocation on large triangular allocations.")
 
+if(APPLE)
+    set(_gcta_default_march "native")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    set(_gcta_default_march "x86-64-v3")
+else()
+    set(_gcta_default_march "native")
+endif()
+set(GCTA_MARCH "${_gcta_default_march}" CACHE STRING
+    "Target CPU architecture for Release builds (-march=<val> on Linux, -mcpu=<val> on macOS; e.g. x86-64-v3, znver4, native, or OFF).")
+set(GCTA_MTUNE "" CACHE STRING
+    "Optional CPU tuning for Release builds (-mtune=<val>, e.g. znver4; empty/OFF disables).")
+
+set(_gcta_arch_flags "")
+set(_gcta_arch_desc "")
+string(TOUPPER "${GCTA_MARCH}" _gcta_march_upper)
+if(NOT _gcta_march_upper MATCHES "^(|OFF|NONE|FALSE)$")
+    if(APPLE)
+        list(APPEND _gcta_arch_flags "-mcpu=${GCTA_MARCH}")
+    else()
+        list(APPEND _gcta_arch_flags "-march=${GCTA_MARCH}")
+    endif()
+    set(_gcta_arch_desc "${GCTA_MARCH}")
+else()
+    set(_gcta_arch_desc "generic")
+endif()
+
+string(TOUPPER "${GCTA_MTUNE}" _gcta_mtune_upper)
+if(NOT _gcta_mtune_upper MATCHES "^(|OFF|NONE|FALSE)$")
+    list(APPEND _gcta_arch_flags "-mtune=${GCTA_MTUNE}")
+    set(_gcta_arch_desc "${_gcta_arch_desc} (tune=${GCTA_MTUNE})")
+endif()
+
 
 # Initialize plink-ng submodule if needed
 if(EXISTS "${CMAKE_SOURCE_DIR}/.git" AND NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/plink-ng/2.0/include/pgenlib_ffi_support.h")
@@ -342,8 +374,8 @@ if(BGEN_SUPPORT)
 endif()
 
 FetchContent_Declare(
-    stdexec
-    URL https://github.com/NVIDIA/stdexec/archive/refs/tags/nvhpc-26.05.tar.gz
+    cli11
+    URL https://github.com/CLIUtils/CLI11/archive/refs/tags/v2.7.2.tar.gz
     SYSTEM
     EXCLUDE_FROM_ALL)
 
@@ -359,18 +391,23 @@ block()
     set(ZSTD_BUILD_STATIC   ON)
     set(SPECTRA_BUILD_TESTS OFF)
     set(BUILD_TESTING       OFF)
+    set(CLI11_BUILD_TESTS    OFF)
+    set(CLI11_BUILD_EXAMPLES OFF)
+    set(CLI11_BUILD_DOCS     OFF)
+    set(CLI11_INSTALL        OFF)
+    set(CLI11_PRECOMPILED    OFF)
     set(BOOST_IOSTREAMS_ENABLE_ZLIB  ON  CACHE BOOL "" FORCE)
     set(BOOST_IOSTREAMS_ENABLE_BZIP2 OFF CACHE BOOL "" FORCE)
     set(BOOST_IOSTREAMS_ENABLE_LZMA  OFF CACHE BOOL "" FORCE)
     set(BOOST_IOSTREAMS_ENABLE_ZSTD  OFF CACHE BOOL "" FORCE)
     if(Boost_DIR)
-        FetchContent_MakeAvailable(zstd)
+        FetchContent_MakeAvailable(zstd cli11)
     else()
         # These vars are only meaningful to Boost's own CMake build system
         set(BOOST_ENABLE_CMAKE ON)
         set(BOOST_ENABLE_COMPATIBILITY_TARGETS ON)
         set(BOOST_INCLUDE_LIBRARIES "algorithm;math;crc;iostreams")
-        FetchContent_MakeAvailable(zstd Boost)
+        FetchContent_MakeAvailable(zstd Boost cli11)
     endif()
 endblock()
 
@@ -386,7 +423,6 @@ set(CMAKE_SKIP_INSTALL_RULES OFF)
 if(BGEN_SUPPORT)
     FetchContent_MakeAvailable(sqlite)
 endif()
-FetchContent_MakeAvailable(stdexec)
 
 # If the user supplied a Boost_DIR, prefer that over fetching Boost.
 if(Boost_DIR)
@@ -515,6 +551,26 @@ else()
                 "AOCL variant mismatch: AOCC compiler but GCC-built AOCL (no libomp.so) at ${_aocl_lib_dir}. "
                 "Consider using the aocc/ variant for best performance.")
         endif()
+
+        # AOCL 6.0+ splits low-precision GEMM (aocl_gemm_s8s8s32os32 / AVX-512 VNNI)
+        # into libaocl-dlp (header aocl_dlp.h / classic/aocl_gemm_interface_apis.h).
+        set(GCTA_AOCL_DLP_LIBRARY "")
+        foreach(_dlp_cand IN ITEMS "${_aocl_lib_dir}/libaocl-dlp.so" "${_aocl_lib_dir}/libaocl-dlp.a")
+            if(EXISTS "${_dlp_cand}")
+                set(_dlp_has_hdr FALSE)
+                if(EXISTS "${GCTA_BLAS_INCLUDE_DIR}/aocl_dlp.h"
+                   OR EXISTS "${GCTA_BLAS_INCLUDE_DIR}/classic/aocl_gemm_interface_apis.h")
+                    set(_dlp_has_hdr TRUE)
+                endif()
+                if(_dlp_has_hdr)
+                    set(GCTA_AOCL_DLP_LIBRARY "${_dlp_cand}")
+                    list(APPEND GCTA_BLAS_LIBS "${GCTA_AOCL_DLP_LIBRARY}")
+                    list(APPEND GCTA_BLAS_DEFINES GCTA_USE_AOCL_DLP)
+                    message(STATUS "AOCL-DLP (s8s8s32 VNNI): ${GCTA_AOCL_DLP_LIBRARY}")
+                    break()
+                endif()
+            endif()
+        endforeach()
     else()
         list(APPEND GCTA_BLAS_DEFINES GCTA_USE_MKL EIGEN_USE_MKL_ALL)
         set(GCTA_BLAS_PROVIDER "MKL" CACHE INTERNAL "")
@@ -575,26 +631,24 @@ add_executable(GCTAg)
 target_sources(GCTAg PRIVATE
             # entry point
         src/main.cpp
-        # src/ module
+        src/Cli.cpp
+        # src/ module (FastFAM.cpp and LD.cpp temporarily omitted while V2 CLI focuses on grm/pca/reml/mlma)
         src/Covar.cpp
-        src/FastFAM.cpp
         src/MLMA_stream.cpp
         src/pca_stream.cpp
         src/RemlEngine.cpp
         src/GRM.cpp
         src/Geno.cpp
+        src/GenoBackend.cpp
         src/BedBackend.cpp
         src/BgenBackend.cpp
         src/PgenBackend.cpp
-        src/LD.cpp
         src/Logger.cpp
         src/Marker.cpp
         src/OptionIO.cpp
         src/Pheno.cpp
         src/StatLib.cpp
-        src/ThreadPool.cpp
         src/mem.cpp
-        src/tables.cpp
         src/utils.cpp
         # main/ legacy module
         main/CommFunc.cpp
@@ -650,17 +704,22 @@ endif()
 set_target_properties(GCTAg PROPERTIES
     UNITY_BUILD                   ${GCTA_UNITY_BUILD}
     INTERPROCEDURAL_OPTIMIZATION  ${GCTA_IPO_ENABLED})
+# Keep CLI11 isolated from unity builds so its headers never interact with
+# legacy main/*.cpp macros or `using namespace std`.
+set_source_files_properties(src/Cli.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
 target_compile_definitions(GCTAg PRIVATE
     ${GCTA_BLAS_DEFINES}
     GCTA_BLAS_BACKEND_STR="${GCTA_BLAS_PROVIDER}"
     GCTA_BLAS_VERSION_STR="${GCTA_BLAS_VERSION}"
+    GCTA_TARGET_ARCH_STR="${_gcta_arch_desc}"
     $<$<BOOL:${GCTA_USE_JEMALLOC}>:GCTA_USE_JEMALLOC>
     $<$<BOOL:${BGEN_SUPPORT}>:BGEN_SUPPORT>)
 
-target_compile_options(GCTAg PRIVATE
-    -pipe
-    $<$<CONFIG:Release>:$<IF:$<BOOL:${APPLE}>,-mcpu=native,-march=native>>)
+target_compile_options(GCTAg PRIVATE -pipe)
+foreach(_arch_flag IN LISTS _gcta_arch_flags)
+    target_compile_options(GCTAg PRIVATE $<$<CONFIG:Release>:${_arch_flag}>)
+endforeach()
 
 # Both GCC (GNU ld) and Clang (lld or GNU ld) default to DT_RUNPATH (--enable-new-dtags),
 # which searches LD_LIBRARY_PATH before RPATH and breaks HPC libstdc++/BLAS pinning.
@@ -697,8 +756,9 @@ target_sources(Pgenlib PRIVATE
 # headers such as GenoBackendFactory.h.
 set_target_properties(Pgenlib PROPERTIES UNITY_BUILD OFF)
 target_include_directories(Pgenlib PUBLIC "${CMAKE_SOURCE_DIR}/third_party/plink-ng/2.0/include")
-target_compile_options(Pgenlib PRIVATE
-    $<$<CONFIG:Release>:$<IF:$<BOOL:${APPLE}>,-mcpu=native,-march=native>>)
+foreach(_arch_flag IN LISTS _gcta_arch_flags)
+    target_compile_options(Pgenlib PRIVATE $<$<CONFIG:Release>:${_arch_flag}>)
+endforeach()
 
 
 target_link_libraries(GCTAg PRIVATE
@@ -707,7 +767,7 @@ target_link_libraries(GCTAg PRIVATE
     ZLIB::ZLIB
     Eigen3::Eigen
     Spectra
-    STDEXEC::stdexec
+    CLI11::CLI11
     libzstd_static
     $<$<BOOL:${GCTA_USE_JEMALLOC}>:${GCTA_JEMALLOC_LIB}>
     OpenMP::OpenMP_CXX
@@ -751,9 +811,17 @@ message(STATUS "==========================================")
 message(STATUS "GCTAg Build Configuration Summary")
 message(STATUS "==========================================")
 message(STATUS "  Build type:        ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Target arch/tune:  ${_gcta_arch_desc}")
 message(STATUS "  BLAS/LAPACK:       ${GCTA_BLAS_PROVIDER} (${GCTA_BLAS_VERSION})")
 if(GCTA_LAPACKE_LIBRARY)
     message(STATUS "  LAPACKE library:   ${GCTA_LAPACKE_LIBRARY}")
+endif()
+if(GCTA_BLAS_PROVIDER STREQUAL "AOCL")
+    if(GCTA_AOCL_DLP_LIBRARY)
+        message(STATUS "  AOCL-DLP (VNNI):   ${GCTA_AOCL_DLP_LIBRARY}")
+    else()
+        message(STATUS "  AOCL-DLP (VNNI):   NOT FOUND (int8 GEMM will fall back to sgemm unless BLIS addon is enabled)")
+    endif()
 endif()
 message(STATUS "  Compiler:          ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}${GCTA_COMPILER_IS_AOCC_STR} (${CMAKE_CXX_COMPILER})")
 message(STATUS "  Archiver (AR):     ${CMAKE_AR}")

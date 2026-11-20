@@ -7,179 +7,72 @@
 #include <Eigen/Dense>
 #include <algorithm>
 #include <chrono>
-#include <cctype>
 #include <fstream>
 #include <unordered_set>
-#include <map>
 #include <string>
 #include <vector>
 
-using std::map;
 using std::string;
 using std::to_string;
 using std::vector;
 
-map<string, string> PCAStream::options;
-map<string, double> PCAStream::options_d;
-vector<string> PCAStream::processFunctions;
-
-int PCAStream::registerOption(map<string, vector<string>>& options_in)
+void PCAStream::run(const gcta_cli::PcaOptions& opts, const std::string& out_prefix)
 {
-    // Always capture --out (shared flag)
-    // Use the pre-processed "out" key (no dashes), which is always set by main.cpp
-    if (!options_in["out"].empty())
-        options["out"] = options_in["out"][0];
+    const string& grm_pfx = opts.grm;
+    std::optional<gcta_cli::PcaApprox> pca_approx = opts.approx;
 
-    const bool has_pca = options_in.find("--pca") != options_in.end();
-    if (!has_pca)
-        return 0;
-
-    // PCAStream argument: --pca [N]
-    // Omitted N means 0 (V1-style "all" sentinel), later mapped to n.
-    {
-        const auto& vals = options_in["--pca"];
-        if (vals.empty()) {
-            options_d["pca_out_num"] = 0.0;
-        } else {
-            options_d["pca_out_num"] = std::stod(vals[0]);
-            if (vals.size() > 1)
-                LOGGER.w(0, "--pca accepts at most one value; using the first one.");
-        }
+    if (opts.seed.has_value()) {
+        const auto seed = static_cast<std::mt19937::result_type>(*opts.seed);
+        gcta_eigh::shared_rng().seed(seed);
+        LOGGER.i(0, "Using random seed: " + to_string(seed) + ".");
     }
 
-    // Only reliable if PCAStream::registerOption runs before whatever else
-    // might consume --grm-cutoff for an unrelated purpose (e.g. --make-grm
-    // --grm-cutoff in the same invocation) — options_in is shared across all
-    // registerOption calls, and this can only see keys not yet erased by an
-    // earlier one. Same ordering dependency the whole registers[] list
-    // already has; nothing new introduced here.
-    if (options_in.find("--grm-cutoff") != options_in.end())
-        LOGGER.e(0, "--pca does not support --grm-cutoff yet "
-                    "(needs off-diagonal GRM values, not just IDs); use --pca-v1 "
-                    "for relatedness pruning, or prune separately first.");
+    // ---- Sample set: full GRM ID list, optionally filtered by --keep/--remove ----
+    const vector<string> grm_ids = Pheno::read_sublist(grm_pfx + ".grm.id");
 
-    if (options_in.find("--grm") == options_in.end() || options_in["--grm"].empty())
-        LOGGER.e(0, "--pca requires --grm <prefix>.");
-    options["grm"] = options_in["--grm"][0];
-    options_in.erase("--grm");
+    vector<string> analysis_ids = grm_ids;  // preserves GRM file order, same as V1's _keep convention
+    if (!opts.keep.empty()) {
+        const vector<string> keep_ids = Pheno::read_sublist(opts.keep);
+        const std::unordered_set<string> keep_set(keep_ids.begin(), keep_ids.end());
+        vector<string> filtered;
+        filtered.reserve(analysis_ids.size());
+        for (const auto& id : analysis_ids)
+            if (keep_set.count(id)) filtered.push_back(id);
+        analysis_ids = std::move(filtered);
+    }
+    if (!opts.remove.empty()) {
+        const vector<string> remove_ids = Pheno::read_sublist(opts.remove);
+        const std::unordered_set<string> remove_set(remove_ids.begin(), remove_ids.end());
+        vector<string> filtered;
+        filtered.reserve(analysis_ids.size());
+        for (const auto& id : analysis_ids)
+            if (!remove_set.count(id)) filtered.push_back(id);
+        analysis_ids = std::move(filtered);
+    }
+    const int n = static_cast<int>(analysis_ids.size());
+    if (n == 0)
+        LOGGER.e(0, "--pca: no individuals remain after --keep/--remove filtering.");
 
-    // Optional: if omitted, --pca runs exact dense PCA (dsyevr/dsyevd)
-    // on the selected sample set. If present with no value, match legacy
-    // default approximate method (Lanczos).
-    if (options_in.find("--pca-approx") != options_in.end()) {
-        const auto& vals = options_in["--pca-approx"];
-        if (vals.empty() || vals[0].empty()) options["pca_approx"] = "Lanczos";
-        else options["pca_approx"] = vals[0];
-        options_in.erase("--pca-approx");
+    int out_pc_num = opts.pcs;
+    if (out_pc_num < 0)
+        LOGGER.e(0, "--pca requires N >= 0 (0 means all, matching V1 semantics).");
+    if (out_pc_num == 0 || out_pc_num > n) out_pc_num = n;
+
+    if (out_pc_num == n && pca_approx.has_value()) {
+        LOGGER.w(0, "--pca-approx is set, but all PCs requested. Falling back to full eigenvalue decomposition.");
+        pca_approx.reset();
     }
 
-    if (options_in.find("--keep") != options_in.end() && !options_in["--keep"].empty()) {
-        options["keep"] = options_in["--keep"][0];
-        options_in.erase("--keep");
-    }
-    if (options_in.find("--remove") != options_in.end() && !options_in["--remove"].empty()) {
-        options["remove"] = options_in["--remove"][0];
-        options_in.erase("--remove");
-    }
+    const double grm_chunked_budget = opts.grm_chunked_budget.value_or(0.0);
+    bool grm_chunked = grm_chunked_budget > 0.0;
+    const bool grm_fp16 = opts.grm_fp16;
+    const int svd_power_iter = opts.svd_power_iter.value_or(3);
 
-    // Same name and meaning as --grm-chunked-budget in MLMA_stream.cpp /
-    // RemlEngine.cpp — GB budget for streaming the GRM in row-chunks instead
-    // of loading it densely — reused verbatim rather than introducing a
-    // PCA-specific flag.
-    if (options_in.find("--grm-chunked-budget") != options_in.end()) {
-        const auto& vals = options_in["--grm-chunked-budget"];
-        if (vals.empty() || vals[0].empty())
-            LOGGER.e(0, "--grm-chunked-budget requires a GB argument (e.g. 20).");
-        options_d["grm_chunked_budget"] = std::stod(vals[0]);
-        options_in.erase("--grm-chunked-budget");
-    }
-
-    if (options_in.find("--svd-method") != options_in.end()) {
-        const auto& vals = options_in["--svd-method"];
-        if (vals.empty() || vals[0].empty())
-            LOGGER.e(0, "--svd-method requires one argument: power or nystrom.");
-        string method = vals[0];
-        std::transform(method.begin(), method.end(), method.begin(),
-                       [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-        if (method == "nystrom") {
-            options["pca_nystrom"] = "1";
-        } else if (method != "power") {
-            LOGGER.e(0, "Unsupported --svd-method value [" + vals[0] + "]. Allowed values: power, nystrom.");
-        }
-        if (vals.size() > 1)
-            LOGGER.w(0, "--svd-method expects exactly one value; using the first one.");
-        options_in.erase("--svd-method");
-    }
-    if (options_in.find("--svd-power-iter") != options_in.end()) {
-        const auto& vals = options_in["--svd-power-iter"];
-        if (vals.empty() || vals[0].empty())
-            LOGGER.e(0, "--svd-power-iter requires one integer argument.");
-        options["svd_power_iter"] = vals[0];
-        if (vals.size() > 1)
-            LOGGER.w(0, "--svd-power-iter expects exactly one value; using the first one.");
-        options_in.erase("--svd-power-iter");
-    }
-
-    processFunctions.push_back("PCAStream");
-    options_in.erase("--pca");
-    return 1;
-}
-
-void PCAStream::processMain()
-{
-    for (const auto& pf : processFunctions) {
-        if (pf != "PCAStream") continue;
-
-        const string grm_pfx    = options.at("grm");
-        const string out_prefix = options.at("out");
-        string pca_approx = options.count("pca_approx") ? options.at("pca_approx") : string();
-
-        // ---- Sample set: full GRM ID list, optionally filtered by --keep/--remove ----
-        const vector<string> grm_ids = Pheno::read_sublist(grm_pfx + ".grm.id");
-
-        vector<string> analysis_ids = grm_ids;  // preserves GRM file order, same as V1's _keep convention
-        if (options.count("keep")) {
-            const vector<string> keep_ids = Pheno::read_sublist(options.at("keep"));
-            const std::unordered_set<string> keep_set(keep_ids.begin(), keep_ids.end());
-            vector<string> filtered;
-            filtered.reserve(analysis_ids.size());
-            for (const auto& id : analysis_ids)
-                if (keep_set.count(id)) filtered.push_back(id);
-            analysis_ids = std::move(filtered);
-        }
-        if (options.count("remove")) {
-            const vector<string> remove_ids = Pheno::read_sublist(options.at("remove"));
-            const std::unordered_set<string> remove_set(remove_ids.begin(), remove_ids.end());
-            vector<string> filtered;
-            filtered.reserve(analysis_ids.size());
-            for (const auto& id : analysis_ids)
-                if (!remove_set.count(id)) filtered.push_back(id);
-            analysis_ids = std::move(filtered);
-        }
-        const int n = static_cast<int>(analysis_ids.size());
-        if (n == 0)
-            LOGGER.e(0, "--pca: no individuals remain after --keep/--remove filtering.");
-
-        int out_pc_num = options_d.count("pca_out_num")
-            ? static_cast<int>(options_d.at("pca_out_num")) : 0;
-        if (out_pc_num < 0)
-            LOGGER.e(0, "--pca requires N >= 0 (0 means all, matching V1 semantics).");
-        if (out_pc_num == 0 || out_pc_num > n) out_pc_num = n;
-
-        if (out_pc_num == n && !pca_approx.empty()) {
-            LOGGER.w(0, "--pca-approx is set, but all PCs requested. Falling back to full eigenvalue decomposition.");
-            pca_approx.clear();
-        }
-
-        const double grm_chunked_budget = options_d.count("grm_chunked_budget")
-            ? options_d.at("grm_chunked_budget") : 0.0;
-        bool grm_chunked = grm_chunked_budget > 0.0;
-        int svd_power_iter = options.count("svd_power_iter")
-            ? std::stoi(options.at("svd_power_iter")) : 3;
-
-        if (pca_approx.empty() && grm_chunked)
-            LOGGER.e(0, "--pca exact mode (dsyevr/dsyevd) requires dense GRM loading. "
-                        "Remove --grm-chunked-budget, or set --pca-approx to Lanczos/rSVD.");
+    if (grm_chunked && grm_fp16)
+        LOGGER.e(0, "--grm-fp16 and --grm-chunked-budget are mutually exclusive.");
+    if (!pca_approx.has_value() && (grm_chunked || grm_fp16))
+        LOGGER.e(0, "--pca exact mode (dsyevr/dsyevd) requires dense GRM loading. "
+                    "Remove --grm-chunked-budget/--grm-fp16, or set --pca-approx to Lanczos/rSVD.");
 
         // Row-chunk size for streaming reads off the GRM (chunked_symmetric_matvec),
         // and the reader's own row-band cache reservation, are now both solved
@@ -188,6 +81,7 @@ void PCAStream::processMain()
         // RemlCtx, so it has no other reason to duplicate that arithmetic.
         int chunk_size = 0;
         gcta_grm_io::ChunkedGrmHandle chunked_handle;  // only populated when grm_chunked
+        gcta_grm_io::PackedGrmFp16Handle fp16_handle;  // only populated when grm_fp16
         if (grm_chunked) {
             // NOTE: this now opens the file and ID-matches against
             // .grm.id/.grm.N.bin unconditionally whenever grm_chunked is
@@ -197,7 +91,8 @@ void PCAStream::processMain()
             // work is cheap (ID matching + one N-mean read, no tile reads
             // yet) but it's a real behavior change worth knowing about.
             chunked_handle = gcta_grm_io::make_chunked_grm_reader(
-                grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--pca");
+                grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--pca",
+                /*need_m_snps=*/false);
             chunk_size = chunked_handle.chunk_rows;
             if (chunk_size >= n) {
                 // The whole GRM fits in a single block: chunking then buys nothing
@@ -217,36 +112,70 @@ void PCAStream::processMain()
 
         // ---- GRM access: chunked tile reader, or dense (fallback / comparison) ----
         gcta_chunked::TileReader chunked_reader;
-        Eigen::MatrixXd G_dense;  // left empty when grm_chunked
+        gcta_chunked::TileReaderF32 chunked_reader_f32;
+        Eigen::MatrixXd G_dense;      // populated only for exact mode (!grm_chunked && !pca_approx.has_value())
+        Eigen::MatrixXf G_dense_f32;  // populated for --pca-approx when !grm_chunked
 
-        if (grm_chunked) {
+        if (grm_fp16) {
+            fp16_handle = gcta_grm_io::load_packed_grm_fp16(
+                grm_pfx, analysis_ids, /*need_m_snps=*/false, "--grm-fp16");
+            chunk_size = fp16_handle.chunk_rows;
+            chunked_reader = std::move(fp16_handle.reader);
+            chunked_reader_f32 = std::move(fp16_handle.reader_f32);
+            grm_chunked = true;
+        } else if (grm_chunked) {
             // make_chunked_grm_reader already logged the budget/chunk_size
             // split above; nothing further to log here.
             chunked_reader = std::move(chunked_handle.reader);
+            chunked_reader_f32 = std::move(chunked_handle.reader_f32);
+        } else if (pca_approx.has_value()) {
+            double m_snps_unused = -1.0;
+            gcta_grm_io::load_and_subset_grm_upper(
+                grm_pfx, analysis_ids, G_dense_f32, m_snps_unused, "--pca");
         } else {
             double m_snps_unused = -1.0;
             gcta_grm_io::load_and_subset_grm_upper(
                 grm_pfx, analysis_ids, G_dense, m_snps_unused, "--pca");
         }
 
-        auto apply = [&](const auto& X) -> Eigen::MatrixXd {
-            if (grm_chunked)
-                return gcta_chunked::chunked_symmetric_matvec(chunked_reader, n, chunk_size, X);
-            else
-                return G_dense.selfadjointView<Eigen::Upper>() * X;
+        double trace_total = 0.0;
+        bool have_trace_total = false;
+        if (grm_fp16) {
+            trace_total = fp16_handle.trace_K;
+            have_trace_total = true;
+            LOGGER.i(0, "Total variance (tr(G)) = " + to_string(trace_total));
+        } else if (!grm_chunked) {
+            if (G_dense_f32.size() > 0) trace_total = G_dense_f32.diagonal().cast<double>().sum();
+            else if (G_dense.size() > 0) trace_total = G_dense.diagonal().sum();
+            have_trace_total = true;
+            LOGGER.i(0, "Total variance (tr(G)) = " + to_string(trace_total));
+        } else if (pca_approx != gcta_cli::PcaApprox::rSVD) {
+            trace_total = gcta_chunked::chunked_diagonal(chunked_reader, n, chunk_size).sum();
+            have_trace_total = true;
+            LOGGER.i(0, "Total variance (tr(G)) = " + to_string(trace_total));
+        }
+
+        auto apply_f32 = [&](const Eigen::Ref<const Eigen::MatrixXf>& X) -> Eigen::MatrixXf {
+            if (grm_chunked) {
+                double* tr_ptr = have_trace_total ? nullptr : &trace_total;
+                Eigen::MatrixXf Y = gcta_chunked::chunked_symmetric_matvec_f32(
+                    chunked_reader_f32, n, chunk_size, X, tr_ptr);
+                if (!have_trace_total) {
+                    have_trace_total = true;
+                    LOGGER.i(0, "Total variance (tr(G)) = " + to_string(trace_total));
+                }
+                return Y;
+            } else {
+                return G_dense_f32.selfadjointView<Eigen::Upper>() * X;
+            }
         };
 
-        // Capture the full trace once here so that a partial spectrum can still be
-        // reported as a proportion of total variance, rather than as if it were the
-        // full sum of eigenvalues. For chunked execution we intentionally read only
-        // the diagonal tiles, not the full matrix.
-        // The GRM can be overwritten in place, so we must compute the trace first.
-        const double trace_total = [&]() {
-            if (grm_chunked) return gcta_chunked::chunked_diagonal(chunked_reader, n, chunk_size).sum();
-            if (G_dense.size() == 0) return 0.0;
-            return G_dense.diagonal().sum();
-        }();
-        LOGGER.i(0, "Total variance (tr(G)) = " + to_string(trace_total));
+        auto apply_f64 = [&](const Eigen::Ref<const Eigen::VectorXd>& x) -> Eigen::VectorXd {
+            if (grm_chunked)
+                return gcta_chunked::chunked_symmetric_matvec(chunked_reader, n, chunk_size, x);
+            else
+                return (G_dense_f32.selfadjointView<Eigen::Upper>() * x.cast<float>()).cast<double>();
+        };
 
         Eigen::VectorXd eval;
         Eigen::MatrixXd evec;
@@ -254,26 +183,28 @@ void PCAStream::processMain()
         const double* raw_evec = nullptr;
 
         try {
-            const bool pca_nystrom = options.count("pca_nystrom") > 0;
-            if (!pca_approx.empty()) {
-                gcta_eigh::EighResult res;
-                if (pca_approx == "rSVD") {
+            const bool pca_nystrom = opts.svd_method == gcta_cli::SvdMethod::Nystrom;
+            if (pca_approx.has_value()) {
+                if (*pca_approx == gcta_cli::PcaApprox::rSVD) {
                     const int oversample = gcta_eigh::recommended_oversample(out_pc_num);
+                    gcta_eigh::EighResultF res_f;
                     if (pca_nystrom) {
                         LOGGER.i(0, "--pca rSVD + --svd-method nystrom: signed single-pass sketch (1 GRM matvec). Accuracy near PC " +
                                     std::to_string(out_pc_num) + " may be lower than power-iteration rSVD.");
-                        res = gcta_eigh::nystrom_symmetric_eigh(apply, n, out_pc_num, oversample);
+                        res_f = gcta_eigh::nystrom_symmetric_eigh<float>(apply_f32, n, out_pc_num, oversample);
                     } else {
-                        res = gcta_eigh::randomized_symmetric_eigh(apply, n, out_pc_num, oversample, svd_power_iter);
+                        res_f = gcta_eigh::randomized_symmetric_eigh<float>(apply_f32, n, out_pc_num, oversample, svd_power_iter);
                     }
-                } else if (pca_approx == "Lanczos") {
-                    const int ncv = std::min(n, std::max(3 * out_pc_num + 1, 30));
-                    res = gcta_eigh::lanczos_symmetric_eigh(apply, n, out_pc_num, ncv);
+                    G_dense_f32.resize(0, 0);
+                    eval = std::move(res_f.eigenvalues);
+                    evec = res_f.eigenvectors.cast<double>();
                 } else {
-                    LOGGER.e(0, "--pca-approx: unrecognised method '" + pca_approx + "'. Use 'rSVD' or 'Lanczos'.");
+                    const int ncv = std::min(n, std::max(3 * out_pc_num + 1, 30));
+                    gcta_eigh::EighResult res = gcta_eigh::lanczos_symmetric_eigh(apply_f64, n, out_pc_num, ncv);
+                    G_dense_f32.resize(0, 0);
+                    eval = std::move(res.eigenvalues);
+                    evec = std::move(res.eigenvectors);
                 }
-                eval = std::move(res.eigenvalues);
-                evec = std::move(res.eigenvectors);
             } else {
                 if (pca_nystrom)
                     LOGGER.w(0, "--svd-method is ignored in exact mode (it only applies to --pca-approx rSVD).");
@@ -324,6 +255,8 @@ void PCAStream::processMain()
         // writes below, rather than sitting at peak size through them.
         if (!used_dsyevd) G_dense.resize(0, 0);
         chunked_reader = nullptr;
+        chunked_reader_f32 = nullptr;
+        fp16_handle.file.reset();
 
         // ---- Write .eigenval / .eigenvec — identical format to gcta::pca()'s writer ----
         auto append_double = [](string &buf, double v) {
@@ -370,6 +303,5 @@ void PCAStream::processMain()
         LOGGER.i(0, to_string(n) + " individuals, " + to_string(out_pc_num) +
                     " eigenvectors saved in [" + evec_file + "].");
 
-        if (used_dsyevd) G_dense.resize(0, 0);
-    }
+    if (used_dsyevd) G_dense.resize(0, 0);
 }

@@ -20,6 +20,7 @@
 #include <string>
 #include <map>
 #include <cstdint>
+#include "Cli.hpp"
 using std::map;
 using std::vector;
 using std::string;
@@ -34,7 +35,10 @@ typedef map<int, uint8_t> Mask_t;
 
 class Pheno {
 public:
-    Pheno();
+    Pheno(const gcta_cli::GenoInputOptions& geno,
+          const gcta_cli::SampleFilterOptions& sample_filter,
+          const gcta_cli::PhenoCovarOptions* pheno_covar = nullptr,
+          bool filter_sex_flag = false);
     PhenoMask get_indi_mask(uint32_t ori_index);
     uint8_t get_mask(uint32_t ori_index);
     void filter_sex();
@@ -66,8 +70,6 @@ public:
     /// Return just the FID (family ID) for the given raw sample index.
     const std::string& getRawFID(uint32_t rawIndex) const { return fid[rawIndex]; }
 
-    static int registerOption(map<string, vector<string>>& options);
-    static void processMain();
     static vector<string> read_sublist(string sublist_file, vector<vector<double>> *phenos = NULL, vector<int> *keep_row = NULL);
 
 private:
@@ -98,7 +100,7 @@ private:
     void read_fam(string fam_file);
     void read_sample(string sample_file);
     void read_psam(string psam_file);
-    void read_checkMPSample(string m_file);
+    void read_checkMPSample(const vector<string>& mfiles);
     static int8_t normalizeSexCode(int raw_code);
     static void loadSexCodeMappingFromFile(const string& file_path);
     void update_pheno(vector<string>& indi_marks, vector<double>& phenos);
@@ -110,8 +112,7 @@ private:
     vector<uint32_t> keep_block_index;
     vector<uint64_t> mask_items;
     vector<uint64_t> mask_add_items;
- 
-    static map<string, string> options;
+
     static int8_t heterogametic_sex_code;
     static int8_t homogametic_sex_code;
     friend class Geno;

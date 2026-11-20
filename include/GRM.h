@@ -18,7 +18,10 @@
 
 #ifndef GCTA2_GRM_H
 #define GCTA2_GRM_H
+#include "Cli.hpp"
 #include "Geno.h"
+#include <memory>
+#include <optional>
 #include <string>
 #include <span>
 #include <vector>
@@ -33,13 +36,10 @@ using std::pair;
 
 class GRM {
 public:
-    GRM(Pheno *pheno, Marker *marker);
-    GRM();
-    ~GRM() {
-        posix_mem_free(grm);
-        posix_mem_free(N);
-        if(geno) delete geno;
-    };
+    GRM(Pheno *pheno, Marker *marker, const gcta_cli::GrmMakeOptions& opts, const std::string& out_prefix);
+    GRM(const std::string& grm_prefix, const std::string& keep_file, const std::string& remove_file,
+        const std::string& out_prefix, bool cutoff_detail = false);
+    ~GRM() = default;
 
     void calculate_GRM_blas(uintptr_t* genobuf, std::span<const uint32_t> markerIndex);
     
@@ -48,8 +48,12 @@ public:
     vector<uint32_t> divide_parts(uint32_t from, uint32_t to, uint32_t num_parts);
     vector<uint32_t> divide_parts_mem(uint32_t n_sample, uint32_t num_parts);
 
-    static int registerOption(map<string, vector<string>>& options_in);
-    static void processMain();
+    static void runMake(const gcta_cli::GrmMakeOptions& opts, const std::string& out_prefix);
+    static void runMerge(const gcta_cli::GrmMergeOptions& opts, const std::string& out_prefix);
+    static void runPrune(const gcta_cli::GrmPruneOptions& opts, const std::string& out_prefix);
+    static void runSparse(const gcta_cli::GrmSparseOptions& opts, const std::string& out_prefix);
+    static void runSubtract(const gcta_cli::GrmCombineOptions& opts, const std::string& out_prefix);
+    static void runUnify(const gcta_cli::GrmCombineOptions& opts, const std::string& out_prefix);
     void processMakeGRM(bool is_homogametic = false);
     void processMakeGRMX();
 
@@ -64,9 +68,9 @@ public:
     inline static int nMarkerBlock = 1024;
 
 private:
-    Pheno *pheno = NULL;
-    Marker *marker = NULL;
-    Geno *geno = NULL;
+    Pheno *pheno = nullptr;
+    Marker *marker = nullptr;
+    std::unique_ptr<Geno> geno;
     std::vector<uint32_t> index_keep;
     uint32_t part;
     uint32_t num_parts;
@@ -75,24 +79,25 @@ private:
     std::pair<uint32_t, uint32_t> part_keep_indices; //the index in pheno keep index;
     std::vector<std::pair<int, int>> index_grm_pairs;
 
-    double *grm = NULL;
-    uint32_t *N = NULL;
+    AlignedUniquePtr<double, 64> grm;
+    AlignedUniquePtr<uint32_t, 64> N;
     std::vector<uint32_t> sub_miss; // sample miss in all markers
     int finished_marker = 0;
     uint64_t num_byte_geno = 0;
     int num_count_handle = 2;
 
     bool bBLAS;
-    double *stdGeno = NULL;
+    AlignedUniquePtr<float, 64> stdGeno;
+    AlignedUniquePtr<int8_t, 64> stdGeno_i8;
+    bool use_int8_grm = false;
 
     void output_id();
 
     string o_name;
-
-    static map<string, string> options;
-    static map<string, double> options_d;
-    static map<string, bool> options_b;
-    static std::vector<string> processFunctions;
+    std::string keep_file;
+    std::string remove_file;
+    std::optional<float> sparse_cutoff;
+    bool cutoff_detail = false;
 
     string grm_file;
     int num_byte_buffer;
@@ -108,18 +113,27 @@ private:
     std::vector<double> sd;
     uint32_t numValidMarkers = 0;
 
-    GenoBufItem *gbufitems = NULL;
+    std::vector<GenoBufItem> gbufitems;
 
     // Constants derived from part_keep_indices, cached after construction
     int grm_n = 0;               // part_keep_indices.second + 1
     int grm_m = 0;               // part_keep_indices.second - part_keep_indices.first + 1
     int grm_s_n = 0;             // grm_n - grm_m
-    int grm_bytes_std_geno = 0;  // sizeof(double) * grm_n
-    int stdGenoLD = 0;           // leading dimension of stdGeno: grm_n rounded up to multiple of 8 (64-byte column alignment)
+    int grm_bytes_std_geno = 0;  // sizeof(float) * grm_n
+    int stdGenoLD = 0;           // leading dimension of stdGeno: grm_n rounded up to multiple of 16 (64-byte column alignment)
 
     // Pre-allocated scratch buffers reused across calculate_GRM_blas calls
     std::vector<int> validIndexBuf;
     std::vector<uintptr_t> sampleMissBuf;
+    std::vector<float> grm_f32_tile_;
+    std::vector<int32_t> grm_i32_tile_;
+    std::vector<float> i8_scratch_A_f32_;
+    std::vector<float> i8_scratch_B_f32_;
+    std::vector<double> mu_vec_;
+    std::vector<double> r_raw_;
+    std::vector<double> r_tilde_;
+    std::vector<int> marker_miss_offset_;
+    std::vector<int> marker_miss_idx_;
 
     // Block-tiled GRM: when grm_tile_size > 0 (set via --GRM-tile-size),
     // processMakeGRM iterates over grm_tile_size-row tiles.  For each tile

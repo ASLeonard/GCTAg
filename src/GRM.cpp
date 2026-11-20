@@ -22,6 +22,7 @@
 #include <Eigen/Dense>
 #include <format>
 #include <limits>
+#include <memory>
 #include <iterator>
 #include <algorithm>
 #include <ranges>
@@ -31,10 +32,8 @@
 #include <numeric>
 #include <unordered_set>
 #include "utils.hpp"
-#include "utils.hpp"
 #include "grm_binary_io.hpp"
 #include <omp.h>
-#include "OptionIO.h"
 #include "third_party/plink-ng/2.0/include/plink2_bits.h"
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/join.hpp>
@@ -75,35 +74,26 @@ bool grm_tile_budget_covers_whole(int full_rs, int full_re, double budget_elems)
 
 } // namespace
 
-map<string, string> GRM::options;
-map<string, double> GRM::options_d;
-map<string, bool> GRM::options_b;
-vector<string> GRM::processFunctions;
-
-
-GRM::GRM(){
-    bool has_single_grm = false;
-    if(options.find("grm_file") != options.end()){
-        has_single_grm = true;
-    }
-    if(has_single_grm){
-        this->grm_file = options["grm_file"];
+GRM::GRM(const std::string& grm_prefix, const std::string& keep, const std::string& remove,
+         const std::string& out_prefix, bool detail)
+    : o_name(out_prefix), keep_file(keep), remove_file(remove), cutoff_detail(detail) {
+    if (!grm_prefix.empty()) {
+        this->grm_file = grm_prefix;
         grm_ids = Pheno::read_sublist(grm_file + ".grm.id");
         num_subjects = grm_ids.size();
 
         uint64_t num_grm = num_subjects * (num_subjects + 1) / 2;
-        FILE *file = fopen((grm_file + ".grm.bin").c_str(), "rb");
-        if(!file){
-            LOGGER.e(0, "can't open " + grm_file + ".grm.bin");
+        UniqueFile file = open_file(grm_file + ".grm.bin", "rb");
+        if (!file) {
+            LOGGER.error(0, "can't open {}.grm.bin", grm_file);
         }
-        const auto grm_file_size = getFileByteSize(file);
-        if(!grm_file_size){
+        const auto grm_file_size = getFileByteSize(file.get());
+        if (!grm_file_size) {
             LOGGER.e(0, "Failed to read GRM binary size for [" + grm_file + "]: " + std::string(getUtilsErrorMessage(grm_file_size.error())));
         }
-        if(num_grm * 4 != grm_file_size.value()){
+        if (num_grm * 4 != grm_file_size.value()) {
             LOGGER.e(0, "The IDs in GRM and the IDs in the GRM binary file do not match [" + grm_file + "]");
         }
-        fclose(file);
 
         uint64_t num_grm_byte = num_grm * 4;
         uint64_t num_parts = (num_grm_byte + num_byte_GRM_read - 1) / num_byte_GRM_read;
@@ -123,22 +113,18 @@ GRM::GRM(){
         index_keep.resize(num_subjects);
         std::iota(index_keep.begin(), index_keep.end(), 0);
 
-        if(options.find("keep_file") != options.end()){
-            vector<string> keep_lists = Pheno::read_sublist(options["keep_file"]);
-            LOGGER << "Get " << keep_lists.size() << " samples from list [" << options["keep_file"] << "]." << std::endl;
+        if (!keep_file.empty()) {
+            vector<string> keep_lists = Pheno::read_sublist(keep_file);
+            LOGGER << "Get " << keep_lists.size() << " samples from list [" << keep_file << "]." << std::endl;
             Pheno::set_keep(keep_lists, grm_ids, index_keep, true);
         }
 
-        if(options.find("remove_file") != options.end()){
-            vector<string> rm_lists = Pheno::read_sublist(options["remove_file"]);
-            LOGGER << "Get " << rm_lists.size() << " samples from list [" << options["remove_file"] << "]." << std::endl;
+        if (!remove_file.empty()) {
+            vector<string> rm_lists = Pheno::read_sublist(remove_file);
+            LOGGER << "Get " << rm_lists.size() << " samples from list [" << remove_file << "]." << std::endl;
             Pheno::set_keep(rm_lists, grm_ids, index_keep, false);
         }
     }
-    if(options.find("mgrm") != options.end()){
-    }
-
-
 }
 
 void GRM::subtract_grm(string mgrm_file, string out_file){
@@ -179,7 +165,7 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
         LOGGER.e(0, "The sample IDs in the two GRMs are not same. You may try --unify-grm first.");
     }
     std::ofstream o_id(out_file + ".grm.id");
-    if(!o_id) LOGGER.e(0, "can't write to [" + options["out"] + ".grm.id]");
+    if(!o_id) LOGGER.e(0, "can't write to [" + out_file + ".grm.id]");
     LOGGER.i(2, "Saving " + to_string(common_id.size()) + " individual IDs");
     std::ranges::copy(common_id, std::ostream_iterator<string>(o_id, "\n"));
     o_id.close();
@@ -187,20 +173,20 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
     uint64_t grm_size = (1 + common_id.size()) * common_id.size() / 2;
     uint64_t grm_file_size = grm_size * 4; 
 
-    FILE * h_grm1 = fopen((files[0] + ".grm.bin").c_str(), "rb");
-    FILE * h_grmN1 = fopen((files[0] + ".grm.N.bin").c_str(), "rb");
-    FILE * h_grm2 = fopen((files[1] + ".grm.bin").c_str(), "rb");
-    FILE * h_grmN2 = fopen((files[1] + ".grm.N.bin").c_str(), "rb");
-    if(grm_file_size != getFileSize(h_grm1)){
+    UniqueFile h_grm1  = open_file(files[0] + ".grm.bin", "rb");
+    UniqueFile h_grmN1 = open_file(files[0] + ".grm.N.bin", "rb");
+    UniqueFile h_grm2  = open_file(files[1] + ".grm.bin", "rb");
+    UniqueFile h_grmN2 = open_file(files[1] + ".grm.N.bin", "rb");
+    if (!h_grm1 || grm_file_size != getFileSize(h_grm1.get())) {
         LOGGER.e(0, "The size of [" + files[0] + ".grm.bin] is not correct.");
     }
-    if(grm_file_size != getFileSize(h_grmN1)){
+    if (!h_grmN1 || grm_file_size != getFileSize(h_grmN1.get())) {
         LOGGER.e(0, "The size of [" + files[0] + ".grm.N.bin] is not correct.");
     }
-    if(grm_file_size != getFileSize(h_grm2)){
+    if (!h_grm2 || grm_file_size != getFileSize(h_grm2.get())) {
         LOGGER.e(0, "The size of [" + files[1] + ".grm.bin] is not correct.");
     }
-    if(grm_file_size != getFileSize(h_grmN2)){
+    if (!h_grmN2 || grm_file_size != getFileSize(h_grmN2.get())) {
         LOGGER.e(0, "The size of [" + files[1] + ".grm.N.bin] is not correct.");
     }
 
@@ -215,15 +201,21 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
     int loop_num = (grm_size + itemRead - 1) / itemRead;
     uint64_t remain_item = grm_size % itemRead;
     LOGGER.i(0, "Subtracting GRMs...");
-    FILE *ho_grm = fopen((out_file + ".grm.bin").c_str(), "wb");
-    FILE *ho_grmN = fopen((out_file + ".grm.N.bin").c_str(), "wb");
+    UniqueFile ho_grm  = open_file(out_file + ".grm.bin", "wb");
+    UniqueFile ho_grmN = open_file(out_file + ".grm.N.bin", "wb");
+    if (!ho_grm) {
+        LOGGER.error(0, "can't write to [{}.grm.bin].", out_file);
+    }
+    if (!ho_grmN) {
+        LOGGER.error(0, "can't write to [{}.grm.N.bin].", out_file);
+    }
 
     for(int i = 0; i < loop_num; i++){
         if(i == loop_num - 1 && remain_item != 0) itemRead = remain_item;
-        readBytes(h_grm1, itemRead, buf1.data());
-        readBytes(h_grm2, itemRead, buf2.data());
-        readBytes(h_grmN1, itemRead, bufN1.data());
-        readBytes(h_grmN2, itemRead, bufN2.data());
+        readBytes(h_grm1.get(), itemRead, buf1.data());
+        readBytes(h_grm2.get(), itemRead, buf2.data());
+        readBytes(h_grmN1.get(), itemRead, bufN1.data());
+        readBytes(h_grmN2.get(), itemRead, bufN2.data());
         // On the first chunk, check that file[0] has at least as many markers as file[1].
         // A negative N_diff means the files are in the wrong order (chr GRM listed first).
         if(i == 0 && bufN1[0] < bufN2[0]){
@@ -239,13 +231,15 @@ void GRM::subtract_grm(string mgrm_file, string out_file){
                 ? (float)(((double)buf1[j] * bufN1[j] - (double)buf2[j] * bufN2[j]) / bufN[j])
                 : 0.0f;
         }
-        if(fwrite(buf.data(), sizeof(float), itemRead, ho_grm) != itemRead){
+        if(fwrite(buf.data(), sizeof(float), itemRead, ho_grm.get()) != itemRead){
             LOGGER.e(0, "can't write to [" + out_file + ".grm.bin].");
         }
-        if(fwrite(bufN.data(), sizeof(float), itemRead, ho_grmN) != itemRead){
+        if(fwrite(bufN.data(), sizeof(float), itemRead, ho_grmN.get()) != itemRead){
             LOGGER.e(0, "can't write to [" + out_file + ".grm.N.bin].");
         }
     }
+    ho_grm.reset();
+    ho_grmN.reset();
     LOGGER.i(0, "The subtracted GRM has been written to [" + out_file + ".grm.bin, .grm.N.bin].");
 }
 
@@ -334,9 +328,9 @@ void GRM::unify_grm(string mgrm_file, string out_file){
         common_id = temp_common_id;
         LOGGER << common_id.size() << " common samples in GRMs" << std::endl;
     }
-    if(options.find("keep_file") != options.end()){
-        LOGGER.i(0, "Keeping individuals listed in [" + options["keep_file"] + "]...");
-        vector<string> keep_id = Pheno::read_sublist(options["keep_file"]);
+    if(!keep_file.empty()){
+        LOGGER.i(0, "Keeping individuals listed in [" + keep_file + "]...");
+        vector<string> keep_id = Pheno::read_sublist(keep_file);
         LOGGER << keep_id.size() << " samples have been read." << std::endl;
         vector<uint32_t> index1, index2;
         vector_commonIndex_sorted1(common_id, keep_id, index1, index2);
@@ -346,9 +340,9 @@ void GRM::unify_grm(string mgrm_file, string out_file){
         common_id = temp_common_id;
         LOGGER << common_id.size() << " common samples after merging." << std::endl;
     }
-    if(options.find("remove_file") != options.end()){
-        LOGGER.i(0, "Excluding individuals listed in [" + options["remove_file"] + "]...");
-        vector<string> remove_id = Pheno::read_sublist(options["remove_file"]);
+    if(!remove_file.empty()){
+        LOGGER.i(0, "Excluding individuals listed in [" + remove_file + "]...");
+        vector<string> remove_id = Pheno::read_sublist(remove_file);
         LOGGER << remove_id.size() << " samples have been read." << std::endl;
         vector<uint32_t> index1, index2;
         vector_commonIndex_sorted1(common_id, remove_id, index1, index2);
@@ -365,7 +359,7 @@ void GRM::unify_grm(string mgrm_file, string out_file){
     vector<vector<uint32_t>> grm_indices(files.size());
     //produce output file names
     vector<string> output_fileNames;
-    string out_string = options["out"];
+    const string& out_string = out_file;
     const auto basename_out_result = getFileName(out_string);
     if(!basename_out_result){
         LOGGER.e(0, "Invalid output path [" + out_string + "]: " + std::string(getUtilsErrorMessage(basename_out_result.error())));
@@ -409,13 +403,13 @@ void GRM::unify_grm(string mgrm_file, string out_file){
         uint32_t largest_grm_size = ids[i].size();
         string file_name = files[i] + ".grm.bin";
         string wfile_name = output_fileNames[i] + ".grm.bin";
-        FILE *h_grm = fopen(file_name.c_str(), "rb");
-        if(!h_grm){
+        UniqueFile h_grm = open_file(file_name, "rb");
+        if (!h_grm) {
             LOGGER.e(0, "can't read " + file_name + ".");
         }
 
-        FILE *h_wgrm = fopen(wfile_name.c_str(), "wb");
-        if(!h_wgrm){
+        UniqueFile h_wgrm = open_file(wfile_name, "wb");
+        if (!h_wgrm) {
             LOGGER.e(0, "can't write to " + wfile_name + ".");
         }
 
@@ -432,9 +426,9 @@ void GRM::unify_grm(string mgrm_file, string out_file){
             uint64_t grm_index = p_index[j];
             uint64_t num_grm = grm_index + 1;
             uint64_t byte_start_grm = start_pos[grm_index];
-            fseek(h_grm, byte_start_grm, SEEK_SET);
-            if(fread(buf.data(), sizeof(float), num_grm, h_grm) != num_grm){
-                LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(ftell(h_grm)), ".");
+            fseek(h_grm.get(), byte_start_grm, SEEK_SET);
+            if(fread(buf.data(), sizeof(float), num_grm, h_grm.get()) != num_grm){
+                LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(ftell(h_grm.get())), ".");
             }
             uint64_t size_write = j + 1;
             for(int k = 0; k < size_write; k++){
@@ -445,8 +439,8 @@ void GRM::unify_grm(string mgrm_file, string out_file){
                 }else{
                     //fill the other parts
                     auto bytes_offset = start_pos[cur_index] + grm_index * sizeof(float);
-                    fseek(h_grm, bytes_offset, SEEK_SET); 
-                    if(fread(&grm_value, sizeof(float), 1, h_grm) != 1){
+                    fseek(h_grm.get(), bytes_offset, SEEK_SET); 
+                    if(fread(&grm_value, sizeof(float), 1, h_grm.get()) != 1){
                         LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(bytes_offset), ".");
                     }
                 }
@@ -455,12 +449,12 @@ void GRM::unify_grm(string mgrm_file, string out_file){
             //last element
             //*(wbuf + j) = *(buf + grm_index);
 
-            if(size_write != fwrite(wbuf.data(), sizeof(float), size_write, h_wgrm)){
-                LOGGER.e(0, "error in writing to [" + wfile_name + "], pos: " + std::to_string(ftell(h_wgrm)) + "."); 
+            if(size_write != fwrite(wbuf.data(), sizeof(float), size_write, h_wgrm.get())){
+                LOGGER.e(0, "error in writing to [" + wfile_name + "], pos: " + std::to_string(ftell(h_wgrm.get())) + "."); 
             }
         }
-        fclose(h_grm);
-        fclose(h_wgrm);
+        h_grm.reset();
+        h_wgrm.reset();
         LOGGER.i(0, "GRM has been written to [" + wfile_name + "].");
     }
 
@@ -469,17 +463,19 @@ void GRM::unify_grm(string mgrm_file, string out_file){
 void GRM::prune_fam(float thresh, bool isSparse, float *value){
     LOGGER.i(0, "Pruning the GRM to a sparse matrix with a cutoff of " + to_string(thresh) + "...");
     LOGGER.i(0, "Total number of parts to be processed: " + to_string(index_grm_pairs.size()));
-    FILE *grmFile = fopen((grm_file + ".grm.bin").c_str(), "rb");
+    UniqueFile grmFile = open_file(grm_file + ".grm.bin", "rb");
+    if (!grmFile) LOGGER.error(0, "can't read [{}.grm.bin]", grm_file);
 
-    std::ofstream o_id((options["out"] + ".grm.id").c_str());
-    if(!o_id) LOGGER.e(0, "can't write to [" + options["out"] + ".grm.id]");
+    std::ofstream o_id((o_name + ".grm.id").c_str());
+    if(!o_id) LOGGER.e(0, "can't write to [" + o_name + ".grm.id]");
     std::ofstream o_fam;
-    FILE* o_bk;
+    UniqueFile o_bk;
     if(isSparse){
-        o_fam.open((options["out"] + ".grm.sp").c_str());
-        if(!o_fam) LOGGER.e(0, "can't write to [" + options["out"] + ".grm.sp]");
+        o_fam.open((o_name + ".grm.sp").c_str());
+        if(!o_fam) LOGGER.e(0, "can't write to [" + o_name + ".grm.sp]");
     }else{
-        o_bk = fopen((options["out"] + ".grm.bin").c_str(), "wb");
+        o_bk = open_file(o_name + ".grm.bin", "wb");
+        if (!o_bk) LOGGER.error(0, "can't write to [{}.grm.bin]", o_name);
     }
 
     //Save the kept IDs, which may change by --keep and --remove
@@ -505,7 +501,7 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
     float *cur_grm_buf;
     int new_id1 = 0;
     for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
-        if(fread(grm_buf.data(), sizeof(float), byte_part_grms[part_index], grmFile) != byte_part_grms[part_index]){
+        if(fread(grm_buf.data(), sizeof(float), byte_part_grms[part_index], grmFile.get()) != byte_part_grms[part_index]){
             LOGGER.e(0, "Failed to read GRM between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
                         + to_string(index_grm_pairs[part_index].second + 1));
         };
@@ -556,19 +552,17 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
         }
         if(!isSparse){
             int write_items = cur_grm_buf - out_grm_buf.data();
-            if(fwrite(out_grm_buf.data(), sizeof(float), write_items, o_bk) != write_items){
+            if(fwrite(out_grm_buf.data(), sizeof(float), write_items, o_bk.get()) != write_items){
                 LOGGER.e(0, "Failed to write the output"); 
             }
         }
 
     }
-    fclose(grmFile);
-    if(!isSparse){
-        fclose(o_bk);
-    }
+    grmFile.reset();
+    o_bk.reset();
 
     if(isSparse){
-        LOGGER.i(0, "Saving the sparse GRM (" + to_string(rm_grm.size()) + " pairs) to [" + options["out"] + ".grm.sp]");
+        LOGGER.i(0, "Saving the sparse GRM (" + to_string(rm_grm.size()) + " pairs) to [" + o_name + ".grm.sp]");
         //    auto sorted_index = sort_indexes(rm_grm_ID2, rm_grm_ID1);
         //    for(auto index : sorted_index){
         o_fam << std::setprecision( std::numeric_limits<float>::digits10+2);
@@ -579,17 +573,20 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
         LOGGER.i(0, "Success:", "finished generating a sparse GRM");
         return;
     }else{
-        LOGGER.i(0, "GRM has been saved to [" + options["out"] + ".grm.bin]");
+        LOGGER.i(0, "GRM has been saved to [" + o_name + ".grm.bin]");
     }
 
-    FILE *NFile = fopen((grm_file + ".grm.N.bin").c_str(), "rb");
-    FILE *ONFile = fopen((options["out"] + ".grm.N.bin").c_str(), "wb");
+    UniqueFile NFile  = open_file(grm_file + ".grm.N.bin", "rb");
+    UniqueFile ONFile = open_file(o_name + ".grm.N.bin", "wb");
+    if (!NFile || !ONFile) {
+        LOGGER.error(0, "can't open [{}.grm.N.bin] or [{}.grm.N.bin]", grm_file, o_name);
+    }
     std::vector<float> N_buf(num_byte_buffer);
     float *cur_N_pos0;
     std::vector<float> out_N_buf(num_byte_buffer);
     float *cur_N_buf;
     for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
-        if(fread(N_buf.data(), sizeof(float), byte_part_grms[part_index], NFile) != byte_part_grms[part_index]){
+        if(fread(N_buf.data(), sizeof(float), byte_part_grms[part_index], NFile.get()) != byte_part_grms[part_index]){
             LOGGER.w(0, "Reading GRM N failed between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
                         + to_string(index_grm_pairs[part_index].second + 1));
             LOGGER.i(0, "Stop pruning the GRM N");
@@ -614,14 +611,14 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
         }
 
         int write_items = cur_N_buf - out_N_buf.data();
-        if(fwrite(out_N_buf.data(), sizeof(float), write_items, ONFile) != write_items){
+        if(fwrite(out_N_buf.data(), sizeof(float), write_items, ONFile.get()) != write_items){
             LOGGER.e(0, "Failed to write the GRM N"); 
         }
 
     }
-    fclose(ONFile);
-    fclose(NFile);
-    LOGGER.i(0, "GRM N has been saved to [" + options["out"] + ".grm.N.bin]");
+    ONFile.reset();
+    NFile.reset();
+    LOGGER.i(0, "GRM N has been saved to [" + o_name + ".grm.N.bin]");
 }
 
 
@@ -629,24 +626,24 @@ void GRM::prune_fam(float thresh, bool isSparse, float *value){
 void GRM::cut_rel(float thresh, bool no_grm){
     LOGGER.i(0, "Pruning the GRM with a cutoff of " + to_string(thresh) + "...");
     LOGGER.i(0, "Total number of parts to be processed: " + to_string(index_grm_pairs.size()));
-    FILE *grmFile = fopen((grm_file + ".grm.bin").c_str(), "rb");
+    UniqueFile grmFile = open_file(grm_file + ".grm.bin", "rb");
+    if (!grmFile) LOGGER.error(0, "can't read [{}.grm.bin]", grm_file);
     // put this first to avoid unwritable disk
     std::ofstream o_keep;
     if(!no_grm){
-        o_keep.open((options["out"] + ".grm.id").c_str());
+        o_keep.open((o_name + ".grm.id").c_str());
         if((!o_keep)){
-            LOGGER.e(0, "can't write to [" + options["out"] + ".grm.id]");
+            LOGGER.e(0, "can't write to [" + o_name + ".grm.id]");
         }
     }
 
-    bool detail_flag = false;
+    const bool detail_flag = cutoff_detail;
     std::ofstream out_fam, o_single;
-    if(options.find("cutoff_detail") != options.end()){
-        detail_flag = true;
-        out_fam.open((options["out"] + ".family.txt").c_str());
-        o_single.open((options["out"] + ".singleton.txt").c_str());
+    if(detail_flag){
+        out_fam.open((o_name + ".family.txt").c_str());
+        o_single.open((o_name + ".singleton.txt").c_str());
         if((!out_fam) || (!o_single)){
-            LOGGER.e(0, "can't write to [" + options["out"] + ".family.txt, .singleton.txt]");
+            LOGGER.e(0, "can't write to [" + o_name + ".family.txt, .singleton.txt]");
         }
     }
  
@@ -658,7 +655,7 @@ void GRM::cut_rel(float thresh, bool no_grm){
     vector<float> rm_grm;
     vector<int> rm_grm_ID1, rm_grm_ID2;
     for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
-        if(fread(grm_buf.data(), sizeof(float), byte_part_grms[part_index], grmFile) != byte_part_grms[part_index]){
+        if(fread(grm_buf.data(), sizeof(float), byte_part_grms[part_index], grmFile.get()) != byte_part_grms[part_index]){
             LOGGER.e(0, "Failed to read GRM between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
                         + to_string(index_grm_pairs[part_index].second + 1));
         };
@@ -689,7 +686,7 @@ void GRM::cut_rel(float thresh, bool no_grm){
             out_fam << grm_ids[rm_grm_ID1[index]] << "\t" <<  grm_ids[rm_grm_ID2[index]] << "\t" << rm_grm[index] << std::endl;
         }
         out_fam.close();
-        LOGGER.i(0, "Related family pairs have been saved to " + options["out"] + ".family.txt");
+        LOGGER.i(0, "Related family pairs have been saved to " + o_name + ".family.txt");
     }
 
     int i_buf;
@@ -737,47 +734,45 @@ void GRM::cut_rel(float thresh, bool no_grm){
     if(!no_grm){
         std::ranges::copy(keep_ID, std::ostream_iterator<string>(o_keep, "\n"));
         o_keep.close();
-        LOGGER.i(2, "Pruned unrelated IDs have been saved to " + options["out"] + ".grm.id");
+        LOGGER.i(2, "Pruned unrelated IDs have been saved to " + o_name + ".grm.id");
     }
 
     if(detail_flag){
         std::ranges::copy(keep_ID, std::ostream_iterator<string>(o_single, "\n"));
         o_single.close();
-        LOGGER.i(2, "Pruned singleton IDs have been saved to " + options["out"] + ".singleton.txt");
+        LOGGER.i(2, "Pruned singleton IDs have been saved to " + o_name + ".singleton.txt");
     }
 
     if(no_grm) {
-        fclose(grmFile);
         return;
     }
 
     LOGGER.i(0, "Pruning GRM values, total parts " + std::to_string(index_grm_pairs.size()));
-    FILE *grm_out_file = fopen((options["out"] + ".grm.bin").c_str(), "wb");
+    UniqueFile grm_out_file = open_file(o_name + ".grm.bin", "wb");
     if(!grm_out_file){
-        LOGGER.e(0, "can't open [" + options["out"] + ".grm.bin] to write");
+        LOGGER.e(0, "can't open [" + o_name + ".grm.bin] to write");
     }
-    fseek(grmFile, 0, SEEK_SET);
-    outBinFile(grmFile, grm_out_file);
-    fclose(grmFile);
-    fclose(grm_out_file);
-    LOGGER.i(2, "GRM values have been saved to [" + options["out"] + ".grm.bin]");
+    fseek(grmFile.get(), 0, SEEK_SET);
+    outBinFile(grmFile.get(), grm_out_file.get());
+    grmFile.reset();
+    grm_out_file.reset();
+    LOGGER.i(2, "GRM values have been saved to [" + o_name + ".grm.bin]");
 
     LOGGER.i(0, "Pruning number of SNPs to calculate GRM, total parts " + std::to_string(index_grm_pairs.size()));
-    FILE *NFile = fopen((grm_file + ".grm.N.bin").c_str(), "rb");
+    UniqueFile NFile = open_file(grm_file + ".grm.N.bin", "rb");
     if(!NFile){
         LOGGER.w(2, "There is no [" + grm_file + ".grm.N.bin]");
         return;
     }
-    FILE *N_out_file = fopen((options["out"] + ".grm.N.bin").c_str(), "wb");
+    UniqueFile N_out_file = open_file(o_name + ".grm.N.bin", "wb");
     if(!N_out_file){
-        LOGGER.w(2, "can't open [" + options["out"] + ".grm.N.bin] to write. Ignore this step");
-        fclose(NFile);
+        LOGGER.w(2, "can't open [" + o_name + ".grm.N.bin] to write. Ignore this step");
         return;
     }
-    outBinFile(NFile, N_out_file);
-    fclose(NFile);
-    fclose(N_out_file);
-    LOGGER.i(2, "Number of SNPs has been saved to [" + options["out"] + ".grm.N.bin]");
+    outBinFile(NFile.get(), N_out_file.get());
+    NFile.reset();
+    N_out_file.reset();
+    LOGGER.i(2, "Number of SNPs has been saved to [" + o_name + ".grm.N.bin]");
 }
 
 void GRM::outBinFile(FILE *sFile, FILE *dFile) {
@@ -814,25 +809,18 @@ void GRM::outBinFile(FILE *sFile, FILE *dFile) {
 }
 
 
-GRM::GRM(Pheno* pheno, Marker* marker) {
-    //clock_t begin = t_begin();
+GRM::GRM(Pheno* pheno, Marker* marker, const gcta_cli::GrmMakeOptions& opts, const std::string& out_prefix) {
+    GRM::nMarkerBlock = opts.n_markers.value_or(1024);
     this->pheno = pheno;
     this->marker = marker;
-    this->geno = new Geno(pheno, marker);
+    this->geno = std::make_unique<Geno>(pheno, marker, opts.geno, opts.marker_filter, out_prefix);
     // Pay attention to not reflect the newest changes of keep;
     this->index_keep = pheno->get_index_keep();
-    this->part = std::stoi(options["cur_part"]);
-    this->num_parts = std::stoi(options["num_parts"]);
+    this->num_parts = opts.part ? static_cast<uint32_t>(opts.part->first) : 1u;
+    this->part = opts.part ? static_cast<uint32_t>(opts.part->second) : 1u;
 
-    // divide the genotype into equal length
-    vector<uint32_t> parts;
-    if(options.find("use_blas") != options.end()){
-        bBLAS = true;
-        parts = divide_parts_mem(pheno->count_keep(), num_parts);
-    }else{
-        bBLAS = false;
-        parts = divide_parts(0, pheno->count_keep() - 1, num_parts);
-    }
+    bBLAS = true;
+    vector<uint32_t> parts = divide_parts_mem(pheno->count_keep(), num_parts);
 
     if (parts.size() != num_parts) {
         LOGGER.w(0, "cannot divide into " + to_string(num_parts) + ". Use " + to_string(parts.size()) + " instead.");
@@ -866,18 +854,24 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
     // the budget is large enough that processMakeGRM will fall back to the
     // dense path itself -- see grm_tile_budget_covers_whole, used both here
     // and there so this can't disagree with that).
-    bool ctor_tiling_enabled = options_d.count("grm_tile_budget_bytes") > 0
-                              && options_d.at("grm_tile_budget_bytes") > 0;
+    grm_tile_budget_bytes = opts.tile_budget_gb
+        ? (*opts.tile_budget_gb * 1024.0 * 1024.0 * 1024.0)
+        : 0.0;
+    if (opts.sparse_cutoff.has_value()) {
+        sparse_cutoff = static_cast<float>(*opts.sparse_cutoff);
+    }
+    bool ctor_tiling_enabled = grm_tile_budget_bytes > 0.0;
     if(ctor_tiling_enabled && grm_tile_budget_covers_whole(
             static_cast<int>(part_keep_indices.first),
             static_cast<int>(part_keep_indices.second) + 1,
-            options_d.at("grm_tile_budget_bytes") / 12.0)){
+            grm_tile_budget_bytes / 12.0)){
         ctor_tiling_enabled = false;
     }
     if(!bBLAS || !ctor_tiling_enabled){
-        int ret_grm = posix_memalign((void **)&grm, 32, fill_grm * sizeof(double));
-        if(ret_grm){
-            LOGGER.e(0, "can't allocate enough memory to store the (parted) GRM: " + to_string(fill_grm*sizeof(double) / 1024.0/1024/1024) + "GB required.");
+        grm = make_aligned_uninitialized<double, 64>(fill_grm);
+        if(!grm){
+            LOGGER.error(0, "can't allocate enough memory to store the (parted) GRM: {:.2f}GB required.",
+                         fill_grm * sizeof(double) / (1024.0 * 1024.0 * 1024.0));
         }
         if(bBLAS){
             // grm here is a dense (grm_m x grm_n) buffer for cblas_dsyrk/dgemm, not the
@@ -889,18 +883,18 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
             // untouched upper triangle. See grm_first_accum.
             grm_first_accum = true;
         } else {
-            memset(grm, 0, fill_grm * sizeof(double));
+            std::memset(grm.get(), 0, fill_grm * sizeof(double));
         }
 
         // N stays packed-triangular size even in bBLAS mode (fill_N was captured
         // before the bBLAS override above), so this memset has no waste to fix.
-        int ret_N = posix_memalign((void **)&N, 64, fill_N * sizeof(uint32_t));
-        if(ret_N){
-            LOGGER.e(0, "can't allocate enough memory to store (parted) N: " + to_string(fill_grm*sizeof(uint32_t) / 1024.0/1024/1024) + "GB required.");
+        N = make_aligned_uninitialized<uint32_t, 64>(fill_N);
+        if(!N){
+            LOGGER.error(0, "can't allocate enough memory to store (parted) N: {:.2f}GB required.",
+                         fill_N * sizeof(uint32_t) / (1024.0 * 1024.0 * 1024.0));
         }
-        memset(N, 0, fill_N * sizeof(uint32_t));
+        std::memset(N.get(), 0, fill_N * sizeof(uint32_t));
     }
-    // grm/N == nullptr for bBLAS; posix_mem_free(nullptr) is a safe no-op.
 
     // +64 pads sub_miss past the last valid index by one full cache line (64 × sizeof(uint32_t) = 256 bytes).
     // This prevents OMP threads from writing to adjacent cache lines when two threads operate on
@@ -920,22 +914,18 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
         index_grm_pairs.push_back(std::make_pair(thread_parts[index - 1] + 1, thread_parts[index]));
     }
 
-    if(options_b.find("isDominance") != options_b.end()){
-        isDominance = options_b["isDominance"];
-    }
-
-    if(options_b.find("isMtd") != options_b.end()){
-        isMtd = options_b["isMtd"];
-    }
+    isDominance = opts.dominance;
+    isMtd = (opts.alg == gcta_cli::GrmAlg::VanRaden);
 
     // Cache constants derived from part_keep_indices
     grm_n = static_cast<int>(part_keep_indices.second) + 1;
     grm_m = static_cast<int>(part_keep_indices.second) - static_cast<int>(part_keep_indices.first) + 1;
     grm_s_n = grm_n - grm_m;
-    grm_bytes_std_geno = static_cast<int>(sizeof(double)) * grm_n;
-    // Round grm_n up to next multiple of 8 (64 bytes) so every column of stdGeno
-    // is 64-byte aligned. Required by single-threaded AVX/AVX-512 BLAS kernels.
-    stdGenoLD = (grm_n + 7) / 8 * 8;
+    grm_bytes_std_geno = static_cast<int>(sizeof(float)) * grm_n;
+    // Round up to a multiple of 64 elements so every column of stdGeno / stdGeno_i8
+    // is 64-byte aligned and has capacity >= index_keep.size() (for --make-grm-part).
+    const int ld_base = std::max(grm_n, static_cast<int>(index_keep.size()));
+    stdGenoLD = (ld_base + 63) / 64 * 64;
     // Pre-allocate scratch buffers for calculate_GRM_blas
     validIndexBuf.reserve(nMarkerBlock);
     {
@@ -955,7 +945,7 @@ GRM::GRM(Pheno* pheno, Marker* marker) {
     LOGGER.i(0, "Subset " + to_string(part) + "/" + to_string(num_parts) + ", no. subject " + to_string(part_keep_indices.first + 1) + "-" + to_string(part_keep_indices.second + 1));
     LOGGER.i(1, to_string(num_individual) + " samples, " + to_string(marker->count_extract()) + " markers, " + to_string(num_grm) + " GRM elements");
 
-    o_name = options["out"];
+    o_name = out_prefix;
 
     if(isDominance){
         o_name += ".d";
@@ -981,12 +971,28 @@ void GRM::output_id() {
 void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerIndex){
     int num_marker = markerIndex.size();
 
-    #pragma omp parallel for schedule(static)
-    for(int i = 0; i < num_marker; i++){
-        GenoBufItem &item = gbufitems[i];
-        item.extractedMarkerIndex = markerIndex[i];
-        item.geno_ptr = stdGeno + static_cast<size_t>(i) * stdGenoLD;
-        geno->getGenoDouble(buf, i, &item);
+    if (use_int8_grm) {
+        int8_t* const std_geno_i8_base = std::assume_aligned<64>(stdGeno_i8.get());
+        #pragma omp parallel for schedule(static)
+        for(int i = 0; i < num_marker; i++){
+            GenoBufItem &item = gbufitems[i];
+            item.extractedMarkerIndex = markerIndex[i];
+            item.geno_ptr = nullptr;
+            item.geno_f32_ptr = nullptr;
+            item.geno_i8_ptr = std_geno_i8_base + static_cast<size_t>(i) * stdGenoLD;
+            geno->getGenoDouble(buf, i, &item);
+        }
+    } else {
+        float* const std_geno_base = std::assume_aligned<64>(stdGeno.get());
+        #pragma omp parallel for schedule(static)
+        for(int i = 0; i < num_marker; i++){
+            GenoBufItem &item = gbufitems[i];
+            item.extractedMarkerIndex = markerIndex[i];
+            item.geno_ptr = nullptr;
+            item.geno_i8_ptr = nullptr;
+            item.geno_f32_ptr = std_geno_base + static_cast<size_t>(i) * stdGenoLD;
+            geno->getGenoDouble(buf, i, &item);
+        }
     }
 
     validIndexBuf.clear();
@@ -999,15 +1005,28 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
     int curNumValidMarkers = static_cast<int>(validIndexBuf.size());
 
     // When all markers in the block pass filters (curNumValidMarkers == num_marker),
-    // every column is already decoded in-place at stdGeno + i * stdGenoLD.
+    // every column is already decoded in-place at stdGeno / stdGeno_i8 + i * stdGenoLD.
     // Otherwise, compact valid columns forward in-place (validIndexBuf[k] >= k).
     if (curNumValidMarkers < num_marker) {
-        for (int k = 0; k < curNumValidMarkers; ++k) {
-            const int src_idx = validIndexBuf[k];
-            if (src_idx != k) {
-                std::memcpy(stdGeno + static_cast<size_t>(k) * stdGenoLD,
-                            stdGeno + static_cast<size_t>(src_idx) * stdGenoLD,
-                            static_cast<size_t>(grm_bytes_std_geno));
+        if (use_int8_grm) {
+            int8_t* const std_geno_i8_base = std::assume_aligned<64>(stdGeno_i8.get());
+            for (int k = 0; k < curNumValidMarkers; ++k) {
+                const int src_idx = validIndexBuf[k];
+                if (src_idx != k) {
+                    std::memcpy(std_geno_i8_base + static_cast<size_t>(k) * stdGenoLD,
+                                std_geno_i8_base + static_cast<size_t>(src_idx) * stdGenoLD,
+                                static_cast<size_t>(grm_bytes_std_geno));
+                }
+            }
+        } else {
+            float* const std_geno_base = std::assume_aligned<64>(stdGeno.get());
+            for (int k = 0; k < curNumValidMarkers; ++k) {
+                const int src_idx = validIndexBuf[k];
+                if (src_idx != k) {
+                    std::memcpy(std_geno_base + static_cast<size_t>(k) * stdGenoLD,
+                                std_geno_base + static_cast<size_t>(src_idx) * stdGenoLD,
+                                static_cast<size_t>(grm_bytes_std_geno));
+                }
             }
         }
     }
@@ -1017,72 +1036,402 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         }
     }
 
-    static constexpr double alpha = 1.0;
-    // beta=0 on the *first* accumulation for this grm buffer (full pass or current
-    // tile) makes cblas_dsyrk/cblas_dgemm write straight into unzeroed memory instead
-    // of accumulating, so the very first touch of every page is confined to the
-    // elements that call actually writes: the lower triangle only for *syrk, the full
-    // rectangle for *gemm. beta=1 on every later block accumulates as before. This is
-    // what lets selfadjointView-style "lower triangle only" storage translate into
-    // actual reduced peak RSS -- a blanket memset before the loop would fault in the
-    // untouched upper triangle regardless of what BLAS does afterwards.
-    const double blas_beta = grm_first_accum ? 0.0 : 1.0;
-    if(grm_tiling_enabled){
-        // Block-tiled path: split into off-diagonal dgemm + diagonal dsyrk.
-        //
-        // grm buffer is column-major (grm_tile_rows × grm_tile_cols):
-        //   cols [0, tile_rs)    — off-diagonal, filled by dgemm
-        //   cols [tile_rs, tile_re) — diagonal block (lower triangle), filled by dsyrk
-        //
-        // A_tile = stdGeno[tile_rs : tile_re, :] — (tile_rows × k), stored column-major
-        // with leading dimension stdGenoLD.
+    constexpr int kTile = 4096;
+    const bool first_accum = grm_first_accum;
+    double* const grm_base = std::assume_aligned<64>(grm.get());
 
-        // Off-diagonal block: only present when tile starts after column 0.
-        // C(tile_rows x tile_rs) := alpha * A_tile * A_top^T + beta * C
-        if(grm_tile_rs > 0){
-            cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans,
-                        grm_tile_rows, grm_tile_rs, curNumValidMarkers,
-                        alpha,
-                        stdGeno + grm_tile_rs, stdGenoLD,
-                        stdGeno, stdGenoLD,
-                        blas_beta,
-                        grm, grm_tile_rows);
+    if (use_int8_grm) {
+        const int8_t* const std_geno_i8_base = std::assume_aligned<64>(stdGeno_i8.get());
+        double S_mu2 = 0.0;
+        for (int m = 0; m < curNumValidMarkers; ++m) {
+            const double mu_m = gbufitems[validIndexBuf[m]].mean;
+            mu_vec_[m] = mu_m;
+            S_mu2 += mu_m * mu_m;
         }
 
-        // Diagonal block (dsyrk — ~2× fewer flops than equivalent dgemm).
-        // Only the lower triangle is written; flush_grm_tile only reads pair2 <= pair1.
-        double *grm_diag = grm + static_cast<size_t>(grm_tile_rs) * grm_tile_rows;
-        cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans,
-                    grm_tile_rows, curNumValidMarkers,
-                    alpha,
-                    stdGeno + grm_tile_rs, stdGenoLD,
-                    blas_beta,
-                    grm_diag, grm_tile_rows);
-    } else if(part_keep_indices.first == 0){
-        cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans,
-                    grm_n, curNumValidMarkers,
-                    alpha,
-                    stdGeno, stdGenoLD,
-                    blas_beta,
-                    grm, grm_n);
-    }else{
-        // C(grm_m x grm_s_n) := alpha * A_bot * A_top^T + beta * C
-        cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans,
-                    grm_m, grm_s_n, curNumValidMarkers,
-                    alpha,
-                    stdGeno + part_keep_indices.first, stdGenoLD,
-                    stdGeno, stdGenoLD,
-                    blas_beta,
-                    grm, grm_m);
-        double *grm_start = grm + (uint64_t)grm_s_n * grm_m;
-        cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans,
-                    grm_m, curNumValidMarkers,
-                    alpha,
-                    stdGeno + part_keep_indices.first, stdGenoLD,
-                    blas_beta,
-                    grm_start, grm_m);
+        // Compute per-sample row sums r_raw_[i] = sum_m g_{im} * mu_m in parallel.
+        constexpr int kRowChunk = 1024;
+        #pragma omp parallel for schedule(static)
+        for (int i0 = 0; i0 < grm_n; i0 += kRowChunk) {
+            const int len = std::min(kRowChunk, grm_n - i0);
+            double* r_slice = r_raw_.data() + i0;
+            std::memset(r_slice, 0, static_cast<size_t>(len) * sizeof(double));
+            for (int m = 0; m < curNumValidMarkers; ++m) {
+                const double mu_m = mu_vec_[m];
+                const int8_t* col_m = std_geno_i8_base + static_cast<size_t>(m) * stdGenoLD + i0;
+                for (int r = 0; r < len; ++r) {
+                    r_slice[r] += static_cast<double>(col_m[r]) * mu_m;
+                }
+            }
+        }
+
+        bool block_has_missing = false;
+        const uint32_t full_keep_ct = static_cast<uint32_t>(index_keep.size());
+        for (int m = 0; m < curNumValidMarkers; ++m) {
+            if (gbufitems[validIndexBuf[m]].nValidN < full_keep_ct) {
+                block_has_missing = true;
+                break;
+            }
+        }
+
+        marker_miss_idx_.clear();
+        if (block_has_missing) {
+            std::memcpy(r_tilde_.data(), r_raw_.data(), static_cast<size_t>(grm_n) * sizeof(double));
+            const int num_words = (grm_n + 63) / 64;
+            const uintptr_t last_word_mask = (grm_n % 64 == 0)
+                ? ~static_cast<uintptr_t>(0)
+                : ((static_cast<uintptr_t>(1) << (grm_n % 64)) - 1);
+            marker_miss_offset_[0] = 0;
+            for (int m = 0; m < curNumValidMarkers; ++m) {
+                const GenoBufItem& item = gbufitems[validIndexBuf[m]];
+                if (item.nValidN < full_keep_ct && !item.missing.empty()) {
+                    const double mu2 = mu_vec_[m] * mu_vec_[m];
+                    const uintptr_t* miss_words = item.missing.data();
+                    for (int w = 0; w < num_words; ++w) {
+                        uintptr_t word = miss_words[w];
+                        if (w == num_words - 1) word &= last_word_mask;
+                        while (word != 0) {
+                            const int bit = std::countr_zero(word);
+                            const int s = w * 64 + bit;
+                            r_tilde_[s] += mu2;
+                            marker_miss_idx_.push_back(s);
+                            word &= (word - 1);
+                        }
+                    }
+                }
+                marker_miss_offset_[m + 1] = static_cast<int>(marker_miss_idx_.size());
+            }
+            if (marker_miss_idx_.empty()) {
+                block_has_missing = false;
+            }
+        }
+        const double* r_row_vec = block_has_missing ? r_tilde_.data() : r_raw_.data();
+
+        std::vector<int> row_miss_b;
+        std::vector<int> row_miss_e;
+        std::vector<int> active_row_miss_markers;
+        std::vector<int> col_miss_offset;
+        std::vector<int> col_miss_m;
+        if (block_has_missing) {
+            row_miss_b.resize(curNumValidMarkers);
+            row_miss_e.resize(curNumValidMarkers);
+            active_row_miss_markers.reserve(curNumValidMarkers);
+        }
+
+        auto prepare_col_missing = [&](int global_c0, int cols) {
+            if (!block_has_missing) return;
+            col_miss_offset.assign(cols + 1, 0);
+            for (int m = 0; m < curNumValidMarkers; ++m) {
+                const int mb = marker_miss_offset_[m];
+                const int me = marker_miss_offset_[m + 1];
+                if (mb == me) continue;
+                const auto it_b = std::lower_bound(marker_miss_idx_.begin() + mb,
+                                                   marker_miss_idx_.begin() + me,
+                                                   global_c0);
+                const auto it_e = std::lower_bound(it_b,
+                                                   marker_miss_idx_.begin() + me,
+                                                   global_c0 + cols);
+                for (auto it = it_b; it != it_e; ++it) {
+                    col_miss_offset[(*it - global_c0) + 1]++;
+                }
+            }
+            for (int c = 0; c < cols; ++c) {
+                col_miss_offset[c + 1] += col_miss_offset[c];
+            }
+            col_miss_m.resize(col_miss_offset[cols]);
+            std::vector<int> write_pos(col_miss_offset.begin(), col_miss_offset.begin() + cols);
+            for (int m = 0; m < curNumValidMarkers; ++m) {
+                const int mb = marker_miss_offset_[m];
+                const int me = marker_miss_offset_[m + 1];
+                if (mb == me) continue;
+                const auto it_b = std::lower_bound(marker_miss_idx_.begin() + mb,
+                                                   marker_miss_idx_.begin() + me,
+                                                   global_c0);
+                const auto it_e = std::lower_bound(it_b,
+                                                   marker_miss_idx_.begin() + me,
+                                                   global_c0 + cols);
+                for (auto it = it_b; it != it_e; ++it) {
+                    col_miss_m[write_pos[*it - global_c0]++] = m;
+                }
+            }
+        };
+
+        auto prepare_row_missing = [&](int global_r0, int rows) {
+            if (!block_has_missing) return;
+            active_row_miss_markers.clear();
+            for (int m = 0; m < curNumValidMarkers; ++m) {
+                const int mb = marker_miss_offset_[m];
+                const int me = marker_miss_offset_[m + 1];
+                if (mb == me) {
+                    row_miss_b[m] = row_miss_e[m] = mb;
+                    continue;
+                }
+                const int b = static_cast<int>(std::lower_bound(
+                    marker_miss_idx_.begin() + mb,
+                    marker_miss_idx_.begin() + me,
+                    global_r0) - marker_miss_idx_.begin());
+                const int e = static_cast<int>(std::lower_bound(
+                    marker_miss_idx_.begin() + b,
+                    marker_miss_idx_.begin() + me,
+                    global_r0 + rows) - marker_miss_idx_.begin());
+                row_miss_b[m] = b;
+                row_miss_e[m] = e;
+                if (b < e) {
+                    active_row_miss_markers.push_back(m);
+                }
+            }
+        };
+
+        auto accum_col_with_centering = [&](int c, int j, int row_start, int len,
+                                            const int32_t* src_col, double* dst_col) {
+            const double r_j_plus_S = S_mu2 - r_raw_[j];
+            const double* r_row_slice = r_row_vec + row_start;
+            if (first_accum) {
+                for (int r = 0; r < len; ++r) {
+                    dst_col[r] = static_cast<double>(src_col[r]) - r_row_slice[r] + r_j_plus_S;
+                }
+            } else {
+                for (int r = 0; r < len; ++r) {
+                    dst_col[r] += static_cast<double>(src_col[r]) - r_row_slice[r] + r_j_plus_S;
+                }
+            }
+            if (!block_has_missing) return;
+
+            // Step 2: markers missing in column j
+            const int cm_b = col_miss_offset[c];
+            const int cm_e = col_miss_offset[c + 1];
+            for (int idx = cm_b; idx < cm_e; ++idx) {
+                const int m = col_miss_m[idx];
+                const double mu_m = mu_vec_[m];
+                const double neg_mu2 = -mu_m * mu_m;
+                const int8_t* col_m = std_geno_i8_base + static_cast<size_t>(m) * stdGenoLD + row_start;
+                for (int r = 0; r < len; ++r) {
+                    dst_col[r] += static_cast<double>(col_m[r]) * mu_m + neg_mu2;
+                }
+                for (int r_idx = row_miss_b[m]; r_idx < row_miss_e[m]; ++r_idx) {
+                    const int s = marker_miss_idx_[r_idx];
+                    if (s >= row_start) {
+                        dst_col[s - row_start] -= neg_mu2;
+                    }
+                }
+            }
+
+            // Step 3: markers missing in rows [row_start, row_start + len)
+            for (int m : active_row_miss_markers) {
+                const int8_t g_jm = std_geno_i8_base[static_cast<size_t>(m) * stdGenoLD + j];
+                if (g_jm != 0) {
+                    const double corr = mu_vec_[m] * static_cast<double>(g_jm);
+                    for (int r_idx = row_miss_b[m]; r_idx < row_miss_e[m]; ++r_idx) {
+                        const int s = marker_miss_idx_[r_idx];
+                        if (s >= row_start) {
+                            dst_col[s - row_start] += corr;
+                        }
+                    }
+                }
+            }
+        };
+
+        auto accum_i8_gemm_to_f64 = [&](int row_base, int M, int col_base, int N_cols, int K,
+                                        double* C, int ldc) {
+            for (int c0 = 0; c0 < N_cols; c0 += kTile) {
+                const int cols = std::min(kTile, N_cols - c0);
+                const int global_c0 = col_base + c0;
+                if (K > 0) prepare_col_missing(global_c0, cols);
+                for (int r0 = 0; r0 < M; r0 += kTile) {
+                    const int rows = std::min(kTile, M - r0);
+                    const int global_r0 = row_base + r0;
+                    if (K > 0) {
+                        prepare_row_missing(global_r0, rows);
+                        gcta_gemm_s8s8s32_colmajor_nt(
+                            rows, cols, K,
+                            std_geno_i8_base + global_r0, stdGenoLD,
+                            std_geno_i8_base + global_c0, stdGenoLD,
+                            grm_i32_tile_.data(), rows,
+                            i8_scratch_A_f32_, i8_scratch_B_f32_, grm_f32_tile_);
+                    }
+                    #pragma omp parallel for schedule(static)
+                    for (int c = 0; c < cols; ++c) {
+                        double* dst_col = C + r0 + static_cast<size_t>(c0 + c) * ldc;
+                        if (K == 0) {
+                            if (first_accum)
+                                std::memset(dst_col, 0, static_cast<size_t>(rows) * sizeof(double));
+                            continue;
+                        }
+                        const int32_t* src_col = grm_i32_tile_.data() + static_cast<size_t>(c) * rows;
+                        accum_col_with_centering(c, global_c0 + c, global_r0, rows, src_col, dst_col);
+                    }
+                }
+            }
+        };
+
+        auto accum_i8_syrk_lower_to_f64 = [&](int base, int N_dim, int K,
+                                              double* C, int ldc) {
+            for (int c0 = 0; c0 < N_dim; c0 += kTile) {
+                const int cols = std::min(kTile, N_dim - c0);
+                const int global_c0 = base + c0;
+                if (K > 0) {
+                    prepare_col_missing(global_c0, cols);
+                    prepare_row_missing(global_c0, cols);
+                    gcta_syrk_s8s8s32_lower_colmajor_nt(
+                        cols, K,
+                        std_geno_i8_base + global_c0, stdGenoLD,
+                        grm_i32_tile_.data(), cols,
+                        i8_scratch_A_f32_, grm_f32_tile_);
+                }
+                #pragma omp parallel for schedule(guided)
+                for (int c = 0; c < cols; ++c) {
+                    double* dst_col = C + (c0 + c) + static_cast<size_t>(c0 + c) * ldc;
+                    const int len = cols - c;
+                    if (K == 0) {
+                        if (first_accum)
+                            std::memset(dst_col, 0, static_cast<size_t>(len) * sizeof(double));
+                        continue;
+                    }
+                    const int32_t* src_col = grm_i32_tile_.data() + c + static_cast<size_t>(c) * cols;
+                    const int j = global_c0 + c;
+                    accum_col_with_centering(c, j, j, len, src_col, dst_col);
+                }
+                const int rem_rows = N_dim - (c0 + cols);
+                if (rem_rows > 0) {
+                    accum_i8_gemm_to_f64(base + c0 + cols, rem_rows,
+                                         global_c0, cols, K,
+                                         C + (c0 + cols) + static_cast<size_t>(c0) * ldc, ldc);
+                }
+            }
+        };
+
+        if (grm_tiling_enabled) {
+            if (grm_tile_rs > 0) {
+                accum_i8_gemm_to_f64(grm_tile_rs, grm_tile_rows, 0, grm_tile_rs, curNumValidMarkers,
+                                     grm_base, grm_tile_rows);
+            }
+            double *grm_diag = grm_base + static_cast<size_t>(grm_tile_rs) * grm_tile_rows;
+            accum_i8_syrk_lower_to_f64(grm_tile_rs, grm_tile_rows, curNumValidMarkers,
+                                       grm_diag, grm_tile_rows);
+        } else if (part_keep_indices.first == 0) {
+            accum_i8_syrk_lower_to_f64(0, grm_n, curNumValidMarkers,
+                                       grm_base, grm_n);
+        } else {
+            const int row_base = static_cast<int>(part_keep_indices.first);
+            accum_i8_gemm_to_f64(row_base, grm_m, 0, grm_s_n, curNumValidMarkers,
+                                 grm_base, grm_m);
+            double *grm_start = grm_base + static_cast<uint64_t>(grm_s_n) * grm_m;
+            accum_i8_syrk_lower_to_f64(row_base, grm_m, curNumValidMarkers,
+                                       grm_start, grm_m);
+        }
+    } else {
+        const float* const std_geno_base = std::assume_aligned<64>(stdGeno.get());
+        // Mixed-precision BLAS3: run cblas_ssyrk / cblas_sgemm (beta=0.0f) on L3-sized
+        // 4096x4096 float32 tiles (grm_f32_tile_), then widen and accumulate into
+        // double* grm. On the first accumulation for this grm buffer (grm_first_accum),
+        // write directly to unzeroed memory instead of accumulating so untouched upper-
+        // triangle pages of grm stay unfaulted in physical RAM.
+        auto accum_sgemm_to_f64 = [&](int M, int N_cols, int K,
+                                      const float* A, int lda,
+                                      const float* B, int ldb,
+                                      double* C, int ldc) {
+            for (int c0 = 0; c0 < N_cols; c0 += kTile) {
+                const int cols = std::min(kTile, N_cols - c0);
+                for (int r0 = 0; r0 < M; r0 += kTile) {
+                    const int rows = std::min(kTile, M - r0);
+                    if (K > 0) {
+                        cblas_sgemm(CblasColMajor, CblasNoTrans, CblasTrans,
+                                    rows, cols, K,
+                                    1.0f,
+                                    A + r0, lda,
+                                    B + c0, ldb,
+                                    0.0f,
+                                    grm_f32_tile_.data(), rows);
+                    }
+                    #pragma omp parallel for schedule(static)
+                    for (int c = 0; c < cols; ++c) {
+                        double* dst_col = C + r0 + static_cast<size_t>(c0 + c) * ldc;
+                        if (K == 0) {
+                            if (first_accum)
+                                std::memset(dst_col, 0, static_cast<size_t>(rows) * sizeof(double));
+                            continue;
+                        }
+                        const float* src_col = grm_f32_tile_.data() + static_cast<size_t>(c) * rows;
+                        if (first_accum) {
+                            for (int r = 0; r < rows; ++r)
+                                dst_col[r] = static_cast<double>(src_col[r]);
+                        } else {
+                            for (int r = 0; r < rows; ++r)
+                                dst_col[r] += static_cast<double>(src_col[r]);
+                        }
+                    }
+                }
+            }
+        };
+
+        auto accum_ssyrk_lower_to_f64 = [&](int N_dim, int K,
+                                            const float* A, int lda,
+                                            double* C, int ldc) {
+            for (int c0 = 0; c0 < N_dim; c0 += kTile) {
+                const int cols = std::min(kTile, N_dim - c0);
+                if (K > 0) {
+                    cblas_ssyrk(CblasColMajor, CblasLower, CblasNoTrans,
+                                cols, K,
+                                1.0f,
+                                A + c0, lda,
+                                0.0f,
+                                grm_f32_tile_.data(), cols);
+                }
+                #pragma omp parallel for schedule(guided)
+                for (int c = 0; c < cols; ++c) {
+                    double* dst_col = C + (c0 + c) + static_cast<size_t>(c0 + c) * ldc;
+                    const int len = cols - c;
+                    if (K == 0) {
+                        if (first_accum)
+                            std::memset(dst_col, 0, static_cast<size_t>(len) * sizeof(double));
+                        continue;
+                    }
+                    const float* src_col = grm_f32_tile_.data() + c + static_cast<size_t>(c) * cols;
+                    if (first_accum) {
+                        for (int r = 0; r < len; ++r)
+                            dst_col[r] = static_cast<double>(src_col[r]);
+                    } else {
+                        for (int r = 0; r < len; ++r)
+                            dst_col[r] += static_cast<double>(src_col[r]);
+                    }
+                }
+                const int rem_rows = N_dim - (c0 + cols);
+                if (rem_rows > 0) {
+                    accum_sgemm_to_f64(rem_rows, cols, K,
+                                       A + c0 + cols, lda,
+                                       A + c0, lda,
+                                       C + (c0 + cols) + static_cast<size_t>(c0) * ldc, ldc);
+                }
+            }
+        };
+
+        if(grm_tiling_enabled){
+            if(grm_tile_rs > 0){
+                accum_sgemm_to_f64(grm_tile_rows, grm_tile_rs, curNumValidMarkers,
+                                   std_geno_base + grm_tile_rs, stdGenoLD,
+                                   std_geno_base, stdGenoLD,
+                                   grm_base, grm_tile_rows);
+            }
+            double *grm_diag = grm_base + static_cast<size_t>(grm_tile_rs) * grm_tile_rows;
+            accum_ssyrk_lower_to_f64(grm_tile_rows, curNumValidMarkers,
+                                     std_geno_base + grm_tile_rs, stdGenoLD,
+                                     grm_diag, grm_tile_rows);
+        } else if(part_keep_indices.first == 0){
+            accum_ssyrk_lower_to_f64(grm_n, curNumValidMarkers,
+                                     std_geno_base, stdGenoLD,
+                                     grm_base, grm_n);
+        }else{
+            accum_sgemm_to_f64(grm_m, grm_s_n, curNumValidMarkers,
+                               std_geno_base + part_keep_indices.first, stdGenoLD,
+                               std_geno_base, stdGenoLD,
+                               grm_base, grm_m);
+            double *grm_start = grm_base + (uint64_t)grm_s_n * grm_m;
+            accum_ssyrk_lower_to_f64(grm_m, curNumValidMarkers,
+                                     std_geno_base + part_keep_indices.first, stdGenoLD,
+                                     grm_start, grm_m);
+        }
     }
-    grm_first_accum = false;  // every later marker block for this buffer accumulates (beta=1)
+    grm_first_accum = false;  // every later marker block for this buffer accumulates
 
     const int markerPerN = sizeof(uintptr_t) * CHAR_BIT;
     const int numNblock = (curNumValidMarkers + markerPerN - 1) / markerPerN;
@@ -1154,33 +1503,34 @@ void GRM::deduce_GRM(){
     LOGGER.i(0, "The GRM computation is completed.");
     float thresh = -99.0f;
     bool isSparse = false;
-    if(options_d.find("sparse_cutoff") != options_d.end()){
-        thresh = static_cast<float>(options_d["sparse_cutoff"]);
+    if(sparse_cutoff.has_value()){
+        thresh = *sparse_cutoff;
         isSparse = true;
         LOGGER.i(0, "Saving sparse GRM with a cutoff " + to_string(thresh) + "...");
     }else{
         LOGGER.i(0, "Saving GRM...");
     }
 
-    FILE *grm_out = nullptr, *N_out = nullptr;
+    UniqueFile grm_out;
+    UniqueFile N_out;
     if(isSparse){
-        grm_out = fopen((o_name + ".grm.sp").c_str(), "wb");
+        grm_out = open_file(o_name + ".grm.sp", "wb");
         if(!grm_out){
-            LOGGER.e(0, "can't open " + o_name + ".grm.sp to write");
+            LOGGER.error(0, "can't open {}.grm.sp to write", o_name);
         }
     }else{
-        grm_out = fopen((o_name + ".grm.bin").c_str(), "wb");
-        N_out   = fopen((o_name + ".grm.N.bin").c_str(), "wb");
+        grm_out = open_file(o_name + ".grm.bin", "wb");
+        N_out   = open_file(o_name + ".grm.N.bin", "wb");
         if((!grm_out) || (!N_out)){
-            LOGGER.e(0, "can't open " + o_name + ".grm.bin or .grm.N.bin to write");
+            LOGGER.error(0, "can't open {}.grm.bin or .grm.N.bin to write", o_name);
         }
         // 4 MiB matches a typical Lustre stripe size and avoids sub-stripe metadata ops.
-        setvbuf(grm_out, nullptr, _IOFBF, 4 << 20);
-        setvbuf(N_out,   nullptr, _IOFBF, 4 << 20);
+        setvbuf(grm_out.get(), nullptr, _IOFBF, 4 << 20);
+        setvbuf(N_out.get(),   nullptr, _IOFBF, 4 << 20);
     }
 
     float mtd_weight = 1.0f;
-    if(options_b["isMtd"]){
+    if(isMtd){
         float weight = 0.0f;
         if(!isDominance){
             for(uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i];
@@ -1200,11 +1550,11 @@ void GRM::deduce_GRM(){
     std::vector<float> w_N;
     std::vector<float> grm_block;
     std::string sparse_buf;
-    flush_grm_tile(grm_out, N_out, thresh, isSparse, mtd_weight,
+    flush_grm_tile(grm_out.get(), N_out.get(), thresh, isSparse, mtd_weight,
                    w_N, grm_block, sparse_buf);
 
-    if(grm_out) fclose(grm_out);
-    if(N_out)   fclose(N_out);
+    grm_out.reset();
+    N_out.reset();
     if(!isSparse){
         LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.bin]");
         LOGGER.i(0, "Number of SNPs in each pair of individuals has been saved in the file [" + o_name + ".grm.N.bin]");
@@ -1240,13 +1590,16 @@ void GRM::flush_grm_tile(FILE *grm_out, FILE *N_out,
     if(isSparse) sparse_buf.reserve(std::max(sparse_buf.capacity(),
         static_cast<size_t>(BLAS_OUT_BLOCK) * tile_cols / 20 * 25));
 
+    const double* const grm_base = std::assume_aligned<64>(grm.get());
+    const uint32_t* const N_base = std::assume_aligned<64>(N.get());
+
     const auto get_N_row = [&](int pair1) -> const uint32_t* {
         if (grm_tiling_enabled) {
-            return N + static_cast<size_t>(pair1 - tile_rs) * tile_cols;
+            return N_base + static_cast<size_t>(pair1 - tile_rs) * tile_cols;
         }
         const size_t start_pos = static_cast<size_t>(pair1 + 1 + tile_rs) *
                                  static_cast<size_t>(pair1 - tile_rs) / 2;
-        return N + start_pos;
+        return N_base + start_pos;
     };
 
     for(int block_start = tile_rs; block_start < tile_re; block_start += BLAS_OUT_BLOCK){
@@ -1259,7 +1612,7 @@ void GRM::flush_grm_tile(FILE *grm_out, FILE *N_out,
         //    needed lower-triangle entries (pair2 <= pair1, i.e. c <= block_start + r).
         #pragma omp parallel for schedule(static)
         for(int c = 0; c < block_cols; ++c){
-            const double *col_src = grm + static_cast<size_t>(c) * tile_rows + local_block_start;
+            const double *col_src = grm_base + static_cast<size_t>(c) * tile_rows + local_block_start;
             const int r_start = std::max(0, c - block_start);
             for(int r = r_start; r < block_rows; ++r){
                 grm_block[static_cast<size_t>(r) * block_cols + c] = static_cast<float>(col_src[r]);
@@ -1316,7 +1669,7 @@ void GRM::flush_grm_tile(FILE *grm_out, FILE *N_out,
 //
 //   grm_tiling_enabled  (tiled path):
 //     N is a RECTANGULAR buffer of shape (grm_tile_rows × grm_tile_cols), allocated in
-//     processMakeGRM with posix_memalign and zeroed per tile.
+//     processMakeGRM with make_aligned_uninitialized and zeroed per tile.
 //     Index: N[(pair1 - grm_tile_rs) * grm_tile_cols + pair2]
 //     pair2 ranges over [0, pair1] (lower triangle), but the stride is grm_tile_cols
 //     (full width), not the triangular row length.  flush_grm_tile reads it the same way.
@@ -1331,9 +1684,10 @@ void GRM::flush_grm_tile(FILE *grm_out, FILE *N_out,
 // when grm_tiling_enabled; the non-tiled path is the fallback otherwise.
 // If the two code paths are ever merged, this layout difference must be resolved first.
 void GRM::N_thread(int grm_index_from, int grm_index_to, const uintptr_t* cur_cmask){
+    uint32_t* const N_base = std::assume_aligned<64>(N.get());
     if(grm_tiling_enabled){
         // Rectangular N layout: N[(pair1 - grm_tile_rs) * grm_tile_cols + pair2]
-        uint32_t *po_N_row = N + static_cast<size_t>(grm_index_from - grm_tile_rs) * grm_tile_cols;
+        uint32_t *po_N_row = N_base + static_cast<size_t>(grm_index_from - grm_tile_rs) * grm_tile_cols;
         const uintptr_t *p_cmask1 = cur_cmask + grm_index_from;
         for(int index_pair1 = grm_index_from; index_pair1 != grm_index_to + 1;
                 index_pair1++, po_N_row += grm_tile_cols){
@@ -1367,7 +1721,7 @@ void GRM::N_thread(int grm_index_from, int grm_index_to, const uintptr_t* cur_cm
 
     uint64_t startPos = ((uint64_t)grm_index_from + 1 + part_keep_indices.first) * (grm_index_from - part_keep_indices.first) / 2;
 
-    uint32_t *po_N_start = N + startPos;
+    uint32_t *po_N_start = N_base + startPos;
     //for(int cur_block = 0; cur_block != Constants::NUM_MARKER_READ / num_cmask_block; cur_block++){
     //uint64_t *cur_cmask = cmask_buf + cur_block * index_keep.size();
     uint32_t *po_N = po_N_start;
@@ -1456,343 +1810,45 @@ vector<uint32_t> GRM::divide_parts(uint32_t from, uint32_t to, uint32_t num_part
     return parts;
 }
 
-int GRM::registerOption(map<string, vector<string>>& options_in) {
-    int return_value = 0;
-    options["out"] = options_in["out"][0];
-
-    if(options_in.find("--grm") != options_in.end()){
-        if(options_in["--grm"].size() == 1){
-            options["grm_file"] = options_in["--grm"][0];
-        }else{
-            LOGGER.e(0, "can't handle multiple GRM files");
-        }
-        options_in.erase("--grm");
-        if(options_in.find("--grm-cutoff") != options_in.end() || 
-                options_in.find("--grm-singleton") != options_in.end() ||
-                options_in.find("--make-bK") != options_in.end()){
-            if(options["grm_file"] == options["out"]){
-                LOGGER.e(0, "it is not allowed to have the same file name for the input and the output files.");
-            }
-        }
-    }
-
-    addOneFileOption("keep_file", "", "--keep", options_in, options);
-    addOneFileOption("remove_file", "", "--remove", options_in, options);
-    addOneFileOption("mgrm", "", "--mgrm", options_in, options);
-
-    if(options_in.find("--nMarkers") != options_in.end()){
-        vector<string> markers = options_in["--nMarkers"];
-        GRM::nMarkerBlock = std::stoi(markers[0]);
-    }
-
-    int num_parts = 1;
-    int cur_part = 1;
-
-    string part_grm = "--make-grm-part";
-    string part_grm_d = "--make-grm-d-part";
-    string part_grm_homogametic = "--make-grm-homogametic-part";
-    bool bool_part_grm = options_in.find(part_grm) != options_in.end();
-    bool bool_part_grm_d = options_in.find(part_grm_d) != options_in.end();
-    bool bool_part_grm_homogametic = options_in.find(part_grm_homogametic) != options_in.end();
-    string part_grm_symbol = "";
-    bool isDominance = false;
-    if(bool_part_grm){
-        part_grm_symbol = part_grm;
-        isDominance = false;
-    }
-    if(bool_part_grm_d){
-        part_grm_symbol = part_grm_d;
-        isDominance = true;
-    }
-    if(bool_part_grm_homogametic){
-        part_grm_symbol = part_grm_homogametic;
-        isDominance = false;
-    }
-    if(bool_part_grm && bool_part_grm_d && bool_part_grm_homogametic){
-        LOGGER.e(0, "can't specify --make-grm-part, --make-grm-d-part or --make-grm-homogametic-part together.");
-    }
-
-    if(bool_part_grm || bool_part_grm_d || bool_part_grm_homogametic){
-        if(options_in[part_grm_symbol].size() == 2){
-            try{
-                num_parts = std::stoi(options_in[part_grm_symbol][0]);
-                cur_part = std::stoi(options_in[part_grm_symbol][1]);
-            }catch(std::invalid_argument&){
-                LOGGER.e(0, part_grm_symbol + " can only deal with integer value.");
-            }
-            if(num_parts <= 0 || cur_part <=0){
-                LOGGER.e(0, part_grm_symbol + " arguments should be >= 1");
-            }
-            if(num_parts < cur_part){
-                LOGGER.e(0, part_grm_symbol + "the 1st parameter (number of parts) can't be smaller than the 2nd parameter");
-            }
-
-            std::string s_parts = std::to_string(num_parts);
-            std::string c_parts = std::to_string(cur_part);
-            options["out"] = options["out"] + ".part_" + s_parts + "_" + std::string(s_parts.length() - c_parts.length(), '0') + c_parts;
-            options_in["out"][0] = options["out"];
-            options_in.erase(part_grm_symbol);
-            if(!bool_part_grm_homogametic){
-                std::map<string, vector<string>> t_option;
-                t_option["--autosome"] = {};
-                Marker::registerOption(t_option);
-                processFunctions.push_back("make_grm");
-                return_value++;
-            }else{
-                options_in["--make-grm-homogametic"] = {};
-            }
- 
-        }else{
-            LOGGER.e(0, part_grm_symbol + " takes two arguments: the number of total parts and the part number to be calculated currently");
-        }
-    }
-
-    options["num_parts"] = std::to_string(num_parts);
-    options["cur_part"] = std::to_string(cur_part);
-
-    if(options_in.find("--grm-singleton") != options_in.end()){
-        options_in["--make-grm"] = {};
-    }
-
-    string op_grm_homogametic = "--make-grm-homogametic";
-    options_b["homogametic_chr"] = false;
-    if(options_in.find(op_grm_homogametic) != options_in.end()){
-        /*
-        std::map<string, vector<string>> t_option;
-        t_option["--chr-homogametic"] = {};
-        t_option["--filter-sex"] = {};
-        Pheno::registerOption(t_option);
-        Marker::registerOption(t_option);
-        Geno::registerOption(t_option);
-        */
-        processFunctions.push_back("make_grm_homogametic");
-        options_b["homogametic_chr"] = true;
-        options_in.erase(op_grm_homogametic);
-        return_value++;
-    }
-
-   
-    string op_grm_d = "--make-grm-d";
-    if(options_in.find(op_grm_d) != options_in.end()){
-        isDominance = true;
-        processFunctions.push_back("make_grm");
-        options_in.erase(op_grm_d);
-
-        std::map<string, vector<string>> t_option;
-        t_option["--autosome"] = {};
-        Marker::registerOption(t_option);
-
-        return_value++;
-    }
-
-    options_b["isMtd"] = false;
-    string op_grm_mtd = "--make-grm-alg";
-    if(options_in.find(op_grm_mtd) != options_in.end()){
-        if(std::stoi(options_in[op_grm_mtd][0]) > 0)
-        options_b["isMtd"] = true;
-    }
-
-        /*
-    string op_grm_sparse = "--make-grm-sparse";
-    if(options_in.find(op_grm_sparse) != options_in.end()){
-        processFunctions.push_back("make_grm");
-        return_value++;
-        if(options_in[op_grm_sparse].size() == 0){
-            options_d["grm_cutoff"] = 0.05;
-        }else if(options_in[op_grm_sparse].size() >= 1){
-            options_d["grm_cutoff"] = std::stod(options_in[op_grm_sparse][0]);
-        }
-        options_in.erase(op_grm_sparse);
-    }
-        
-        */
-    string op_grm_sparse = "--sparse-cutoff";
-    if(options_in.find(op_grm_sparse) != options_in.end()){
-        if(options_in[op_grm_sparse].size() == 0){
-            options_d["sparse_cutoff"] = 0.05;
-        }else if(options_in[op_grm_sparse].size() >= 1){
-            options_d["sparse_cutoff"] = std::stod(options_in[op_grm_sparse][0]);
-        }
-    }
- 
-
-    string op_grm_unify = "--unify-grm";
-    if(options_in.find(op_grm_unify) != options_in.end()){
-        processFunctions.push_back("unify_grm");
-        options_in.erase(op_grm_unify);
-        return_value++;
-    }
-
-    string op_grm = "--subtract-grm";
-    if(options_in.find(op_grm) != options_in.end()){
-        processFunctions.push_back("subtract_grm");
-        options_in.erase(op_grm);
-        return_value++;
-    }
-
-    string op_merge_grm = "--merge-grms";
-    if(options_in.find(op_merge_grm) != options_in.end()){
-        if(options.find("mgrm") == options.end() || options["mgrm"].empty())
-            LOGGER.e(0, "--merge-grms requires --mgrm <file>.");
-        if(options_in[op_merge_grm].size() == 1){
-            options_d["merge_grm"] = std::stod(options_in[op_merge_grm][0]);
-        }
-        else {
-            options_d["merge_grm"] = 0.0;
-        }
-        processFunctions.push_back("merge_grm");
-        options_in.erase(op_merge_grm);
-        return_value++;
-    }
-
-    if(options_in.find("--make-grm") != options_in.end()){
-        isDominance = false;
-        if(options.find("grm_file") == options.end()){
-            processFunctions.push_back("make_grm");
-            options_in.erase("--make-grm");
-            std::map<string, vector<string>> t_option;
-            if(options_in.find("--chr") != options_in.end()){
-                t_option["--chr"] = options_in["--chr"];
-                options_in.erase("--chr");
-            } else {
-                t_option["--autosome"] = {};
-            }
-            Marker::registerOption(t_option);
-            return_value++;
-        }else{
-            if(options_in.find("--grm-cutoff") != options_in.end()){
-                if(options_in["--grm-cutoff"].size() == 1){
-                    options_d["grm_cutoff"] = std::stod(options_in["--grm-cutoff"][0]);
-                }else{
-                    LOGGER.e(0, "--grm-cutoff can't deal with more than one value currently");
-                }
-                if(options.find("grm_file") == options.end()){
-                    LOGGER.e(0, "can't find the --grm flag that is essential to --grm-cutoff");
-                }
-
-                processFunctions.push_back("grm_cutoff");
-                options_in.erase("--grm-cutoff");
-
-                return_value++;
-            }
-
-            string opitem = "--grm-singleton";
-
-            if(options_in.find(opitem) != options_in.end()){
-                if(options_in[opitem].size() == 1){
-                    options_d["grm_cutoff"] = std::stod(options_in[opitem][0]);
-                }else{
-                    LOGGER.e(0, opitem + " can't deal with more than one value currently.");
-                }
-                if(options.find("grm_file") == options.end()){
-                    LOGGER.e(0, "can't find the --grm flag that is essential to " + opitem);
-                }
-
-                processFunctions.push_back("grm_cutoff");
-                options_in.erase(opitem);
-                options["no_grm"] = "true";
-                options["cutoff_detail"] = "true";
-
-                return_value++;
-            }
-
-
-            if(options_in.find("--cutoff-detail") != options_in.end()){
-                options["cutoff_detail"] = "true";
-            }
-        }
-
-    }
-
-
-    vector<string> flags = {"--make-bK-sparse", "--make-bK"};
-    vector<bool> isSparse = {true, false};
-    for(int index = 0; index != flags.size(); index++){
-        string curFlag = flags[index];
-        if(options_in.find(curFlag) != options_in.end()){
-            if(options.find("grm_file") == options.end()){
-                LOGGER.e(0, "can't find the --grm flag that is essential to " + curFlag);
-            }
-            if(options_in[curFlag].size() == 1){
-                options_d["grm_cutoff"] = std::stod(options_in[curFlag][0]);
-                options_b["sparse"] = isSparse[index]; 
-                processFunctions.push_back("make_fam");
-            }else if(options_in[curFlag].size() == 2){
-                options_d["grm_cutoff"] = std::stod(options_in[curFlag][0]);
-                options_b["sparse"] = isSparse[index]; 
-                options_d["grm_set_value"] = std::stod(options_in[curFlag][1]);
-                processFunctions.push_back("make_fam");
-            }else{
-                LOGGER.e(0, curFlag + " can't deal with more than one value currently.");
-            }
-            return_value++;
-        }
-    }
-
-    options_b["isDominance"] = isDominance;
-
-    string op_tile_budget = "--GRM-tile-budget";
-    if(options_in.find(op_tile_budget) != options_in.end()){
-        if(options_in[op_tile_budget].size() != 1)
-            LOGGER.e(0, op_tile_budget + " requires exactly one value, in GB, e.g. 10.");
-        // Budget covers only the GRM tile buffer itself (grm + N, 8+4 bytes/elem),
-        // not genotype buffers or other working memory.
-        double budget_gb;
-        try{
-            budget_gb = std::stod(options_in[op_tile_budget][0]);
-        } catch(...) {
-            LOGGER.e(0, op_tile_budget + ": can't parse GB value '" + options_in[op_tile_budget][0] + "'.");
-            budget_gb = 0; // unreachable, silences -Wmaybe-uninitialized
-        }
-        if(budget_gb <= 0)
-            LOGGER.e(0, op_tile_budget + " must be a positive number of GB, e.g. 10.");
-        options_d["grm_tile_budget_bytes"] = budget_gb * 1024.0 * 1024.0 * 1024.0;
-        options_in.erase(op_tile_budget);
-    }
-
-    options["use_blas"] = "yes";
-    /*
-    auto it = std::ranges::find(processFunctions, "make_grm");
-    if(it != processFunctions.end()){
-        if((!options_b["isDominance"]) && (!options_b["isMtd"])){
-        }
-    }
-
-    string op_blas = "--noblas";
-    if(options_in.find(op_blas) != options_in.end()){
-        if(options.find("use_blas")!=options.end()){
-            options.erase("use_blas");
-        }
-        options_in.erase(op_blas);
-    }
-    */
-
-    return return_value;
-
-}
-
 void GRM::processMakeGRM(bool is_homogametic){
-    gbufitems = new GenoBufItem[nMarkerBlock];
+    gbufitems.assign(nMarkerBlock, GenoBufItem{});
     {
         const int markerPerN = static_cast<int>(sizeof(uintptr_t) * CHAR_BIT);
         const int numNSampleBlock = (grm_n + markerPerN - 1) / markerPerN;
         const int numNblockMax = (nMarkerBlock + markerPerN - 1) / markerPerN;
         sampleMissBuf.resize(static_cast<size_t>(numNSampleBlock) * markerPerN * numNblockMax);
     }
-    this->num_byte_geno = sizeof(double) * nMarkerBlock * stdGenoLD;
-    int ret = posix_memalign((void **)&stdGeno, 64, num_byte_geno);
-    if(ret != 0){
-        LOGGER.e(0, "can't allocate enough memory for the genotype buffer.");
+    use_int8_grm = bBLAS && isMtd && !isDominance && !is_homogametic
+                   && (geno->getGenoFormat() == "BED")
+                   && (std::getenv("GCTA_DISABLE_INT8_GRM") == nullptr);
+    const int max_tile_dim = std::min(4096, std::max(1, grm_n));
+    const size_t geno_block_elems = static_cast<size_t>(nMarkerBlock) * stdGenoLD;
+    if (use_int8_grm) {
+        grm_bytes_std_geno = static_cast<int>(sizeof(int8_t)) * grm_n;
+        this->num_byte_geno = sizeof(int8_t) * static_cast<uint64_t>(geno_block_elems);
+        stdGeno_i8 = make_aligned_uninitialized<int8_t, 64>(geno_block_elems);
+        if (!stdGeno_i8) {
+            LOGGER.e(0, "can't allocate enough memory for the int8 genotype buffer.");
+        }
+        grm_i32_tile_.resize(static_cast<size_t>(max_tile_dim) * max_tile_dim);
+        mu_vec_.resize(nMarkerBlock);
+        r_raw_.resize(grm_n);
+        r_tilde_.resize(grm_n);
+        marker_miss_offset_.resize(nMarkerBlock + 1);
+    } else {
+        grm_bytes_std_geno = static_cast<int>(sizeof(float)) * grm_n;
+        this->num_byte_geno = sizeof(float) * static_cast<uint64_t>(geno_block_elems);
+        stdGeno = make_aligned_uninitialized<float, 64>(geno_block_elems);
+        if (!stdGeno) {
+            LOGGER.e(0, "can't allocate enough memory for the genotype buffer.");
+        }
+        grm_f32_tile_.resize(static_cast<size_t>(max_tile_dim) * max_tile_dim);
     }
     
     vector<function<void (uintptr_t *, std::span<const uint32_t>)>> callBacks;
-    if(options.find("use_blas") != options.end()){
-        callBacks.push_back([this](uintptr_t *buf, std::span<const uint32_t> idx){
-            calculate_GRM_blas(buf, idx);
-        });
-    }else{
-        LOGGER.e(0, "the original version has been deleted. Please use GCTA >= 1.92.4");
-    }
+    callBacks.push_back([this](uintptr_t *buf, std::span<const uint32_t> idx){
+        calculate_GRM_blas(buf, idx);
+    });
     geno->setGRMMode(true, isDominance);
     const bool isSTD = !isMtd;
     const vector<uint32_t> processIndex = is_homogametic
@@ -1800,10 +1856,7 @@ void GRM::processMakeGRM(bool is_homogametic){
         : marker->get_extract_index_autosome();
     sd.reserve(processIndex.size());
 
-    grm_tile_budget_bytes = (options_d.count("grm_tile_budget_bytes") > 0)
-                    ? static_cast<double>(options_d["grm_tile_budget_bytes"]) : 0;
-
-    grm_tiling_enabled = grm_tile_budget_bytes > 0;
+    grm_tiling_enabled = grm_tile_budget_bytes > 0.0;
 
     if(grm_tiling_enabled){
         // If the budget covers the *whole* GRM's triangular
@@ -1812,9 +1865,8 @@ void GRM::processMakeGRM(bool is_homogametic){
         const int full_re = static_cast<int>(part_keep_indices.second) + 1;
         const double budget_elems = grm_tile_budget_bytes / 12.0;
         if(grm_tile_budget_covers_whole(full_rs, full_re, budget_elems)){
-            LOGGER.i(0, "--GRM-tile-budget ("
-                        + to_string(grm_tile_budget_bytes / (1024.0*1024.0*1024.0)).substr(0, 6)
-                        + " GB) covers the whole GRM in one tile; using the dense path instead.");
+            LOGGER.info(0, "--GRM-tile-budget ({:.3f} GB) covers the whole GRM in one tile; using the dense path instead.",
+                        grm_tile_budget_bytes / (1024.0 * 1024.0 * 1024.0));
             grm_tiling_enabled = false;
         }
     }
@@ -1827,26 +1879,27 @@ void GRM::processMakeGRM(bool is_homogametic){
 
         float thresh = -99.0f;
         bool isSparse = false;
-        if(options_d.find("sparse_cutoff") != options_d.end()){
-            thresh   = static_cast<float>(options_d["sparse_cutoff"]);
+        if(sparse_cutoff.has_value()){
+            thresh   = *sparse_cutoff;
             isSparse = true;
             LOGGER.i(0, "Computing sparse GRM with a cutoff " + to_string(thresh) + "...");
         } else {
             LOGGER.i(0, "Computing tiled GRM...");
         }
 
-        FILE *grm_out = nullptr, *N_out = nullptr;
+        UniqueFile grm_out;
+        UniqueFile N_out;
         if(isSparse){
-            grm_out = fopen((o_name + ".grm.sp").c_str(), "wb");
-            if(!grm_out) LOGGER.e(0, "can't open " + o_name + ".grm.sp to write");
+            grm_out = open_file(o_name + ".grm.sp", "wb");
+            if(!grm_out) LOGGER.error(0, "can't open {}.grm.sp to write", o_name);
         } else {
-            grm_out = fopen((o_name + ".grm.bin").c_str(), "wb");
-            N_out   = fopen((o_name + ".grm.N.bin").c_str(), "wb");
+            grm_out = open_file(o_name + ".grm.bin", "wb");
+            N_out   = open_file(o_name + ".grm.N.bin", "wb");
             if(!grm_out || !N_out)
-                LOGGER.e(0, "can't open " + o_name + ".grm.bin or .grm.N.bin to write");
+                LOGGER.error(0, "can't open {}.grm.bin or .grm.N.bin to write", o_name);
             // 4 MiB matches a typical Lustre stripe size and avoids sub-stripe metadata ops.
-            setvbuf(grm_out, nullptr, _IOFBF, 4 << 20);
-            setvbuf(N_out,   nullptr, _IOFBF, 4 << 20);
+            setvbuf(grm_out.get(), nullptr, _IOFBF, 4 << 20);
+            setvbuf(N_out.get(),   nullptr, _IOFBF, 4 << 20);
         }
 
         const int num_thread = omp_get_max_threads();
@@ -1864,21 +1917,19 @@ void GRM::processMakeGRM(bool is_homogametic){
             const int re = solve_tile_budget_end(rs, full_re, budget_elems);
             if(re <= rs){
                 const uint64_t need_bytes = static_cast<uint64_t>(rs + 1) * 12ULL;
-                LOGGER.e(0, "--GRM-tile-budget is too small: the next row (sample offset "
-                            + to_string(rs) + ") alone needs "
-                            + to_string(need_bytes / (1024.0*1024.0*1024.0)).substr(0, 6)
-                            + " GB for its GRM+N row, but the budget is only "
-                            + to_string(grm_tile_budget_bytes / (1024.0*1024.0*1024.0)).substr(0, 6)
-                            + " GB. Increase --GRM-tile-budget.");
+                LOGGER.error(0, "--GRM-tile-budget is too small: the next row (sample offset {}) alone needs {:.3f} GB for its GRM+N row, but the budget is only {:.3f} GB. Increase --GRM-tile-budget.",
+                             rs,
+                             need_bytes / (1024.0 * 1024.0 * 1024.0),
+                             grm_tile_budget_bytes / (1024.0 * 1024.0 * 1024.0));
             }
             tile_ranges.push_back({rs, re});
             rs = re;
         }
-        LOGGER.i(0, "Block-tiled GRM (memory budget "
-                    + to_string(grm_tile_budget_bytes / (1024.0*1024.0*1024.0)).substr(0, 6)
-                    + " GB): " + to_string(tile_ranges.size()) + " tile(s), rows/tile ranging "
-                    + to_string(tile_ranges.front().second - tile_ranges.front().first) + "-"
-                    + to_string(tile_ranges.back().second - tile_ranges.back().first) + ".");
+        LOGGER.info(0, "Block-tiled GRM (memory budget {:.3f} GB): {} tile(s), rows/tile ranging {}-{}.",
+                    grm_tile_budget_bytes / (1024.0 * 1024.0 * 1024.0),
+                    tile_ranges.size(),
+                    tile_ranges.front().second - tile_ranges.front().first,
+                    tile_ranges.back().second - tile_ranges.back().first);
 
         // flush_grm_tile's output-formatting scratch, sized once to the final
         // (widest) tile -- tile_ranges is monotonically widening in `re`, so
@@ -1906,24 +1957,25 @@ void GRM::processMakeGRM(bool is_homogametic){
 
             // Fresh, exactly-sized allocation for this tile only
             const size_t tile_rect_elems = static_cast<size_t>(grm_tile_rows) * grm_tile_cols;
-            if(posix_memalign((void**)&grm, 64, tile_rect_elems * sizeof(double)) != 0)
+            grm = make_aligned_uninitialized<double, 64>(tile_rect_elems);
+            if(!grm)
                 LOGGER.e(0, "Can't allocate GRM tile buffer.");
-            if(posix_memalign((void**)&N, 64, tile_rect_elems * sizeof(uint32_t)) != 0)
+            N = make_aligned_uninitialized<uint32_t, 64>(tile_rect_elems);
+            if(!N)
                 LOGGER.e(0, "Can't allocate N tile buffer.");
 
             const double drs = tile_rs, dre = tile_re;
             const size_t tile_elems = static_cast<size_t>((dre * (dre + 1.0) - drs * (drs + 1.0)) / 2.0);
             const double tile_gb    = tile_elems * 12.0 / (1024.0 * 1024.0 * 1024.0);
-            LOGGER.i(0, "  Tile rows " + to_string(tile_rs) + "-" + to_string(tile_re - 1)
-                        + " (" + to_string(tile_gb).substr(0, 4) + " GB grm+N)");
+            LOGGER.info(0, "  Tile rows {}-{} ({:.2f} GB grm+N)", tile_rs, tile_re - 1, tile_gb);
 
             grm_first_accum = true;
 
             for(int r = 0; r < grm_tile_rows; r++){
                 const int pair1 = tile_rs + r;               // global row index
                 const int valid_cols = pair1 + 1;             // N_thread writes cols [0, pair1]
-                memset(N + static_cast<size_t>(r) * grm_tile_cols, 0,
-                       static_cast<size_t>(valid_cols) * sizeof(uint32_t));
+                std::memset(N.get() + static_cast<size_t>(r) * grm_tile_cols, 0,
+                            static_cast<size_t>(valid_cols) * sizeof(uint32_t));
             }
 
             index_grm_pairs.clear();
@@ -1937,7 +1989,7 @@ void GRM::processMakeGRM(bool is_homogametic){
 
             grm_skip_global_state = true;
 
-            if(is_first_tile && options_b["isMtd"]){
+            if(is_first_tile && isMtd){
                 float weight = 0.0f;
                 if(!isDominance)
                     for(uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i];
@@ -1946,15 +1998,15 @@ void GRM::processMakeGRM(bool is_homogametic){
                 if(weight > 0.0f) mtd_weight = static_cast<float>(numValidMarkers) / weight;
             }
 
-            flush_grm_tile(grm_out, N_out, thresh, isSparse, mtd_weight,
+            flush_grm_tile(grm_out.get(), N_out.get(), thresh, isSparse, mtd_weight,
                            flush_w_N, flush_grm_block, flush_sparse_buf);
 
-            posix_mem_free(grm); grm = nullptr;
-            posix_mem_free(N);   N   = nullptr;
+            grm.reset();
+            N.reset();
         }
 
-        if(grm_out) fclose(grm_out);
-        if(N_out)   fclose(N_out);
+        grm_out.reset();
+        N_out.reset();
         LOGGER << "  Used " << numValidMarkers << " valid SNPs." << std::endl;
         if(!isSparse){
             LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.bin]");
@@ -1970,8 +2022,9 @@ void GRM::processMakeGRM(bool is_homogametic){
         deduce_GRM();
     }
 
-    delete[] gbufitems;
-    posix_mem_free(stdGeno);
+    gbufitems.clear();
+    stdGeno.reset();
+    stdGeno_i8.reset();
     geno->setGRMMode(false, false);
 }
 
@@ -1979,65 +2032,52 @@ void GRM::processMakeGRMX(){
     processMakeGRM(true);
 }
 
-void GRM::processMain() {
-    vector<function<void (uint64_t *, int)>> callBacks;
-    for(auto &process_function : processFunctions){
-        if(process_function == "make_grm"){
-            LOGGER.i(0, "Note: GRM is computed using the SNPs on the autosomes.");
-            Pheno pheno;
-            Marker marker;
-            GRM grm(&pheno, &marker);
-            grm.processMakeGRM();
-            return;
-        }
-
-        if(process_function == "make_grm_homogametic"){
-            LOGGER.i(0, "Note: this function treats homogametic chromosomes as non-PAR regions.");
-
-            Pheno pheno;
-            Marker marker;
-            GRM grm(&pheno, &marker);
-            grm.processMakeGRMX();
-            return;
-        }
-
-
-        if(process_function == "grm_cutoff"){
-            GRM grm;
-            bool no_grm = false;
-            if(options.find("no_grm") != options.end()) {
-                no_grm = true;
-            }
-            grm.cut_rel(options_d["grm_cutoff"], no_grm);
-           // grm.loop_block(callBacks);
-
-        }
-
-        if(process_function == "make_fam"){
-            GRM grm;
-            float *grm_value = NULL;
-            float value;
-            if(options_d.find("grm_set_value") != options_d.end()){
-                value = options_d["grm_set_value"];
-                grm_value = &value;
-            }
-            grm.prune_fam(options_d["grm_cutoff"], options_b["sparse"], grm_value);
-        }
-
-        if(process_function == "unify_grm"){
-            GRM grm;
-            grm.unify_grm(options["mgrm"], options["out"]);
-        }
-        if(process_function == "subtract_grm"){
-            GRM grm;
-            grm.subtract_grm(options["mgrm"], options["out"]);
-        }
-
-        if(process_function == "merge_grm"){
-            GRM grm;
-            const int stream_budget = static_cast<int>(options_d["merge_grm"]);
-            grm.merge_grm(options["mgrm"], options["out"], stream_budget);
-        }
+void GRM::runMake(const gcta_cli::GrmMakeOptions& opts, const std::string& out_prefix) {
+    if (opts.homogametic) {
+        LOGGER.i(0, "Note: this function treats homogametic chromosomes as non-PAR regions.");
+    } else {
+        LOGGER.i(0, "Note: GRM is computed using the SNPs on the autosomes.");
     }
+    const bool has_explicit_chr = opts.marker_filter.autosome || opts.marker_filter.autosome_sex ||
+                                  opts.marker_filter.chr_homogametic || !opts.marker_filter.chr.empty();
+    Pheno pheno(opts.geno, opts.sample_filter);
+    Marker marker(opts.geno, opts.sample_filter, opts.marker_filter,
+                  /*default_autosome=*/!opts.homogametic && !has_explicit_chr,
+                  /*force_chr_homogametic=*/opts.homogametic && !has_explicit_chr);
+    GRM grm(&pheno, &marker, opts, out_prefix);
+    grm.processMakeGRM(opts.homogametic);
+}
 
+void GRM::runMerge(const gcta_cli::GrmMergeOptions& opts, const std::string& out_prefix) {
+    GRM grm("", "", "", out_prefix);
+    grm.merge_grm(opts.mgrm, out_prefix, opts.budget_gb);
+}
+
+void GRM::runPrune(const gcta_cli::GrmPruneOptions& opts, const std::string& out_prefix) {
+    const bool no_grm = opts.singleton.has_value();
+    const float cutoff = static_cast<float>(no_grm ? *opts.singleton : *opts.cutoff);
+    const bool detail = no_grm || opts.cutoff_detail;
+    GRM grm(opts.grm, opts.keep, opts.remove, out_prefix, detail);
+    grm.cut_rel(cutoff, no_grm);
+}
+
+void GRM::runSparse(const gcta_cli::GrmSparseOptions& opts, const std::string& out_prefix) {
+    GRM grm(opts.grm, opts.keep, opts.remove, out_prefix);
+    float set_val = 0.0f;
+    float* p = nullptr;
+    if (opts.set_value.has_value()) {
+        set_val = static_cast<float>(*opts.set_value);
+        p = &set_val;
+    }
+    grm.prune_fam(static_cast<float>(opts.cutoff), !opts.dense, p);
+}
+
+void GRM::runSubtract(const gcta_cli::GrmCombineOptions& opts, const std::string& out_prefix) {
+    GRM grm("", opts.keep, opts.remove, out_prefix);
+    grm.subtract_grm(opts.mgrm, out_prefix);
+}
+
+void GRM::runUnify(const gcta_cli::GrmCombineOptions& opts, const std::string& out_prefix) {
+    GRM grm("", opts.keep, opts.remove, out_prefix);
+    grm.unify_grm(opts.mgrm, out_prefix);
 }

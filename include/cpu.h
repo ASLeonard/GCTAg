@@ -31,6 +31,15 @@
 #elif defined(GCTA_USE_AOCL)
   #include <cblas.h>
   #include <lapacke.h>
+  #if defined(GCTA_USE_AOCL_DLP)
+    #if __has_include(<aocl_dlp.h>)
+      #include <aocl_dlp.h>
+    #elif __has_include(<classic/aocl_gemm_interface_apis.h>)
+      #include <classic/aocl_gemm_interface_apis.h>
+    #endif
+  #elif __has_include(<blis.h>)
+    #include <blis.h>
+  #endif
   typedef lapack_int gcta_blas_int;
 
 #elif defined(GCTA_USE_ACCELERATE)
@@ -203,6 +212,21 @@ inline int gcta_dgeqrf(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_in
 #endif
 }
 
+inline int gcta_sgeqrf(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, float* tau) {
+#if defined(GCTA_USE_ACCELERATE)
+    gcta_blas_int lwork = -1, info = 0;
+    float wkopt = 0.0f;
+    sgeqrf_(&m, &k, A, &lda, tau, &wkopt, &lwork, &info);
+    if (info != 0) return static_cast<int>(info);
+    lwork = static_cast<gcta_blas_int>(wkopt);
+    Eigen::VectorXf work(lwork);
+    sgeqrf_(&m, &k, A, &lda, tau, work.data(), &lwork, &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(LAPACKE_sgeqrf(LAPACK_COL_MAJOR, m, k, A, lda, tau));
+#endif
+}
+
 // Overwrite A (post-dgeqrf) with the explicit m x k orthonormal Q factor,
 // in place, from the reflectors produced by gcta_dgeqrf. Destroys R — call
 // after extracting R if the caller needs it.
@@ -221,6 +245,21 @@ inline int gcta_dorgqr(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_in
 #endif
 }
 
+inline int gcta_sorgqr(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda, const float* tau) {
+#if defined(GCTA_USE_ACCELERATE)
+    gcta_blas_int lwork = -1, info = 0;
+    float wkopt = 0.0f;
+    sorgqr_(&m, &k, &k, A, &lda, tau, &wkopt, &lwork, &info);
+    if (info != 0) return static_cast<int>(info);
+    lwork = static_cast<gcta_blas_int>(wkopt);
+    Eigen::VectorXf work(lwork);
+    sorgqr_(&m, &k, &k, A, &lda, tau, work.data(), &lwork, &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(LAPACKE_sorgqr(LAPACK_COL_MAJOR, m, k, k, A, lda, tau));
+#endif
+}
+
 // Convenience fusion for callers that only need Q (R discarded) — the
 // power-iteration QR passes in symmetric_eigendecomp.hpp never use R.
 inline int gcta_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas_int lda) {
@@ -228,6 +267,13 @@ inline int gcta_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* A, gcta_blas
     int info = gcta_dgeqrf(m, k, A, lda, tau.data());
     if (info != 0) return info;
     return gcta_dorgqr(m, k, A, lda, tau.data());
+}
+
+inline int gcta_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* A, gcta_blas_int lda) {
+    Eigen::VectorXf tau(k);
+    int info = gcta_sgeqrf(m, k, A, lda, tau.data());
+    if (info != 0) return info;
+    return gcta_sorgqr(m, k, A, lda, tau.data());
 }
 
 // CholeskyQR2: forms the m x k orthonormal factor Q of Y in place using two
@@ -258,6 +304,31 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* Y, 
         }
         cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
                     m, k, 1.0, G.data(), k, Y, ldY);
+    }
+    return 0;
+}
+
+// Mixed-precision CholeskyQR2 for float32 m x k subspace matrices:
+// O(m * k^2) SYRK and TRSM run in float32 (cblas_ssyrk / cblas_strsm), while
+// the tiny k x k Gram Cholesky factorization runs in double (gcta_dpotrf) to
+// avoid premature single-precision breakdown on squared condition numbers.
+inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, gcta_blas_int ldY,
+                                    Eigen::MatrixXd* workspace = nullptr) {
+    Eigen::MatrixXd local_G;
+    Eigen::MatrixXd& G = workspace ? *workspace : local_G;
+    G.resize(k, k);
+    Eigen::MatrixXf G_f(k, k);
+    for (int pass = 0; pass < 2; ++pass) {
+        cblas_ssyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0f, Y, ldY, 0.0f, G_f.data(), k);
+        G.triangularView<Eigen::Lower>() = G_f.cast<double>();
+        const int info = gcta_dpotrf(k, G.data(), k);
+        if (info != 0) {
+            if (pass != 0) break;  // pass 0's Q already orthonormal; skip the refinement.
+            return gcta_qr_thin_Q(m, k, Y, ldY);
+        }
+        G_f.triangularView<Eigen::Lower>() = G.cast<float>();
+        cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
+                    m, k, 1.0f, G_f.data(), k, Y, ldY);
     }
     return 0;
 }
@@ -294,6 +365,248 @@ inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, double* Y,
         Rmat = (pass == 0) ? R_pass : Eigen::MatrixXd(R_pass * Rmat);
     }
     return 0;
+}
+
+inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, float* Y, gcta_blas_int ldY,
+                                     double* R, gcta_blas_int ldR, Eigen::MatrixXd* workspace = nullptr) {
+    Eigen::Map<Eigen::MatrixXd, 0, Eigen::OuterStride<>> Rmat(R, k, k, Eigen::OuterStride<>(ldR));
+    Eigen::MatrixXd local_G;
+    Eigen::MatrixXd& G = workspace ? *workspace : local_G;
+    G.resize(k, k);
+    Eigen::MatrixXf G_f(k, k);
+    for (int pass = 0; pass < 2; ++pass) {
+        cblas_ssyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0f, Y, ldY, 0.0f, G_f.data(), k);
+        G.triangularView<Eigen::Lower>() = G_f.cast<double>();
+        const int info = gcta_dpotrf(k, G.data(), k);
+        if (info != 0) {
+            if (pass != 0) break;  // pass 0's Q/R already valid; skip the refinement.
+            Eigen::VectorXf tau(k);
+            const int info_qr = gcta_sgeqrf(m, k, Y, ldY, tau.data());
+            if (info_qr != 0) return info_qr;
+            Rmat = Eigen::Map<Eigen::MatrixXf, 0, Eigen::OuterStride<>>(Y, k, k, Eigen::OuterStride<>(ldY))
+                       .triangularView<Eigen::Upper>()
+                       .toDenseMatrix()
+                       .cast<double>();
+            return gcta_sorgqr(m, k, Y, ldY, tau.data());
+        }
+        const Eigen::MatrixXd R_pass = Eigen::MatrixXd(G.triangularView<Eigen::Lower>()).transpose();
+        G_f.triangularView<Eigen::Lower>() = G.cast<float>();
+        cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
+                    m, k, 1.0f, G_f.data(), k, Y, ldY);
+        Rmat = (pass == 0) ? R_pass : Eigen::MatrixXd(R_pass * Rmat);
+    }
+    return 0;
+}
+
+#if defined(GCTA_USE_AOCL_DLP) || (defined(GCTA_USE_AOCL) && defined(BLIS_ENABLE_ADDON_AOCL_GEMM))
+  #define GCTA_HAS_AOCL_S8_GEMM 1
+#else
+  #define GCTA_HAS_AOCL_S8_GEMM 0
+#endif
+
+// Compute C(rows x cols, column-major, leading dim ldc) = A(rows x K, lda) * B(cols x K, ldb)^T
+// where A and B are column-major int8_t matrices in {0, 1, 2} and C is a column-major int32_t matrix.
+// On AOCL with BLIS_ENABLE_ADDON_AOCL_GEMM, dispatches directly to Zen 4 AVX-512 VNNI
+// aocl_gemm_s8s8s32os32 via row-major transpose equivalence:
+//   C_colmajor(rows x cols, ldc) == C_rowmajor(cols x rows, ldc) = B_rowmajor^T(cols x K) * A_rowmajor(K x rows).
+// On other BLAS backends (where K <= 1024 and A, B in {0, 1, 2} so every dot product is <= 4096,
+// well below float32's exact integer limit 2^24 = 16,777,216), converts the tile panels A and B
+// to float32 scratch buffers and runs cblas_sgemm, yielding the exact same int32_t integers.
+inline void gcta_gemm_s8s8s32_colmajor_nt(
+    gcta_blas_int rows, gcta_blas_int cols, gcta_blas_int K,
+    const int8_t* A, gcta_blas_int lda,
+    const int8_t* B, gcta_blas_int ldb,
+    int32_t* C, gcta_blas_int ldc,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_B_f32,
+    std::vector<float>& scratch_C_f32)
+{
+    if (rows <= 0 || cols <= 0 || K <= 0) return;
+#if GCTA_HAS_AOCL_S8_GEMM
+    (void)scratch_A_f32;
+    (void)scratch_B_f32;
+    (void)scratch_C_f32;
+    aocl_gemm_s8s8s32os32('r', 't', 'n',
+                          cols, rows, K,
+                          1,
+                          B, ldb, 'n',
+                          A, lda, 'n',
+                          0,
+                          C, ldc,
+                          nullptr);
+#else
+    const size_t size_A = static_cast<size_t>(rows) * static_cast<size_t>(K);
+    if (scratch_A_f32.size() < size_A) scratch_A_f32.resize(size_A);
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int k = 0; k < K; ++k) {
+        const int8_t* src = A + static_cast<size_t>(k) * lda;
+        float* dst = scratch_A_f32.data() + static_cast<size_t>(k) * rows;
+        for (gcta_blas_int r = 0; r < rows; ++r) {
+            dst[r] = static_cast<float>(src[r]);
+        }
+    }
+    const size_t size_B = static_cast<size_t>(cols) * static_cast<size_t>(K);
+    if (scratch_B_f32.size() < size_B) scratch_B_f32.resize(size_B);
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int k = 0; k < K; ++k) {
+        const int8_t* src = B + static_cast<size_t>(k) * ldb;
+        float* dst = scratch_B_f32.data() + static_cast<size_t>(k) * cols;
+        for (gcta_blas_int c = 0; c < cols; ++c) {
+            dst[c] = static_cast<float>(src[c]);
+        }
+    }
+    const size_t size_C = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+    if (scratch_C_f32.size() < size_C) scratch_C_f32.resize(size_C);
+    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasTrans,
+                rows, cols, K,
+                1.0f,
+                scratch_A_f32.data(), rows,
+                scratch_B_f32.data(), cols,
+                0.0f,
+                scratch_C_f32.data(), rows);
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int c = 0; c < cols; ++c) {
+        const float* src = scratch_C_f32.data() + static_cast<size_t>(c) * rows;
+        int32_t* dst = C + static_cast<size_t>(c) * ldc;
+        for (gcta_blas_int r = 0; r < rows; ++r) {
+            dst[r] = static_cast<int32_t>(src[r]);
+        }
+    }
+#endif
+}
+
+// Compute C(rows x cols, column-major, leading dim ldc) =
+//   beta * C + A(rows x K, lda) * B(K x cols, ldb)
+// where A has signed int8_t values in [-127, 127], B has int8_t values in {0, 1, 2},
+// and C is int32_t.
+// On AOCL with BLIS_ENABLE_ADDON_AOCL_GEMM, dispatches directly to Zen 4 AVX-512 VNNI
+// aocl_gemm_s8s8s32os32 via row-major transpose equivalence:
+//   C_colmajor(rows x cols) == C_rowmajor(cols x rows) = B_col_as_row(cols x K) * A_col_as_row(K x rows).
+// On other BLAS backends (for K <= 8192 where |dot| <= 2 * 127 * 8192 = 2,080,768 < 2^24),
+// converts A and B to float32 scratch panels and executes cblas_sgemm, recovering exact integers.
+inline void gcta_gemm_s8s8s32_colmajor_nn(
+    gcta_blas_int rows, gcta_blas_int cols, gcta_blas_int K,
+    const int8_t* A, gcta_blas_int lda,
+    const int8_t* B, gcta_blas_int ldb,
+    int32_t* C, gcta_blas_int ldc,
+    int32_t beta,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_B_f32,
+    std::vector<float>& scratch_C_f32)
+{
+    if (rows <= 0 || cols <= 0 || K <= 0) return;
+#if GCTA_HAS_AOCL_S8_GEMM
+    (void)scratch_A_f32;
+    (void)scratch_B_f32;
+    (void)scratch_C_f32;
+    aocl_gemm_s8s8s32os32('r', 'n', 'n',
+                          cols, rows, K,
+                          1,
+                          B, ldb, 'n',
+                          A, lda, 'n',
+                          beta,
+                          C, ldc,
+                          nullptr);
+#else
+    const size_t size_A = static_cast<size_t>(rows) * static_cast<size_t>(K);
+    if (scratch_A_f32.size() < size_A) scratch_A_f32.resize(size_A);
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int k = 0; k < K; ++k) {
+        const int8_t* src = A + static_cast<size_t>(k) * lda;
+        float* dst = scratch_A_f32.data() + static_cast<size_t>(k) * rows;
+        for (gcta_blas_int r = 0; r < rows; ++r) {
+            dst[r] = static_cast<float>(src[r]);
+        }
+    }
+    const size_t size_B = static_cast<size_t>(K) * static_cast<size_t>(cols);
+    if (scratch_B_f32.size() < size_B) scratch_B_f32.resize(size_B);
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int c = 0; c < cols; ++c) {
+        const int8_t* src = B + static_cast<size_t>(c) * ldb;
+        float* dst = scratch_B_f32.data() + static_cast<size_t>(c) * K;
+        for (gcta_blas_int k = 0; k < K; ++k) {
+            dst[k] = static_cast<float>(src[k]);
+        }
+    }
+    const size_t size_C = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+    if (scratch_C_f32.size() < size_C) scratch_C_f32.resize(size_C);
+    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                rows, cols, K,
+                1.0f,
+                scratch_A_f32.data(), rows,
+                scratch_B_f32.data(), K,
+                0.0f,
+                scratch_C_f32.data(), rows);
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int c = 0; c < cols; ++c) {
+        const float* src = scratch_C_f32.data() + static_cast<size_t>(c) * rows;
+        int32_t* dst = C + static_cast<size_t>(c) * ldc;
+        if (beta == 0) {
+            for (gcta_blas_int r = 0; r < rows; ++r) {
+                dst[r] = static_cast<int32_t>(std::lround(src[r]));
+            }
+        } else if (beta == 1) {
+            for (gcta_blas_int r = 0; r < rows; ++r) {
+                dst[r] += static_cast<int32_t>(std::lround(src[r]));
+            }
+        } else {
+            for (gcta_blas_int r = 0; r < rows; ++r) {
+                dst[r] = beta * dst[r] + static_cast<int32_t>(std::lround(src[r]));
+            }
+        }
+    }
+#endif
+}
+
+// Compute the lower triangle of C(cols x cols, column-major, leading dim ldc) = A(cols x K, lda) * A(cols x K, lda)^T.
+inline void gcta_syrk_s8s8s32_lower_colmajor_nt(
+    gcta_blas_int cols, gcta_blas_int K,
+    const int8_t* A, gcta_blas_int lda,
+    int32_t* C, gcta_blas_int ldc,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_C_f32)
+{
+    if (cols <= 0 || K <= 0) return;
+#if GCTA_HAS_AOCL_S8_GEMM
+    (void)scratch_A_f32;
+    (void)scratch_C_f32;
+    aocl_gemm_s8s8s32os32('r', 't', 'n',
+                          cols, cols, K,
+                          1,
+                          A, lda, 'n',
+                          A, lda, 'n',
+                          0,
+                          C, ldc,
+                          nullptr);
+#else
+    const size_t size_A = static_cast<size_t>(cols) * static_cast<size_t>(K);
+    if (scratch_A_f32.size() < size_A) scratch_A_f32.resize(size_A);
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int k = 0; k < K; ++k) {
+        const int8_t* src = A + static_cast<size_t>(k) * lda;
+        float* dst = scratch_A_f32.data() + static_cast<size_t>(k) * cols;
+        for (gcta_blas_int r = 0; r < cols; ++r) {
+            dst[r] = static_cast<float>(src[r]);
+        }
+    }
+    const size_t size_C = static_cast<size_t>(cols) * static_cast<size_t>(cols);
+    if (scratch_C_f32.size() < size_C) scratch_C_f32.resize(size_C);
+    cblas_ssyrk(CblasColMajor, CblasLower, CblasNoTrans,
+                cols, K,
+                1.0f,
+                scratch_A_f32.data(), cols,
+                0.0f,
+                scratch_C_f32.data(), cols);
+    #pragma omp parallel for schedule(guided)
+    for (gcta_blas_int c = 0; c < cols; ++c) {
+        const float* src = scratch_C_f32.data() + c + static_cast<size_t>(c) * cols;
+        int32_t* dst = C + c + static_cast<size_t>(c) * ldc;
+        const gcta_blas_int len = cols - c;
+        for (gcta_blas_int r = 0; r < len; ++r) {
+            dst[r] = static_cast<int32_t>(src[r]);
+        }
+    }
+#endif
 }
 
 #endif  //END GCTA_CPU_H

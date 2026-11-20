@@ -23,197 +23,166 @@
 */
 
 #include "Logger.h"
-#include <iostream>
 #include <cstdlib>
-
-#ifdef _WIN32
-#include <io.h>
-#include <stdio.h>
-#define ISATTY(x) _isatty(_fileno(x))
-#else 
+#include <iostream>
 #include <unistd.h>
-#define ISATTY(x) isatty(fileno(x))
-#endif
 
 using std::cout;
 
-std::mutex Logger::log_mutex;
-std::string Logger::empty = {};
-std::map<string, std::chrono::time_point<std::chrono::steady_clock>> Logger::time_map;
-#ifdef _WIN32 
-std::map<Logger::Type, string> Logger::style_map = {{Logger::INFO, ""}, {Logger::PROMPT, ""},
-                                                     {Logger::PROGRESS, "\r"}, {Logger::WARN, ""},
-                                                     {Logger::ERROR, ""}, {Logger::DEBUG, ""}};
-#else
-std::map<Logger::Type, string> Logger::style_map = {{Logger::INFO, "\033[0m"}, {Logger::PROMPT, "\033[0;32m"},
-                                                     {Logger::PROGRESS, "\r"}, {Logger::WARN, "\033[0;33m"},
-                                                     {Logger::ERROR, "\033[0;31m"}, {Logger::DEBUG, "\033[0;34m"}};
-#endif
-Logger* Logger::m_pThis = NULL;
-Logger::Type Logger::m_stat = Logger::INFO;
-std::ofstream Logger::m_logFile;
-string Logger::m_FileName = "";
-
-Logger::Logger(){
-    if(!ISATTY(stdout)){
-        Logger::style_map =  {{Logger::INFO, ""}, {Logger::PROMPT, ""},
-                              {Logger::PROGRESS, "\n"}, {Logger::WARN, ""},
-                              {Logger::ERROR, ""}, {Logger::DEBUG, ""}};
+Logger::Logger() {
+    if (isatty(STDOUT_FILENO)) {
+        style_map_ = {"\033[0m", "\033[0;32m", "\r", "\033[0;33m", "\033[0;31m", "\033[0;34m"};
+    } else {
+        style_map_ = {"", "", "\n", "", "", ""};
     }
-
 }
 
-Logger* Logger::GetLogger(){
-    if(m_pThis == NULL) {
-        m_pThis = new Logger();
-    }
-    return m_pThis;
+Logger& Logger::instance() {
+    static Logger inst;
+    return inst;
 }
 
-bool Logger::check(){
-    if(m_pThis == NULL){
-        return false;
-    }
-    if(!m_logFile.is_open()){
-        return false;
-    }
-    if(m_FileName.empty()){
-        return false;
-    }
-    return true;
+bool Logger::check() const {
+    return m_logFile_.is_open() && !m_FileName_.empty();
 }
 
-void Logger::open(string ofile){
-    if(check()){
+void Logger::open(std::string_view ofile) {
+    if (check()) {
         cout << "Logger has been set, not support to set another time" << endl;
-    }else{
-        m_logFile.open(ofile, std::ios::out);
-        m_FileName = ofile;
-        if(!check()){
-            m_pThis->e(0, "can't write to log file [" + ofile + "].\nPlease check file/folder permission or disk quota.");
+    } else {
+        m_FileName_ = std::string(ofile);
+        m_logFile_.open(m_FileName_, std::ios::out);
+        if (!check()) {
+            error(0, "can't write to log file [{}].\nPlease check file/folder permission or disk quota.", ofile);
         }
     }
 }
 
-void Logger::close(){
-    m_logFile.close();
+void Logger::close() {
+    m_logFile_.close();
 }
 
-void Logger::flush(){
-    m_logFile.flush();
+void Logger::flush() {
+    m_logFile_.flush();
 }
 
-void Logger::Log(int level, Type type, const string& prompt, const string& message){
-    string spaces(level * 2, ' ');
-    std::lock_guard<std::mutex> lock(log_mutex);
-    (*m_pThis) << spaces << type << prompt << INFO << message << endl;
+void Logger::Log(int level, Type type, std::string_view prompt, std::string_view message) {
+    const std::string spaces(static_cast<std::size_t>(level) * 2, ' ');
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    (*this) << spaces << type << prompt << INFO << message << endl;
 }
 
-[[noreturn]] void Logger::e(int level, const string& message, const string& title){
-    string head = title.empty() ? "Error: " : (title+" ");
-    m_pThis->Log(level, ERROR, head, message);
-    m_pThis->Log(level, INFO, "", "An error occurs, please check the options or data");
-    exit(EXIT_FAILURE);
+[[noreturn]] void Logger::e(int level, std::string_view message, std::string_view title) {
+    const std::string head = title.empty() ? std::string("Error: ") : (std::string(title) + " ");
+    Log(level, ERROR, head, message);
+    Log(level, INFO, "", "An error occurs, please check the options or data");
+    std::exit(EXIT_FAILURE);
 }
 
-int Logger::precision(int p){
+int Logger::precision(int p) {
     cout.precision(p);
-    m_logFile.precision(p);
-    return cout.precision();
+    m_logFile_.precision(p);
+    return static_cast<int>(cout.precision());
 }
 
-string Logger::setprecision(int p){
+string Logger::setprecision(int p) {
     cout.precision(p);
-    m_logFile.precision(p);
-    return("");
+    m_logFile_.precision(p);
+    return {};
 }
 
-int Logger::precision(){
-    return cout.precision();
+int Logger::precision() {
+    return static_cast<int>(cout.precision());
 }
 
-void Logger::i(int level, const string& message, const string& title){
-    string head = title.empty() ? "" : (title + " ");
-    m_pThis->Log(level, PROMPT, head, message);
+void Logger::i(int level, std::string_view message, std::string_view title) {
+    const std::string head = title.empty() ? std::string() : (std::string(title) + " ");
+    Log(level, PROMPT, head, message);
 }
 
-void Logger::w(int level, const string &message, const string& title) {
-    string head = title.empty() ? "Warning: " : (title + " ");
-    m_pThis->Log(level, WARN, head, message);
+void Logger::w(int level, std::string_view message, std::string_view title) {
+    const std::string head = title.empty() ? std::string("Warning: ") : (std::string(title) + " ");
+    Log(level, WARN, head, message);
 }
 
-void Logger::d(int level, const string &message, const string& title) {
-    #ifndef NDEBUG
-    string head = title.empty() ? "Debug: " : (title + " ");
-    m_pThis->Log(level, DEBUG, head, message);
-    #endif
+void Logger::d(int level, std::string_view message, std::string_view title) {
+#ifndef NDEBUG
+    const std::string head = title.empty() ? std::string("Debug: ") : (std::string(title) + " ");
+    Log(level, DEBUG, head, message);
+#else
+    (void)level;
+    (void)message;
+    (void)title;
+#endif
 }
 
-void Logger::p(int level, const string &message, const string& title) {
-    string head = title.empty() ? "" : (title + " ");
-    string spaces(level * 2, ' ');
-    m_stat = PROGRESS;
-    std::lock_guard<std::mutex> lock(log_mutex);
-    (*m_pThis) << spaces << head << message << PROGRESS << std::flush;
-    m_stat = INFO;
+void Logger::p(int level, std::string_view message, std::string_view title) {
+    const std::string head = title.empty() ? std::string() : (std::string(title) + " ");
+    const std::string spaces(static_cast<std::size_t>(level) * 2, ' ');
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    m_stat_ = PROGRESS;
+    (*this) << spaces << head << message << PROGRESS << std::flush;
+    m_stat_ = INFO;
 }
 
-void Logger::m(int level, const string &message, const string& title){
-    string head = title.empty() ? "" : (title + " ");
-    string spaces(level * 2, ' ');
-    m_stat = PROGRESS;
-    std::lock_guard<std::mutex> lock(log_mutex);
-    (*m_pThis) << spaces << PROMPT << head << INFO << message << endl;
-    m_stat = INFO;
+void Logger::m(int level, std::string_view message, std::string_view title) {
+    const std::string head = title.empty() ? std::string() : (std::string(title) + " ");
+    const std::string spaces(static_cast<std::size_t>(level) * 2, ' ');
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    m_stat_ = PROGRESS;
+    (*this) << spaces << PROMPT << head << INFO << message << endl;
+    m_stat_ = INFO;
 }
 
-void Logger::l(int level, const string &message, const string &title){
-    string head = title.empty() ? "" : (title + " ");
-    string spaces(level * 2, ' ');
-    m_logFile << spaces << head << message << endl;
+void Logger::l(int level, std::string_view message, std::string_view title) {
+    const std::string head = title.empty() ? std::string() : (std::string(title) + " ");
+    const std::string spaces(static_cast<std::size_t>(level) * 2, ' ');
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    m_logFile_ << spaces << head << message << endl;
 }
 
-void Logger::ts(string key){
-    time_map[key] = std::chrono::steady_clock::now();
-}
-
-float Logger::tp(string key){
-    auto end = std::chrono::steady_clock::now();
-    float secs = 0.0;
-    if(time_map.find(key) != time_map.end()){
-        auto duration = end - time_map[key];
-        secs = std::chrono::duration_cast<std::chrono::duration<float>>(duration).count();
-    }else{
-        m_pThis->w(2, "can't find key of time start");
+void Logger::ts(std::string_view key) {
+    const auto now = std::chrono::steady_clock::now();
+    if (auto it = time_map_.find(key); it != time_map_.end()) {
+        it->second = now;
+    } else {
+        time_map_.emplace(std::string(key), now);
     }
-    return secs;
 }
 
-Logger& Logger::operator<<(Type type){
-    m_stat = type;
-    cout << style_map[type];
-    return *m_pThis;
+float Logger::tp(std::string_view key) {
+    const auto end = std::chrono::steady_clock::now();
+    if (auto it = time_map_.find(key); it != time_map_.end()) {
+        return std::chrono::duration_cast<std::chrono::duration<float>>(end - it->second).count();
+    }
+    w(2, "can't find key of time start");
+    return 0.0f;
 }
 
-Logger& Logger::operator<<(std::ostream& (*op)(std::ostream&)){
+Logger& Logger::operator<<(Type type) {
+    m_stat_ = type;
+    cout << style_map_[static_cast<std::size_t>(type)];
+    return *this;
+}
+
+Logger& Logger::operator<<(std::ostream& (*op)(std::ostream&)) {
     (*op)(cout);
-    if(m_stat !=PROGRESS){
-        (*op)(m_logFile);
-        //m_logFile.flush();
+    if (m_stat_ != PROGRESS) {
+        (*op)(m_logFile_);
     }
-    return *m_pThis;
+    return *this;
 }
 
-Logger& Logger::operator<<(std::ios& (*pf)(std::ios&)){
+Logger& Logger::operator<<(std::ios& (*pf)(std::ios&)) {
     cout << pf;
-    m_logFile << pf;
-    return *m_pThis;
+    m_logFile_ << pf;
+    return *this;
 }
 
-Logger& Logger::operator<<(std::ios_base& (*pf)(std::ios_base&)){
+Logger& Logger::operator<<(std::ios_base& (*pf)(std::ios_base&)) {
     cout << pf;
-    m_logFile << pf;
-    return *m_pThis;
+    m_logFile_ << pf;
+    return *this;
 }
 
 

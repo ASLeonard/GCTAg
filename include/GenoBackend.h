@@ -1,72 +1,48 @@
 /*
    GCTA: a tool for Genome-wide Complex Trait Analysis
 
-   Coroutine-based genotype I/O backend interface.
-
-   Replaces the six dispatch-map families (preGenoDoubleFuncs,
-   getGenoDoubleFuncs, endGenoDoubleFuncs, readGenoFuncs, preProcessFuncs,
-   endProcessFuncs) and the AsyncBuffer<uintptr_t> pipeline with a
-   single virtual stream() method per format.
+   Double-buffered genotype I/O backend interface.
 
    Each backend:
-     - runs pre-logic (mask allocation etc.) in its constructor
-     - runs end-logic (mask deallocation etc.) in its destructor
-     - implements stream() as a C++ coroutine that reads raw genotype blocks
-       on an I/O thread and hands them to the user callback on a CPU thread,
-       using the NVIDIA/stdexec P2300 reference implementation.
-
-    The callback now uses zero-copy marker-index views
-    (void(uintptr_t* buf, std::span<const uint32_t> exIndex)).
+     - runs pre-logic (mask allocation, file opening) in its constructor
+     - runs end-logic (mask deallocation, file closing) in its destructor
+     - provides a synchronous Producer that fills each GenoBlock on a
+       dedicated std::jthread while compute callbacks execute on the
+       calling thread (preserving OpenMP/BLAS thread affinity).
 */
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
 #include <vector>
 
 #include "mem.hpp"
 
 // --------------------------------------------------------------------------
-// stdexec (P2300 reference implementation) — required for exec::task<void>
-// and exec::static_thread_pool.
-// --------------------------------------------------------------------------
-#include <stdexec/execution.hpp>
-#include <exec/task.hpp>
-#include <exec/static_thread_pool.hpp>
-
-// --------------------------------------------------------------------------
 // GenoBlock
 //
-// One block of raw genotype data as filled by a backend's I/O coroutine.
+// One block of raw genotype data filled by a backend Producer.
 // The layout of buf[] is format-specific (BED / BGEN / PGEN); callers that
 // need to interpret it call Geno::getGenoDouble(buf.data(), i, &item).
 // --------------------------------------------------------------------------
 struct GenoBlock {
-    std::vector<uintptr_t, AlignedAllocator<uintptr_t, 32>> buf;  ///< raw packed data, stride × numMarkers elements; 32-byte aligned for AVX2 vmovdqa
+    std::vector<uintptr_t, AlignedAllocator<uintptr_t, 64>> buf;  ///< 64-byte aligned packed data
     std::span<const uint32_t> extractIndex; ///< marker extract-indices view for this block
-    uint32_t               numMarkers = 0;
-    uint8_t                sexChromType   = 0; ///< 0=non-sex, 1=homogametic, 2=heterogametic
-    int                    fileIndex  = 0; ///< which geno_file[] this block came from
+    uint32_t               numMarkers   = 0;
+    uint8_t                sexChromType = 0; ///< 0=non-sex, 1=homogametic, 2=heterogametic
+    int                    fileIndex    = 0; ///< which geno_file[] this block came from
 };
 
 // --------------------------------------------------------------------------
-// GenoScheduler — the concrete scheduler type from exec::static_thread_pool.
-// Using decltype avoids hard-coding an implementation-internal type name.
-// --------------------------------------------------------------------------
-using GenoScheduler =
-    decltype(std::declval<exec::static_thread_pool &>().get_scheduler());
-
-// --------------------------------------------------------------------------
-// GenoBackend — abstract base for BED / BGEN / PGEN backends.
+// GenoBackend — base class for BED / BGEN / PGEN backends.
 //
-// Lifecycle:
-//   construction  → runs format-specific pre-logic  (mask allocation, file setup)
-//   stream()      → coroutine I/O loop
-//   destruction   → runs format-specific end-logic  (mask deallocation, file close)
-//
-// All three backends share this interface so that loopDouble() can hold a
-// std::unique_ptr<GenoBackend> without knowing the concrete format.
+// Owns a 2-slot double-buffered std::jthread pipeline: stream() runs the
+// format Producer on an I/O thread while invoking callback on the caller thread.
 // --------------------------------------------------------------------------
 class GenoBackend {
 public:
@@ -75,16 +51,22 @@ public:
     GenoBackend()          = default;
     virtual ~GenoBackend() = default;
 
-    // Non-copyable, non-moveable (owns OS resources and Geno pointers).
     GenoBackend(const GenoBackend &)            = delete;
     GenoBackend &operator=(const GenoBackend &) = delete;
 
-    /// Stream all blocks for extractIndex through callback.
-    /// I/O runs on io_sched (1 thread); callback runs on cpu_sched.
-    /// The coroutine returns only when all blocks have been processed.
-    virtual exec::task<void> stream(
-        GenoScheduler               io_sched,
-        GenoScheduler               cpu_sched,
-        std::vector<uint32_t>       extractIndex,
-        Callback                    callback) = 0;
+    void stream(std::span<const uint32_t> extractIndex, Callback callback);
+
+protected:
+    struct Producer {
+        virtual ~Producer() = default;
+        // Populate `block` with the next batch of markers; return false at EOF.
+        virtual bool nextBlock(GenoBlock &block) = 0;
+    };
+
+    virtual std::size_t initialBlockCapacity() const { return 0; }
+    virtual std::unique_ptr<Producer> makeProducer(std::span<const uint32_t> extractIndex) = 0;
+
+private:
+    std::array<GenoBlock, 2> blocks_;
+    std::atomic<bool>        streamActive_{false};
 };

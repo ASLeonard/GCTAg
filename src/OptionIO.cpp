@@ -25,6 +25,56 @@ void addOneFileOption(string key_store, string append_string, string key_name, m
     }
 }
 
+void requireFileReadable(const string& flag_name, const string& path) {
+    if (!checkFileReadable(path)) {
+        LOGGER.e(0, flag_name + " " + path + " not found");
+    }
+}
+
+vector<string> expandFileList(const string& list_filename, const string& suffix) {
+    requireFileReadable("file list", list_filename);
+
+    vector<string> m_files;
+    std::ifstream m_file(list_filename);
+    string line;
+    while (std::getline(m_file, line)) {
+        std::istringstream iss(line);
+        string temp_fname;
+        if (!(iss >> temp_fname)) {
+            continue;
+        }
+        boost::replace_all(temp_fname, "\r", "");
+        m_files.push_back(temp_fname);
+    }
+
+    if (m_files.empty()) {
+        LOGGER.e(0, "no item in [" + list_filename + "].");
+    }
+
+    std::set<string> unique_mfiles;
+    auto ends = std::remove_if(m_files.begin(), m_files.end(),
+                               [&unique_mfiles](const string& item) {
+                                   if (unique_mfiles.find(item) != unique_mfiles.end()) {
+                                       return true;
+                                   }
+                                   unique_mfiles.insert(item);
+                                   return false;
+                               });
+    m_files.erase(ends, m_files.end());
+
+    vector<string> out_files;
+    out_files.reserve(m_files.size());
+    for (const auto& temp_fname : m_files) {
+        if (temp_fname.size() >= suffix.size() &&
+            temp_fname.compare(temp_fname.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            out_files.push_back(temp_fname);
+        } else {
+            out_files.push_back(temp_fname + suffix);
+        }
+    }
+    return out_files;
+}
+
 void addMFileListsOption(string key_store, string append_string, string key_name, map<string, vector<string>> options_in, map<string,string>& options){
     string list_filename;
     if(options_in.find(key_name) != options_in.end()){
@@ -37,53 +87,8 @@ void addMFileListsOption(string key_store, string append_string, string key_name
             LOGGER.e(0, "no " + key_name + " parameter found");
         }
 
-        vector<string> m_files;
-        std::ifstream m_file(list_filename);
-        string line;
-        while(std::getline(m_file, line)){
-            std::istringstream iss(line);
-            string temp_fname;
-            if (!(iss >> temp_fname)){
-                continue;
-            }
-            boost::replace_all(temp_fname, "\r", "");
-            m_files.push_back(temp_fname);
-        }
-        m_file.close();
-
-        if(m_files.size() > 0){
-            std::set<string> unique_mfiles;
-            auto ends = std::remove_if(m_files.begin(), m_files.end(),
-                    [&unique_mfiles](const string& item){
-                        if(unique_mfiles.find(item) != unique_mfiles.end()){
-                            return true;
-                        }
-                        unique_mfiles.insert(item);
-                        return false;
-                    });
-            m_files.erase(ends, m_files.end());
-            //LOGGER.i(0, to_string(m_files.size()) + " unique items in [" + list_filename + "].");
-
-            vector<string> mc_files;
-            for(auto &temp_fname : m_files){
-                string t2_fname;
-                if(temp_fname.size() < append_string.size()){
-                    t2_fname = temp_fname + append_string;
-                }else{
-                    string ext = temp_fname.substr(temp_fname.size() - append_string.size());
-                    if(ext == append_string){
-                        t2_fname = temp_fname;
-                    }else{
-                        t2_fname = temp_fname + append_string;
-                    }
-                }
-                mc_files.push_back(t2_fname);
-            }
-
-            options[key_store] = boost::algorithm::join(mc_files, "\t");
-        }else{
-            LOGGER.e(0, "no item in [" + list_filename + "].");
-        }
+        const vector<string> mc_files = expandFileList(list_filename, append_string);
+        options[key_store] = boost::algorithm::join(mc_files, "\t");
     }
 }
 

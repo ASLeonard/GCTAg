@@ -28,6 +28,8 @@ using std::to_string;
 
 void addOneFileOption(string key_store, string append_string, string key_name, map<string, vector<string>> options_in, map<string,string>& options);
 void addMFileListsOption(string key_store, string append_string, string key_name, map<string, vector<string>> options_in, map<string,string>& options);
+vector<string> expandFileList(const string& list_filename, const string& suffix);
+void requireFileReadable(const string& flag_name, const string& path);
 
 // get the header of the text file; true: get success, false: only string start with #
 bool getListHeaderNew(std::ifstream *input, bool &ioerr, int &ncol, vector<string> &head, int &nHeader);

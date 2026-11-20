@@ -55,7 +55,9 @@
         "GCTA_BLAS_BACKEND": "AOCL",
         "GCTA_BLAS_LIBRARY": "$env{AOCL_ROOT}/lib/libblis-mt.so",
         "GCTA_LAPACKE_LIBRARY": "$env{AOCL_ROOT}/lib/libflame.so",
-        "GCTA_BLAS_INCLUDE_DIR": "$env{AOCL_ROOT}/include"
+        "GCTA_BLAS_INCLUDE_DIR": "$env{AOCL_ROOT}/include",
+        "GCTA_MARCH": "x86-64-v3",
+        "GCTA_MTUNE": "znver4"
       }
     },
     {

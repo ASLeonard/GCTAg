@@ -24,10 +24,10 @@
 #include <vector>
 #include "Pheno.h"
 #include "Marker.h"
+#include "Cli.hpp"
 #include "Logger.h"
-#include "GenoBackend.h"     // GenoBlock, GenoBackend, GenoScheduler
+#include "GenoBackend.h"     // GenoBlock, GenoBackend
 #include <functional>
-#include "tables.h"
 
 // Forward declarations for the three concrete backends (needed for friend).
 class BedBackend;
@@ -38,14 +38,13 @@ using std::function;
 using std::string;
 using std::map;
 using std::vector;
-using std::placeholders::_1;
-using std::placeholders::_2;
-using std::bind;
 
 typedef struct GenoBufItem{
     // in
     uint32_t extractedMarkerIndex = 0;   // for allele lookup
     double *geno_ptr = nullptr;          // optional external genotype buffer (length >= keepSampleCT)
+    float  *geno_f32_ptr = nullptr;      // optional external float32 genotype buffer (length >= keepSampleCT)
+    int8_t *geno_i8_ptr = nullptr;       // optional external int8 raw {0,1,2} genotype buffer (length >= keepSampleCT)
 
     // out
     bool valid = false;
@@ -69,7 +68,11 @@ typedef struct GenoBufItem{
 
 class Geno {
 public:
-    Geno(Pheno* pheno, Marker* marker);
+    Geno(Pheno* pheno,
+         Marker* marker,
+         const gcta_cli::GenoInputOptions& geno_opts,
+         const gcta_cli::MarkerFilterOptions& marker_filter,
+         const std::string& out_prefix = "");
     ~Geno();
     // Used internally by bgen2bed for BED output
     void save_bed(uint64_t *buf, int num_marker);
@@ -84,10 +87,7 @@ public:
             
     bool check_bed() = delete;
     void out_freq(string filename);
-    static int registerOption(map<string, vector<string>>& options_in);
-    static void processMain();
     bool filterMAF();
-    static void setSexMode();
     uint32_t getTotalMarker();
 
     // coroutine-based loop — pre/end now handled by GenoBackend RAII
@@ -100,12 +100,30 @@ public:
                       float &af_out, float &additive_af_out,
                       bool &valid_out, uint32_t extractedMarkerIndex);
 
+    // Direct uncentered int8 genotype decode for BED additive MLMA streaming:
+    // writes n int8 values {0, 1, 2} (missing -> 0) into dest[], and populates
+    // miss_out bitmask when nValidN_out < keepSampleCT.
+    void getGenoInt8_bed(uintptr_t *buf, int idx, int8_t *dest,
+                         float &af_out, float &additive_af_out,
+                         double &mu_out, uint32_t &nValidN_out,
+                         uintptr_t *miss_out, bool &valid_out,
+                         uint32_t extractedMarkerIndex);
+
+    bool canUseInt8Mlma() const {
+        return genoFormat == "BED" &&
+               genoCodingModel == GenoCodingModel::ADDITIVE &&
+               iDC == 1;
+    }
+    int getMissPtrSize() const { return missPtrSize; }
+    uint32_t getRawSampleCT() { return pheno ? pheno->count_raw() : keepSampleCT; }
+
     void loopDouble(const vector<uint32_t> &extractIndex, int numMarkerBuf, bool bMakeGeno, bool bGenoCenter, bool bGenoStd, bool bMakeMiss, vector<function<void (uintptr_t *buf, std::span<const uint32_t> exIndex)>> callbacks = vector<function<void (uintptr_t *buf, std::span<const uint32_t> exIndex)>>(), bool showLog = true);
 
     bool getGenoHasInfo();
+    const string& getGenoFormat() const { return genoFormat; }
 
     void setGRMMode(bool grm, bool dominace);
-    void setGenoCodingModel(const string& model_name);
+    void setGenoCodingModel(gcta_cli::GenoModel model);
     void setGenoItemSize(uint32_t &genoSize, uint32_t &missSize);
  
 private:
@@ -113,7 +131,6 @@ private:
     Marker* marker;
     FILE* hOut = NULL;
 
-    GBitCountTable g_table;
     vector<double> AFA1;
     
     //vector<uint32_t> countA1A1;
@@ -121,14 +138,17 @@ private:
     //vector<uint32_t> countA2A2;
     vector<uint32_t> countMarkers;
     //vector<double> RDev;
-    uint32_t total_markers;
+    uint32_t total_markers = 0;
 
-    
-    static map<string, string> options;
-    static map<string, double> options_d;
-    static vector<string> processFunctions;
-    static void addOneFileOption(string key_store, string append_string, string key_name,
-                                 map<string, vector<string>> options_in);
+    std::string out_prefix_;
+    std::string recode_method_ = "nomiss";
+    double opt_min_maf = 0.0;
+    double opt_max_maf = 0.5;
+    double opt_geno_rate = 1.0;
+    double opt_info_score = 0.0;
+    double opt_dos_dc = -1.0;
+    double opt_hard_call_thresh = 0.9;
+    bool opt_dosage_call = false;
 
     void init_AF(string alleleFileName);
     uint64_t num_item_1geno;

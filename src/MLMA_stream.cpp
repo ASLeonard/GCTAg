@@ -61,19 +61,10 @@
 #include <cstring>
 #include <cerrno>
 
-using std::map;
 using std::string;
 using std::to_string;
 using std::vector;
 using std::function;
-
-// ---------------------------------------------------------------------------
-// Static member definitions
-// ---------------------------------------------------------------------------
-map<string, string>  MLMA::options;
-map<string, double>  MLMA::options_d;
-map<string, vector<double>> MLMA::options_vd;
-vector<string>       MLMA::processFunctions;
 
 // ---------------------------------------------------------------------------
 // Internal types (anonymous namespace)
@@ -403,7 +394,7 @@ void writeRemlStateFromCtx(const std::string& filename, RemlCtx& ctx, bool no_ad
         #pragma omp parallel for schedule(static)
         for (int32_t i = 0; i < ctx.n; ++i) {
             for (int32_t j = 0; j < k; ++j)
-                Uk_f(j, i) = static_cast<float>(ctx.Uk(i, j));
+                Uk_f(j, i) = ctx.Uk(i, j);
         }
         ctx.Uk.resize(0, 0);
         write_exact(fd, Uk_f.data(), static_cast<size_t>(ctx.n) * k * sizeof(float), filename);
@@ -566,19 +557,19 @@ void load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ctx, uint64_t
     read_exact(fd, dk_f.data(), dk_bytes, filename);
     close(fd);
 
-    // k x n float -> n x k double; parallel over samples (contiguous reads).
+    // k x n float -> n x k float; parallel over samples (contiguous reads).
     ctx.Uk.resize(ctx.n, k);
     #pragma omp parallel for schedule(static)
     for (int32_t i = 0; i < ctx.n; ++i)
         for (int32_t j = 0; j < k; ++j)
-            ctx.Uk(i, j) = static_cast<double>(Uk_f(j, i));
+            ctx.Uk(i, j) = Uk_f(j, i);
     Uk_f.resize(0, 0);
 
     ctx.dk                       = dk_f.cast<double>();
     ctx.lambda_tail              = lambda_tail;
     ctx.tail_d_var               = tail_d_var;
+    ctx.woodbury_basis           = WoodburyBasisSpec{WoodburyBasisSpec::Kind::Fixed, k};
     ctx.woodbury_basis_rank_     = k;
-    ctx.woodbury_basis_rank      = k;
     ctx.Vi_use_woodbury_basis    = true;
     ctx.woodbury_basis_preloaded = true;
 
@@ -635,14 +626,14 @@ void write_hsq_from_ctx(const string& out_prefix, const RemlCtx& ctx)
 // individual's eigenvector — worse than no warm start at all — so any
 // mismatch between the file's sample set and the current analysis sample
 // set is a hard error, not a fallback.
-Eigen::MatrixXd load_pca_warm_start(const string& eigenvec_prefix,
+Eigen::MatrixXf load_pca_warm_start(const string& eigenvec_prefix,
                                      const vector<string>& analysis_ids)
 {
     const string path = eigenvec_prefix + ".eigenvec";
     std::ifstream in(path);
     if (!in) LOGGER.e(0, "--reml-woodbury-basis-warm-start: cannot open [" + path + "].");
 
-    std::unordered_map<string, vector<double>> by_id;
+    std::unordered_map<string, vector<float>> by_id;
     by_id.reserve(analysis_ids.size() * 2);
 
     string line, fid, iid;
@@ -652,8 +643,8 @@ Eigen::MatrixXd load_pca_warm_start(const string& eigenvec_prefix,
         std::istringstream ss(line);
         if (!(ss >> fid >> iid))
             LOGGER.e(0, "--reml-woodbury-basis-warm-start: malformed line in [" + path + "].");
-        vector<double> pcs;
-        double v;
+        vector<float> pcs;
+        float v;
         while (ss >> v) pcs.push_back(v);
         if (k < 0) k = static_cast<int>(pcs.size());
         else if (static_cast<int>(pcs.size()) != k)
@@ -664,7 +655,7 @@ Eigen::MatrixXd load_pca_warm_start(const string& eigenvec_prefix,
         LOGGER.e(0, "--reml-woodbury-basis-warm-start: no eigenvectors read from [" + path + "].");
 
     const int n = static_cast<int>(analysis_ids.size());
-    Eigen::MatrixXd Uk(n, k);
+    Eigen::MatrixXf Uk(n, k);
     for (int i = 0; i < n; ++i) {
         const auto it = by_id.find(analysis_ids[i]);
         if (it == by_id.end())
@@ -683,398 +674,61 @@ Eigen::MatrixXd load_pca_warm_start(const string& eigenvec_prefix,
 
 
 // ---------------------------------------------------------------------------
-// registerOption
+// MLMA::run
 // ---------------------------------------------------------------------------
-int MLMA::registerOption(map<string, vector<string>>& options_in)
+void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
 {
-    // Always capture --out (shared flag)
-    // Use the pre-processed "out" key (no dashes), which is always set by main.cpp
-    if (!options_in["out"].empty())
-        options["out"] = options_in["out"][0];
-
-    const bool has_mlma_stream = options_in.find("--mlma-stream") != options_in.end();
-    const bool has_load_reml   = options_in.find("--load-reml")   != options_in.end()
-                                  && !options_in["--load-reml"].empty();
-    // --save-reml is a boolean flag (no argument): the REML state is always
-    // written to "<out>.reml". Any value accidentally supplied is ignored.
-    const bool has_save_reml   = options_in.find("--save-reml")   != options_in.end();
-    const bool has_reuse       = options_in.find("--reml-woodbury-reuse") != options_in.end();
-
-    auto capture_common_reml_flags = [&]() {
-        if (options_in.find("--reml-alg") != options_in.end()
-                && !options_in["--reml-alg"].empty()) {
-            options_d["reml_alg"] = std::stod(options_in["--reml-alg"][0]);
-            options_in.erase("--reml-alg");
-        }
-        if (options_in.find("--reml-no-constrain") != options_in.end()) {
-            options["no_constrain"] = "1";
-            options_in.erase("--reml-no-constrain");
-        }
-        if (options_in.find("--reml-diagV-adj") != options_in.end()
-                && !options_in["--reml-diagV-adj"].empty()) {
-            options_d["reml_diagV_adj"] = std::stod(options_in["--reml-diagV-adj"][0]);
-            options_in.erase("--reml-diagV-adj");
-        }
-        if (options_in.find("--seed") != options_in.end()
-             && !options_in["--seed"].empty()) {
-            options_d["seed"] = std::stod(options_in["--seed"][0]);
-            options_in.erase("--seed");
-        }
-    };
-
-    if (!has_mlma_stream)
-        return 0;
-
-    if (has_load_reml && has_save_reml)
-        LOGGER.e(0, "--mlma-stream does not allow --load-reml with --save-reml.");
-    if (has_reuse && has_load_reml)
-        LOGGER.e(0, "--reml-woodbury-reuse re-fits REML for the current phenotype and cannot be "
-                    "combined with --load-reml (which uses a fitted state as-is).");
-    if (has_reuse && (options_in["--reml-woodbury-reuse"].empty()
-                      || options_in["--reml-woodbury-reuse"][0].empty()))
-        LOGGER.e(0, "--reml-woodbury-reuse requires a .reml file argument.");
-
-    if (has_save_reml) {
-        if (!options_in["--save-reml"].empty())
-            LOGGER.w(0, "--save-reml takes no argument in --mlma-stream; the REML state "
-                        "will be saved to [" + options.at("out") + ".reml" + "].");
-        options["save_reml"] = "1";
-        options_in.erase("--save-reml");
+    const auto& r = opts.reml;
+    const bool   no_adj_covar   = opts.no_preadj_covar;
+    const bool   log_pval       = opts.log_pval;
+    const bool   weighted_pheno = opts.pheno_covar.weighted_phenotypes;
+    // --save-reml only fits/saves the REML state and never streams SNPs,
+    // so the bim (Marker) and genotype (Geno) data are never touched.
+    const bool   reml_only      = opts.save_reml;
+    const FastMlmaMode fast_mlma_mode = opts.fast_mlma.value_or(FastMlmaMode::Off);
+    if (opts.fast_mlma.has_value() && reml_only) {
+        LOGGER.w(0, "--fast-mlma applies to association scanning and has no effect with --save-reml.");
     }
 
-    capture_common_reml_flags();
+    if (no_adj_covar)
+        LOGGER.e(0, "--mlma-no-preadj-covar is not yet supported in --MLMA. "
+                    "Re-run without this flag (pre-adjustment is the default).");
 
-    if (has_load_reml) {
-        // Pre-built REML state: load from file.
-        options["load_reml"] = options_in["--load-reml"][0];
-        options_in.erase("--load-reml");
-        // REML tuning flags are irrelevant when a saved state is loaded; consume to suppress warnings.
-        options_in.erase("--reml-woodbury-basis");
-        options_in.erase("--svd-method");
-        options_in.erase("--reml-trace-hutchpp");
-        options_in.erase("--reml-trace-hutchpp-fixed-probes");
-        options_in.erase("--reml-maxit");
-        options_in.erase("--reml-priors");
-        options_in.erase("--reml-priors-var");
-        options_in.erase("--reml-no-HE-start");
-        options_in.erase("--reml-woodbury-basis-EIG-mass");
-        options_in.erase("--reml-woodbury-basis-VAR-tail");
-        options_in.erase("--reml-woodbury-basis-range");
-        options_in.erase("--grm-chunked-budget");
-        options_in.erase("--reml-ai-robust");
-        options_in.erase("--reml-ai-robust-tol");
-        options_in.erase("--reml-ai-robust-risk");
-        options_in.erase("--reml-force-dense-V");
-        options_in.erase("--reml-print-trajectory");
-    } else {
-        // Inline REML path: --grm is required, unless the Woodbury basis comes
-        // from a saved .reml (--reml-woodbury-reuse), in which case no GRM is read.
-        const bool has_grm = options_in.find("--grm") != options_in.end()
-                              && !options_in["--grm"].empty();
-        if (has_reuse) {
-            if (has_grm)
-                LOGGER.e(0, "--reml-woodbury-reuse takes the basis from the .reml file and does not read a GRM; remove --grm.");
-            if (options_in.find("--reml-woodbury-basis") != options_in.end())
-                LOGGER.e(0, "--reml-woodbury-reuse cannot be combined with --reml-woodbury-basis (the rank comes from the .reml file).");
-            if (options_in.find("--reml-woodbury-basis-posthoc-correction") != options_in.end())
-                LOGGER.e(0, "--reml-woodbury-reuse is incompatible with --reml-woodbury-basis-posthoc-correction (no exact GRM is loaded).");
-            options["woodbury_reuse"] = options_in["--reml-woodbury-reuse"][0];
-            options_in.erase("--reml-woodbury-reuse");
-        } else {
-            if (!has_grm)
-                LOGGER.e(0, "--mlma-stream requires either --load-reml <file>, --reml-woodbury-reuse <file> or --grm <prefix>.");
-            options["grm"] = options_in["--grm"][0];
-            options_in.erase("--grm");
-        }
-
-        // --reml-woodbury [k]  (k optional; -1 = MP-k, -2 = EIG, -3 = variance)
-        if (options_in.find("--reml-woodbury-basis") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis"];
-            if (!vals.empty() && !vals[0].empty()) {
-                if (vals[0] == "EIG")
-                    options_d["woodbury_basis_rank"] = -2.0;  // Eigenvalue mass k
-                else if (vals[0] == "VAR")
-                    options_d["woodbury_basis_rank"] = -3.0;  // Variance-k
-                else if (vals[0] == "MP")
-                    options_d["woodbury_basis_rank"] = -1.0;  // MP-k
-                else
-                    options_d["woodbury_basis_rank"] = std::stod(vals[0]);
-            } else
-                options_d["woodbury_basis_rank"] = -1.0;   // MP-k
-            options_in.erase("--reml-woodbury-basis");
-        }
-        if (options_in.find("--reml-woodbury-basis-EIG-mass") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-EIG-mass"];
-            if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-EIG-mass requires a fractional argument (e.g. 0.15).");
-            options_d["woodbury_basis_eigen_mass"] = std::stof(vals[0]);
-            options_in.erase("--reml-woodbury-basis-EIG-mass");
-        }
-        if (options_in.find("--reml-woodbury-basis-VAR-tail") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-VAR-tail"];
-            if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-VAR-tail requires a relative Frobenius error argument (e.g. 0.001).");
-            options_d["woodbury_basis_var_thresh"] = std::stod(vals[0]);
-            options_in.erase("--reml-woodbury-basis-VAR-tail");
-        }
-        // --svd-method <power|nystrom>: select the Woodbury basis sketch.
-        // The default power path uses subspace iteration; Nystrom is single-pass.
-        if (options_in.find("--svd-method") != options_in.end()) {
-            const auto& vals = options_in["--svd-method"];
-            if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--svd-method requires one argument: power or nystrom.");
-            string method = vals[0];
-            std::transform(method.begin(), method.end(), method.begin(),
-                           [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-            if (method == "nystrom") {
-                options["svd_nystrom"] = "1";
-            } else if (method != "power") {
-                LOGGER.e(0, "Unsupported --svd-method value [" + vals[0] + "]. Allowed values: power, nystrom.");
-            }
-            if (vals.size() > 1)
-                LOGGER.w(0, "--svd-method expects exactly one value; using the first one.");
-            options_in.erase("--svd-method");
-        }
-        if (options_in.find("--svd-power-iter") != options_in.end()) {
-            const auto& vals = options_in["--svd-power-iter"];
-            if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--svd-power-iter requires one integer argument.");
-            options_d["svd_power_iter"] = std::stod(vals[0]);
-            if (vals.size() > 1)
-                LOGGER.w(0, "--svd-power-iter expects exactly one value; using the first one.");
-            options_in.erase("--svd-power-iter");
-        }
-        // --reml-woodbury-basis-warm-start <prefix>: seed the Woodbury rSVD sketch
-        // with eigenvectors from a prior "<prefix>.eigenvec" (e.g. written by
-        // --pca-approx rSVD on the same GRM/sample set), instead of a cold
-        // Gaussian draw. Ignored when --svd-method nystrom is set, since
-        // the Nystrom path doesn't use power iteration.
-        if (options_in.find("--reml-woodbury-basis-warm-start") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-warm-start"];
-            if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-warm-start requires a file prefix argument.");
-            options["woodbury_basis_warm_start"] = vals[0];
-            options_in.erase("--reml-woodbury-basis-warm-start");
-        }
-        if (options_in.find("--reml-no-HE-start") != options_in.end()) {
-            if (!options_in["--reml-no-HE-start"].empty())
-                LOGGER.w(0, "--reml-no-HE-start takes no argument; ignoring the supplied value.");
-            options["no_HE_start"] = "1";
-            options_in.erase("--reml-no-HE-start");
-        }
-        if (options_in.find("--reml-force-dense-V") != options_in.end()) {
-            if (!options_in["--reml-force-dense-V"].empty())
-                LOGGER.w(0, "--reml-force-dense-V takes no argument; ignoring the supplied value.");
-            options["force_dense_V"] = "1";
-            options_in.erase("--reml-force-dense-V");
-        }
-        // --grm-chunked-budget: read K in lower-triangular tiles for the
-        // Woodbury basis rSVD instead of holding a dense n x n K resident —
-        // see chunked_grm_matvec.hpp. Requires the caller (below, once
-        // grm_binary_io.hpp's reader is wired up) to populate
-        // ctx.grm_tile_reader; RemlEngine enforces this at runtime.
-        if (options_in.find("--grm-chunked-budget") != options_in.end()) {
-            const auto& vals = options_in["--grm-chunked-budget"];
-            if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--grm-chunked-budget requires a target memory in GB.");
-            options_d["grm_chunked_budget"] = std::stod(vals[0]);
-            options_in.erase("--grm-chunked-budget");
-        }
-        if (options_in.find("--reml-woodbury-basis-MP-margin") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-MP-margin"];
-            if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-MP-margin requires a fractional argument (e.g. 0.15).");
-            options_d["woodbury_basis_edge_margin"] = std::stod(vals[0]);
-            options_in.erase("--reml-woodbury-basis-MP-margin");
-        }
-        if (options_in.find("--reml-woodbury-basis-MP-confirm") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-MP-confirm"];
-            if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-MP-confirm requires an integer argument.");
-            options_d["woodbury_basis_edge_confirm"] = std::stod(vals[0]);
-            options_in.erase("--reml-woodbury-basis-MP-confirm");
-        }
-        if (options_in.find("--reml-woodbury-basis-EIG-k-buffer") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-EIG-k-buffer"];
-            if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-EIG-k-buffer requires an integer argument.");
-            options_d["woodbury_basis_EIG_k_buffer"] = std::stod(vals[0]);
-            options_in.erase("--reml-woodbury-basis-EIG-k-buffer");
-        }
-        // --reml-woodbury-basis-mem-budget <GB>: hard cap on k_svd derived from an
-        // approximate rSVD sketch memory budget, independent of n-1. See the
-        // svd_mem_budget_gb comment in RemlCtx.hpp — chunking K does
-        // nothing to bound this, since the sketch buffers scale with k_ext
-        // regardless of whether K itself is chunked or dense.
-        if (options_in.find("--reml-woodbury-basis-mem-budget") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-mem-budget"];
-            if (vals.empty() || vals[0].empty())
-                LOGGER.e(0, "--reml-woodbury-basis-mem-budget requires a GB argument (e.g. 32).");
-            options_d["woodbury_basis_mem_budget_gb"] = std::stod(vals[0]);
-            options_in.erase("--reml-woodbury-basis-mem-budget");
-        }
-        if (options_in.find("--reml-woodbury-basis-range") != options_in.end()) {
-            const auto& vals = options_in["--reml-woodbury-basis-range"];
-            if (vals.size() < 2)
-                LOGGER.e(0, "--reml-woodbury-basis-range requires two integer arguments.");
-            options_d["woodbury_basis_range_init"] = std::stod(vals[0]);
-            options_d["woodbury_basis_range_max"] = std::stod(vals[1]);
-            options_in.erase("--reml-woodbury-basis-range");
-        }
-        if (options_in.find("--reml-woodbury-basis-posthoc-correction") != options_in.end()) {
-            options["woodbury_basis_posthoc_correction"] = "1";
-            options_in.erase("--reml-woodbury-basis-posthoc-correction");
-            LOGGER.w(0, "--reml-woodbury-basis-posthoc-correction is an experimental feature and likely to worsen results.");
-        }
-        if (options_in.find("--reml-trace-hutchpp") != options_in.end()) {
-            options["trace_hutchpp"] = "1";
-            const auto& v = options_in["--reml-trace-hutchpp"];
-            if (!v.empty() && !v[0].empty())
-                options_d["trace_hutchpp_nprobes"] = std::stod(v[0]);
-            options_in.erase("--reml-trace-hutchpp");
-        }
-        if (options_in.find("--reml-trace-hutchpp-fixed-probes") != options_in.end()) {
-            options["trace_hutchpp_fixed_probes"] = "1";
-            options_in.erase("--reml-trace-hutchpp-fixed-probes");
-        }
-        if (options_in.find("--reml-maxit") != options_in.end()
-                && !options_in["--reml-maxit"].empty()) {
-            options_d["reml_maxit"] = std::stod(options_in["--reml-maxit"][0]);
-            options_in.erase("--reml-maxit");
-        }
-        if (options_in.find("--reml-priors-var") != options_in.end()) {
-            options["reml_priors_var"] = "1";
-            const auto& vals = options_in["--reml-priors-var"];
-            for (const auto& s : vals) {
-                if (!s.empty())
-                    options_vd["reml_priors_var"].push_back(std::stod(s));
-            }
-            options_in.erase("--reml-priors-var");
-        }
-        if (options_in.find("--reml-priors") != options_in.end()) {
-            const auto& vals = options_in["--reml-priors"];
-            for (const auto& s : vals) {
-                if (!s.empty())
-                    options_vd["reml_priors"].push_back(std::stod(s));
-            }
-            options_in.erase("--reml-priors");
-        }
-        if (options_in.find("--reml-ai-robust") != options_in.end()) {
-            options["reml_ai_robust"] = "1";
-            options_in.erase("--reml-ai-robust");
-        }
-        if (options_in.find("--reml-ai-robust-tol") != options_in.end()
-                && !options_in["--reml-ai-robust-tol"].empty()) {
-            options_d["reml_ai_robust_tol"] = std::stod(options_in["--reml-ai-robust-tol"][0]);
-            options_in.erase("--reml-ai-robust-tol");
-        }
-        if (options_in.find("--reml-ai-robust-risk") != options_in.end()
-                && !options_in["--reml-ai-robust-risk"].empty()) {
-            options_d["reml_ai_robust_risk"] = std::stod(options_in["--reml-ai-robust-risk"][0]);
-            options_in.erase("--reml-ai-robust-risk");
-        }
-        if (options_in.find("--reml-print-trajectory") != options_in.end()) {
-            options["reml_print_trajectory"] = "1";
-            options_in.erase("--reml-print-trajectory");
-        }
+    // only if requested; otherwise leave it seeded from entropy (the default).
+    if (r.seed.has_value()) {
+        const auto seed = static_cast<std::mt19937::result_type>(*r.seed);
+        gcta_eigh::shared_rng().seed(seed);
+        LOGGER.i(0, "Using random seed: " + to_string(seed) + ".");
     }
 
-    if (options_in.find("--mlma-no-preadj-covar") != options_in.end()) {
-        options["no_adj_covar"] = "1";
-        options_in.erase("--mlma-no-preadj-covar");
+    if (r.ai_robust && r.trace_hutchpp.has_value() && !r.trace_hutchpp_fixed_probes)
+        LOGGER.w(0, "Using fresh Hutch++ probes without robust AI convergence can lead to unstable REML convergence. Consider using --reml-ai-robust or --reml-trace-hutchpp-fixed-probes.");
+    if (r.woodbury_posthoc_correction)
+        LOGGER.w(0, "--reml-woodbury-basis-posthoc-correction is an experimental feature and likely to worsen results.");
+
+    // ---- Pheno / Marker / Geno (Geno re-reads pheno state in loopDouble) ----
+    // Pheno alone reads the .fam (sample IDs); Marker/Geno additionally need
+    // the .bim/.bed and are skipped entirely in --save-reml-only mode.
+    Pheno pheno(opts.geno, opts.sample_filter, &opts.pheno_covar);
+    std::unique_ptr<Marker> marker;
+    std::unique_ptr<Geno>   geno;
+    if (!reml_only) {
+        marker = std::make_unique<Marker>(opts.geno, opts.sample_filter, opts.marker_filter);
+        geno   = std::make_unique<Geno>(&pheno, marker.get(), opts.geno, opts.marker_filter, out_prefix);
+        geno->setGenoCodingModel(opts.model);
+        LOGGER.i(0, std::string("MLMA_stream genotype model: ") + gcta_cli::geno_model_name(opts.model) + ".");
     }
-    if (options_in.find("--mlma-stream") != options_in.end()) {
-        const auto& vals = options_in["--mlma-stream"];
-        if (!vals.empty()) {
-            if (vals.size()==1)
-                options_d["mlma_tile_budget_gb"] = {std::stod(vals[0])};
-            else
-                LOGGER.e(0, "--mlma-stream accepts at most one value: the memory budget in GB for tile-based streaming.");
-        }
-    }
-    options_in.erase("--mlma-stream");
-    if (options_in.find("--log-pval") != options_in.end()) {
-        options["log_pval"] = "1";
-        options_in.erase("--log-pval");
-    }
-    if (options_in.find("--weighted-phenotypes") != options_in.end()) {
-        options["weighted_phenotypes"] = "1";
-        options_in.erase("--weighted-phenotypes");
-    }
-    if (options_in.find("--model") != options_in.end()) {
-        const auto& vals = options_in["--model"];
-        if (vals.size() != 1 || vals[0].empty())
-            LOGGER.e(0, "--model expects exactly one value: additive, nonadditive, or dominance.");
-
-        string model = vals[0];
-        std::transform(model.begin(), model.end(), model.begin(),
-                       [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-        if (model != "additive" && model != "nonadditive" && model != "dominance") {
-            LOGGER.e(0, "Unsupported --model value [" + vals[0] + "]. Allowed values: additive, nonadditive, dominance.");
-        }
-        options["model"] = model;
-        options_in.erase("--model");
-    }
-
-    processFunctions.push_back("MLMA");
-    return 1;
-}
-
-
-// ---------------------------------------------------------------------------
-// processMain
-// ---------------------------------------------------------------------------
-void MLMA::processMain()
-{
-    for (const auto& pf : processFunctions) {
-        if (pf != "MLMA") continue;
-
-        const string out_prefix     = options.at("out");
-        const bool   no_adj_covar   = options.count("no_adj_covar") > 0;
-        const bool   log_pval       = options.count("log_pval") > 0;
-        const bool   weighted_pheno = options.count("weighted_phenotypes") > 0;
-        // --save-reml only fits/saves the REML state and never streams SNPs,
-        // so the bim (Marker) and genotype (Geno) data are never touched.
-        const bool   reml_only      = options.count("save_reml") > 0;
-
-        if (no_adj_covar)
-            LOGGER.e(0, "--mlma-no-preadj-covar is not yet supported in --MLMA. "
-                        "Re-run without this flag (pre-adjustment is the default).");
-
-        // only if requested; otherwise leave it seeded from entropy (the default).
-        if (options_d.count("seed")) {
-            const auto seed = static_cast<std::mt19937::result_type>(options_d.at("seed"));
-            gcta_eigh::shared_rng().seed(seed);
-            LOGGER.i(0, "Using random seed: " + to_string(seed) + ".");
-        }
-
-        if (options.count("reml_ai_robust") && options.count("trace_hutchpp") > 0 &&options.count("trace_hutchpp_fixed_probes") == 0)
-            LOGGER.w(0, "Using fresh Hutch++ probes without robust AI convergence can lead to unstable REML convergence. Consider using --reml-ai-robust or --reml-trace-hutchpp-fixed-probes.");
-
-        // ---- Pheno / Marker / Geno (Geno re-reads pheno state in loopDouble) ----
-        // Pheno alone reads the .fam (sample IDs); Marker/Geno additionally need
-        // the .bim/.bed and are skipped entirely in --save-reml-only mode.
-        Pheno*  pheno  = new Pheno();
-        Marker* marker = nullptr;
-        Geno*   geno   = nullptr;
-        if (!reml_only) {
-            marker = new Marker();
-            geno   = new Geno(pheno, marker);
-            const string model_name = options.count("model") ? options.at("model") : "additive";
-            geno->setGenoCodingModel(model_name);
-            LOGGER.i(0, "MLMA_stream genotype model: " + model_name + ".");
-        }
 
         // ---- Phenotype ----
-        const uint32_t n_init = pheno->count_keep();
+        const uint32_t n_init = pheno.count_keep();
         vector<string> ids;
         vector<double> phenos_vec;
-        pheno->get_pheno(ids, phenos_vec);
+        pheno.get_pheno(ids, phenos_vec);
         if (ids.size() != n_init)
             LOGGER.e(0, "--MLMA requires --pheno to be specified.");
 
         // ---- Covariates ----
-        Covar covar;
+        Covar covar(opts.pheno_covar);
         bool  has_covar = false;
         int   x_c       = 1;
         Eigen::MatrixXd X_design;
@@ -1086,7 +740,7 @@ void MLMA::processMain()
             if (has_covar) {
                 LOGGER.i(0, to_string(remain_index.size()) +
                             " overlapping individuals with non-missing covariate data.");
-                pheno->filter_keep_index(remain_index);
+                pheno.filter_keep_index(remain_index);
             } else if (covar.hasCovar()) {
                 LOGGER.e(0, "no overlapping individuals with non-missing covariate data.");
             } else {
@@ -1099,13 +753,13 @@ void MLMA::processMain()
             phenos_vec = compact_sample_vector(phenos_vec, remain_index);
         }
 
-        const int n = static_cast<int>(pheno->count_keep());
+        const int n = static_cast<int>(pheno.count_keep());
         LOGGER.i(0, "After matching all files, " + to_string(n) +
                     " individuals to be included in --MLMA.");
 
         // Build design matrix X  (n × x_c, column-major)
         if (has_covar) {
-            vector<string> final_ids = pheno->get_id(0, n - 1, "\t");
+            vector<string> final_ids = pheno.get_id(0, n - 1, "\t");
             vector<double> covar_X;
             vector<uint32_t> ck_dummy;
             covar.getCovarX(final_ids, covar_X, ck_dummy);
@@ -1133,20 +787,19 @@ void MLMA::processMain()
         // multi-GB at large n). Opt-in, matching --GRM-tile-budget /
         // --grm-chunked-budget elsewhere: omitting the flag reproduces the
         // old fixed-10000 behavior exactly (see resolve_mlma_block_size).
-        const double mlma_tile_budget_gb = options_d.count("mlma_tile_budget_gb")
-            ? options_d.at("mlma_tile_budget_gb") : 0.0;
+        const double mlma_tile_budget_gb = opts.stream_budget_gb.value_or(0.0);
 
-        if (options.count("load_reml")) {
+        if (!opts.load_reml.empty()) {
             // --load-reml uses the serialized RemlState path: the state is read
             // from disk and then consumed by run_mlma_stream_association(RemlState&)
             // below. This is the saved-state code path and uses the float-first
             // Woodbury/L factor data in RemlState (see RemlState.hpp and the
             // RemlState overload in MLMA_stream_common.hpp).
-            const string load_reml_file = options.at("load_reml");
+            const string& load_reml_file = opts.load_reml;
             LOGGER.i(0, "Loading REML state from [" + load_reml_file + "]...");
             LOGGER.ts("load_reml");
             state = readRemlState(load_reml_file, no_adj_covar, n,
-                                  hash_sample_ids(pheno->get_id(0, n - 1, "\t")));
+                                  hash_sample_ids(pheno.get_id(0, n - 1, "\t")));
             LOGGER.i(0, "REML state loaded in " + to_string(LOGGER.tp("load_reml")) + " seconds.");
 
             if (state.n != n)
@@ -1168,79 +821,72 @@ void MLMA::processMain()
             // run reml::compute() to populate its V^{-1} / Woodbury state, and then
             // pass that RemlCtx through run_mlma_stream_association(RemlCtx&) below.
             // This is distinct from the --load-reml serialized RemlState path above.
-            const bool   reuse_basis = options.count("woodbury_reuse") > 0;
-            const string grm_pfx     = reuse_basis ? string() : options.at("grm");
+            const bool   reuse_basis = !r.woodbury_reuse.empty();
+            const string grm_pfx     = reuse_basis ? string() : r.grm;
             if (reuse_basis)
                 LOGGER.i(0, "Running inline REML with the Woodbury basis reused from [" +
-                            options.at("woodbury_reuse") + "] (no GRM is read) ...");
+                            r.woodbury_reuse + "] (no GRM is read) ...");
             else
                 LOGGER.i(0, "Running inline REML using GRM [" + grm_pfx + "] ...");
 
-            const vector<string> analysis_ids = pheno->get_id(0, n - 1, "\t");
+            const vector<string> analysis_ids = pheno.get_id(0, n - 1, "\t");
             const uint64_t id_hash = hash_sample_ids(analysis_ids);
-            bool grm_chunked = !reuse_basis && options_d.count("grm_chunked_budget") > 0.0;
-            const double grm_chunked_budget = options_d.count("grm_chunked_budget")
-                ? options_d.at("grm_chunked_budget") : 0.0;
+            const double grm_chunked_budget = reuse_basis ? 0.0 : r.grm_chunked_budget.value_or(0.0);
+            bool grm_chunked = grm_chunked_budget > 0.0;
+            const bool grm_fp16 = !reuse_basis && r.grm_fp16;
+            if (grm_chunked && grm_fp16)
+                LOGGER.e(0, "--grm-fp16 and --grm-chunked-budget are mutually exclusive: "
+                            "--grm-fp16 holds the packed fp16 lower triangle in memory, whereas "
+                            "--grm-chunked-budget streams float32 bands from disk.");
 
             // REML tuning parameters. Parsed here (ahead of the GRM load below,
             // not after it as before) because woodbury_basis_mem_budget_gb feeds
             // the chunk-size solve immediately below, which needs to run before
             // committing to a chunked vs. dense load. Also lets the
-            // reml_alg/svd_nystrom/etc. validation checks fail fast, ahead of
+            // svd_nystrom/etc. validation checks fail fast, ahead of
             // the (potentially expensive) GRM read, instead of after it.
-            const int  woodbury_basis_rank  = options_d.count("woodbury_basis_rank")
-                ? static_cast<int>(options_d.at("woodbury_basis_rank")) : 0;
-            const bool trace_hutchpp   = options.count("trace_hutchpp") > 0;
-            const int  trace_hutchpp_nprobes  = options_d.count("trace_hutchpp_nprobes")
-                ? static_cast<int>(options_d.at("trace_hutchpp_nprobes")) : 100;
-            const int  reml_maxit     = options_d.count("reml_maxit")
-                ? static_cast<int>(options_d.at("reml_maxit")) : 100;
-            const int  reml_alg       = options_d.count("reml_alg")
-                ? static_cast<int>(options_d.at("reml_alg")) : 0;
-            const int  reml_diagV_adj = options_d.count("reml_diagV_adj")
-                ? static_cast<int>(options_d.at("reml_diagV_adj")) : 0;
-            const bool no_constrain   = options.count("no_constrain") > 0;
-            const bool svd_nystrom = options.count("svd_nystrom") > 0;
-            const int svd_power_iter = options_d.count("svd_power_iter")
-                ? static_cast<int>(options_d.at("svd_power_iter")) : 3;
-            const float  woodbury_basis_eigen_mass  = options_d.count("woodbury_basis_eigen_mass")
-                ? static_cast<float>(options_d.at("woodbury_basis_eigen_mass")) : 0.99f;
-            const double woodbury_basis_edge_margin = options_d.count("woodbury_basis_edge_margin")
-                ? options_d.at("woodbury_basis_edge_margin") : 0.15;
-            const int    woodbury_basis_edge_confirm = options_d.count("woodbury_basis_edge_confirm")
-                ? static_cast<int>(options_d.at("woodbury_basis_edge_confirm")) : 20;
-            const int woodbury_basis_EIG_k_buffer = options_d.count("woodbury_basis_EIG_k_buffer")
-                ? static_cast<int>(options_d.at("woodbury_basis_EIG_k_buffer")) : 0;
-            const double woodbury_basis_mem_budget_gb = options_d.count("woodbury_basis_mem_budget_gb")
-                ? options_d.at("woodbury_basis_mem_budget_gb") : 0.0;
-            const bool no_HE_start = options.count("no_HE_start") > 0;
-            const bool reml_ai_robust = options.count("reml_ai_robust") > 0;
-            const double reml_ai_robust_tol = options_d.count("reml_ai_robust_tol")
-                ? options_d.at("reml_ai_robust_tol") : 1e-4;
-            const double reml_ai_robust_risk = options_d.count("reml_ai_robust_risk")
-                ? options_d.at("reml_ai_robust_risk") : 0.01;
+            const bool   have_wb                      = r.woodbury_basis.has_value();
+            const bool   is_wb_mp                     = have_wb && r.woodbury_basis->kind == WoodburyBasisSpec::Kind::MP;
+            const bool   trace_hutchpp                = r.trace_hutchpp.has_value();
+            const int    trace_hutchpp_nprobes        = r.trace_hutchpp.value_or(100);
+            const int    reml_maxit                   = r.maxit.value_or(100);
+            const bool   no_constrain                 = r.no_constrain;
+            const bool   svd_nystrom                  = (r.svd_method == gcta_cli::SvdMethod::Nystrom);
+            const int    svd_power_iter               = r.svd_power_iter.value_or(3);
+            const float  woodbury_basis_eigen_mass    = static_cast<float>(r.woodbury_eig_mass.value_or(0.99));
+            const double woodbury_basis_edge_margin   = r.woodbury_mp_margin.value_or(0.15);
+            const int    woodbury_basis_edge_confirm  = r.woodbury_mp_confirm.value_or(20);
+            const int    woodbury_basis_EIG_k_buffer  = r.woodbury_eig_k_buffer.value_or(0);
+            const double woodbury_basis_mem_budget_gb = r.woodbury_mem_budget_gb.value_or(0.0);
+            const bool   no_HE_start                  = r.no_he_start;
+            const bool   reml_ai_robust               = r.ai_robust;
+            const double reml_ai_robust_tol           = r.ai_robust_tol.value_or(1e-4);
+            const double reml_ai_robust_risk          = r.ai_robust_risk.value_or(0.01);
 
-            if (reml_alg < 0 || reml_alg > 2)
-                LOGGER.e(0, "--reml-alg should be 0, 1 or 2.");
-            if (reml_diagV_adj < 0 || reml_diagV_adj > 2)
-                LOGGER.e(0, "--reml-diagV-adj should be 0, 1, or 2.");
-            if ((woodbury_basis_rank != 0 || reuse_basis) && reml_alg == 1)
+            if ((have_wb || reuse_basis) && r.alg == RemlAlg::Fisher)
                 LOGGER.e(0, "--reml-woodbury is incompatible with Fisher-scoring REML (--reml-alg 1). Use AI-REML (default) or EM-REML (--reml-alg 2).");
-            if (svd_nystrom && woodbury_basis_rank == 0)
+            if (svd_nystrom && !have_wb)
                 LOGGER.e(0, "--svd-method nystrom requires --reml-woodbury <k|MP|EIG|VAR>.");
-            if ((woodbury_basis_rank != 0 || reuse_basis) && trace_hutchpp)
+            if ((have_wb || reuse_basis) && trace_hutchpp)
                 LOGGER.w(0, "--reml-woodbury-basis/--reml-woodbury-reuse and --reml-trace-hutchpp both given; "
                             "the Woodbury basis provides an exact tr(PA) and takes precedence — "
                             "--reml-trace-hutchpp is ignored.");
 
             int grm_chunk_rows = 0;
-            Eigen::MatrixXd G_n;      // left empty when grm_chunked
-            double m_all = options_d["woodbury_basis_rank"] == -1 ? 0.0 : -1.0;  // only populated when dense GRM and Woodbury-MP mode is selected
-            gcta_grm_io::ChunkedGrmHandle chunked_grm;  // only populated when grm_chunked
+            Eigen::MatrixXf G_n;      // left empty when grm_chunked or grm_fp16
+            double m_all = is_wb_mp ? 0.0 : -1.0;  // only populated when Woodbury-MP mode is selected
+            gcta_grm_io::ChunkedGrmHandle chunked_grm;       // only populated when grm_chunked
+            gcta_grm_io::PackedGrmFp16Handle fp16_grm;       // only populated when grm_fp16
 
-            if (grm_chunked) {
+            if (grm_fp16) {
+                fp16_grm = gcta_grm_io::load_packed_grm_fp16(
+                    grm_pfx, analysis_ids, /*need_m_snps=*/is_wb_mp, "--grm-fp16");
+                grm_chunk_rows = fp16_grm.chunk_rows;
+                m_all = fp16_grm.m_snps;
+            } else if (grm_chunked) {
                 chunked_grm = gcta_grm_io::make_chunked_grm_reader(
-                    grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget");
+                    grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget",
+                    /*need_m_snps=*/is_wb_mp);
                 grm_chunk_rows = chunked_grm.chunk_rows;
                 m_all = chunked_grm.m_snps;
                 if (grm_chunk_rows >= n) {
@@ -1251,15 +897,12 @@ void MLMA::processMain()
                     grm_chunked = false;
                 }
             }
-            if (!grm_chunked && !reuse_basis) {
-                load_and_subset_grm_upper(grm_pfx, analysis_ids, G_n, m_all, "--mlma");
+            if (!grm_chunked && !grm_fp16 && !reuse_basis) {
+                double m_all_load = (m_all > 0.0) ? -1.0 : m_all;
+                load_and_subset_grm_upper(grm_pfx, analysis_ids, G_n, m_all_load, "--mlma");
+                if (m_all <= 0.0) m_all = m_all_load;
             }
 
-
-            const vector<double> priors =
-                options_vd.count("reml_priors") ? options_vd.at("reml_priors") : vector<double>{};
-            const vector<double> priors_var =
-                options_vd.count("reml_priors_var") ? options_vd.at("reml_priors_var") : vector<double>{};
 
             // Build REML context
             RemlCtx ctx;
@@ -1273,13 +916,26 @@ void MLMA::processMain()
                 ctx.y_Ssq = ctx.y.squaredNorm();
             }
             ctx.A.resize(2);
-            if (grm_chunked) {
+            if (grm_fp16) {
+                ctx.grm_fp16 = true;
+                ctx.grm_fp16_trace_K = fp16_grm.trace_K;
+                ctx.grm_fp16_trace_K2 = fp16_grm.trace_K2;
+                ctx.grm_chunk_rows_from_budget = fp16_grm.chunk_rows;
+                ctx.grm_tile_reader = std::move(fp16_grm.reader);
+                ctx.grm_tile_reader_f32 = std::move(fp16_grm.reader_f32);
+                ctx.grm_fp16_release = [file = std::move(fp16_grm.file), &ctx]() mutable {
+                    file.reset();
+                    ctx.grm_tile_reader = nullptr;
+                    ctx.grm_tile_reader_f32 = nullptr;
+                };
+            } else if (grm_chunked) {
                 // ctx.A[0] stays empty (default RemlMat()); RemlEngine reads
                 // K through ctx.grm_tile_reader instead. See the guard in
                 // compute_woodbury_basis_basis that errors out if this flag is set
                 // without a reader.
                 ctx.grm_chunk_rows_from_budget = chunked_grm.chunk_rows;
                 ctx.grm_tile_reader = std::move(chunked_grm.reader);
+                ctx.grm_tile_reader_f32 = std::move(chunked_grm.reader_f32);
             } else {
                 ctx.A[0] = std::move(G_n);
             }
@@ -1291,53 +947,50 @@ void MLMA::processMain()
             ctx.hsq_name = {"V(G)/Vp"};
             ctx.out      = out_prefix;
 
-            ctx.reml_mtd                 = reml_alg;
+            ctx.reml_mtd                 = r.alg;
             ctx.reml_max_iter            = reml_maxit;
             ctx.reml_inv_mtd             = 0;  // LLT
-            ctx.reml_diagV_adj           = reml_diagV_adj;
-            ctx.reml_force_dense_vi     = options.count("force_dense_V") > 0;
-            ctx.woodbury_basis_rank            = woodbury_basis_rank;
+            ctx.reml_diagV_adj           = r.diagV_adj;
+            ctx.reml_force_dense_vi      = r.force_dense_v;
+            ctx.woodbury_basis           = r.woodbury_basis;
             ctx.woodbury_basis_edge_margin        = woodbury_basis_edge_margin;
             ctx.woodbury_basis_edge_confirm       = woodbury_basis_edge_confirm;
             ctx.woodbury_basis_EIG_k_buffer  = woodbury_basis_EIG_k_buffer;
-            ctx.woodbury_basis_var_thresh         = options_d.count("woodbury_basis_var_thresh")
-                ? options_d.at("woodbury_basis_var_thresh") : 0.001;
-            ctx.woodbury_basis_k_init = options_d.count("woodbury_basis_range_init")
-                ? static_cast<int>(options_d.at("woodbury_basis_range_init")) : 2000;
-            ctx.woodbury_basis_k_max  = options_d.count("woodbury_basis_range_max")
-                ? static_cast<int>(options_d.at("woodbury_basis_range_max")) : 25000;
-            ctx.woodbury_basis_posthoc_correction = options.count("woodbury_basis_posthoc_correction") > 0;
+            ctx.woodbury_basis_var_thresh         = r.woodbury_var_tail.value_or(0.001);
+            ctx.woodbury_basis_k_init = r.woodbury_range ? r.woodbury_range->first : 2000;
+            ctx.woodbury_basis_k_max  = r.woodbury_range ? r.woodbury_range->second : 25000;
+            ctx.woodbury_basis_posthoc_correction = r.woodbury_posthoc_correction;
             ctx.svd_mem_budget_gb   = woodbury_basis_mem_budget_gb;
             ctx.svd_nystrom         = svd_nystrom;
             ctx.svd_power_iter       = svd_power_iter;
             ctx.grm_chunked_budget         = grm_chunked ? grm_chunked_budget : 0.0;
             ctx.reml_trace_hutchpp        = trace_hutchpp;
             ctx.reml_trace_hutchpp_nprobes = trace_hutchpp_nprobes;
-            ctx.reml_hutchpp_fixed_probes = options.count("trace_hutchpp_fixed_probes") > 0;
+            ctx.reml_hutchpp_fixed_probes = r.trace_hutchpp_fixed_probes;
             ctx.woodbury_basis_eigen_mass             = woodbury_basis_eigen_mass;
             ctx.reml_no_HE_start         = no_HE_start;
             ctx.reml_ai_robust      = reml_ai_robust;
             ctx.reml_ai_robust_tol  = reml_ai_robust_tol;
             ctx.reml_ai_robust_risk = reml_ai_robust_risk;
-            ctx.reml_print_trajectory = options.count("reml_print_trajectory") > 0;
+            ctx.reml_print_trajectory = r.print_trajectory;
 
-            if (options.count("woodbury_basis_warm_start")) {
-                if (woodbury_basis_rank == 0)
+            if (!r.woodbury_warm_start.empty()) {
+                if (!have_wb)
                     LOGGER.w(0, "--reml-woodbury-basis-warm-start given without --reml-woodbury; ignoring.");
                 else if (svd_nystrom)
                     LOGGER.w(0, "--reml-woodbury-basis-warm-start has no effect with --svd-method nystrom "
                                 "(the Nystrom path doesn't use power iteration); ignoring.");
                 else
-                    ctx.Uk = load_pca_warm_start(options.at("woodbury_basis_warm_start"), analysis_ids);
+                    ctx.Uk = load_pca_warm_start(r.woodbury_warm_start, analysis_ids);
             }
 
             // Fill ctx.Uk/dk/lambda_tail from the saved basis (after the warm-start
             // block above, which it supersedes); reml::compute() then skips the
             // basis construction (ctx.woodbury_basis_preloaded).
             if (reuse_basis)
-                load_woodbury_basis_into_ctx(options.at("woodbury_reuse"), ctx, id_hash);
+                load_woodbury_basis_into_ctx(r.woodbury_reuse, ctx, id_hash);
 
-            reml::compute(ctx, priors, priors_var, no_constrain);
+            reml::compute(ctx, r.priors, r.priors_var, no_constrain);
 
             LOGGER.i(0, "Inline REML complete. Variance components:");
             for (size_t ci = 0; ci < ctx.varcmp.size(); ++ci)
@@ -1346,7 +999,7 @@ void MLMA::processMain()
             // Reuse the already-computed REML summary to write .hsq (same feature as --mlma).
             write_hsq_from_ctx(out_prefix, ctx);
 
-            if (options.count("save_reml")) {
+            if (reml_only) {
                 const string save_reml_file = out_prefix + ".reml";
                 LOGGER.i(0, "Saving REML state to [" + save_reml_file + "] ...");
                 LOGGER.ts("save_reml");
@@ -1354,10 +1007,7 @@ void MLMA::processMain()
                 LOGGER.i(0, "REML state saved in " + to_string(LOGGER.tp("save_reml")) + " seconds.");
                 LOGGER.i(0, "REML estimation completed. Use --load-reml " + save_reml_file +
                             " to perform association tests.");
-                delete geno;
-                delete marker;
-                delete pheno;
-                continue;
+                return;
             }
 
             // y_adj = y - X*b
@@ -1376,19 +1026,16 @@ void MLMA::processMain()
                   << (log_pval ? "log_p" : "p") << "\n";
 
             Eigen::VectorXf w_sqrt = weighted_pheno
-                ? pheno->get_sqrt_weight_keep()
+                ? pheno.get_sqrt_weight_keep()
                 : Eigen::VectorXf::Ones(n);
-            run_mlma_stream_association(ctx, y_vec, w_sqrt, geno, marker, n, log_pval, ofile,
-                                        mlma_tile_budget_gb);
+            run_mlma_stream_association(ctx, y_vec, w_sqrt, geno.get(), marker.get(), n, log_pval, ofile,
+                                        mlma_tile_budget_gb, fast_mlma_mode);
             LOGGER << "\nAssociation results saved to [" << out_file << "]." << std::endl;
             ofile.close();
         }
 
         if (use_inline_ctx) {
-            delete geno;
-            delete marker;
-            delete pheno;
-            continue;
+            return;
         }
 
         // ---- Open output file ----
@@ -1400,15 +1047,10 @@ void MLMA::processMain()
 
         // ---- Stream SNPs ----
         Eigen::VectorXf w_sqrt = weighted_pheno
-            ? pheno->get_sqrt_weight_keep()
+            ? pheno.get_sqrt_weight_keep()
             : Eigen::VectorXf::Ones(n);
-        run_mlma_stream_association(state, y_vec, w_sqrt, geno, marker, n, log_pval, ofile,
-                                    mlma_tile_budget_gb);
+        run_mlma_stream_association(state, y_vec, w_sqrt, geno.get(), marker.get(), n, log_pval, ofile,
+                                    mlma_tile_budget_gb, fast_mlma_mode);
         LOGGER << "\nAssociation results saved to [" << out_file << "]." << std::endl;
         ofile.close();
-
-        delete geno;
-        delete marker;
-        delete pheno;
-    }
 }

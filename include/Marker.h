@@ -22,6 +22,7 @@
 #include <set>
 #include <utility>
 #include <cstdint>
+#include "Cli.hpp"
 using std::string;
 using std::to_string;
 
@@ -42,7 +43,11 @@ struct MarkerParam{
 class Marker {
 
 public:
-    Marker();
+    Marker(const gcta_cli::GenoInputOptions& geno,
+           const gcta_cli::SampleFilterOptions& sample_filter,
+           const gcta_cli::MarkerFilterOptions& marker_filter,
+           bool default_autosome = false,
+           bool force_chr_homogametic = false);
     uint32_t count_raw(int part = -1);
     uint32_t count_extract();
     bool isInExtract(uint32_t index);
@@ -55,8 +60,6 @@ public:
     void getStartPosSize(uint32_t raw_index, uint64_t &pos, uint64_t &size);
     std::string get_marker(int rawindex);
     std::string getMarkerStrExtract(int extractindex);
-    static int registerOption(std::map<string, std::vector<string>>& options_in);
-    static void processMain();
     static MarkerInfo extractBgenMarkerInfo(FILE *h_bgen, uint64_t &pos);
     
     void extract_marker(std::vector<string> markers, bool isExtract);
@@ -85,13 +88,12 @@ public:
     const std::string& getRawA2(uint32_t i)    const { return a2[i]; }  ///< reference allele
 
 private:
-    static bool isHomogameticChr(const std::string& chr_label);
-    static bool isHeterogameticChr(const std::string& chr_label);
+    bool isHomogameticChr(const std::string& chr_label) const;
+    bool isHeterogameticChr(const std::string& chr_label) const;
     static bool isPositiveIntegerChrLabel(const std::string& chr_label);
-    static bool isAllowedChrLabel(const std::string& chr_label);
+    bool isAllowedChrLabel(const std::string& chr_label) const;
     static std::string normalizeChrLabel(const std::string& chr_label);
-    static void resetSexChromosomeSets();
-    static void loadSexChromosomeFile(const std::string& file_path);
+    void loadSexChromosomeFile(const std::string& file_path);
 
     std::vector<string> chr;
     std::vector<string> name;
@@ -102,30 +104,24 @@ private:
     std::vector<uint64_t> byte_start;
     std::vector<uint32_t> raw_limits;
 
-    
-
     std::vector<uint32_t> index_extract;
     std::vector<uint32_t> index_exclude;
-    uint32_t num_marker;
-    uint32_t num_extract;
-    uint32_t num_exclude;
+    uint32_t num_marker = 0;
+    uint32_t num_extract = 0;
+    uint32_t num_exclude = 0;
 
     void read_bim(string bim_file);
-    void read_mbim(string bim_file);
-
+    void read_mbim(const std::vector<string>& mfiles);
 
     void read_pvar(string pvar_file);
-    void read_mpvar(string mpvar_file);
+    void read_mpvar(const std::vector<string>& mfiles);
 
-    static std::map<string, std::string> options;
-    static std::map<string, int> options_i;
-    static std::set<string> homogametic_chrs;
-    static std::set<string> heterogametic_chrs;
-    static void addOneFileOption(string key_store, std::string append_string, std::string key_name,
-                                 std::map<string, std::vector<string>> options_in);
+    int chr_filter_mode = 0;
+    std::set<string> homogametic_chrs;
+    std::set<string> heterogametic_chrs;
     std::vector<string> read_snplist(string snplist_file);
 
-    static std::set<string> allowed_chrs;
+    std::set<string> allowed_chrs;
     std::vector<MarkerParam> markerParams;
 
     uint64_t maxGeno1ByteSize = 0;
@@ -133,10 +129,8 @@ private:
     std::vector<uint64_t> byte_size;
    #ifdef BGEN_SUPPORT
     //bgen
-
-
     void read_bgen(string bgen_file);
-    void read_mbgen(string mbgen_file);
+    void read_mbgen(const std::vector<string>& mfiles);
     void read_bgen_index(string bgen_file);
    #endif
 };

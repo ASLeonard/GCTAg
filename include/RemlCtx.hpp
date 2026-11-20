@@ -14,23 +14,17 @@
  */
 #pragma once
 
+#include "ModeTypes.hpp"
 #include "mlma_woodbury.hpp"
 #include "chunked_grm_matvec.hpp"
 #include <Eigen/Dense>
+#include <optional>
 #include <string>
 #include <vector>
 
 // REML is always double-precision irrespective of SINGLE_PRECISION build flag.
 using RemlMat = Eigen::MatrixXd;
 using RemlVec = Eigen::VectorXd;
-
-enum class WoodburyMode {
-    Off      = 0,
-    Fixed    = 1,
-    MP   = -1, // Marchenko-Pastur bulk edge
-    EIG  = -2, // Eigenvalue spectral mass fraction
-    VAR = -3  // Relative tail variance dispersion ratio
-};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // RemlCtx: input + config + workspace + output
@@ -39,13 +33,6 @@ enum class WoodburyMode {
 // "Workspace" holds the V^{-1} state needed for the subsequent association test.
 // ──────────────────────────────────────────────────────────────────────────────
 struct RemlCtx {
-    WoodburyMode woodbury_mode() const {
-        if (woodbury_basis_rank == -1) return WoodburyMode::MP;
-        if (woodbury_basis_rank == -2) return WoodburyMode::EIG;
-        if (woodbury_basis_rank == -3) return WoodburyMode::VAR;
-        if (woodbury_basis_rank > 0)   return WoodburyMode::Fixed;
-        return WoodburyMode::Off;
-    }
     // ── Input (set by caller before reml::compute()) ──────────────────────────
     int  n     = 0;   // sample size
     int  X_c   = 0;   // columns in design matrix (1 + n_covariates)
@@ -56,7 +43,8 @@ struct RemlCtx {
     // GRM components: A[r_indx[i]] is the i-th variance component matrix.
     // For standard single-GRM REML: A = {GRM, empty} and r_indx = {0, 1}.
     // An empty matrix (size() == 0) represents the identity component (residual).
-    std::vector<RemlMat> A;
+    // Stored in float32 (matching .grm.bin's native precision, upper triangle only).
+    std::vector<Eigen::MatrixXf> A;
     std::vector<int>     r_indx;  // typically {0, 1}
     RemlMat grm_N;   // from _grm_N — used only for Woodbury MP-k M estimation
 
@@ -71,7 +59,12 @@ struct RemlCtx {
     // float32-on-disk should be widened to double at the tile level, not for
     // the whole file up front).
     double                      grm_chunked_budget = 0.0;  // GB budget for streaming chunk rows, off by default
-    gcta_chunked::TileReader grm_tile_reader;               // caller-populated when chunked
+    bool                        grm_fp16           = false; // true -> in-memory packed lower-triangular fp16 GRM (--grm-fp16)
+    double                      grm_fp16_trace_K   = 0.0;   // exact trace(K) accumulated during fp16 load
+    double                      grm_fp16_trace_K2  = 0.0;   // exact trace(K^2) accumulated during fp16 load
+    std::function<void()>       grm_fp16_release;           // releases PackedGrmFp16 storage once Woodbury basis is built
+    gcta_chunked::TileReader    grm_tile_reader;           // caller-populated when chunked or grm_fp16 (double tiles)
+    gcta_chunked::TileReaderF32 grm_tile_reader_f32;       // caller-populated when chunked or grm_fp16 (float32 tiles for rSVD)
     int grm_chunk_rows_from_budget = 0;
 
     // Set once, in reml::compute(), before the AI-REML/EM-REML loop begins,
@@ -96,12 +89,12 @@ struct RemlCtx {
     double svd_mem_budget_gb = 0.0;
 
     // ── Config (algorithm control) ────────────────────────────────────────────
-    int    reml_mtd                  = 0;     // 0=AI-REML, 1=Fisher, 2=EM-REML
-    int    reml_max_iter             = 100;
-    int    reml_inv_mtd              = 0;     // 0=LLT, 1=LU (for V inversion fallback)
-    double reml_diag_mul             = 0.01;  // diagonal jitter when V is near-singular
-    int    reml_diagV_adj            = 0;     // 0=none, 1=diag jitter, 2=bending
-    int    woodbury_basis_rank             = 0;     // >0 fixed k; -1 MP-k; -2 EIG-k; -3 VAR-k; 0 off
+    RemlAlg  reml_mtd       = RemlAlg::AI;
+    int      reml_max_iter  = 100;
+    int      reml_inv_mtd   = 0;     // 0=LLT, 1=LU (for V inversion fallback)
+    double   reml_diag_mul  = 0.01;  // diagonal jitter when V is near-singular
+    DiagVAdj reml_diagV_adj = DiagVAdj::None;
+    std::optional<WoodburyBasisSpec> woodbury_basis;
     // MP-k: eigenvalues fall off a cliff at the Marchenko-Pastur bulk edge,
     // but the exact crossing point is noisy over a band of eigenvalues near
     // the edge (rSVD tail estimation error + finite-M lambda_plus estimate +
@@ -161,7 +154,7 @@ struct RemlCtx {
     int     woodbury_basis_rank_  = 0;     // actual rank used (<= woodbury_basis_rank or MP)
     float woodbury_basis_eigen_mass = 0.99f;    // fraction of eigenvalue mass captured by Uk
     bool woodbury_basis_eigen_adaptive = true; // true → adaptively raise k until mass target is reached rather than doubling
-    RemlMat Uk;                      // n x k leading eigenvectors of K
+    Eigen::MatrixXf Uk;              // n x k leading eigenvectors of K (float32)
     RemlVec dk;                      // k eigenvalues (clamped >= 0)
     double  lambda_tail     = 0.0;   // average bulk eigenvalue
     double  tail_d_var      = 0.0;   // var of tail eigenvalues (2nd-order logdet corr)

@@ -36,6 +36,7 @@
 #include <unistd.h>
 
 static_assert(sizeof(uintptr_t) == sizeof(uint64_t), "BED kernels assume 64-bit words");
+static_assert(sizeof(off_t) >= 8, "BedBackend requires 64-bit file offsets");
 
 namespace {
 
@@ -45,12 +46,65 @@ constexpr int kMaxIov = (IOV_MAX < 1024) ? IOV_MAX : 1024;
 constexpr int kMaxIov = 1024;
 #endif
 
+// Cap each preadv() batch well below INT_MAX (macOS EINVAL) and 0x7ffff000
+// (Linux readv/preadv transfer limit).
+constexpr uint64_t kMaxBatchBytes = 1ull << 30;
+
 // Merge gaps of at most this many records (and bytes) into one preadv call
 // by reading the gap into a discard buffer: far cheaper than a syscall.
 constexpr uint64_t kMaxGapRecords = 16;
 constexpr uint64_t kMaxGapBytes   = 1ull << 20;
 
 std::string errno_str() { return std::string(std::strerror(errno)); }
+
+// Move-only RAII wrapper for a POSIX file descriptor so validation errors or
+// mid-stream exceptions never leak fds and --mbfile never holds more than one
+// open fd at a time.
+class UniqueFd {
+public:
+    UniqueFd() = default;
+    explicit UniqueFd(int fd) : fd_(fd) {}
+    ~UniqueFd() { reset(); }
+    UniqueFd(const UniqueFd&) = delete;
+    UniqueFd& operator=(const UniqueFd&) = delete;
+    UniqueFd(UniqueFd&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
+    UniqueFd& operator=(UniqueFd&& o) noexcept {
+        if (this != &o) {
+            reset(o.fd_);
+            o.fd_ = -1;
+        }
+        return *this;
+    }
+    int get() const { return fd_; }
+    explicit operator bool() const { return fd_ >= 0; }
+    void reset(int new_fd = -1) {
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = new_fd;
+    }
+
+private:
+    int fd_ = -1;
+};
+
+UniqueFd open_bed_fd(const std::string& fname, bool sequential_hint) {
+    const int fd = ::open(fname.c_str(), O_RDONLY
+#ifdef O_CLOEXEC
+                                             | O_CLOEXEC
+#endif
+    );
+    if (fd < 0) {
+        LOGGER.e(0, "BedBackend: can't open [" + fname + "]: " + errno_str());
+    }
+    UniqueFd ufd(fd);
+    if (sequential_hint) {
+#if defined(__linux__) && defined(POSIX_FADV_SEQUENTIAL)
+        (void)::posix_fadvise(ufd.get(), 0, 0, POSIX_FADV_SEQUENTIAL);
+#elif defined(__APPLE__) && defined(F_RDAHEAD)
+        (void)::fcntl(ufd.get(), F_RDAHEAD, 1);
+#endif
+    }
+    return ufd;
+}
 
 // pread() the full [off, off + len) range, retrying on EINTR / short reads.
 void pread_full(int fd, void* dst, size_t len, uint64_t off, const std::string& fname) {
@@ -133,7 +187,6 @@ private:
     class BedProducer;
 
     Geno &g_;
-    std::vector<int> fds_;
     uint64_t recBytes_ = 0;
 
     // Owned 1-bit raw-sample masks (lifetime = this backend). Geno's raw
@@ -144,10 +197,9 @@ private:
 
 class BedBackend::BedProducer final : public GenoBackend::Producer {
 public:
-    BedProducer(Geno &geno, const std::vector<int> &fds, uint64_t recBytes,
+    BedProducer(Geno &geno, uint64_t recBytes,
                 std::span<const uint32_t> extractIndex)
         : g_(geno),
-          fds_(fds),
           extractIndex_(extractIndex),
           rawMarkerIndex_(g_.marker->get_extract_index()),
           recBytes_(recBytes),
@@ -190,8 +242,13 @@ public:
         }
         block.extractIndex = extractIndex_.subspan(finishedMarker_, nextSize);
 
-        const int fd = fds_[static_cast<std::size_t>(fileIndex_)];
         const std::string &fname = g_.geno_files[static_cast<std::size_t>(fileIndex_)];
+        if (curFileIndex_ != fileIndex_) {
+            curFd_.reset();
+            curFd_ = open_bed_fd(fname, /*sequential_hint=*/true);
+            curFileIndex_ = fileIndex_;
+        }
+        const int fd = curFd_.get();
         const uint64_t nSnpFile = g_.rawCountSNPs[static_cast<std::size_t>(fileIndex_)];
         const int64_t baseIndex = g_.baseIndexLookup[static_cast<std::size_t>(fileIndex_)];
 
@@ -209,10 +266,12 @@ public:
         iov_.clear();
         uint64_t batchStart = 0;   // record index of first iovec
         uint64_t nextRec = 0;      // record index following the last iovec
+        uint64_t batchBytes = 0;   // total bytes queued in iov_
         auto flush = [&]() {
             if (!iov_.empty()) {
                 preadv_full(fd, iov_.data(), static_cast<int>(iov_.size()), 3 + batchStart * recBytes_, fname);
                 iov_.clear();
+                batchBytes = 0;
             }
         };
         for (uint32_t i = 0; i < nextSize; ++i) {
@@ -225,21 +284,27 @@ public:
                     const uint64_t gap = rec - nextRec;
                     const uint64_t gapBytes = gap * recBytes_;
                     if (gap <= kMaxGapRecords && gapBytes <= discard_.size() &&
-                        iov_.size() + 2 <= static_cast<size_t>(kMaxIov)) {
+                        iov_.size() + 2 <= static_cast<size_t>(kMaxIov) &&
+                        batchBytes + gapBytes + recBytes_ <= kMaxBatchBytes) {
                         iov_.push_back({discard_.data(), static_cast<size_t>(gapBytes)});
+                        batchBytes += gapBytes;
                         nextRec = rec;
                     } else {
                         startNew = true;
                     }
                 }
             }
-            if (!startNew && iov_.size() + 1 > static_cast<size_t>(kMaxIov)) startNew = true;
+            if (!startNew && (iov_.size() + 1 > static_cast<size_t>(kMaxIov) ||
+                              batchBytes + recBytes_ > kMaxBatchBytes)) {
+                startNew = true;
+            }
             if (startNew) {
                 flush();
                 batchStart = rec;
                 nextRec = rec;
             }
             iov_.push_back({base + static_cast<size_t>(i) * strideBytes_, static_cast<size_t>(recBytes_)});
+            batchBytes += recBytes_;
             nextRec = rec + 1;
         }
         flush();
@@ -250,13 +315,14 @@ public:
 
 private:
     Geno &g_;
-    const std::vector<int> &fds_;
     std::span<const uint32_t> extractIndex_;
     const std::vector<uint32_t> &rawMarkerIndex_;
     uint64_t recBytes_ = 0;
     uint64_t strideBytes_ = 0;
     int markerBlock_ = 0;
 
+    UniqueFd curFd_;
+    int curFileIndex_ = -1;
     std::vector<unsigned char> discard_;
     std::vector<struct iovec> iov_;
     std::vector<uint32_t> rawRefScratch_;
@@ -285,19 +351,13 @@ BedBackend::BedBackend(Geno &geno) : g_(geno)
         g_.rawCountSamples.push_back(rawCT);
         g_.rawCountSNPs.push_back(p.rawCountSNP);
 
+        // Open, validate magic + exact size, and close immediately via RAII so
+        // --mbfile can hold more files than RLIMIT_NOFILE without leaking fds.
         const std::string &fname = g_.geno_files[i];
-        const int fd = ::open(fname.c_str(), O_RDONLY
-#ifdef O_CLOEXEC
-                                                 | O_CLOEXEC
-#endif
-        );
-        if (fd < 0) {
-            LOGGER.e(0, "BedBackend: can't open [" + fname + "]: " + errno_str());
-        }
-        fds_.push_back(fd);
+        UniqueFd fd = open_bed_fd(fname, /*sequential_hint=*/false);
 
         unsigned char magic[3] = {0, 0, 0};
-        pread_full(fd, magic, 3, 0, fname);
+        pread_full(fd.get(), magic, 3, 0, fname);
         if (magic[0] != 0x6c || magic[1] != 0x1b) {
             LOGGER.e(0, "[" + fname + "] is not a PLINK 1 binary genotype (.bed) file (bad magic number).");
         }
@@ -305,21 +365,16 @@ BedBackend::BedBackend(Geno &geno) : g_(geno)
             LOGGER.e(0, "[" + fname + "] is in individual-major mode; only variant-major (SNP-major) .bed files are supported.");
         }
         struct stat st;
-        if (::fstat(fd, &st) != 0) {
+        if (::fstat(fd.get(), &st) != 0) {
             LOGGER.e(0, "BedBackend: can't stat [" + fname + "]: " + errno_str());
         }
         const uint64_t expected = 3ull + recBytes_ * static_cast<uint64_t>(p.rawCountSNP);
-        if (static_cast<uint64_t>(st.st_size) != expected) {
+        if (st.st_size < 0 || static_cast<uint64_t>(st.st_size) != expected) {
             LOGGER.e(0, "Unexpected PLINK 1 .bed file size for [" + fname + "] (expected " +
                             std::to_string(expected) + " bytes for " + std::to_string(rawCT) +
                             " samples x " + std::to_string(p.rawCountSNP) + " variants, found " +
-                            std::to_string(static_cast<uint64_t>(st.st_size)) + ").");
+                            std::to_string(static_cast<long long>(st.st_size)) + ").");
         }
-#if defined(__linux__) && defined(POSIX_FADV_SEQUENTIAL)
-        (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-#elif defined(__APPLE__) && defined(F_RDAHEAD)
-        (void)::fcntl(fd, F_RDAHEAD, 1);
-#endif
     }
 
     // 64-byte aligned, 64-byte padded slot per variant so every record starts
@@ -343,9 +398,6 @@ BedBackend::BedBackend(Geno &geno) : g_(geno)
 // --------------------------------------------------------------------------
 BedBackend::~BedBackend()
 {
-    for (int fd : fds_) {
-        if (fd >= 0) ::close(fd);
-    }
     // AlignedUniquePtr members free the masks; null Geno's raw pointers so any
     // accidental post-destruction use fails fast.
     g_.keepMaskPtr          = nullptr;
@@ -359,7 +411,7 @@ std::size_t BedBackend::initialBlockCapacity() const {
 }
 
 std::unique_ptr<GenoBackend::Producer> BedBackend::makeProducer(std::span<const uint32_t> extractIndex) {
-    return std::make_unique<BedProducer>(g_, fds_, recBytes_, extractIndex);
+    return std::make_unique<BedProducer>(g_, recBytes_, extractIndex);
 }
 
 // --------------------------------------------------------------------------

@@ -411,6 +411,78 @@ static void run_file(const std::string& dir, uint32_t n_raw) {
     std::remove(path.c_str());
 }
 
+// Large-N accumulator overflow test (N > 65535 and > 262144, e.g. 16-bit lane
+// reduction wrap in NEON/SIMD accumulators) against PgenReader.
+static void run_large_n(const std::string& dir, uint32_t n_raw) {
+    const uint32_t nvar = 5;   // all-0xFF, all-0xAA, all-0x55, all-0x00, random
+    const uint32_t nb = bed_simd::record_bytes(n_raw);
+    std::vector<uint8_t> file(3 + (size_t)nvar * nb);
+    file[0] = 0x6c; file[1] = 0x1b; file[2] = 0x01;
+    const int pats[5] = {0xFF, 0xAA, 0x55, 0x00, -1};
+    for (uint32_t v = 0; v < nvar; ++v) {
+        uint8_t* rec = &file[3 + (size_t)v * nb];
+        if (pats[v] >= 0) std::memset(rec, pats[v], nb);
+        else gen_record(rec, n_raw, 0.05);
+    }
+    const std::string path = dir + "/bed_vs_pgen_large_" + std::to_string(n_raw) + ".bed";
+    {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f || std::fwrite(file.data(), 1, file.size(), f) != file.size()) {
+            std::fprintf(stderr, "cannot write %s\n", path.c_str());
+            std::exit(2);
+        }
+        std::fclose(f);
+    }
+    PgenReader pr;
+    uint32_t rawN = n_raw, nv = nvar;
+    pr.Load(path, &rawN, &nv, {});
+    std::vector<uint32_t> full_idx(n_raw), sub_idx;
+    for (uint32_t i = 0; i < n_raw; ++i) {
+        full_idx[i] = i;
+        if (i % 7 != 3) sub_idx.push_back(i);
+    }
+    const Subset keeps[2] = {{"full", full_idx, true}, {"sub_6of7", sub_idx, false}};
+    AWords genovec(PgenReader::GetGenoBufPtrSize(n_raw) + 8);
+    for (uint32_t v = 0; v < nvar; ++v) {
+        uint8_t* raw = static_cast<uint8_t*>(std::malloc(nb));
+        std::memcpy(raw, &file[3 + (size_t)v * nb], nb);
+        for (const Subset& ks : keeps) {
+            const uint32_t keepN = (uint32_t)ks.idx.size();
+            PgMasks pm(n_raw, ks.full ? std::vector<uint32_t>{} : ks.idx);
+            BedMask bm(n_raw, ks.idx);
+            const uint64_t* km = ks.full ? nullptr : bm.p;
+            pr.ReadRawFullHard(genovec.p, (int)v);
+            plink2::ZeroTrailingNyps(n_raw, genovec.p);
+            std::array<uint32_t, 4> gc{};
+            if (ks.full) plink2::GenoarrCountFreqsUnsafe(genovec.p, keepN, gc);
+            else plink2::GenoarrCountSubsetFreqs(genovec.p, pm.inter.p, n_raw, keepN, gc);
+
+            std::vector<int8_t> r_i8(keepN);
+            PgenReader::ExtractInt8Ext(genovec.p, pm.incl.p, n_raw, keepN, r_i8.data(), nullptr);
+
+            for (bed_simd::Isa isa : g_isas) {
+                bed_simd::set_isa(isa);
+                ++g_cases;
+                char ctx[160];
+                std::snprintf(ctx, sizeof ctx, "isa=%s large n_raw=%u v=%u pat=%d keep=%s",
+                              isa_str(isa), n_raw, v, pats[v], ks.name.c_str());
+                g_ctx = ctx;
+                const Counts c = bed_simd::count(raw, km, n_raw, keepN);
+                CHECK(eqc(c, gc), "large count mismatch: (%u,%u,%u,%u) vs (%u,%u,%u,%u)",
+                      c.n0, c.n1, c.n2, c.nmiss, gc[0], gc[1], gc[2], gc[3]);
+                Guarded<int8_t> o(keepN);
+                const Counts ci = bed_simd::decode_i8(raw, km, n_raw, keepN, o.p, nullptr);
+                CHECK(eqc(ci, gc), "large decode_i8 counts mismatch");
+                CHECK(std::memcmp(o.p, r_i8.data(), keepN) == 0, "large decode_i8 output mismatch");
+                CHECK(o.guard_ok(), "large decode_i8 overrun");
+            }
+        }
+        std::free(raw);
+    }
+    pr.Close();
+    std::remove(path.c_str());
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : (std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp");
     if (argc > 2) g_rng.seed(std::strtoull(argv[2], nullptr, 0));
@@ -421,6 +493,8 @@ int main(int argc, char** argv) {
     std::printf(" (best=%s)\n", isa_str(bed_simd::best_isa()));
     const uint32_t sizes[] = {1, 3, 4, 5, 63, 64, 65, 255, 256, 257, 1000, 4097};
     for (uint32_t n : sizes) run_file(dir, n);
+    run_large_n(dir, 70000);
+    run_large_n(dir, 270000);
     std::printf("%s: %llu cases, %llu checks, %llu failures\n", g_fail ? "FAIL" : "PASS",
                 (unsigned long long)g_cases, (unsigned long long)g_checks, (unsigned long long)g_fail);
     return g_fail ? 1 : 0;

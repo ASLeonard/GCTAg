@@ -788,18 +788,20 @@ if(GCTA_BUILD_BED_TESTS)
     # (runs on any host, e.g. Apple Silicon) against the scalar reference.
     add_executable(test_bed_simd_emu tests/test_bed_simd_emu.cpp src/bed_simd.cpp)
     target_include_directories(test_bed_simd_emu PRIVATE include)
+    set(_bed_test_targets test_bed_simd_emu bench_bed_simd)
     # Bit-for-bit comparison against the PLINK2 PgenReader BED pipeline.
     if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bed_vs_pgen.cpp")
         add_executable(test_bed_vs_pgen tests/test_bed_vs_pgen.cpp src/bed_simd.cpp)
         target_include_directories(test_bed_vs_pgen PRIVATE include ${CMAKE_SOURCE_DIR}
             third_party/plink-ng/2.0/include third_party/plink-ng/2.0/simde)
         target_link_libraries(test_bed_vs_pgen PRIVATE Pgenlib)
+        list(APPEND _bed_test_targets test_bed_vs_pgen)
     endif()
     add_executable(bench_bed_simd tests/bench_bed_simd.cpp src/bed_simd.cpp)
     target_include_directories(bench_bed_simd PRIVATE include ${CMAKE_SOURCE_DIR}
         third_party/plink-ng/2.0/include third_party/plink-ng/2.0/simde)
     target_link_libraries(bench_bed_simd PRIVATE Pgenlib)
-    foreach(_t test_bed_simd_emu bench_bed_simd)
+    foreach(_t IN LISTS _bed_test_targets)
         foreach(_arch_flag IN LISTS _gcta_arch_flags)
             target_compile_options(${_t} PRIVATE $<$<CONFIG:Release>:${_arch_flag}>)
         endforeach()

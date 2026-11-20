@@ -28,12 +28,13 @@
 #  define BED_T512 __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512vbmi,avx512vbmi2,avx512vpopcntdq,bmi,bmi2,popcnt")))
 #  define BED_T256 __attribute__((target("avx2,bmi,bmi2,popcnt,fma")))
 #  if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VL__) && \
-      defined(__AVX512VBMI__) && defined(__AVX512VBMI2__) && defined(__AVX512VPOPCNTDQ__) && defined(__BMI2__)
+      defined(__AVX512VBMI__) && defined(__AVX512VBMI2__) && defined(__AVX512VPOPCNTDQ__) && \
+      defined(__BMI__) && defined(__BMI2__) && defined(__POPCNT__)
 #    define BED_STATIC_AVX512 1   // e.g. -march=znver4 / native on Zen 4: no CPUID dispatch needed
 #  else
 #    define BED_STATIC_AVX512 0
 #  endif
-#  if defined(__AVX2__) && defined(__BMI2__) && defined(__POPCNT__)
+#  if defined(__AVX2__) && defined(__BMI__) && defined(__BMI2__) && defined(__POPCNT__) && defined(__FMA__)
 #    define BED_STATIC_AVX2 1
 #  else
 #    define BED_STATIC_AVX2 0
@@ -254,10 +255,10 @@ static void weight_pass(const int8_t* g, uint32_t n, I8Opts* o) {
 }
 
 static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
-                        uint32_t r_begin, uint32_t n_out, int8_t* out, I8Opts* o) {
+                        uint32_t r_begin, uint32_t n_out, int8_t* out, I8Opts* o, bool want_counts) {
     for_each_code(raw, keep, n_raw, r_begin, n_out, [&](uint32_t s, uint32_t c) { out[s] = kCodeVal[c]; });
     Counts c;
-    if (r_begin == 0) c = count_scalar(raw, keep, n_raw, n_out);
+    if (want_counts) c = count_scalar(raw, keep, n_raw, n_out);
     if (o) {
         MissSink sink;
         sink.init(o, n_out);
@@ -328,9 +329,9 @@ static Counts count(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, ui
             sh = vpadalq_u8(sh, vcntq_u8(vandq_u8(vbicq_u8(h, v), k)));
             sm = vpadalq_u8(sm, vcntq_u8(vandq_u8(vbicq_u8(v, h), k)));
         }
-        n0 += vaddvq_u16(s0);
-        nh += vaddvq_u16(sh);
-        nm += vaddvq_u16(sm);
+        n0 += vaddlvq_u16(s0);
+        nh += vaddlvq_u16(sh);
+        nm += vaddlvq_u16(sm);
     }
     // tail (< 64 samples): scalar word kernel on the remaining bytes
     const uint32_t done = nblk << 6;
@@ -529,7 +530,7 @@ static void run_stages(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
 }
 
 static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
-                        uint32_t r_begin, uint32_t n_out, int8_t* out, I8Opts* o) {
+                        uint32_t r_begin, uint32_t n_out, int8_t* out, I8Opts* o, bool want_counts) {
     if (keep) {
         run_stages(raw, keep, n_raw, r_begin, n_out,
                    [&](const uint8_t* c, uint32_t n, uint32_t p) { map_i8(c, n, out + p); });
@@ -537,7 +538,7 @@ static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw
         decode_i8_full(raw + (r_begin >> 2), n_out, out);
     }
     Counts c;
-    if (r_begin == 0) c = count(raw, keep, n_raw, n_out);
+    if (want_counts) c = count(raw, keep, n_raw, n_out);
     if (o) {
         MissSink sink;
         sink.init(o, n_out);
@@ -761,11 +762,11 @@ BED_T256 static void run_stages(const uint8_t* raw, const uint64_t* keep, uint32
 }
 
 BED_T256 static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
-                                 uint32_t r_begin, uint32_t n_out, int8_t* out, I8Opts* o) {
+                                 uint32_t r_begin, uint32_t n_out, int8_t* out, I8Opts* o, bool want_counts) {
     run_stages(raw, keep, n_raw, r_begin, n_out,
                [&](const uint8_t* c, uint32_t n, uint32_t p) { map_i8(c, n, out + p); });
     Counts c;
-    if (r_begin == 0) c = count_popcnt(raw, keep, n_raw, n_out);
+    if (want_counts) c = count_popcnt(raw, keep, n_raw, n_out);
     if (o) {
         MissSink sink;
         sink.init(o, n_out);
@@ -817,7 +818,7 @@ BED_T256 static Counts decode_f64(const uint8_t* raw, const uint64_t* keep, uint
 struct Kernels {
     Isa isa;
     Counts (*count)(const uint8_t*, const uint64_t*, uint32_t, uint32_t);
-    Counts (*i8)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, uint32_t, int8_t*, I8Opts*);
+    Counts (*i8)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, uint32_t, int8_t*, I8Opts*, bool);
     Counts (*f32)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, const float*, float*, uint64_t*);
     Counts (*f64)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, const double*, double*, uint64_t*);
 };
@@ -838,8 +839,8 @@ static bool cpu_has_avx512() {
     return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
            __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vl") &&
            __builtin_cpu_supports("avx512vbmi") && __builtin_cpu_supports("avx512vbmi2") &&
-           __builtin_cpu_supports("avx512vpopcntdq") && __builtin_cpu_supports("bmi2") &&
-           __builtin_cpu_supports("popcnt");
+           __builtin_cpu_supports("avx512vpopcntdq") && __builtin_cpu_supports("bmi") &&
+           __builtin_cpu_supports("bmi2") && __builtin_cpu_supports("popcnt");
 #endif
 }
 static bool cpu_has_avx2() {
@@ -847,8 +848,9 @@ static bool cpu_has_avx2() {
     return true;
 #else
     __builtin_cpu_init();
-    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi2") &&
-           __builtin_cpu_supports("popcnt") && __builtin_cpu_supports("fma");
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi") &&
+           __builtin_cpu_supports("bmi2") && __builtin_cpu_supports("popcnt") &&
+           __builtin_cpu_supports("fma");
 #endif
 }
 #endif
@@ -955,7 +957,7 @@ Counts count(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t 
 
 Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_keep,
                  int8_t* out, I8Opts* opts) {
-    return K().i8(raw, keep, n_raw, 0, keep ? n_keep : n_raw, out, opts);
+    return K().i8(raw, keep, n_raw, 0, keep ? n_keep : n_raw, out, opts, true);
 }
 
 Counts decode_f32(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_keep,
@@ -971,7 +973,7 @@ Counts decode_f64(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint
 void decode_i8_range(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
                      uint32_t r_begin, uint32_t n_out, int8_t* out) {
     if (n_out == 0) return;
-    K().i8(raw, keep, n_raw, r_begin, n_out, out, nullptr);
+    K().i8(raw, keep, n_raw, r_begin, n_out, out, nullptr, false);
 }
 
 }  // namespace bed_simd

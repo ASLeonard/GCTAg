@@ -1102,11 +1102,11 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                 geno->getGenoDouble(buf, bi, &item);
                 item.geno_i8_ptr = nullptr;
             }
-            std::memcpy(r_tilde_.data(), r_raw_.data(), static_cast<size_t>(grm_n) * sizeof(double));
-            const int num_words = (grm_n + 63) / 64;
-            const uintptr_t last_word_mask = (grm_n % 64 == 0)
+            std::memcpy(r_tilde_.data(), r_raw_.data(), static_cast<size_t>(decode_rows) * sizeof(double));
+            const int num_words = (decode_rows + 63) / 64;
+            const uintptr_t last_word_mask = (decode_rows % 64 == 0)
                 ? ~static_cast<uintptr_t>(0)
-                : ((static_cast<uintptr_t>(1) << (grm_n % 64)) - 1);
+                : ((static_cast<uintptr_t>(1) << (decode_rows % 64)) - 1);
             marker_miss_offset_[0] = 0;
             for (int m = 0; m < curNumValidMarkers; ++m) {
                 const GenoBufItem& item = gbufitems[validIndexBuf[m]];
@@ -1132,16 +1132,16 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             } else {
                 // Build global per-sample missing-marker CSR once per marker block
                 // instead of binary-searching marker_miss_idx_ on every column tile.
-                std::fill(sample_miss_offset_.begin(), sample_miss_offset_.begin() + grm_n + 1, 0);
+                std::fill(sample_miss_offset_.begin(), sample_miss_offset_.begin() + decode_rows + 1, 0);
                 for (int s : marker_miss_idx_) {
                     sample_miss_offset_[s + 1]++;
                 }
-                for (int s = 0; s < grm_n; ++s) {
+                for (int s = 0; s < decode_rows; ++s) {
                     sample_miss_offset_[s + 1] += sample_miss_offset_[s];
                 }
-                sample_miss_m_.resize(sample_miss_offset_[grm_n]);
+                sample_miss_m_.resize(sample_miss_offset_[decode_rows]);
                 std::vector<int> write_pos(sample_miss_offset_.begin(),
-                                           sample_miss_offset_.begin() + grm_n);
+                                           sample_miss_offset_.begin() + decode_rows);
                 for (int m = 0; m < curNumValidMarkers; ++m) {
                     const int mb = marker_miss_offset_[m];
                     const int me = marker_miss_offset_[m + 1];

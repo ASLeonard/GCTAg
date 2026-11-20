@@ -298,7 +298,9 @@ BED_T512 static Counts decode_f64_t(const uint8_t* raw, const uint64_t* keep, ui
 // Entry points (non-template, uniform signatures for the dispatch table).
 // ---------------------------------------------------------------------------
 BED_T512 static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
-                                 uint32_t r_begin, uint32_t n_out, int8_t* out, I8Opts* o) {
+                                 uint32_t r_begin, uint32_t n_out, int8_t* out, I8Opts* o,
+                                 bool want_counts = true) {
+    (void)want_counts;   // fused loop only visits n_out samples anyway
     MissSink sink;
     MissSink* ms = nullptr;
     const float* wf = nullptr;

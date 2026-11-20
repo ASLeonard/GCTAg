@@ -5,7 +5,7 @@
 // scalar emulation of the intrinsics it uses).
 //
 // Build (macOS arm64 example):
-//   clang++ -std=c++23 -O1 -g -fsanitize=address,undefined -Iinclude \
+//   clang++ -std=c++23 -O1 -g -fsanitize=address,undefined -Iinclude
 //       tests/test_bed_simd_emu.cpp src/bed_simd.cpp -o test_bed_simd_emu
 // -----------------------------------------------------------------------------
 #include "bed_simd.hpp"
@@ -60,7 +60,7 @@ static std::string g_ctx;
 template <class T> struct Exact {
     T* p = nullptr;
     size_t n = 0;
-    explicit Exact(size_t n_) : n(n_) { p = static_cast<T*>(std::malloc(n * sizeof(T) ? n * sizeof(T) : 1)); }
+    explicit Exact(size_t n_) : n(n_) { p = static_cast<T*>(std::malloc((n != 0) ? n * sizeof(T) : 1)); }
     ~Exact() { std::free(p); }
     Exact(const Exact&) = delete;
     Exact& operator=(const Exact&) = delete;
@@ -357,6 +357,46 @@ int main(int argc, char** argv) {
                               ks.full ? (size_t)n_raw : ks.idx.size());
                 g_ctx = ctx;
                 run_case(raw.p, n_raw, ks);
+            }
+        }
+    }
+    // Large-N accumulator overflow regression (N > 65535 and > 262144):
+    // exercises constant 0xFF / 0xAA / 0x55 / 0x00 and random records.
+    for (uint32_t n_raw : {70000u, 270000u}) {
+        const uint32_t nb = bed_simd::record_bytes(n_raw);
+        Exact<uint8_t> raw(nb);
+        std::vector<uint32_t> sub;
+        for (uint32_t i = 0; i < n_raw; ++i)
+            if (i % 7 != 3) sub.push_back(i);
+        const KeepSpec kfull{"full", true, {}};
+        const KeepSpec ksub{"sub", false, sub};
+        for (int pat : {0xFF, 0xAA, 0x55, 0x00, -1}) {
+            if (pat >= 0) std::memset(raw.p, pat, nb);
+            else gen_raw(raw.p, n_raw, 0.05);
+            for (const KeepSpec& ks : {kfull, ksub}) {
+                char ctx[160];
+                std::snprintf(ctx, sizeof ctx, "large n_raw=%u pat=%d keep=%s", n_raw, pat, ks.name.c_str());
+                g_ctx = ctx;
+                ++g_cases;
+                const uint32_t n_out = ks.full ? n_raw : (uint32_t)ks.idx.size();
+                std::vector<uint64_t> mask;
+                const uint64_t* km = nullptr;
+                if (!ks.full) {
+                    mask.resize(bed_simd::keep_mask_words(n_raw));
+                    bed_simd::build_keep_mask(ks.idx.data(), ks.idx.size(), n_raw, mask.data());
+                    km = mask.data();
+                }
+                const Counts rc = bed_simd::count(raw.p, km, n_raw, n_out);
+                const Counts gc = emu::count(raw.p, km, n_raw, n_out);
+                CHECK_COUNTS(rc, gc, "large count");
+                if (n_raw == 70000u) {
+                    Guarded<int8_t> r(n_out), g(n_out);
+                    const Counts di_r = bed_simd::decode_i8(raw.p, km, n_raw, n_out, r.p, nullptr);
+                    const Counts di_g = emu::decode_i8(raw.p, km, n_raw, 0, n_out, g.p, nullptr);
+                    CHECK_COUNTS(di_r, di_g, "large decode_i8");
+                    CHECK(std::memcmp(r.p, g.p, n_out) == 0, "large decode_i8 output mismatch");
+                    CHECK(g.guard_ok(), "large decode_i8 overrun");
+                }
             }
         }
     }

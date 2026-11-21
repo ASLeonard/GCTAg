@@ -73,9 +73,3 @@ int getMemPeakKB() { return readProcStatus("VmHWM:",  6); }
 int getVMPeakKB()  { return readProcStatus("VmPeak:", 7); }
 
 #endif // __APPLE__
-
-
-
-
-
-

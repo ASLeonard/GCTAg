@@ -78,14 +78,13 @@ struct RemlCtx {
     // fall back to the dense ctx.A path.
     int grm_chunk_rows = 0;
 
-    // Hard cap on rSVD sketch memory (Omega/Y/qr_scratch/Q, each ~n*k_ext*8
-    // bytes, several live simultaneously during power iteration) as k_ext
-    // escalates. Chunking K (grm_chunked) removes K's own O(n^2)
-    // footprint but does nothing to bound this — it scales with k_ext
-    // identically whether K is chunked or dense, and unbounded escalation on
-    // a pathological (near-full-rank) GRM can reach hundreds of GB before
-    // the "may not offer a computational advantage" warning below even
-    // fires. 0 = no explicit cap (only bounded by n-1, as before).
+    // Hard cap on rSVD sketch memory (live float32 buffers Q + AQ ~ 2.4 * n * k_ext * 4
+    // bytes during power iteration and Rayleigh-Ritz) as k_ext escalates.
+    // Chunking K (grm_chunked) removes K's own O(n^2) footprint but does nothing
+    // to bound this — it scales with k_ext identically whether K is chunked or dense,
+    // and unbounded escalation on a pathological (near-full-rank) GRM can reach
+    // hundreds of GB before the "may not offer a computational advantage" warning
+    // even fires. 0 = no explicit cap (only bounded by n-1, as before).
     double svd_mem_budget_gb = 0.0;
 
     // ── Config (algorithm control) ────────────────────────────────────────────
@@ -171,6 +170,13 @@ struct RemlCtx {
     RemlMat Uk_Vi_X;            // U_k^T V^{-1} X  (k x X_c, Woodbury)
     RemlMat UkTX;               // U_k^T X  (k x X_c, constant, cached)
     RemlVec UkTy;               // U_k^T y  (k, constant, cached)
+    // Precomputed perpendicular Gram blocks for spectral-subspace Woodbury REML
+    // (X_perp = X - Uk * UkTX, y_perp = y - Uk * UkTy), enabling O(k * c^2)
+    // HE warm-start and AI/EM-REML iterations with zero Uk scans after iter 0.
+    bool    wb_subspace_ready = false;
+    RemlMat wb_XtX_perp;        // X_perp^T X_perp (X_c x X_c, PSD)
+    RemlVec wb_Xty_perp;        // X_perp^T y_perp (X_c)
+    double  wb_yty_perp = 0.0;  // y_perp^T y_perp
     RemlMat hutchpp_S;          // Hutch++ Rademacher probes  (n x k)
     RemlMat hutchpp_G;          // Hutch++ Rademacher probes  (n x k)
     bool reml_hutchpp_fixed_probes = false; // true → don't redraw every call/iteration (default false)

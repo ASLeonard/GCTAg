@@ -36,20 +36,35 @@
 using std::to_string;
 using std::unique_ptr;
 
+void Marker::normalizeChrLabelInto(std::string_view chr_label, std::string& out) {
+    size_t b = 0;
+    size_t e = chr_label.size();
+    while (b < e && std::isspace(static_cast<unsigned char>(chr_label[b]))) ++b;
+    while (e > b && std::isspace(static_cast<unsigned char>(chr_label[e - 1]))) --e;
+    out.resize(e - b);
+    for (size_t i = 0; i < e - b; ++i) {
+        out[i] = gcta_text_io::ascii_toupper(chr_label[b + i]);
+    }
+}
+
 std::string Marker::normalizeChrLabel(const std::string& chr_label) {
-    std::string norm = chr_label;
-    boost::trim(norm);
-    std::transform(norm.begin(), norm.end(), norm.begin(),
-                   [](unsigned char c){ return static_cast<char>(std::toupper(c)); });
+    std::string norm;
+    normalizeChrLabelInto(chr_label, norm);
     return norm;
 }
 
 bool Marker::isHomogameticChr(const std::string& chr_label) const {
-    return homogametic_chrs.count(normalizeChrLabel(chr_label)) > 0;
+    if (homogametic_chrs.empty()) return false;
+    std::string norm;
+    normalizeChrLabelInto(chr_label, norm);
+    return homogametic_chrs.count(norm) > 0;
 }
 
 bool Marker::isHeterogameticChr(const std::string& chr_label) const {
-    return heterogametic_chrs.count(normalizeChrLabel(chr_label)) > 0;
+    if (heterogametic_chrs.empty()) return false;
+    std::string norm;
+    normalizeChrLabelInto(chr_label, norm);
+    return heterogametic_chrs.count(norm) > 0;
 }
 
 bool Marker::isPositiveIntegerChrLabel(const std::string& chr_label) {
@@ -58,23 +73,32 @@ bool Marker::isPositiveIntegerChrLabel(const std::string& chr_label) {
     for (char c : norm) {
         if (!std::isdigit(static_cast<unsigned char>(c))) return false;
     }
-    try {
-        return std::stoi(norm) >= 1;
-    } catch (...) {
-        return false;
-    }
+    int v = 0;
+    return gcta_text_io::parse_int_sv(norm, v) && v >= 1;
 }
 
-bool Marker::isAllowedChrLabel(const std::string& chr_label) const {
-    const std::string norm = normalizeChrLabel(chr_label);
-
-    if (chr_filter_mode == 1) {
-        return !isHomogameticChr(norm) && !isHeterogameticChr(norm);
-    }
+bool Marker::isAllowedChrLabelView(std::string_view chr_label) const {
     if (chr_filter_mode == 2) {
         return true;
     }
-    return allowed_chrs.empty() || allowed_chrs.count(norm) > 0;
+    if (chr_filter_mode == 1) {
+        if (homogametic_chrs.empty() && heterogametic_chrs.empty()) {
+            return true;
+        }
+        std::string norm;
+        normalizeChrLabelInto(chr_label, norm);
+        return homogametic_chrs.count(norm) == 0 && heterogametic_chrs.count(norm) == 0;
+    }
+    if (allowed_chrs.empty()) {
+        return true;
+    }
+    std::string norm;
+    normalizeChrLabelInto(chr_label, norm);
+    return allowed_chrs.count(norm) > 0;
+}
+
+bool Marker::isAllowedChrLabel(const std::string& chr_label) const {
+    return isAllowedChrLabelView(chr_label);
 }
 
 void Marker::loadSexChromosomeFile(const std::string& file_path) {
@@ -576,9 +600,10 @@ void Marker::save_marker(string filename){
     LOGGER.i(0, "Saving SNP information to [" + filename + "]...");
     std::ofstream out(filename.c_str());
     for(auto & i : index_extract){
-        out << chr[i] << "\t" << name[i] << "\t" << gd[i] 
+        const float gd_val = (i < gd.size()) ? gd[i] : 0.0f;
+        out << chr[i] << "\t" << name[i] << "\t" << gd_val
             << "\t" << pd[i] << "\t" << a1[i] << "\t"
-            << a2[i] << std::endl;
+            << a2[i] << "\n";
     }
     LOGGER.i(0, to_string(index_extract.size()) + " SNPs saved.");
 
@@ -586,176 +611,262 @@ void Marker::save_marker(string filename){
 
 void Marker::read_pvar(string pvar_file){
     LOGGER.i(0, "Reading PLINK2 PVAR file from [" + pvar_file + "]...");
-    std::vector<string> head;
-    std::map<int, std::vector<string>> lists;
-    int nHeader = 0;
-    if(readTxtList(pvar_file, 5, head, nHeader, lists)){
-        int ncol = lists.size();
-        int iChr, iPOS, iID, iA1, iA2;
-        if(head.empty()){
-            if(ncol==6){
-                iChr = 0;
-                iID = 1;
-                iPOS = 3;
-                iA1 = 4;
-                iA2 = 5;
-            }else if(ncol == 5){
-                iChr = 0;
-                iID = 1;
-                iPOS = 2;
-                iA1 = 3;
-                iA2 = 4;
-            }else{
-                LOGGER.e(0, "The .bim file only has " + to_string(ncol) + " columns, which is not valid.");
-            }
-        }else{
-            if(head[0]=="#CHROM"){
-                iChr = 0;
-                int validHeadCT = 1;
-                bool found;
-                iPOS = findElementVector(head, std::string("POS"), found);
-                if(found)validHeadCT++;
-
-                iID = findElementVector(head, std::string("ID"), found);
-                if(found) validHeadCT++;
-
-                iA2 = findElementVector(head, std::string("REF"), found);
-                if(found) validHeadCT++;
-
-                iA1 = findElementVector(head, std::string("ALT"), found);
-                if(found) validHeadCT++;
-
-                if(validHeadCT != 5){
-                    LOGGER.e(0, "can't find all the essential columns in the PVAR file.");
-                }
-            }else{
-                LOGGER.e(0, "invalid PVAR file. It should start with #CHROM.");
-            }
-        }
-
-
-        uint32_t nrows = lists[0].size();
-        uint32_t oriSize = chr.size();
-        uint32_t newSize = oriSize + nrows;
-        chr.resize(newSize);
-        name.resize(newSize);
-        pd.resize(newSize);
-        a1.resize(newSize);
-        a2.resize(newSize);
-        byte_start.resize(newSize, 1);
-        std::vector<uint8_t> validSNP(nrows);
-        #pragma omp parallel for
-        for(int i = 0; i < nrows; i++){
-            uint32_t curRow = i + oriSize;
-            std::string chr_str = lists[iChr][i];
-            chr[curRow] = chr_str;
-            validSNP[i] = isAllowedChrLabel(chr_str) ? 1 : 0;
-            name[curRow] = lists[iID][i];
-            try{
-                //gd here if need;
-                pd[curRow] = std::stoi(lists[iPOS][i]);
-            }catch(std::invalid_argument&){
-                LOGGER.e(0, "line " + to_string(nHeader + i + 1) + " contains invalid distance value.");
-            }
-            auto &curA1 = lists[iA1][i];
-            std::transform(curA1.begin(), curA1.end(), curA1.begin(), toupper);
-            a1[curRow] = curA1;
-
-            auto &curA2 = lists[iA2][i];
-            std::transform(curA2.begin(), curA2.end(), curA2.begin(), toupper);
-            a2[curRow] = curA2;
-        }
-
-        index_extract.reserve(newSize);
-        uint32_t nValidSNP = 0;
-        for(int i = 0; i < nrows; i++){
-            uint32_t curRow = i + oriSize;
-            if(validSNP[i]){
-                index_extract.push_back(curRow);
-                nValidSNP++;
-            }
-        }
-        index_extract.shrink_to_fit();
-
-        num_marker = name.size();
-        num_extract = index_extract.size();
-
-        LOGGER.i(0, to_string(num_marker) + " SNPs to be included from PVAR file(s).");
-        if(nrows != nValidSNP){
-            LOGGER.i(0, to_string(num_extract) + " SNPs to be included on valid chromosomes");
-        }
-
-        MarkerParam markerParam;
-        markerParam.rawCountSNP = nrows;
-        markerParam.rawCountSample = 0; // dummy 
-        markerParam.compressFormat = 0;
-        markerParam.posGenoDataStart = 3; // just dummy, pgen don't start with 3
-        markerParams.push_back(markerParam);
-    }else{
-        LOGGER.e(0, "invalid PVAR file.");
+    gcta_text_io::FastLineReader reader;
+    if (!reader.open(pvar_file)) {
+        LOGGER.e(0, "can't read [" + pvar_file + "].");
     }
+
+    std::string_view line;
+    std::string preLine;
+    int curReadLine = 0;
+    bool found_data = false;
+    while (reader.next_line(line)) {
+        curReadLine++;
+        const size_t first_non_ws = line.find_first_not_of("\r\t ");
+        if (first_non_ws != std::string_view::npos && line[first_non_ws] == '#') {
+            preLine.assign(line);
+            continue;
+        }
+        if (first_non_ws == std::string_view::npos) {
+            LOGGER.e(0, "blank header line or no valid text data.");
+        }
+        found_data = true;
+        break;
+    }
+    if (!found_data) {
+        LOGGER.e(0, "blank header line or no valid text data.");
+    }
+
+    const int nHeader = curReadLine - 1;
+    std::vector<std::string_view> toks;
+    toks.reserve(16);
+    gcta_text_io::split_ws_exact(line, toks);
+    const int ncol = static_cast<int>(toks.size());
+
+    std::vector<std::string_view> head_toks;
+    if (!preLine.empty()) {
+        gcta_text_io::split_ws_exact(preLine, head_toks);
+        if (static_cast<int>(head_toks.size()) != ncol) {
+            LOGGER.e(0, "data are inconsistent with the headers.");
+        }
+    }
+    if (ncol < 5) {
+        LOGGER.e(0, "the number of fields in [" + pvar_file + "] is less than 5.");
+    }
+
+    int iChr = -1, iPOS = -1, iID = -1, iA1 = -1, iA2 = -1;
+    if (head_toks.empty()) {
+        if (ncol == 6) {
+            iChr = 0;
+            iID  = 1;
+            iPOS = 3;
+            iA1  = 4;
+            iA2  = 5;
+        } else if (ncol == 5) {
+            iChr = 0;
+            iID  = 1;
+            iPOS = 2;
+            iA1  = 3;
+            iA2  = 4;
+        } else {
+            LOGGER.e(0, "The .bim file only has " + to_string(ncol) + " columns, which is not valid.");
+        }
+    } else {
+        if (head_toks[0] != "#CHROM") {
+            LOGGER.e(0, "invalid PVAR file. It should start with #CHROM.");
+        }
+        iChr = 0;
+        int validHeadCT = 1;
+        for (int c = 0; c < ncol; ++c) {
+            if (head_toks[c] == "POS" && iPOS < 0)      { iPOS = c; validHeadCT++; }
+            else if (head_toks[c] == "ID" && iID < 0)   { iID  = c; validHeadCT++; }
+            else if (head_toks[c] == "REF" && iA2 < 0)  { iA2  = c; validHeadCT++; }
+            else if (head_toks[c] == "ALT" && iA1 < 0)  { iA1  = c; validHeadCT++; }
+        }
+        if (validHeadCT != 5) {
+            LOGGER.e(0, "can't find all the essential columns in the PVAR file.");
+        }
+    }
+
+    const uint32_t oriSize = static_cast<uint32_t>(chr.size());
+    if (reader.file_size() > 0) {
+        const size_t avg_line = std::max<size_t>(line.size() + 1, 10);
+        const size_t est_rows = static_cast<size_t>(reader.file_size() / avg_line) + 64;
+        const size_t target = static_cast<size_t>(oriSize) + est_rows;
+        chr.reserve(target);
+        name.reserve(target);
+        pd.reserve(target);
+        a1.reserve(target);
+        a2.reserve(target);
+        index_extract.reserve(index_extract.size() + est_rows);
+    }
+
+    uint32_t nrows = 0;
+    uint32_t nValidSNP = 0;
+    int line_number = nHeader;
+    std::string last_chr;
+    bool has_last_chr = false;
+    bool last_chr_allowed = false;
+
+    auto process_row = [&]() {
+        line_number++;
+        if (static_cast<int>(toks.size()) < ncol) {
+            LOGGER.e(0, "the file [" + pvar_file + "] contains different number of elements in line " + to_string(line_number) + ".");
+        } else if (static_cast<int>(toks.size()) > ncol) {
+            LOGGER.w(0, "the file [" + pvar_file + "] contains extra number of elements in line " + to_string(line_number) + ".");
+        }
+        const std::string_view sv_chr = toks[static_cast<size_t>(iChr)];
+        const std::string_view sv_id  = toks[static_cast<size_t>(iID)];
+        const std::string_view sv_pos = toks[static_cast<size_t>(iPOS)];
+        const std::string_view sv_a1  = toks[static_cast<size_t>(iA1)];
+        const std::string_view sv_a2  = toks[static_cast<size_t>(iA2)];
+
+        int64_t pos_val = 0;
+        if (!gcta_text_io::parse_int64_sv(sv_pos, pos_val) ||
+            pos_val < std::numeric_limits<int>::min() ||
+            pos_val > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+            LOGGER.e(0, "line " + to_string(line_number) + " contains invalid distance value.");
+        }
+
+        const uint32_t curRow = oriSize + nrows;
+        chr.emplace_back(sv_chr);
+        name.emplace_back(sv_id);
+        pd.push_back(static_cast<uint32_t>(pos_val));
+        a1.emplace_back(sv_a1);
+        gcta_text_io::uppercase_inplace(a1.back());
+        a2.emplace_back(sv_a2);
+        gcta_text_io::uppercase_inplace(a2.back());
+
+        bool allowed;
+        if (has_last_chr && sv_chr == last_chr) {
+            allowed = last_chr_allowed;
+        } else {
+            last_chr.assign(sv_chr);
+            has_last_chr = true;
+            last_chr_allowed = isAllowedChrLabelView(sv_chr);
+            allowed = last_chr_allowed;
+        }
+        if (allowed) {
+            index_extract.push_back(curRow);
+            nValidSNP++;
+        }
+        nrows++;
+    };
+
+    process_row();
+    while (reader.next_line(line)) {
+        gcta_text_io::split_ws_exact(line, toks);
+        process_row();
+    }
+
+    num_marker = static_cast<uint32_t>(name.size());
+    num_extract = static_cast<uint32_t>(index_extract.size());
+
+    LOGGER.i(0, to_string(num_marker) + " SNPs to be included from PVAR file(s).");
+    if (nrows != nValidSNP) {
+        LOGGER.i(0, to_string(num_extract) + " SNPs to be included on valid chromosomes");
+    }
+
+    MarkerParam markerParam;
+    markerParam.rawCountSNP = nrows;
+    markerParam.rawCountSample = 0; // dummy
+    markerParam.compressFormat = 0;
+    markerParam.posGenoDataStart = 3; // just dummy, pgen don't start with 3
+    markerParams.push_back(markerParam);
 }
 
 void Marker::read_bim(string bim_file) {
     LOGGER.i(0, "Reading PLINK BIM file from [" + bim_file + "]...");
-    std::ifstream bim(bim_file.c_str());
-    if(!bim){
+    gcta_text_io::FastLineReader reader;
+    if (!reader.open(bim_file)) {
         LOGGER.e(0, "cannot open the file [" + bim_file + "] to read");
     }
 
-    int line_number = name.size();
-    int last_length = 0;
-    std::string line;
-    int start_line_number = name.size() + 1;
-    std::vector<string> line_elements;
-    while(std::getline(bim, line)){
-        line_number++;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        line_elements.clear();
-        size_t start = 0, pos;
-        while ((pos = line.find_first_of("\t ", start)) != std::string::npos) {
-            line_elements.emplace_back(line, start, pos - start);
-            start = pos + 1;
+    const uint32_t oriSize = static_cast<uint32_t>(name.size());
+    uint32_t line_number = oriSize;
+    const uint32_t start_line_number = oriSize + 1;
+    size_t last_length = 0;
+    bool reserved = false;
+
+    std::vector<std::string_view> toks;
+    toks.reserve(8);
+    std::string last_chr;
+    bool has_last_chr = false;
+    bool last_chr_allowed = false;
+
+    std::string_view line;
+    while (reader.next_line(line)) {
+        if (!reserved) {
+            reserved = true;
+            if (reader.file_size() > 0) {
+                const size_t avg_line = std::max<size_t>(line.size() + 1, 10);
+                const size_t est_rows = static_cast<size_t>(reader.file_size() / avg_line) + 64;
+                const size_t target = static_cast<size_t>(oriSize) + est_rows;
+                chr.reserve(target);
+                name.reserve(target);
+                pd.reserve(target);
+                a1.reserve(target);
+                a2.reserve(target);
+                index_extract.reserve(index_extract.size() + est_rows);
+                if (!gd.empty()) gd.reserve(target);
+            }
         }
-        line_elements.emplace_back(line, start);
-        if(line_elements.size() < Constants::NUM_BIM_COL) {
+        line_number++;
+        gcta_text_io::split_ws_exact(line, toks);
+        if (toks.size() < static_cast<size_t>(Constants::NUM_BIM_COL)) {
             LOGGER.e(0, "the bim file [" + bim_file + "], line " + to_string(line_number)
                    + " has elements less than " + to_string(Constants::NUM_BIM_COL));
         }
-        if(line_number > start_line_number && line_elements.size() != last_length){
+        if (line_number > start_line_number && toks.size() != last_length) {
             LOGGER.w(0, "the bim file [" + bim_file + "], line " + to_string(line_number) +
                     " have different elements, take care");
         }
-        // replace std::strings
 
-        std::string chr_str = line_elements[0];
-        chr.push_back(chr_str);
-        name.push_back(line_elements[1]);
-        try{
-            gd.push_back(std::stof(line_elements[2]));
-            pd.push_back(std::stoi(line_elements[3]));
-        }catch(std::invalid_argument&){
+        float gd_val = 0.0f;
+        int64_t pd_val = 0;
+        if (!gcta_text_io::parse_float_sv(toks[2], gd_val) ||
+            !gcta_text_io::parse_int64_sv(toks[3], pd_val) ||
+            pd_val < std::numeric_limits<int>::min() ||
+            pd_val > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
             LOGGER.e(0, "Line " + to_string(line_number) + " of [" + bim_file +
                         "] contains illegal distance value, please check");
         }
-        std::transform(line_elements[4].begin(), line_elements[4].end(), line_elements[4].begin(), toupper);
-        std::transform(line_elements[5].begin(), line_elements[5].end(), line_elements[5].begin(), toupper);
-        a1.push_back(line_elements[4]);
-        a2.push_back(line_elements[5]);
-        //TODO refractor the code.
-        byte_start.push_back(1);
-        last_length = line_elements.size();
-        if(isAllowedChrLabel(chr_str)){
+
+        const std::string_view sv_chr = toks[0];
+        chr.emplace_back(sv_chr);
+        name.emplace_back(toks[1]);
+        if (!gd.empty() || gd_val != 0.0f) {
+            if (gd.empty()) {
+                gd.assign(static_cast<size_t>(line_number - 1), 0.0f);
+            }
+            gd.push_back(gd_val);
+        }
+        pd.push_back(static_cast<uint32_t>(pd_val));
+        a1.emplace_back(toks[4]);
+        gcta_text_io::uppercase_inplace(a1.back());
+        a2.emplace_back(toks[5]);
+        gcta_text_io::uppercase_inplace(a2.back());
+
+        last_length = toks.size();
+        bool allowed;
+        if (has_last_chr && sv_chr == last_chr) {
+            allowed = last_chr_allowed;
+        } else {
+            last_chr.assign(sv_chr);
+            has_last_chr = true;
+            last_chr_allowed = isAllowedChrLabelView(sv_chr);
+            allowed = last_chr_allowed;
+        }
+        if (allowed) {
             index_extract.push_back(line_number - 1);
         }
     }
-    num_marker = name.size();
-    num_extract = index_extract.size();
+    num_marker = static_cast<uint32_t>(name.size());
+    num_extract = static_cast<uint32_t>(index_extract.size());
     LOGGER.i(0, to_string(num_marker) + " SNPs to be included from BIM file(s).");
-    if(num_marker != num_extract){
+    if (num_marker != num_extract) {
         LOGGER.i(0, to_string(num_extract) + " SNPs to be included on valid chromosomes");
     }
-    bim.close();
     MarkerParam markerParam;
     markerParam.rawCountSNP = num_marker - start_line_number + 1;
     markerParam.rawCountSample = 0;
@@ -878,8 +989,8 @@ std::vector<std::pair<std::string, std::vector<uint32_t>>> Marker::read_gene(str
 
 
 void Marker::getStartPosSize(uint32_t raw_index, uint64_t &pos, uint64_t &size){
-    pos = byte_start[raw_index];
-    size = byte_size[raw_index];
+    pos = (raw_index < byte_start.size()) ? byte_start[raw_index] : 1;
+    size = (raw_index < byte_size.size()) ? byte_size[raw_index] : 0;
 }
 
 #ifdef BGEN_SUPPORT
@@ -1367,23 +1478,58 @@ std::vector<uint32_t>& Marker::get_extract_index(){ // raw index
 
 std::vector<uint32_t> Marker::get_extract_index_autosome(){ // returns the index in keep list not raw
     std::vector<uint32_t> auto_index;
-    for(int i = 0; i < (int)index_extract.size(); i++){
-        uint32_t curIndex = index_extract[i];
-        const std::string& c = chr[curIndex];
-        if(!isHomogameticChr(c) && !isHeterogameticChr(c)) auto_index.push_back(i);
+    const size_t n = index_extract.size();
+    if (homogametic_chrs.empty() && heterogametic_chrs.empty()) {
+        auto_index.resize(n);
+        std::iota(auto_index.begin(), auto_index.end(), static_cast<uint32_t>(0));
+        return auto_index;
+    }
+    auto_index.reserve(n);
+    std::string last_chr;
+    bool has_last = false;
+    bool last_is_auto = false;
+    for (size_t i = 0; i < n; ++i) {
+        const std::string& c = chr[index_extract[i]];
+        bool is_auto;
+        if (has_last && c == last_chr) {
+            is_auto = last_is_auto;
+        } else {
+            last_chr = c;
+            has_last = true;
+            std::string norm;
+            normalizeChrLabelInto(c, norm);
+            last_is_auto = (homogametic_chrs.count(norm) == 0 && heterogametic_chrs.count(norm) == 0);
+            is_auto = last_is_auto;
+        }
+        if (is_auto) auto_index.push_back(static_cast<uint32_t>(i));
     }
     return auto_index;
 }
 
 std::vector<uint32_t> Marker::get_extract_index_X(){
-   std::vector<uint32_t> auto_index;
-   for(int i = 0; i < (int)index_extract.size(); i++){
-       uint32_t curIndex = index_extract[i];
-       if(isHomogameticChr(chr[curIndex])){
-           auto_index.push_back(i);
-       }
-   }
-   return auto_index;
+    std::vector<uint32_t> x_index;
+    if (homogametic_chrs.empty()) {
+        return x_index;
+    }
+    const size_t n = index_extract.size();
+    x_index.reserve(n / 16 + 16);
+    std::string last_chr;
+    bool has_last = false;
+    bool last_is_x = false;
+    for (size_t i = 0; i < n; ++i) {
+        const std::string& c = chr[index_extract[i]];
+        bool is_x;
+        if (has_last && c == last_chr) {
+            is_x = last_is_x;
+        } else {
+            last_chr = c;
+            has_last = true;
+            last_is_x = isHomogameticChr(c);
+            is_x = last_is_x;
+        }
+        if (is_x) x_index.push_back(static_cast<uint32_t>(i));
+    }
+    return x_index;
 }
 
 
@@ -1417,13 +1563,23 @@ void Marker::extract_marker(std::vector<string> markers, bool isExtract) {
 }
 
 void Marker::reset_exclude(){
-   std::vector<uint32_t> whole_index(num_marker);
-   std::iota(whole_index.begin(), whole_index.end(), 0);
-
-   index_exclude.resize(whole_index.size() - index_extract.size());
-   std::set_difference(whole_index.begin(), whole_index.end(), index_extract.begin(), 
-           index_extract.end(), index_exclude.begin());
-   num_exclude = index_exclude.size();
+    index_exclude.clear();
+    if (index_extract.size() == num_marker) {
+        num_exclude = 0;
+        return;
+    }
+    index_exclude.reserve(num_marker - index_extract.size());
+    uint32_t expected = 0;
+    for (uint32_t idx : index_extract) {
+        while (expected < idx) {
+            index_exclude.push_back(expected++);
+        }
+        expected = idx + 1;
+    }
+    while (expected < num_marker) {
+        index_exclude.push_back(expected++);
+    }
+    num_exclude = static_cast<uint32_t>(index_exclude.size());
 }
 
 // didn't check whether in extracted list or not;
@@ -1474,35 +1630,38 @@ uint32_t Marker::getRawIndex(uint32_t extractedIndex){
 //TODO support multiple column SNP list, currently only take the first SNP list
 // If multiple column provided, it will miss the correct SNP name.
 std::vector<string> Marker::read_snplist(string snplist_file) {
-    std::ifstream if_snplist(snplist_file.c_str());
+    gcta_text_io::FastLineReader reader;
+    if (!reader.open(snplist_file)) {
+        LOGGER.e(0, "cannot open the file [" + snplist_file + "] to read");
+    }
     std::vector<string> snplist;
+    std::vector<std::string_view> toks;
+    toks.reserve(4);
 
-    std::string line;
     int line_number = 0;
-    int last_length = 0;
-    std::vector<string> line_elements;
-    while(std::getline(if_snplist, line)){
-        line_number++;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        line_elements.clear();
-        size_t start = 0, pos;
-        while ((pos = line.find_first_of("\t ", start)) != std::string::npos) {
-            line_elements.emplace_back(line, start, pos - start);
-            start = pos + 1;
+    size_t last_length = 0;
+    bool reserved = false;
+    std::string_view line;
+    while (reader.next_line(line)) {
+        if (!reserved) {
+            reserved = true;
+            if (reader.file_size() > 0) {
+                const size_t avg_line = std::max<size_t>(line.size() + 1, 4);
+                snplist.reserve(static_cast<size_t>(reader.file_size() / avg_line) + 64);
+            }
         }
-        line_elements.emplace_back(line, start);
-        if(line_elements.size() < 1){
+        line_number++;
+        gcta_text_io::split_ws_exact(line, toks);
+        if (toks.empty()) {
             LOGGER.e(0, "the SNP list file [" + snplist_file + "], line " + to_string(line_number) +
                         " has elements less than 1");
         }
-
-        if(line_number > 1 && line_elements.size() != last_length){
+        if (line_number > 1 && toks.size() != last_length) {
             LOGGER.w(0, "the SNP list file [" + snplist_file + "], line " + to_string(line_number) +
                         " has different elements");
         }
-        snplist.push_back(line_elements[0]);
-        last_length = line_elements.size();
+        snplist.emplace_back(toks[0]);
+        last_length = toks.size();
     }
-    if_snplist.close();
     return snplist;
 }

@@ -38,20 +38,21 @@ struct RemlState {
     int32_t n           = 0;
     int32_t x_c         = 0;
     bool    is_woodbury = false;
-    // Non-Woodbury path: Vi_L_f always holds a lower-triangular Cholesky
-    // factor, contiguous n×n. is_llt selects which one:
-    //   is_llt=true  -> Vi_L_f = L,  where V      = L  L^T. Apply V^{-1}
-    //                   via two triangular SOLVES (TRSV/TRSM): L^{-T}(L^{-1}·v).
-    //   is_llt=false -> Vi_L_f = Li, where V^{-1} = Li Li^T. Apply V^{-1}
-    //                   via two triangular PRODUCTS (TRMV/TRMM): Li(Li^T·v).
+    // Non-Woodbury path: Vi_L_f always holds an upper-triangular Cholesky
+    // factor (from dpotrf('U')), contiguous n×n with only the upper triangle
+    // populated (strict lower triangle stays unfaulted). is_llt selects which one:
+    //   is_llt=true  -> Vi_L_f = U,  where V      = U^T U. Apply V^{-1}
+    //                   via two upper-triangular SOLVES (TRSV/TRSM): U^{-1}(U^{-T}·v).
+    //   is_llt=false -> Vi_L_f = Ui, where V^{-1} = Ui^T Ui. Apply V^{-1}
+    //                   via two upper-triangular PRODUCTS (TRMV/TRMM): Ui^T(Ui·v).
     // V^{-1} itself is never stored explicitly. Whichever factor REML
-    // produced cheaply (the common is_llt=true case costs one dpotrf, no
+    // produced cheaply (the common is_llt=true case costs one dpotrf('U'), no
     // inversion) — or, in the reml_diagV_adj fallback where only the
     // explicit inverse is available, whichever factor is derived from it —
     // is computed exactly once (at REML exit / save time) and reused as-is
     // by every downstream consumer. No consumer re-factorizes.
     bool    is_llt      = false;
-    Eigen::MatrixXf Vi_L_f;  // Cholesky factor per is_llt above
+    Eigen::MatrixXf Vi_L_f;  // Upper-triangular Cholesky factor per is_llt above
     WoodburyMLMACache wb;    // TUNA: Woodbury low-rank factors (is_woodbury=true)
     Eigen::VectorXf dk_f;    // TUNA: top-k eigenvalues of K (needed for save-reml)
     float lambda_tail_f = 0.0f; // TUNA: tail mean eigenvalue of K

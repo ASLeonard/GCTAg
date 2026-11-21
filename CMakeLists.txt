@@ -552,21 +552,35 @@ else()
                 "Consider using the aocc/ variant for best performance.")
         endif()
 
-        # AOCL 6.0+ splits low-precision GEMM (aocl_gemm_s8s8s32os32 / AVX-512 VNNI)
-        # into libaocl-dlp (header aocl_dlp.h / classic/aocl_gemm_interface_apis.h).
+        # AOCL 6.0+ splits low-precision GEMM (u8s8s32 / bf16 / AVX-512 VNNI)
+        # into libaocl-dlp (umbrella header aocl_dlp.h or classic/aocl_gemm_interface_apis.h).
         set(GCTA_AOCL_DLP_LIBRARY "")
+        set(GCTA_AOCL_DLP_HEADER "")
         foreach(_dlp_cand IN ITEMS "${_aocl_lib_dir}/libaocl-dlp.so" "${_aocl_lib_dir}/libaocl-dlp.a")
             if(EXISTS "${_dlp_cand}")
-                set(_dlp_has_hdr FALSE)
-                if(EXISTS "${GCTA_BLAS_INCLUDE_DIR}/aocl_dlp.h"
-                   OR EXISTS "${GCTA_BLAS_INCLUDE_DIR}/classic/aocl_gemm_interface_apis.h")
-                    set(_dlp_has_hdr TRUE)
+                if(EXISTS "${GCTA_BLAS_INCLUDE_DIR}/aocl_dlp.h")
+                    set(GCTA_AOCL_DLP_HEADER "aocl_dlp.h")
+                    list(APPEND GCTA_BLAS_DEFINES GCTA_AOCL_DLP_HAS_DLP_H)
+                elseif(EXISTS "${GCTA_BLAS_INCLUDE_DIR}/classic/aocl_gemm_interface_apis.h")
+                    set(GCTA_AOCL_DLP_HEADER "classic/aocl_gemm_interface_apis.h")
+                    list(APPEND GCTA_BLAS_DEFINES GCTA_AOCL_DLP_HAS_CLASSIC_H)
                 endif()
-                if(_dlp_has_hdr)
+                if(GCTA_AOCL_DLP_HEADER)
                     set(GCTA_AOCL_DLP_LIBRARY "${_dlp_cand}")
                     list(APPEND GCTA_BLAS_LIBS "${GCTA_AOCL_DLP_LIBRARY}")
                     list(APPEND GCTA_BLAS_DEFINES GCTA_USE_AOCL_DLP)
-                    message(STATUS "AOCL-DLP (s8s8s32 VNNI): ${GCTA_AOCL_DLP_LIBRARY}")
+                    # Record whether the installed DLP header uses AOCL 6.0 dlp_metadata_t
+                    # (6-arg get_reorder_buf_size / 9-arg reorder). cpu.h also auto-adapts
+                    # via C++23 requires-expressions for AOCL 5.x/6.0 compatibility.
+                    set(_dlp_api_hdr "${GCTA_BLAS_INCLUDE_DIR}/${GCTA_AOCL_DLP_HEADER}")
+                    if(EXISTS "${GCTA_BLAS_INCLUDE_DIR}/classic/aocl_gemm_interface_apis.h")
+                        set(_dlp_api_hdr "${GCTA_BLAS_INCLUDE_DIR}/classic/aocl_gemm_interface_apis.h")
+                    endif()
+                    file(READ "${_dlp_api_hdr}" _dlp_hdr_text)
+                    if(_dlp_hdr_text MATCHES "dlp_metadata_t")
+                        list(APPEND GCTA_BLAS_DEFINES GCTA_AOCL_DLP_V6_METADATA)
+                    endif()
+                    message(STATUS "AOCL-DLP (u8s8s32/bf16 VNNI): ${GCTA_AOCL_DLP_LIBRARY} (header: ${GCTA_AOCL_DLP_HEADER})")
                     break()
                 endif()
             endif()
@@ -641,6 +655,7 @@ target_sources(GCTAg PRIVATE
         src/Geno.cpp
         src/GenoBackend.cpp
         src/BedBackend.cpp
+        src/bed_simd.cpp
         src/BgenBackend.cpp
         src/PgenBackend.cpp
         src/Logger.cpp
@@ -707,6 +722,10 @@ set_target_properties(GCTAg PROPERTIES
 # Keep CLI11 isolated from unity builds so its headers never interact with
 # legacy main/*.cpp macros or `using namespace std`.
 set_source_files_properties(src/Cli.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+# bed_simd.cpp uses per-function __attribute__((target("avx512..."))) runtime
+# dispatch; keep it out of unity TUs so AVX-512 code paths never mix with
+# (or get attributes/macros from) other sources.
+set_source_files_properties(src/bed_simd.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
 target_compile_definitions(GCTAg PRIVATE
     ${GCTA_BLAS_DEFINES}
@@ -716,7 +735,10 @@ target_compile_definitions(GCTAg PRIVATE
     $<$<BOOL:${GCTA_USE_JEMALLOC}>:GCTA_USE_JEMALLOC>
     $<$<BOOL:${BGEN_SUPPORT}>:BGEN_SUPPORT>)
 
-target_compile_options(GCTAg PRIVATE -pipe)
+target_compile_options(GCTAg PRIVATE
+    -pipe
+    $<$<CONFIG:Release>:-fno-math-errno>
+    $<$<CONFIG:Release>:-fno-trapping-math>)
 foreach(_arch_flag IN LISTS _gcta_arch_flags)
     target_compile_options(GCTAg PRIVATE $<$<CONFIG:Release>:${_arch_flag}>)
 endforeach()
@@ -776,6 +798,33 @@ target_link_libraries(GCTAg PRIVATE
     Threads::Threads
     ${GCTA_BLAS_LIBS})
 
+# ── Native BED kernel tests / microbenchmark (opt-in, never part of GCTAg) ──
+option(GCTA_BUILD_BED_TESTS "Build native PLINK1 .bed kernel tests and microbenchmark" OFF)
+if(GCTA_BUILD_BED_TESTS)
+    # AVX-512 kernel logic validated through a portable intrinsic emulator
+    # (runs on any host, e.g. Apple Silicon) against the scalar reference.
+    add_executable(test_bed_simd_emu tests/test_bed_simd_emu.cpp src/bed_simd.cpp)
+    target_include_directories(test_bed_simd_emu PRIVATE include)
+    set(_bed_test_targets test_bed_simd_emu bench_bed_simd)
+    # Bit-for-bit comparison against the PLINK2 PgenReader BED pipeline.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_bed_vs_pgen.cpp")
+        add_executable(test_bed_vs_pgen tests/test_bed_vs_pgen.cpp src/bed_simd.cpp)
+        target_include_directories(test_bed_vs_pgen PRIVATE include ${CMAKE_SOURCE_DIR}
+            third_party/plink-ng/2.0/include third_party/plink-ng/2.0/simde)
+        target_link_libraries(test_bed_vs_pgen PRIVATE Pgenlib)
+        list(APPEND _bed_test_targets test_bed_vs_pgen)
+    endif()
+    add_executable(bench_bed_simd tests/bench_bed_simd.cpp src/bed_simd.cpp)
+    target_include_directories(bench_bed_simd PRIVATE include ${CMAKE_SOURCE_DIR}
+        third_party/plink-ng/2.0/include third_party/plink-ng/2.0/simde)
+    target_link_libraries(bench_bed_simd PRIVATE Pgenlib)
+    foreach(_t IN LISTS _bed_test_targets)
+        foreach(_arch_flag IN LISTS _gcta_arch_flags)
+            target_compile_options(${_t} PRIVATE $<$<CONFIG:Release>:${_arch_flag}>)
+        endforeach()
+    endforeach()
+endif()
+
 # Remove any duplicate entries added by compiler probes, BLAS detection, and
 # toolchain logic (e.g. BLAS lib dir may match OpenMP dir on some installs).
 list(REMOVE_DUPLICATES CMAKE_BUILD_RPATH)
@@ -818,9 +867,9 @@ if(GCTA_LAPACKE_LIBRARY)
 endif()
 if(GCTA_BLAS_PROVIDER STREQUAL "AOCL")
     if(GCTA_AOCL_DLP_LIBRARY)
-        message(STATUS "  AOCL-DLP (VNNI):   ${GCTA_AOCL_DLP_LIBRARY}")
+        message(STATUS "  AOCL-DLP (VNNI):   ${GCTA_AOCL_DLP_LIBRARY} (${GCTA_AOCL_DLP_HEADER})")
     else()
-        message(STATUS "  AOCL-DLP (VNNI):   NOT FOUND (int8 GEMM will fall back to sgemm unless BLIS addon is enabled)")
+        message(STATUS "  AOCL-DLP (VNNI):   NOT FOUND (int8/bf16 GEMM will fall back to sgemm unless BLIS addon is enabled)")
     endif()
 endif()
 message(STATUS "  Compiler:          ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}${GCTA_COMPILER_IS_AOCC_STR} (${CMAKE_CXX_COMPILER})")

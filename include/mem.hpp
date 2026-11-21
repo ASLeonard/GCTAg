@@ -23,6 +23,7 @@
 #include <memory>
 #include <new>
 #include <type_traits>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // AlignedAllocator<T, Align>
@@ -82,6 +83,8 @@ constexpr bool operator!=(const AlignedAllocator<T, A>&, const AlignedAllocator<
 // AlignedUniquePtr<T, Align> / make_aligned_uninitialized<T, Align>
 //
 // RAII owner for large uninitialized SIMD/cache-line-aligned buffers.
+// Backed by ::operator new(std::align_val_t) so jemalloc/amdalloc's aligned
+// fast path applies cleanly.
 // Does NOT zero-fill or touch allocated pages, preserving OS lazy demand
 // paging (critical for triangular/tiled GRM buffers where the upper triangle
 // must stay un-faulted in physical RAM).
@@ -113,6 +116,97 @@ template <typename T, std::size_t Align = 64>
     void* p = ::operator new(count * sizeof(T), std::align_val_t{Align}, std::nothrow);
     return AlignedUniquePtr<T, Align>{static_cast<T*>(p)};
 }
+
+// ---------------------------------------------------------------------------
+// AlignedRawBuffer<T, Align>
+//
+// Lightweight RAII uninitialized aligned buffer with std::vector-like
+// .data()/.size()/.resize()/.clear() plus .reset(). Never zero-fills on
+// resize (eliminating serial Core-0 page faults on multi-GB I/O or scratch
+// buffers). Note: growing beyond capacity() reallocates uninitialized storage
+// and does NOT preserve previous contents.
+// ---------------------------------------------------------------------------
+template <typename T, std::size_t Align = 64>
+class AlignedRawBuffer {
+    static_assert(Align >= alignof(T) && std::has_single_bit(Align),
+                  "Alignment must be a power of two >= alignof(T)");
+    static_assert(std::is_trivially_default_constructible_v<T> &&
+                  std::is_trivially_destructible_v<T>,
+                  "AlignedRawBuffer requires trivial T");
+
+public:
+    using value_type = T;
+
+    AlignedRawBuffer() noexcept = default;
+    explicit AlignedRawBuffer(std::size_t count) {
+        resize(count);
+    }
+
+    AlignedRawBuffer(const AlignedRawBuffer&) = delete;
+    AlignedRawBuffer& operator=(const AlignedRawBuffer&) = delete;
+
+    AlignedRawBuffer(AlignedRawBuffer&& other) noexcept
+        : ptr_(std::move(other.ptr_)),
+          size_(std::exchange(other.size_, 0)),
+          capacity_(std::exchange(other.capacity_, 0)) {}
+
+    AlignedRawBuffer& operator=(AlignedRawBuffer&& other) noexcept {
+        if (this != &other) {
+            ptr_ = std::move(other.ptr_);
+            size_ = std::exchange(other.size_, 0);
+            capacity_ = std::exchange(other.capacity_, 0);
+        }
+        return *this;
+    }
+
+    ~AlignedRawBuffer() = default;
+
+    [[nodiscard]] T* data() noexcept { return ptr_.get(); }
+    [[nodiscard]] const T* data() const noexcept { return ptr_.get(); }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+
+    T& operator[](std::size_t i) noexcept { return ptr_[i]; }
+    const T& operator[](std::size_t i) const noexcept { return ptr_[i]; }
+
+    T* begin() noexcept { return ptr_.get(); }
+    const T* begin() const noexcept { return ptr_.get(); }
+    T* end() noexcept { return ptr_.get() + size_; }
+    const T* end() const noexcept { return ptr_.get() + size_; }
+
+    void resize(std::size_t n) {
+        if (n <= capacity_) {
+            size_ = n;
+            return;
+        }
+        // Release old allocation first to avoid transient 2x peak RSS.
+        ptr_.reset();
+        size_ = 0;
+        capacity_ = 0;
+
+        AlignedUniquePtr<T, Align> fresh = make_aligned_uninitialized<T, Align>(n);
+        if (!fresh) {
+            throw std::bad_alloc();
+        }
+        ptr_ = std::move(fresh);
+        size_ = n;
+        capacity_ = n;
+    }
+
+    void clear() noexcept { size_ = 0; }
+
+    void reset() noexcept {
+        ptr_.reset();
+        size_ = 0;
+        capacity_ = 0;
+    }
+
+private:
+    AlignedUniquePtr<T, Align> ptr_;
+    std::size_t size_ = 0;
+    std::size_t capacity_ = 0;
+};
 
 // These functions are only for test purpose, don't forget to remove calls
 int getVMemKB();

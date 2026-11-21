@@ -29,7 +29,7 @@ namespace StatLib{
 
     double pchisqd1(double x){
         if(x > 0 && std::isfinite(x)){
-            return boost::math::cdf(boost::math::complement(dist1, x));
+            return std::erfc(std::sqrt(0.5 * x));
         }else{
             return std::numeric_limits<double>::quiet_NaN();
         }

@@ -6,26 +6,67 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cerrno>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+#include <omp.h>
 
 #include "chunked_grm_matvec.hpp"
+#include "mem.hpp"
+#include "Pheno.h"
 
 namespace gcta_grm_io {
 
 // Forward declared so read_grm_binary (below) can call this instead of
-// duplicating its logic inline -- see the definition further down for the
-// implementation and why it deliberately does NOT use the whole-file warm-up
-// pattern used elsewhere in this file.
+// duplicating its logic inline -- see the definition further down.
 inline double read_grm_N_mean(const std::string& prefix, int n_grm);
+
+// Contiguous run-length encoding of a strictly increasing monotonic sample map kp:
+// analysis indices [dst_start, dst_start + len) map to contiguous file indices
+// [src_start, src_start + len). Replaces scalar gathers with bulk memcpy / SIMD
+// conversions when most individuals are retained.
+struct KpRun {
+    int dst_start;
+    int src_start;
+    int len;
+};
+
+inline std::vector<KpRun> build_kp_runs(const std::vector<int>& kp) {
+    std::vector<KpRun> runs;
+    const int n = static_cast<int>(kp.size());
+    int i = 0;
+    while (i < n) {
+        const int dst0 = i;
+        const int src0 = kp[i];
+        int len = 1;
+        while (i + len < n && kp[i + len] == src0 + len) {
+            ++len;
+        }
+        runs.push_back({dst0, src0, len});
+        i += len;
+    }
+    return runs;
+}
+
+inline size_t find_first_kp_run(const std::vector<KpRun>& runs, int cs) noexcept {
+    const auto it = std::upper_bound(
+        runs.begin(), runs.end(), cs,
+        [](int val, const KpRun& r) { return val < r.dst_start + r.len; });
+    return static_cast<size_t>(it - runs.begin());
+}
 
 // Row boundaries [0, b1, b2, ..., n] splitting a packed lower-triangle-by-row
 // file (row i holds i+1 elements) into num_parts contiguous ranges with
@@ -46,11 +87,7 @@ inline std::vector<int> triangular_row_partition(int n, int num_parts) {
 }
 
 // Size in bytes of a GCTA-format packed lower-triangle .grm.bin (or
-// .grm.N.bin) for n individuals: n(n+1)/2 float32 entries. Exposed so
-// callers sizing a memory budget that ChunkedGrmReader's fixed-size buffer
-// shares space with (see that class's constructor) can reserve this amount
-// up front, e.g. via solve_chunk_rows's reserved_gb parameter in
-// chunked_grm_matvec.hpp, rather than duplicating this formula themselves.
+// .grm.N.bin) for n individuals: n(n+1)/2 float32 entries.
 inline size_t grm_packed_bytes(int n) {
     return static_cast<size_t>(n) * (n + 1) / 2 * sizeof(float);
 }
@@ -127,55 +164,21 @@ inline void write_exact(int fd, const void* buf, size_t count, const std::string
     }
 }
 
-
 // Returns:
-//   ids      — "FID\tIID" strings in GRM file order
-//   G        — full symmetric n×n matrix (double precision), unless
-//              upper_only is set (see below), in which case only the upper
-//              triangle (row <= col) holds valid data -- the lower triangle
-//              is whatever the allocator handed back (kernel-zero pages for
-//              a fresh, sufficiently large Eigen::MatrixXd; not guaranteed
-//              zero in general -- see upper_only note).
-//   m_snps   — SNP count from element (0,0) of .grm.N.bin; 0 if N file missing
-//
-// upper_only (default false): skip the upper->lower mirror pass after the
-// triangle fill. Saves ~n^2/2 double writes and, for a freshly-constructed
-// G (resize() on an empty matrix, no prior .setZero()/full touch), avoids
-// physically faulting in the lower-triangle pages at all -- confirmed via
-// RSS sampling (~n^2/2 * 8 bytes reduction at n=150k on the REML load
-// path). This last part depends on G having received no prior full-matrix
-// touch; if G is reused across calls or zero-initialised by the caller
-// first, the memory saving does not apply (the mirror-pass write-bandwidth
-// saving still does). Only pass upper_only=true when every downstream
-// consumer of G has been updated to read it as upper-triangle-only (dense
-// products via selfadjointView<Eigen::Upper>(), symmetric reads via row
-// instead of column tail on the lower half). Default false preserves the
-// original full-matrix contract for any caller not yet audited.
-//
-// Implementation notes:
-//   - .grm.bin is read sequentially in row-aligned chunks (grm_read_chunk_
-//     bytes each, default 1GiB) via a single blocking read() stream, not
-//     mmap'd. This was a deliberate change from an earlier mmap-based
-//     version: even with each thread faulting in its own monotonically
-//     increasing row range, N threads doing so *concurrently* against the
-//     same mapping still presents the kernel/filesystem with N interleaved
-//     access offsets, which defeated page-cache readahead and, on this
-//     project's Lustre-backed cluster storage, fragmented reads across
-//     whichever OSTs happened to back each thread's current extent.
-//   - Only the read itself is single-threaded; float→double conversion
-//     and the scatter into G are parallelized per chunk, once that
-//     chunk's bytes are already in memory (see the loop below).
-//   - The chunk buffer is the only extra transient allocation (bounded by
-//     grm_read_chunk_bytes, independent of n) -- negligible next to G's
-//     own n²·8 bytes and to what every downstream consumer of G already
-//     needs at peak.
+//   ids          — "FID\tIID" strings in GRM file order
+//   G            — n×n matrix (upper-triangle-only when upper_only=true)
+//   m_snps       — mean SNP count from .grm.N.bin diagonal (skipped if m_snps < 0)
+//   trace_K_out  — optional exact trace(K) accumulated during load
+//   trace_K2_out — optional exact trace(K^2) accumulated during load
 template <typename Scalar>
 inline void read_grm_binary(const std::string& prefix,
                              std::vector<std::string>& ids,
                              Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& G,
                              double& m_snps,
                              bool upper_only = false,
-                             size_t grm_read_chunk_bytes = (1ull << 30) /* 1GiB */)
+                             size_t grm_read_chunk_bytes = (1ull << 30) /* 1GiB */,
+                             double* trace_K_out = nullptr,
+                             double* trace_K2_out = nullptr)
 {
     LOGGER.ts("grm");
     using std::to_string;
@@ -187,7 +190,6 @@ inline void read_grm_binary(const std::string& prefix,
     const size_t tri      = static_cast<size_t>(n) * (n + 1) / 2;
     const size_t byte_len = tri * sizeof(float);
 
-    // ---- read .grm.bin in row-aligned chunks, fill G -------------------
     const std::string bin_path = prefix + ".grm.bin";
     const int fd = ::open(bin_path.c_str(), O_RDONLY);
     if (fd == -1)
@@ -203,18 +205,14 @@ inline void read_grm_binary(const std::string& prefix,
         }
     }
 
-    // Scatter the lower-triangle float32 entries into G (Scalar precision)
-    // one row-aligned chunk at a time: a single blocking read() pulls the
-    // next chunk in fully (read_exact, above -- one coherent sequential
-    // stream, no concurrent-offset I/O), then the cast+scatter of that
-    // chunk's rows into G is parallelized (schedule(dynamic, 64) balances
-    // the triangular per-row workload). Column-contiguous write per row
-    // (G.col(i).head(i+1)) for the same reason as before: it matches the
-    // chunk buffer's own contiguous row-major-packed layout, keeping the
-    // copy/cast vectorizable.
     G.resize(n, n);
+
+    const bool want_traces = (trace_K_out != nullptr || trace_K2_out != nullptr);
+    double tr_K = 0.0;
+    double tr_K2 = 0.0;
+
     const size_t max_elems_per_chunk = std::max<size_t>(1, grm_read_chunk_bytes / sizeof(float));
-    std::vector<float> chunk_buf(max_elems_per_chunk);
+    AlignedRawBuffer<float, 64> chunk_buf(max_elems_per_chunk);
     int row_cursor = 0;
     while (row_cursor < n) {
         const size_t row_base_cursor = static_cast<size_t>(row_cursor) * (row_cursor + 1) / 2;
@@ -224,22 +222,52 @@ inline void read_grm_binary(const std::string& prefix,
         const size_t elems_this_chunk = row_base_end - row_base_cursor;
 
         if (elems_this_chunk > chunk_buf.size())
-            chunk_buf.resize(elems_this_chunk); // only ever needed if a single row exceeds the chunk budget
+            chunk_buf.resize(elems_this_chunk);
         read_exact(fd, chunk_buf.data(), elems_this_chunk * sizeof(float), bin_path);
 
-        #pragma omp parallel for schedule(dynamic, 64)
-        for (int i = row_cursor; i < row_end; ++i) {
-            const size_t local_off = static_cast<size_t>(i) * (i + 1) / 2 - row_base_cursor;
-            G.col(i).head(i + 1) =
-                Eigen::Map<const Eigen::VectorXf>(chunk_buf.data() + local_off, i + 1).template cast<Scalar>();
+        if (want_traces) {
+            #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+            for (int i = row_cursor; i < row_end; ++i) {
+                const size_t local_off = static_cast<size_t>(i) * (i + 1) / 2 - row_base_cursor;
+                const float* __restrict__ src_row = chunk_buf.data() + local_off;
+                Scalar* __restrict__ dst_col = G.col(i).data();
+                double row_off_sq = 0.0;
+                #pragma omp simd reduction(+:row_off_sq)
+                for (int r = 0; r < i; ++r) {
+                    const float v = src_row[r];
+                    dst_col[r] = static_cast<Scalar>(v);
+                    const double vd = static_cast<double>(v);
+                    row_off_sq += vd * vd;
+                }
+                const float diag_v = src_row[i];
+                dst_col[i] = static_cast<Scalar>(diag_v);
+                const double diag_d = static_cast<double>(diag_v);
+                tr_K  += diag_d;
+                tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
+            }
+        } else {
+            #pragma omp parallel for schedule(dynamic, 64)
+            for (int i = row_cursor; i < row_end; ++i) {
+                const size_t local_off = static_cast<size_t>(i) * (i + 1) / 2 - row_base_cursor;
+                if constexpr (std::is_same_v<Scalar, float>) {
+                    std::memcpy(G.col(i).data(), chunk_buf.data() + local_off,
+                                static_cast<size_t>(i + 1) * sizeof(float));
+                } else {
+                    G.col(i).head(i + 1) =
+                        Eigen::Map<const Eigen::VectorXf>(chunk_buf.data() + local_off, i + 1).template cast<Scalar>();
+                }
+            }
         }
         row_cursor = row_end;
     }
     ::close(fd);
+    if (trace_K_out)  *trace_K_out  = tr_K;
+    if (trace_K2_out) *trace_K2_out = tr_K2;
+
     LOGGER.i(0, "The .grm.bin fill took " + std::to_string(LOGGER.tp("grm")) + " seconds.");
     if (!upper_only) {
         LOGGER.ts("grm_mirror");
-        #pragma omp parallel for schedule(dynamic, 64)
+        #pragma omp parallel for schedule(guided)
         for (int c = 0; c < n; ++c)
             for (int r = c + 1; r < n; ++r)
                 G(r, c) = G(c, r);
@@ -247,30 +275,19 @@ inline void read_grm_binary(const std::string& prefix,
     }
 
     if (m_snps < 0.0) {
-        LOGGER.i(0,"Skipping SNP count read from .grm.N.bin.");
-    }
-    else {
-        // ------------------------------------------------------------------ //
-        // Read SNP count (.grm.N.bin) — same lower-triangle layout as        //
-        // .grm.bin. We only need the diagonal (each individual's own         //
-        // non-missing SNP count), so extract it without materialising the    //
-        // full n×n N matrix. read_grm_N_mean (below) does exactly this --    //
-        // call it rather than duplicating the extraction logic here.         //
-        // ------------------------------------------------------------------ //
+        LOGGER.i(0, "Skipping SNP count read from .grm.N.bin.");
+    } else {
         m_snps = read_grm_N_mean(prefix, n);
     }
 }
 
 // Build a mapping from a reference ID list to indices in grm_ids.
 // Returns kp[i] = index in grm_ids matching ref_ids[i], or -1 if not found.
-//
-// Uses unordered_map (O(1) average lookup) rather than std::map (O(log n))
-// and reserves capacity upfront to avoid rehashing.
 inline std::vector<int> match_ids_to_grm(const std::vector<std::string>& ref_ids,
                                           const std::vector<std::string>& grm_ids)
 {
     std::unordered_map<std::string, int> grm_map;
-    grm_map.reserve(grm_ids.size() * 2); // factor of 2 keeps load factor ≤ 0.5
+    grm_map.reserve(grm_ids.size() * 2);
     for (int i = 0; i < static_cast<int>(grm_ids.size()); ++i)
         grm_map.emplace(grm_ids[i], i);
 
@@ -282,32 +299,15 @@ inline std::vector<int> match_ids_to_grm(const std::vector<std::string>& ref_ids
     return kp;
 }
 
-// Tile reader for --reml-svd-chunked: returns K in ANALYSIS sample order
-// (post-kp reindexing), keeping only a bounded row-band resident at once
-// (see ensure_band below) rather than the whole file. Requires kp to be at
-// least an order-preserving subset of the file's row order (identity or
-// monotonic) -- see the constructor check for why scrambled kp isn't
-// supported: a row-band cache only pays off when each band's bytes are
-// read once and reused by every tile touching those rows, which needs
-// exactly the monotonicity this class requires.
+// Tile reader for --grm-chunked-budget: returns K in ANALYSIS sample order
+// (post-kp reindexing), keeping at most a bounded double-buffered row-band
+// resident at once (strictly <= band_byte_budget_) rather than the whole file.
+// Supports contiguous transposed tiles (`read_tile_T` / `read_tile_f32_T`,
+// eliminating 16 KiB power-of-2 stride scatter), direct diagonal pread
+// (`read_diagonal`), run-length contiguous spans for monotonic kp subsetting,
+// and double-buffered `std::jthread` band prefetch (`begin_sweep`).
 class ChunkedGrmReader {
 public:
-    // kp[i] = row index (in whatever file this wraps) for analysis
-    // individual i (see match_ids_to_grm). Every entry must be >= 0 —
-    // validate before constructing, since a -1 here means "individual not
-    // in this file" and silently reading garbage at that index is far worse
-    // than refusing to start.
-    //
-    // `path` is the full file path, not a prefix — .grm.bin and .grm.N.bin
-    // share an identical packed-lower-triangular float32 layout, so this
-    // class serves either; callers needing both (e.g. a weighted merge)
-    // construct two instances against the same kp.
-    //
-    // band_byte_budget caps how much of the file ensure_band() keeps
-    // resident at once (default 1GiB). Callers that size --grm-chunked-budget
-    // against a fixed reservation for this reader (see solve_chunk_rows's
-    // reserved_gb) must pass that same number here — the two are meant to
-    // be the same budget split two ways, not independently chosen.
     ChunkedGrmReader(const std::string& path, std::vector<int> kp, int n_grm,
                       size_t band_byte_budget = (1ull << 30) /* 1GiB */)
         : kp_(std::move(kp)), path_(path), n_grm_(n_grm), band_byte_budget_(band_byte_budget)
@@ -332,149 +332,274 @@ public:
             if (i > 0 && kp_[i] <= kp_[i - 1]) kp_is_monotonic = false;
         }
 
-        // A scrambled kp has no row-range locality: the band cache below
-        // only pays off because each row-band's full span is read once and
-        // reused by every tile touching those rows. Without monotonicity
-        // that reuse doesn't happen, and this degrades to a pread per
-        // output entry -- millions of syscalls for a single mid-size tile,
-        // far worse than the dense path. Rejected outright, no fallback
-        // (an earlier version of this class had a scrambled-kp fallback
-        // path; removed together with kp_is_monotonic_/read_raw once this
-        // became a hard error instead of a warning).
-        if (!kp_is_monotonic)
-            LOGGER.e(0, "--reml-svd-chunked requires the analysis sample order to match "
+        if (!kp_is_monotonic) {
+            ::close(fd_);
+            fd_ = -1;
+            LOGGER.e(0, "--grm-chunked-budget requires the analysis sample order to match "
                         "(or be an ordered subset of) [" + path + "]'s row order. Re-run "
                         "with sample IDs sorted to match the GRM's native order, or drop "
-                        "--reml-svd-chunked to use the dense path.");
+                        "--grm-chunked-budget to use the dense path.");
+        }
 
-        // fd_ stays open for this object's lifetime; ensure_band() preads
-        // from it on demand, band by band. No whole-file buffer is
-        // allocated here (unlike the earlier version of this constructor,
-        // which read the entire file up front -- see chat history for why
-        // that was dropped in favor of a bounded band cache).
+        if (!kp_is_identity_ && !kp_.empty()) {
+            std::vector<KpRun> runs = build_kp_runs(kp_);
+            if (runs.size() * 2 < kp_.size()) {
+                kp_runs_ = std::move(runs);
+            }
+        }
     }
 
     ~ChunkedGrmReader() {
-        if (fd_ != -1) ::close(fd_);
+        if (fd_ != -1) {
+            ::close(fd_);
+        }
     }
     ChunkedGrmReader(const ChunkedGrmReader&)            = delete;
     ChunkedGrmReader& operator=(const ChunkedGrmReader&) = delete;
 
-    // K_analysis[rs:re, cs:ce]. Every consumer (chunked_symmetric_matvec,
-    // chunked_diagonal, chunked_trace_K_squared) only ever reads a
-    // diagonal-block tile (rs==cs) through selfadjointView<Lower>() or
-    // .diagonal() -- so only the tile's lower triangle (lq <= lp) needs to
-    // be valid there; both paths below leave the upper triangle
-    // uninitialized for diagonal tiles.
-    //
-    // NOT reentrant: this call, and the ensure_band refill it may trigger,
-    // mutate band_buf_/band_lo_/band_hi_ and tile_scratch_ with no locking.
-    // Only the #pragma omp parallel for loop body inside one call may run
-    // concurrently. Two overlapping read_tile calls on the same reader --
-    // e.g. a caller that parallelizes the outer row-band loop instead of
-    // just the inner per-row loop -- will race on which band is resident
-    // and silently produce wrong numbers, not a crash.
-    //
-    // Also assumes rs is non-decreasing across a sweep (each call's row
-    // range starts at or after the previous call's, as chunked_grm_matvec's
-    // row-owner traversal does): ensure_band only grows the band forward,
-    // so a call requesting an earlier row than the current band's start
-    // pays a fresh read from that point -- still correct, just not the
-    // sequential-pass behavior this cache is for.
-    Eigen::Ref<const Eigen::MatrixXd> read_tile(int rs, int re, int cs, int ce) const {
-        const int tile_rows = re - rs, tile_cols = ce - cs;
-        if (tile_scratch_.rows() < tile_rows || tile_scratch_.cols() < tile_cols) {
-            tile_scratch_.resize(std::max<Eigen::Index>(tile_scratch_.rows(), tile_rows),
-                                  std::max<Eigen::Index>(tile_scratch_.cols(), tile_cols));
-        }
-        auto tile = tile_scratch_.topLeftCorner(tile_rows, tile_cols);
-        const bool diagonal_tile = (rs == cs);
-
-        // kp_ is strictly increasing (enforced at construction), so
-        // kp_[rs]/kp_[re-1] are this tile's min/max file row. Single-
-        // threaded pread, outside the parallel loop below.
-        ensure_band(kp_[rs], kp_[re - 1] + 1);
-
-        const float* buf = band_buf_.data();
-        const size_t band_elem_lo = static_cast<size_t>(band_lo_) * (band_lo_ + 1) / 2;
-
-        if (kp_is_identity_) {
-            // No reindexing at all: gj - gj_lo == lq exactly, so the source
-            // span maps onto the destination row with no gaps. Skip kp_[]
-            // (and the per-entry gj/subtraction arithmetic below) entirely
-            // and let Eigen vectorize the float->double widen as one cast
-            // instead of a hand-rolled scalar gather loop.
-            #pragma omp parallel for schedule(dynamic, 64)
-            for (int lp = 0; lp < tile_rows; ++lp) {
-                const int gi = rs + lp;
-                const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
-                if (lq_end == 0) continue;
-                const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2 - band_elem_lo;
-                const float* row_span = buf + row_base + cs;
-                tile.row(lp).head(lq_end) =
-                    Eigen::Map<const Eigen::RowVectorXf>(row_span, lq_end).cast<double>();
-            }
-            return tile;
-        }
-
-        // Monotonic kp (an order-preserving subset, not full identity): kp
-        // is strictly increasing, so every gj needed by row lp satisfies
-        // gj <= gi (true for off-diagonal tiles because the whole column
-        // block precedes the row block; true for the diagonal tile's lower
-        // triangle because lq <= lp there) — so file_row == gi is constant
-        // across the row. Still a scalar per-entry gather (kp_ may have
-        // gaps within [cs, cs+lq_end), so the needed file columns aren't
-        // necessarily contiguous even though they're bounded and increasing)
-        // — bounded to one row's own span (now within the resident band,
-        // not the whole file) rather than a filesystem read.
-        #pragma omp parallel for schedule(dynamic, 64)
-        for (int lp = 0; lp < tile_rows; ++lp) {
-            const int gi = kp_[rs + lp];
-            const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;  // upper triangle unused for diagonal tiles
-            if (lq_end == 0) continue;
-            const int gj_lo = kp_[cs];
-            const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2 - band_elem_lo;
-            const float* row_span = buf + row_base + gj_lo;
-            for (int lq = 0; lq < lq_end; ++lq) {
-                const int gj = kp_[cs + lq];
-                tile(lp, lq) = static_cast<double>(row_span[gj - gj_lo]);
-            }
-        }
-        return tile;
+    // Release cached row-band and tile-scratch buffers immediately (safe to reuse later).
+    void release_buffers() const noexcept {
+        band_buf_[0].reset();
+        band_buf_[1].reset();
+        band_lo_ = {0, 0};
+        band_hi_ = {0, 0};
+        active_buf_ = 0;
+        tile_scratch_.resize(0, 0);
+        tile_scratch_f32_.resize(0, 0);
+        tile_scratch_T_.resize(0, 0);
+        tile_scratch_f32_T_.resize(0, 0);
     }
 
-    // Native float32 counterpart to read_tile: avoids widening .grm.bin's float32
-    // entries to double when the consumer (e.g. chunked_symmetric_matvec_f32 for
-    // Woodbury basis rSVD or --pca-approx rSVD) runs in float32.
-    Eigen::Ref<const Eigen::MatrixXf> read_tile_f32(int rs, int re, int cs, int ce) const {
-        const int tile_rows = re - rs, tile_cols = ce - cs;
-        if (tile_scratch_f32_.rows() < tile_rows || tile_scratch_f32_.cols() < tile_cols) {
-            tile_scratch_f32_.resize(std::max<Eigen::Index>(tile_scratch_f32_.rows(), tile_rows),
-                                     std::max<Eigen::Index>(tile_scratch_f32_.cols(), tile_cols));
+    // Partition analysis rows [0, n) into variable-height row bands [rs, re) so
+    // each band has at most max_rows_per_band rows AND its file rows
+    // [kp_[rs], kp_[re-1] + 1) fit within band_byte_budget_ / 2 (keeping two
+    // double-buffered bands strictly within band_byte_budget_).
+    std::vector<int> compute_row_bands(int max_rows_per_band) const {
+        const int n = static_cast<int>(kp_.size());
+        std::vector<int> bands;
+        bands.push_back(0);
+        if (n == 0) return bands;
+
+        const int max_rows = std::max(1, max_rows_per_band);
+        const size_t min_one_row_bytes = static_cast<size_t>(std::max(1, n_grm_)) * sizeof(float);
+        const size_t per_buf_bytes = std::max(band_byte_budget_ / 2, min_one_row_bytes);
+        const size_t per_buf_elems = std::max<size_t>(1, per_buf_bytes / sizeof(float));
+
+        int rs = 0;
+        while (rs < n) {
+            const int file_lo = kp_[rs];
+            const size_t elem_lo = static_cast<size_t>(file_lo) * (file_lo + 1) / 2;
+            const int max_file_hi = row_bound_for_cumulative(elem_lo + per_buf_elems, file_lo, n_grm_);
+            const int lim = std::min(n, rs + max_rows);
+
+            // Largest re in (rs, lim] with kp_[re - 1] < max_file_hi
+            const auto it = std::lower_bound(kp_.begin() + rs, kp_.begin() + lim, max_file_hi);
+            int re = static_cast<int>(it - kp_.begin());
+            if (re <= rs) re = rs + 1;
+            bands.push_back(re);
+            rs = re;
         }
-        auto tile = tile_scratch_f32_.topLeftCorner(tile_rows, tile_cols);
+        return bands;
+    }
+
+    // Double-buffered async band prefetcher for streaming sweeps.
+    // Spawns one std::jthread that prefetches band b+1 into slot (b+1)&1
+    // while the caller computes tiles on band b in slot b&1.
+    class BandSweepSession final : public gcta_chunked::TileSweep {
+    public:
+        BandSweepSession(const ChunkedGrmReader& reader, const std::vector<int>& bands)
+            : reader_(reader),
+              bands_(bands),
+              num_bands_(static_cast<int>(bands.size()) - 1)
+        {
+            io_thread_ = std::jthread([this](std::stop_token st) {
+                try {
+                    for (int b = 0; b < num_bands_ && !st.stop_requested(); ++b) {
+                        const int slot = b & 1;
+                        {
+                            std::unique_lock<std::mutex> lock(mu_);
+                            free_cv_.wait(lock, st, [&]() { return !slot_busy_[slot]; });
+                            if (st.stop_requested()) return;
+                            slot_busy_[slot] = true;
+                        }
+                        const int rs = bands_[b];
+                        const int re = bands_[b + 1];
+                        const int fl = reader_.kp_[rs];
+                        const int fh = reader_.kp_[re - 1] + 1;
+                        reader_.load_band_exact_into_slot(slot, fl, fh);
+                        {
+                            std::lock_guard<std::mutex> lock(mu_);
+                            slot_ready_band_[slot] = b;
+                        }
+                        ready_cv_.notify_one();
+                    }
+                } catch (...) {
+                    {
+                        std::lock_guard<std::mutex> lock(mu_);
+                        io_error_ = std::current_exception();
+                        failed_ = true;
+                    }
+                    ready_cv_.notify_all();
+                }
+            });
+        }
+
+        ~BandSweepSession() override {
+            io_thread_.request_stop();
+            free_cv_.notify_all();
+            if (io_thread_.joinable()) {
+                io_thread_.join();
+            }
+        }
+
+        void acquire(int band_idx) override {
+            const int slot = band_idx & 1;
+            std::unique_lock<std::mutex> lock(mu_);
+            ready_cv_.wait(lock, [&]() {
+                return slot_ready_band_[slot] == band_idx || failed_;
+            });
+            if (failed_) {
+                std::rethrow_exception(io_error_);
+            }
+            reader_.active_buf_ = slot;
+        }
+
+        void release(int band_idx) override {
+            const int slot = band_idx & 1;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                slot_ready_band_[slot] = -1;
+                slot_busy_[slot] = false;
+            }
+            free_cv_.notify_one();
+        }
+
+    private:
+        const ChunkedGrmReader& reader_;
+        std::vector<int> bands_;
+        int num_bands_ = 0;
+        std::mutex mu_;
+        std::condition_variable_any ready_cv_;
+        std::condition_variable_any free_cv_;
+        std::array<bool, 2> slot_busy_{false, false};
+        std::array<int, 2> slot_ready_band_{-1, -1};
+        bool failed_ = false;
+        std::exception_ptr io_error_;
+        std::jthread io_thread_;
+    };
+
+    std::unique_ptr<gcta_chunked::TileSweep> begin_sweep(const std::vector<int>& bands) const {
+        if (bands.size() <= 2) return nullptr;
+        return std::make_unique<BandSweepSession>(*this, bands);
+    }
+
+    // Direct diagonal pread without scanning off-diagonal entries of .grm.bin.
+    // Coalesces leading rows (< 2048) into one contiguous read and bounds
+    // parallel pread threads (<= 16) with MADV/POSIX_FADV_RANDOM for the rest.
+    Eigen::VectorXd read_diagonal() const {
+        const int n = static_cast<int>(kp_.size());
+        Eigen::VectorXd diag(n);
+        if (n == 0) return diag;
+
+        constexpr int kCoalesceMaxRow = 2048;
+        int split = 0;
+        while (split < n && kp_[split] < kCoalesceMaxRow) ++split;
+
+        if (split > 0) {
+            const int max_row = kp_[split - 1];
+            const size_t elems = static_cast<size_t>(max_row + 1) * (max_row + 2) / 2;
+            AlignedRawBuffer<float, 64> head_buf(elems);
+            read_exact_at(fd_, head_buf.data(), elems * sizeof(float), 0, path_);
+            for (int i = 0; i < split; ++i) {
+                const int gi = kp_[i];
+                const size_t diag_idx = static_cast<size_t>(gi) * (gi + 1) / 2 + gi;
+                diag[i] = static_cast<double>(head_buf[diag_idx]);
+            }
+        }
+
+        if (split < n) {
+            const int n_io_threads = std::min(omp_get_max_threads(), 16);
+            bool failed = false;
+            #pragma omp parallel for schedule(static) num_threads(n_io_threads)
+            for (int i = split; i < n; ++i) {
+                const int gi = kp_[i];
+                const size_t diag_idx = static_cast<size_t>(gi) * (gi + 1) / 2 + gi;
+                float v = 0.0f;
+                ssize_t r = 0;
+                do {
+                    r = ::pread(fd_, &v, sizeof(v), static_cast<off_t>(diag_idx * sizeof(float)));
+                } while (r < 0 && errno == EINTR);
+                if (r == static_cast<ssize_t>(sizeof(v))) {
+                    diag[i] = static_cast<double>(v);
+                } else {
+                    #pragma omp atomic write
+                    failed = true;
+                }
+            }
+            if (failed)
+                LOGGER.e(0, "pread() failed while reading diagonal of [" + path_ + "].");
+        }
+        return diag;
+    }
+
+    // Fast-path transposed float32 tile: returns K[rs:re, cs:ce]^T of shape
+    // (ce-cs) x (re-rs) ColMajor so each GRM row unpacks into a contiguous
+    // column (zero 16 KiB power-of-2 stride scatter). For diagonal tiles
+    // (rs == cs), the UPPER triangle (r <= c) is populated.
+    Eigen::Ref<const Eigen::MatrixXf> read_tile_f32_T(int rs, int re, int cs, int ce) const {
+        const int tile_rows = re - rs, tile_cols = ce - cs;
+        if (tile_scratch_f32_T_.rows() < tile_cols || tile_scratch_f32_T_.cols() < tile_rows) {
+            tile_scratch_f32_T_.resize(
+                std::max<Eigen::Index>(tile_scratch_f32_T_.rows(), tile_cols),
+                std::max<Eigen::Index>(tile_scratch_f32_T_.cols(), tile_rows));
+        }
+        auto tile_T = tile_scratch_f32_T_.topLeftCorner(tile_cols, tile_rows);
         const bool diagonal_tile = (rs == cs);
 
         ensure_band(kp_[rs], kp_[re - 1] + 1);
-
-        const float* buf = band_buf_.data();
-        const size_t band_elem_lo = static_cast<size_t>(band_lo_) * (band_lo_ + 1) / 2;
+        const int slot = active_buf_;
+        const float* buf = band_buf_[slot].data();
+        const size_t band_elem_lo = static_cast<size_t>(band_lo_[slot]) * (band_lo_[slot] + 1) / 2;
 
         if (kp_is_identity_) {
-            #pragma omp parallel for schedule(dynamic, 64)
+            #pragma omp parallel for schedule(guided)
             for (int lp = 0; lp < tile_rows; ++lp) {
                 const int gi = rs + lp;
                 const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
                 if (lq_end == 0) continue;
                 const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2 - band_elem_lo;
-                const float* row_span = buf + row_base + cs;
-                tile.row(lp).head(lq_end) =
-                    Eigen::Map<const Eigen::RowVectorXf>(row_span, lq_end);
+                std::memcpy(tile_T.col(lp).data(), buf + row_base + cs,
+                            static_cast<size_t>(lq_end) * sizeof(float));
             }
-            return tile;
+            return tile_T;
         }
 
-        #pragma omp parallel for schedule(dynamic, 64)
+        if (!kp_runs_.empty()) {
+            const size_t first_run = find_first_kp_run(kp_runs_, cs);
+            #pragma omp parallel for schedule(guided)
+            for (int lp = 0; lp < tile_rows; ++lp) {
+                const int gi = kp_[rs + lp];
+                const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
+                if (lq_end == 0) continue;
+                const int dst_limit = cs + lq_end;
+                const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2 - band_elem_lo;
+                const float* row_ptr = buf + row_base;
+                float* dst_col = tile_T.col(lp).data();
+                for (size_t ri = first_run; ri < kp_runs_.size(); ++ri) {
+                    const KpRun& r = kp_runs_[ri];
+                    if (r.dst_start >= dst_limit) break;
+                    const int d0 = std::max(r.dst_start, cs);
+                    const int d1 = std::min(r.dst_start + r.len, dst_limit);
+                    const int cnt = d1 - d0;
+                    const int s0 = r.src_start + (d0 - r.dst_start);
+                    std::memcpy(dst_col + (d0 - cs), row_ptr + s0,
+                                static_cast<size_t>(cnt) * sizeof(float));
+                }
+            }
+            return tile_T;
+        }
+
+        #pragma omp parallel for schedule(guided)
         for (int lp = 0; lp < tile_rows; ++lp) {
             const int gi = kp_[rs + lp];
             const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
@@ -482,9 +607,146 @@ public:
             const int gj_lo = kp_[cs];
             const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2 - band_elem_lo;
             const float* row_span = buf + row_base + gj_lo;
+            float* dst_col = tile_T.col(lp).data();
             for (int lq = 0; lq < lq_end; ++lq) {
-                const int gj = kp_[cs + lq];
-                tile(lp, lq) = row_span[gj - gj_lo];
+                dst_col[lq] = row_span[kp_[cs + lq] - gj_lo];
+            }
+        }
+        return tile_T;
+    }
+
+    // Fast-path transposed double tile: returns K[rs:re, cs:ce]^T of shape
+    // (ce-cs) x (re-rs) ColMajor. Diagonal tiles have UPPER triangle valid.
+    Eigen::Ref<const Eigen::MatrixXd> read_tile_T(int rs, int re, int cs, int ce) const {
+        const int tile_rows = re - rs, tile_cols = ce - cs;
+        if (tile_scratch_T_.rows() < tile_cols || tile_scratch_T_.cols() < tile_rows) {
+            tile_scratch_T_.resize(
+                std::max<Eigen::Index>(tile_scratch_T_.rows(), tile_cols),
+                std::max<Eigen::Index>(tile_scratch_T_.cols(), tile_rows));
+        }
+        auto tile_T = tile_scratch_T_.topLeftCorner(tile_cols, tile_rows);
+        const bool diagonal_tile = (rs == cs);
+
+        ensure_band(kp_[rs], kp_[re - 1] + 1);
+        const int slot = active_buf_;
+        const float* buf = band_buf_[slot].data();
+        const size_t band_elem_lo = static_cast<size_t>(band_lo_[slot]) * (band_lo_[slot] + 1) / 2;
+
+        if (kp_is_identity_) {
+            #pragma omp parallel for schedule(guided)
+            for (int lp = 0; lp < tile_rows; ++lp) {
+                const int gi = rs + lp;
+                const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
+                if (lq_end == 0) continue;
+                const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2 - band_elem_lo;
+                const float* __restrict__ src = buf + row_base + cs;
+                double* __restrict__ dst = tile_T.col(lp).data();
+                #pragma omp simd
+                for (int lq = 0; lq < lq_end; ++lq) {
+                    dst[lq] = static_cast<double>(src[lq]);
+                }
+            }
+            return tile_T;
+        }
+
+        if (!kp_runs_.empty()) {
+            const size_t first_run = find_first_kp_run(kp_runs_, cs);
+            #pragma omp parallel for schedule(guided)
+            for (int lp = 0; lp < tile_rows; ++lp) {
+                const int gi = kp_[rs + lp];
+                const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
+                if (lq_end == 0) continue;
+                const int dst_limit = cs + lq_end;
+                const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2 - band_elem_lo;
+                const float* __restrict__ row_ptr = buf + row_base;
+                double* __restrict__ dst_col = tile_T.col(lp).data();
+                for (size_t ri = first_run; ri < kp_runs_.size(); ++ri) {
+                    const KpRun& r = kp_runs_[ri];
+                    if (r.dst_start >= dst_limit) break;
+                    const int d0 = std::max(r.dst_start, cs);
+                    const int d1 = std::min(r.dst_start + r.len, dst_limit);
+                    const int cnt = d1 - d0;
+                    const int s0 = r.src_start + (d0 - r.dst_start);
+                    const float* __restrict__ src_seg = row_ptr + s0;
+                    double* __restrict__ dst_seg = dst_col + (d0 - cs);
+                    #pragma omp simd
+                    for (int k = 0; k < cnt; ++k) {
+                        dst_seg[k] = static_cast<double>(src_seg[k]);
+                    }
+                }
+            }
+            return tile_T;
+        }
+
+        #pragma omp parallel for schedule(guided)
+        for (int lp = 0; lp < tile_rows; ++lp) {
+            const int gi = kp_[rs + lp];
+            const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
+            if (lq_end == 0) continue;
+            const int gj_lo = kp_[cs];
+            const size_t row_base = static_cast<size_t>(gi) * (gi + 1) / 2 - band_elem_lo;
+            const float* row_span = buf + row_base + gj_lo;
+            double* dst_col = tile_T.col(lp).data();
+            for (int lq = 0; lq < lq_end; ++lq) {
+                dst_col[lq] = static_cast<double>(row_span[kp_[cs + lq] - gj_lo]);
+            }
+        }
+        return tile_T;
+    }
+
+    // Legacy non-transposed double tile (shape (re-rs) x (ce-cs), lower triangle valid on diagonal).
+    Eigen::Ref<const Eigen::MatrixXd> read_tile(int rs, int re, int cs, int ce) const {
+        const auto tile_T = read_tile_T(rs, re, cs, ce);
+        const int tile_rows = re - rs, tile_cols = ce - cs;
+        if (tile_scratch_.rows() < tile_rows || tile_scratch_.cols() < tile_cols) {
+            tile_scratch_.resize(std::max<Eigen::Index>(tile_scratch_.rows(), tile_rows),
+                                 std::max<Eigen::Index>(tile_scratch_.cols(), tile_cols));
+        }
+        auto tile = tile_scratch_.topLeftCorner(tile_rows, tile_cols);
+        const bool diagonal_tile = (rs == cs);
+        constexpr int kB = 64;
+        #pragma omp parallel for schedule(guided) if (tile_rows >= 128)
+        for (int c0 = 0; c0 < tile_cols; c0 += kB) {
+            const int c1 = std::min(tile_cols, c0 + kB);
+            const int r_begin = diagonal_tile ? c0 : 0;
+            for (int r0 = r_begin; r0 < tile_rows; r0 += kB) {
+                const int r1 = std::min(tile_rows, r0 + kB);
+                for (int c = c0; c < c1; ++c) {
+                    const int r_lo = diagonal_tile ? std::max(r0, c) : r0;
+                    double* dst = tile.col(c).data();
+                    for (int r = r_lo; r < r1; ++r) {
+                        dst[r] = tile_T(c, r);
+                    }
+                }
+            }
+        }
+        return tile;
+    }
+
+    // Legacy non-transposed float32 tile (shape (re-rs) x (ce-cs), lower triangle valid on diagonal).
+    Eigen::Ref<const Eigen::MatrixXf> read_tile_f32(int rs, int re, int cs, int ce) const {
+        const auto tile_T = read_tile_f32_T(rs, re, cs, ce);
+        const int tile_rows = re - rs, tile_cols = ce - cs;
+        if (tile_scratch_f32_.rows() < tile_rows || tile_scratch_f32_.cols() < tile_cols) {
+            tile_scratch_f32_.resize(std::max<Eigen::Index>(tile_scratch_f32_.rows(), tile_rows),
+                                     std::max<Eigen::Index>(tile_scratch_f32_.cols(), tile_cols));
+        }
+        auto tile = tile_scratch_f32_.topLeftCorner(tile_rows, tile_cols);
+        const bool diagonal_tile = (rs == cs);
+        constexpr int kB = 64;
+        #pragma omp parallel for schedule(guided) if (tile_rows >= 128)
+        for (int c0 = 0; c0 < tile_cols; c0 += kB) {
+            const int c1 = std::min(tile_cols, c0 + kB);
+            const int r_begin = diagonal_tile ? c0 : 0;
+            for (int r0 = r_begin; r0 < tile_rows; r0 += kB) {
+                const int r1 = std::min(tile_rows, r0 + kB);
+                for (int c = c0; c < c1; ++c) {
+                    const int r_lo = diagonal_tile ? std::max(r0, c) : r0;
+                    float* dst = tile.col(c).data();
+                    for (int r = r_lo; r < r1; ++r) {
+                        dst[r] = tile_T(c, r);
+                    }
+                }
             }
         }
         return tile;
@@ -493,42 +755,51 @@ public:
 private:
     mutable Eigen::MatrixXd tile_scratch_;
     mutable Eigen::MatrixXf tile_scratch_f32_;
+    mutable Eigen::MatrixXd tile_scratch_T_;
+    mutable Eigen::MatrixXf tile_scratch_f32_T_;
 
-    // [band_lo_, band_hi_) = file-row range currently resident in
-    // band_buf_. The packed layout has row_base(i+1) == row_base(i) + (i+1),
-    // so any contiguous run of file rows is one contiguous byte range,
-    // loadable with a single sequential pread.
-    //
-    // ensure_band grows band_hi_ past what the immediate tile needs, up to
-    // band_byte_budget_ total, via row_bound_for_cumulative -- the same
-    // closed-form triangular-row math read_grm_binary/merge_grms already
-    // use for their own chunk boundaries -- rather than a fixed row count,
-    // since a fixed row count is a very different byte size near the top
-    // of the matrix than the bottom. Growing past the immediate need also
-    // means later tiles sharing this row range (different column tiles,
-    // same row-band, as in chunked_symmetric_matvec's inner j loop) hit
-    // the resident buffer instead of re-reading.
-    mutable std::vector<float> band_buf_;
-    mutable int band_lo_ = 0, band_hi_ = 0;
+    mutable std::array<AlignedRawBuffer<float, 64>, 2> band_buf_;
+    mutable std::array<int, 2> band_lo_{0, 0};
+    mutable std::array<int, 2> band_hi_{0, 0};
+    mutable int active_buf_ = 0;
+
+    void load_band_exact_into_slot(int slot, int file_lo, int file_hi) const {
+        if (file_lo >= band_lo_[slot] && file_hi <= band_hi_[slot]) return;
+        band_lo_[slot] = 0;
+        band_hi_[slot] = 0;
+        const size_t elem_lo = static_cast<size_t>(file_lo) * (file_lo + 1) / 2;
+        const size_t elem_hi = static_cast<size_t>(file_hi) * (file_hi + 1) / 2;
+        const size_t count = elem_hi - elem_lo;
+        band_buf_[slot].resize(count);
+        read_exact_at(fd_, band_buf_[slot].data(), count * sizeof(float),
+                      static_cast<off_t>(elem_lo * sizeof(float)), path_);
+        band_lo_[slot] = file_lo;
+        band_hi_[slot] = file_hi;
+    }
 
     void ensure_band(int file_lo, int file_hi) const {
-        if (file_lo >= band_lo_ && file_hi <= band_hi_) return;   // already resident
+        const int slot = active_buf_;
+        if (file_lo >= band_lo_[slot] && file_hi <= band_hi_[slot]) return;
 
+        band_lo_[slot] = 0;
+        band_hi_[slot] = 0;
         const size_t elem_lo = static_cast<size_t>(file_lo) * (file_lo + 1) / 2;
         const size_t target_elems = elem_lo + band_byte_budget_ / sizeof(float);
         const int grown_hi  = row_bound_for_cumulative(target_elems, file_lo, n_grm_);
-        const int actual_hi = std::max(file_hi, grown_hi);  // never smaller than this tile's own need
+        const int actual_hi = std::max(file_hi, grown_hi);
 
         const size_t elem_hi = static_cast<size_t>(actual_hi) * (actual_hi + 1) / 2;
-        band_buf_.resize(elem_hi - elem_lo);
-        read_exact_at(fd_, band_buf_.data(), (elem_hi - elem_lo) * sizeof(float),
+        const size_t count = elem_hi - elem_lo;
+        band_buf_[slot].resize(count);
+        read_exact_at(fd_, band_buf_[slot].data(), count * sizeof(float),
                       static_cast<off_t>(elem_lo * sizeof(float)), path_);
-        band_lo_ = file_lo;
-        band_hi_ = actual_hi;
+        band_lo_[slot] = file_lo;
+        band_hi_[slot] = actual_hi;
     }
 
     std::vector<int> kp_;
-    std::string path_;   // kept for ensure_band's read_exact_at error messages
+    std::vector<KpRun> kp_runs_;
+    std::string path_;
     int fd_ = -1;
     size_t byte_len_ = 0;
     int n_grm_ = 0;
@@ -536,28 +807,11 @@ private:
     bool kp_is_identity_ = false;
 };
 
-// .grm.N.bin diagonal only (mean SNP count) — same file, same packed layout,
-// same lower-triangle-by-row indexing as .grm.bin, but this touches only n
-// scattered entries out of a possible n(n+1)/2. read_grm_binary (above) now
-// calls this directly rather than duplicating the extraction.
-//
-// Deliberately NOT the whole-file warm-up pattern used by read_grm_binary's
-// dense fill or ChunkedGrmReader's constructor: those warm the whole file
-// because they go on to use (or may use) most or all of it, so paying for
-// one coherent sequential pass once is strictly better than letting a
-// scattered/concurrent access pattern re-derive that same data cold. Here,
-// the diagonal genuinely is all we want -- n elements out of possibly
-// billions -- so warming the whole file would mean fetching gigabytes to
-// read a few hundred KB of actually-needed data. With no sequential
-// alternative being defeated (there's no "right order" to visit n
-// unrelated, non-adjacent offsets in), concurrency here is a straightforward
-// win rather than the regression it caused elsewhere in this file: each
-// pread() targets an independent, already-known offset, so running many in
-// flight hides per-request latency instead of interleaving otherwise-
-// sequential streams. pread() (not mmap+page-fault) makes that concurrency
-// explicit and, unlike a page fault, gives us a return value to check --
-// a failed read here fails loudly instead of segfaulting.
+// .grm.N.bin diagonal only (mean SNP count): coalesces the leading <=2048 rows
+// into one contiguous pread (<= 8.4 MB), and reads remaining diagonals via
+// bounded-thread random pread (<= 16 threads) to avoid Lustre RPC lock storms.
 inline double read_grm_N_mean(const std::string& prefix, int n_grm) {
+    if (n_grm <= 0) return 0.0;
     const size_t tri = static_cast<size_t>(n_grm) * (n_grm + 1) / 2;
     const size_t byte_len = tri * sizeof(float);
     const std::string n_path = prefix + ".grm.N.bin";
@@ -578,17 +832,52 @@ inline double read_grm_N_mean(const std::string& prefix, int n_grm) {
 
     double sum = 0.0;
     bool read_failed = false;
-    #pragma omp parallel for reduction(+:sum) schedule(static)
-    for (int i = 0; i < n_grm; ++i) {
-        const size_t diag_idx = static_cast<size_t>(i) * (i + 1) / 2 + i;
-        float v = 0.0f;
-        const ssize_t r = ::pread(nfd, &v, sizeof(v),
-                                   static_cast<off_t>(diag_idx * sizeof(float)));
-        if (r == static_cast<ssize_t>(sizeof(v))) {
-            sum += static_cast<double>(v);
-        } else {
-            #pragma omp atomic write
-            read_failed = true;
+
+    const int c_end = std::min(n_grm, 2048);
+    if (c_end > 0) {
+        const size_t head_elems = static_cast<size_t>(c_end) * (c_end + 1) / 2;
+        AlignedRawBuffer<float, 64> head_buf(head_elems);
+        const size_t head_bytes = head_elems * sizeof(float);
+        size_t done = 0;
+        char* dst = reinterpret_cast<char*>(head_buf.data());
+        while (done < head_bytes) {
+            const ssize_t r = ::pread(nfd, dst + done, head_bytes - done, static_cast<off_t>(done));
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                read_failed = true;
+                break;
+            }
+            if (r == 0) {
+                read_failed = true;
+                break;
+            }
+            done += static_cast<size_t>(r);
+        }
+        if (!read_failed) {
+            for (int i = 0; i < c_end; ++i) {
+                const size_t diag_idx = static_cast<size_t>(i) * (i + 1) / 2 + i;
+                sum += static_cast<double>(head_buf[diag_idx]);
+            }
+        }
+    }
+
+    if (!read_failed && c_end < n_grm) {
+        const int n_io_threads = std::min(omp_get_max_threads(), 16);
+        #pragma omp parallel for reduction(+:sum) schedule(static) num_threads(n_io_threads)
+        for (int i = c_end; i < n_grm; ++i) {
+            const size_t diag_idx = static_cast<size_t>(i) * (i + 1) / 2 + i;
+            float v = 0.0f;
+            ssize_t r = 0;
+            do {
+                r = ::pread(nfd, &v, sizeof(v),
+                            static_cast<off_t>(diag_idx * sizeof(float)));
+            } while (r < 0 && errno == EINTR);
+            if (r == static_cast<ssize_t>(sizeof(v))) {
+                sum += static_cast<double>(v);
+            } else {
+                #pragma omp atomic write
+                read_failed = true;
+            }
         }
     }
     ::close(nfd);
@@ -601,21 +890,12 @@ inline double read_grm_N_mean(const std::string& prefix, int n_grm) {
     return sum / n_grm;
 }
 
-
-// Splits a --grm-chunked-budget-style total (GB) into the slice reserved for
-// ChunkedGrmReader's row-band cache. Kept as one function, rather than each
-// call site independently picking a fraction, so the band_byte_budget passed
-// to make_chunked_grm_reader and the reserved_gb passed to
-// gcta_chunked::solve_chunk_rows can't silently drift apart -- see
-// chunked_grm_matvec.hpp's reserved_gb doc for why that drift matters
-// (previously reserved_gb was left at its 0.0 default at one call site and
-// set to the full packed-file size, a stale pre-band-cache assumption, at
-// the other -- both call sites should route through this instead).
-// Capped at 512MB so a large total budget doesn't hand the reader far more
-// than one row-band ever needs; 10% so a small budget still leaves the
-// reader a usable slice.
+// Splits a --grm-chunked-budget total (GB) into the slice reserved for
+// ChunkedGrmReader's double-buffered row-band cache. Because column tiles are
+// capped at 4096 (<= 64-128 MB tile scratch), up to 2.0 GB (1.0 GB per buffer)
+// can go to row bands while keeping total memory strictly <= total_budget_gb.
 inline double chunked_reader_reserved_gb(double total_budget_gb) {
-    return std::min(0.5, total_budget_gb * 0.10);
+    return std::min(2.0, total_budget_gb * 0.50);
 }
 
 struct ChunkedGrmHandle {
@@ -623,30 +903,9 @@ struct ChunkedGrmHandle {
     gcta_chunked::TileReaderF32 reader_f32;
     std::shared_ptr<const ChunkedGrmReader> file;
     double m_snps = 0.0;
-    int chunk_rows = 0;   // block_size for chunked_symmetric_matvec/diagonal/trace_K_squared,
-                           // solved once here so every caller uses the same number instead of
-                           // each re-deriving it (and each independently reserving budget for
-                           // the row-band cache above) from scratch.
+    int chunk_rows = 0;
 };
 
-// Build the chunked reader (+ m_snps, read the same way read_grm_binary()
-// reads it) for RemlCtx::grm_tile_reader. analysis_ids must be in the exact
-// row/column order ctx.y/ctx.X/ctx.A would be built in — same requirement
-// as load_pca_warm_start's alignment in MLMA_stream.cpp. Fails loudly (not
-// a fallback) on any individual missing from the GRM: a silent misalignment
-// here corrupts every downstream REML result without any obvious symptom.
-//
-// budget_gb/k_ext/feature_flag drive the SAME chunk-sizing math previously
-// duplicated (and, in two of three copies, silently stale) across
-// pca_stream.cpp, MLMA_stream.cpp, and RemlEngine.cpp's
-// setup_chunked_grm_stream: the reader's own row-band cache reservation and
-// the resulting chunk_rows are now solved once, here, and returned on the
-// handle. feature_flag only affects wording in the error/log messages
-// below (which CLI flag to blame) — it does not change the arithmetic, so
-// callers whose downstream feature isn't known yet at construction time can
-// pass the generic default and the chunk_rows value is still correct for
-// whichever feature ends up consuming it, as long as that feature also
-// uses k_ext=0 (true of every current caller of this default).
 inline ChunkedGrmHandle make_chunked_grm_reader(
     const std::string& prefix,
     const std::vector<std::string>& analysis_ids,
@@ -679,7 +938,7 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
                 std::to_string(reader_reserved_gb) + "GB reader cache + " +
                 std::to_string(budget_gb - reader_reserved_gb) + "GB tiles" +
                 (k_ext > 0 ? ", k_ext up to " + std::to_string(k_ext) : "") +
-                ") -> " + std::to_string(chunk_rows) + "-row chunks from [" + prefix +
+                ") -> " + std::to_string(chunk_rows) + "-col tiles from [" + prefix +
                 ".grm.bin], not loaded densely.");
 
     ChunkedGrmHandle handle;
@@ -693,25 +952,51 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
     auto file = std::make_shared<ChunkedGrmReader>(prefix + ".grm.bin", std::move(kp), n_grm,
                                                     static_cast<size_t>(reader_reserved_gb * 1e9));
     handle.file = file;
-    handle.reader = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXd> {
+
+    handle.reader.read_fn = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXd> {
         return file->read_tile(rs, re, cs, ce);
     };
-    handle.reader_f32 = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXf> {
+    handle.reader.read_T_fn = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXd> {
+        return file->read_tile_T(rs, re, cs, ce);
+    };
+    handle.reader.read_diagonal_fn = [file]() -> Eigen::VectorXd {
+        return file->read_diagonal();
+    };
+    handle.reader.row_bands_fn = [file](int max_rows) -> std::vector<int> {
+        return file->compute_row_bands(max_rows);
+    };
+    handle.reader.begin_sweep_fn = [file](const std::vector<int>& bands) {
+        return file->begin_sweep(bands);
+    };
+    handle.reader.release_fn = [file]() {
+        file->release_buffers();
+    };
+
+    handle.reader_f32.read_fn = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXf> {
         return file->read_tile_f32(rs, re, cs, ce);
     };
+    handle.reader_f32.read_T_fn = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXf> {
+        return file->read_tile_f32_T(rs, re, cs, ce);
+    };
+    handle.reader_f32.read_diagonal_fn = [file]() -> Eigen::VectorXd {
+        return file->read_diagonal();
+    };
+    handle.reader_f32.row_bands_fn = [file](int max_rows) -> std::vector<int> {
+        return file->compute_row_bands(max_rows);
+    };
+    handle.reader_f32.begin_sweep_fn = [file](const std::vector<int>& bands) {
+        return file->begin_sweep(bands);
+    };
+    handle.reader_f32.release_fn = [file]() {
+        file->release_buffers();
+    };
+
     return handle;
 }
 
 // ---------------------------------------------------------------------------
 // Opt-in packed lower-triangular IEEE fp16 in-memory GRM (--grm-fp16)
 // ---------------------------------------------------------------------------
-// Stores the n(n+1)/2 lower-triangular entries in IEEE 754 binary16 (2 bytes/entry,
-// 10 mantissa bits => ~9.8e-4 relative precision, no overflow for related/inbred
-// individuals), while keeping the diagonal in exact float32 and accumulating
-// trace(K) and trace(K^2) in double from the raw float32 .grm.bin stream during
-// load. At N = 500,000, this reduces in-memory GRM storage from 1,000 GB
-// (Eigen::MatrixXf(n, n)) to 250 GB (4x reduction) and eliminates all disk I/O
-// during rSVD power iterations.
 #if defined(__FLT16_MANT_DIG__)
 using GrmFp16 = _Float16;
 inline GrmFp16 f32_to_fp16(float x) noexcept { return static_cast<_Float16>(x); }
@@ -766,7 +1051,7 @@ inline float fp16_to_f32(GrmFp16 h) noexcept {
 
 class PackedGrmFp16 {
 public:
-    PackedGrmFp16(int n, std::vector<GrmFp16> packed, Eigen::VectorXf diag_f32,
+    PackedGrmFp16(int n, AlignedUniquePtr<GrmFp16, 64> packed, Eigen::VectorXf diag_f32,
                   double trace_K, double trace_K2)
         : n_(n),
           packed_(std::move(packed)),
@@ -779,7 +1064,83 @@ public:
     double trace_K2() const noexcept { return trace_K2_; }
     const Eigen::VectorXf& diagonal_f32() const noexcept { return diag_f32_; }
 
+    Eigen::VectorXd read_diagonal() const {
+        return diag_f32_.cast<double>();
+    }
+
+    void release_scratch() const noexcept {
+        tile_scratch_f32_.resize(0, 0);
+        tile_scratch_f64_.resize(0, 0);
+        tile_scratch_f32_T_.resize(0, 0);
+        tile_scratch_f64_T_.resize(0, 0);
+    }
+
+    // Fast-path transposed float32 tile: shape (ce-cs) x (re-rs) ColMajor so
+    // each fp16 row unpacks straight into a contiguous column via SIMD vcvtph2ps
+    // (eliminating 16 KiB power-of-2 L1D/STLB stride scatter). Diagonal tiles
+    // have their UPPER triangle valid with exact float32 diagonal entries.
+    Eigen::Ref<const Eigen::MatrixXf> read_tile_f32_T(int rs, int re, int cs, int ce) const {
+        const int tile_rows = re - rs, tile_cols = ce - cs;
+        if (tile_scratch_f32_T_.rows() < tile_cols || tile_scratch_f32_T_.cols() < tile_rows) {
+            tile_scratch_f32_T_.resize(
+                std::max<Eigen::Index>(tile_scratch_f32_T_.rows(), tile_cols),
+                std::max<Eigen::Index>(tile_scratch_f32_T_.cols(), tile_rows));
+        }
+        auto tile_T = tile_scratch_f32_T_.topLeftCorner(tile_cols, tile_rows);
+        const bool diagonal_tile = (rs == cs);
+        const GrmFp16* base = packed_.get();
+
+        #pragma omp parallel for schedule(guided)
+        for (int lp = 0; lp < tile_rows; ++lp) {
+            const int gi = rs + lp;
+            const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
+            if (lq_end == 0) continue;
+            const GrmFp16* __restrict__ src = base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
+            float* __restrict__ dst = tile_T.col(lp).data();
+            #pragma omp simd
+            for (int lq = 0; lq < lq_end; ++lq) {
+                dst[lq] = fp16_to_f32(src[lq]);
+            }
+            if (diagonal_tile) {
+                dst[lp] = diag_f32_[gi];
+            }
+        }
+        return tile_T;
+    }
+
+    // Fast-path transposed double tile: shape (ce-cs) x (re-rs) ColMajor.
+    Eigen::Ref<const Eigen::MatrixXd> read_tile_T(int rs, int re, int cs, int ce) const {
+        const int tile_rows = re - rs, tile_cols = ce - cs;
+        if (tile_scratch_f64_T_.rows() < tile_cols || tile_scratch_f64_T_.cols() < tile_rows) {
+            tile_scratch_f64_T_.resize(
+                std::max<Eigen::Index>(tile_scratch_f64_T_.rows(), tile_cols),
+                std::max<Eigen::Index>(tile_scratch_f64_T_.cols(), tile_rows));
+        }
+        auto tile_T = tile_scratch_f64_T_.topLeftCorner(tile_cols, tile_rows);
+        const bool diagonal_tile = (rs == cs);
+        const GrmFp16* base = packed_.get();
+
+        #pragma omp parallel for schedule(guided)
+        for (int lp = 0; lp < tile_rows; ++lp) {
+            const int gi = rs + lp;
+            const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
+            if (lq_end == 0) continue;
+            const GrmFp16* __restrict__ src = base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
+            double* __restrict__ dst = tile_T.col(lp).data();
+            #pragma omp simd
+            for (int lq = 0; lq < lq_end; ++lq) {
+                dst[lq] = static_cast<double>(fp16_to_f32(src[lq]));
+            }
+            if (diagonal_tile) {
+                dst[lp] = static_cast<double>(diag_f32_[gi]);
+            }
+        }
+        return tile_T;
+    }
+
+    // Legacy non-transposed float32 tile (shape (re-rs) x (ce-cs)).
     Eigen::Ref<const Eigen::MatrixXf> read_tile_f32(int rs, int re, int cs, int ce) const {
+        const auto tile_T = read_tile_f32_T(rs, re, cs, ce);
         const int tile_rows = re - rs, tile_cols = ce - cs;
         if (tile_scratch_f32_.rows() < tile_rows || tile_scratch_f32_.cols() < tile_cols) {
             tile_scratch_f32_.resize(std::max<Eigen::Index>(tile_scratch_f32_.rows(), tile_rows),
@@ -787,30 +1148,28 @@ public:
         }
         auto tile = tile_scratch_f32_.topLeftCorner(tile_rows, tile_cols);
         const bool diagonal_tile = (rs == cs);
-        const GrmFp16* base = packed_.data();
-
-        #pragma omp parallel for schedule(dynamic, 32)
-        for (int lp = 0; lp < tile_rows; ++lp) {
-            const int gi = rs + lp;
-            const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
-            if (lq_end == 0) continue;
-            const GrmFp16* __restrict__ src = base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
-            alignas(64) float row_f32[64];
-            for (int lq0 = 0; lq0 < lq_end; lq0 += 64) {
-                const int bw = std::min(64, lq_end - lq0);
-                #pragma omp simd
-                for (int k = 0; k < bw; ++k)
-                    row_f32[k] = fp16_to_f32(src[lq0 + k]);
-                tile.row(lp).segment(lq0, bw) = Eigen::Map<const Eigen::RowVectorXf>(row_f32, bw);
-            }
-            if (diagonal_tile) {
-                tile(lp, lp) = diag_f32_[gi];
+        constexpr int kB = 64;
+        #pragma omp parallel for schedule(guided) if (tile_rows >= 128)
+        for (int c0 = 0; c0 < tile_cols; c0 += kB) {
+            const int c1 = std::min(tile_cols, c0 + kB);
+            const int r_begin = diagonal_tile ? c0 : 0;
+            for (int r0 = r_begin; r0 < tile_rows; r0 += kB) {
+                const int r1 = std::min(tile_rows, r0 + kB);
+                for (int c = c0; c < c1; ++c) {
+                    const int r_lo = diagonal_tile ? std::max(r0, c) : r0;
+                    float* dst = tile.col(c).data();
+                    for (int r = r_lo; r < r1; ++r) {
+                        dst[r] = tile_T(c, r);
+                    }
+                }
             }
         }
         return tile;
     }
 
+    // Legacy non-transposed double tile (shape (re-rs) x (ce-cs)).
     Eigen::Ref<const Eigen::MatrixXd> read_tile(int rs, int re, int cs, int ce) const {
+        const auto tile_T = read_tile_T(rs, re, cs, ce);
         const int tile_rows = re - rs, tile_cols = ce - cs;
         if (tile_scratch_f64_.rows() < tile_rows || tile_scratch_f64_.cols() < tile_cols) {
             tile_scratch_f64_.resize(std::max<Eigen::Index>(tile_scratch_f64_.rows(), tile_rows),
@@ -818,24 +1177,20 @@ public:
         }
         auto tile = tile_scratch_f64_.topLeftCorner(tile_rows, tile_cols);
         const bool diagonal_tile = (rs == cs);
-        const GrmFp16* base = packed_.data();
-
-        #pragma omp parallel for schedule(dynamic, 32)
-        for (int lp = 0; lp < tile_rows; ++lp) {
-            const int gi = rs + lp;
-            const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
-            if (lq_end == 0) continue;
-            const GrmFp16* __restrict__ src = base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
-            alignas(64) double row_f64[64];
-            for (int lq0 = 0; lq0 < lq_end; lq0 += 64) {
-                const int bw = std::min(64, lq_end - lq0);
-                #pragma omp simd
-                for (int k = 0; k < bw; ++k)
-                    row_f64[k] = static_cast<double>(fp16_to_f32(src[lq0 + k]));
-                tile.row(lp).segment(lq0, bw) = Eigen::Map<const Eigen::RowVectorXd>(row_f64, bw);
-            }
-            if (diagonal_tile) {
-                tile(lp, lp) = static_cast<double>(diag_f32_[gi]);
+        constexpr int kB = 64;
+        #pragma omp parallel for schedule(guided) if (tile_rows >= 128)
+        for (int c0 = 0; c0 < tile_cols; c0 += kB) {
+            const int c1 = std::min(tile_cols, c0 + kB);
+            const int r_begin = diagonal_tile ? c0 : 0;
+            for (int r0 = r_begin; r0 < tile_rows; r0 += kB) {
+                const int r1 = std::min(tile_rows, r0 + kB);
+                for (int c = c0; c < c1; ++c) {
+                    const int r_lo = diagonal_tile ? std::max(r0, c) : r0;
+                    double* dst = tile.col(c).data();
+                    for (int r = r_lo; r < r1; ++r) {
+                        dst[r] = tile_T(c, r);
+                    }
+                }
             }
         }
         return tile;
@@ -843,12 +1198,14 @@ public:
 
 private:
     int n_ = 0;
-    std::vector<GrmFp16> packed_;
+    AlignedUniquePtr<GrmFp16, 64> packed_;
     Eigen::VectorXf diag_f32_;
     double trace_K_ = 0.0;
     double trace_K2_ = 0.0;
     mutable Eigen::MatrixXf tile_scratch_f32_;
     mutable Eigen::MatrixXd tile_scratch_f64_;
+    mutable Eigen::MatrixXf tile_scratch_f32_T_;
+    mutable Eigen::MatrixXd tile_scratch_f64_T_;
 };
 
 struct PackedGrmFp16Handle {
@@ -894,6 +1251,14 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
         LOGGER.e(0, caller_flag + " requires the analysis sample order to match "
                     "(or be an ordered subset of) [" + grm_prefix + ".grm.id]'s row order.");
 
+    std::vector<KpRun> kp_runs;
+    if (!is_identity && n > 0) {
+        std::vector<KpRun> runs = build_kp_runs(kp);
+        if (runs.size() * 2 < static_cast<size_t>(n)) {
+            kp_runs = std::move(runs);
+        }
+    }
+
     const size_t tri_grm  = static_cast<size_t>(n_grm) * (n_grm + 1) / 2;
     const size_t byte_len = tri_grm * sizeof(float);
     const std::string bin_path = grm_prefix + ".grm.bin";
@@ -916,13 +1281,19 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
                 to_string(packed_gb) + " GB for n=" + to_string(n) +
                 ", 4x smaller than dense float32) ...");
 
-    std::vector<GrmFp16> packed(tri_n);
+    // Uninitialized allocation with parallel first-touch eliminates single-threaded zero-fill.
+    AlignedUniquePtr<GrmFp16, 64> packed = make_aligned_uninitialized<GrmFp16, 64>(tri_n);
+    if (tri_n > 0 && !packed) {
+        ::close(fd);
+        LOGGER.e(0, caller_flag + ": failed to allocate " + to_string(packed_gb) +
+                    " GB for packed fp16 GRM.");
+    }
     Eigen::VectorXf diag_f32(n);
     double tr_K  = 0.0;
     double tr_K2 = 0.0;
 
     const size_t max_elems_per_chunk = std::max<size_t>(1, grm_read_chunk_bytes / sizeof(float));
-    std::vector<float> chunk_buf(max_elems_per_chunk);
+    AlignedRawBuffer<float, 64> chunk_buf(max_elems_per_chunk);
     int row_cursor = 0;
     int j_cursor = 0;
     while (row_cursor < n_grm && j_cursor < n) {
@@ -944,12 +1315,13 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
         read_exact(fd, chunk_buf.data(), elems_this_chunk * sizeof(float), bin_path);
 
         if (j_end > j_cursor) {
+            GrmFp16* packed_ptr = packed.get();
             if (is_identity) {
                 #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
                 for (int j = j_cursor; j < j_end; ++j) {
                     const float* __restrict__ src_row = chunk_buf.data() +
                         (static_cast<size_t>(j) * (j + 1) / 2 - row_base_cursor);
-                    GrmFp16* __restrict__ dst_row = packed.data() +
+                    GrmFp16* __restrict__ dst_row = packed_ptr +
                         static_cast<size_t>(j) * (j + 1) / 2;
                     double row_off_sq = 0.0;
                     #pragma omp simd reduction(+:row_off_sq)
@@ -966,13 +1338,42 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
                     tr_K  += diag_d;
                     tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
                 }
+            } else if (!kp_runs.empty()) {
+                #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                for (int j = j_cursor; j < j_end; ++j) {
+                    const int r_grm = kp[j];
+                    const float* __restrict__ src_row = chunk_buf.data() +
+                        (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
+                    GrmFp16* __restrict__ dst_row = packed_ptr +
+                        static_cast<size_t>(j) * (j + 1) / 2;
+                    double row_off_sq = 0.0;
+                    for (const KpRun& r : kp_runs) {
+                        if (r.dst_start >= j) break;
+                        const int cnt = std::min(r.len, j - r.dst_start);
+                        const float* __restrict__ src_seg = src_row + r.src_start;
+                        GrmFp16* __restrict__ dst_seg = dst_row + r.dst_start;
+                        #pragma omp simd reduction(+:row_off_sq)
+                        for (int k = 0; k < cnt; ++k) {
+                            const float v = src_seg[k];
+                            dst_seg[k] = f32_to_fp16(v);
+                            const double vd = static_cast<double>(v);
+                            row_off_sq += vd * vd;
+                        }
+                    }
+                    const float diag_v = src_row[r_grm];
+                    dst_row[j] = f32_to_fp16(diag_v);
+                    diag_f32[j] = diag_v;
+                    const double diag_d = static_cast<double>(diag_v);
+                    tr_K  += diag_d;
+                    tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
+                }
             } else {
                 #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
                 for (int j = j_cursor; j < j_end; ++j) {
                     const int r_grm = kp[j];
                     const float* __restrict__ src_row = chunk_buf.data() +
                         (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
-                    GrmFp16* __restrict__ dst_row = packed.data() +
+                    GrmFp16* __restrict__ dst_row = packed_ptr +
                         static_cast<size_t>(j) * (j + 1) / 2;
                     double row_off_sq = 0.0;
                     for (int i = 0; i < j; ++i) {
@@ -994,8 +1395,7 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
         row_cursor = row_end;
     }
     ::close(fd);
-    chunk_buf.clear();
-    chunk_buf.shrink_to_fit();
+    chunk_buf.reset();
 
     LOGGER.i(0, "The .grm.bin packed fp16 fill took " + to_string(LOGGER.tp("grm_fp16")) + " seconds.");
 
@@ -1013,46 +1413,43 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
     auto file = std::make_shared<PackedGrmFp16>(
         n, std::move(packed), std::move(diag_f32), tr_K, tr_K2);
     handle.file = file;
-    handle.reader = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXd> {
+
+    handle.reader.read_fn = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXd> {
         return file->read_tile(rs, re, cs, ce);
     };
-    handle.reader_f32 = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXf> {
+    handle.reader.read_T_fn = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXd> {
+        return file->read_tile_T(rs, re, cs, ce);
+    };
+    handle.reader.read_diagonal_fn = [file]() -> Eigen::VectorXd {
+        return file->read_diagonal();
+    };
+    handle.reader.release_fn = [file]() {
+        file->release_scratch();
+    };
+    handle.reader.small_k_block_size = std::min(n, 8192);
+
+    handle.reader_f32.read_fn = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXf> {
         return file->read_tile_f32(rs, re, cs, ce);
     };
+    handle.reader_f32.read_T_fn = [file](int rs, int re, int cs, int ce) -> Eigen::Ref<const Eigen::MatrixXf> {
+        return file->read_tile_f32_T(rs, re, cs, ce);
+    };
+    handle.reader_f32.read_diagonal_fn = [file]() -> Eigen::VectorXd {
+        return file->read_diagonal();
+    };
+    handle.reader_f32.release_fn = [file]() {
+        file->release_scratch();
+    };
+    // Avoid small-k tile starvation in PCA rSVD (k_ext < 256): use 8192-row tiles.
+    handle.reader_f32.small_k_block_size = std::min(n, 8192);
+
     return handle;
 }
 
-// Merge K GRMs that share the exact same sample order (no subsetting, no
-// reindexing) into one N-weighted-average GRM, entirely streamed: never
-// holds a dense n x n matrix for any input file, nor for the output.
-//
-// Each row-block is read via one sequential read() per input file (2K reads
-// per block total: .grm.bin and .grm.N.bin for each of the K inputs), not
-// mmap. An earlier mmap-based version parallelized the per-row mixing loop
-// with schedule(dynamic, 64) directly against the mmap'd files -- which
-// means up to 2K files were faulted in via non-monotonic, interleaved
-// offsets (threads grab row-chunks in whatever order they finish, not in
-// row order), the same failure mode diagnosed for read_grm_binary's
-// original dense fill (see that function's comment) and for
-// ChunkedGrmReader's constructor. Reading each block into a plain buffer
-// first, single-threaded and strictly in order, then parallelizing only the
-// in-RAM mixing math, avoids that: the row_block_rows loop itself is
-// already the "coherent sequential stream" every filesystem's readahead is
-// built around, so there's no reason to let the compute-side parallelism
-// leak back into how the files are read.
-//
-// row_block_rows bounds the only thing that isn't O(1): the per-block
-// buffers (input read buffers and the output merge buffer), which hold one
-// row-block's worth of values before each write — same role as
-// --reml-svd-chunk-size elsewhere, smaller for tighter RSS.
-//
-// If your GRMs might have different sample orderings, this isn't the right
-// tool — use ChunkedGrmReader-based per-entry lookups instead (each source
-// file gets its own kp).
 // Load a binary GRM (upper triangle only) and subset/reorder it to match
 // `analysis_ids`, writing only the upper triangle of `G_out` so lower-triangle
-// pages stay unfaulted. If `m_snps_out >= 0.0` on entry, `.grm.N.bin`'s mean
-// diagonal is read into `m_snps_out`.
+// pages stay unfaulted. Optionally accumulates exact trace(K) and trace(K^2)
+// during load to eliminate a separate O(N^2) DRAM sweep.
 template <typename Scalar>
 inline void load_and_subset_grm_upper(
     const std::string& grm_prefix,
@@ -1060,7 +1457,9 @@ inline void load_and_subset_grm_upper(
     Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& G_out,
     double& m_snps_out,
     const std::string& caller_flag,
-    size_t grm_read_chunk_bytes = (1ull << 30) /* 1GiB */)
+    size_t grm_read_chunk_bytes = (1ull << 30) /* 1GiB */,
+    double* trace_K_out = nullptr,
+    double* trace_K2_out = nullptr)
 {
     std::vector<std::string> grm_ids = Pheno::read_sublist(grm_prefix + ".grm.id");
     const int n_grm = static_cast<int>(grm_ids.size());
@@ -1083,13 +1482,25 @@ inline void load_and_subset_grm_upper(
     }
 
     if (is_identity) {
-        read_grm_binary(grm_prefix, grm_ids, G_out, m_snps_out, /*upper_only=*/true, grm_read_chunk_bytes);
+        read_grm_binary(grm_prefix, grm_ids, G_out, m_snps_out, /*upper_only=*/true,
+                        grm_read_chunk_bytes, trace_K_out, trace_K2_out);
         return;
     }
+
+    const bool want_traces = (trace_K_out != nullptr || trace_K2_out != nullptr);
 
     if (is_monotonic) {
         LOGGER.ts("grm");
         using std::to_string;
+
+        std::vector<KpRun> kp_runs;
+        if (n > 0) {
+            std::vector<KpRun> runs = build_kp_runs(kp);
+            if (runs.size() * 2 < static_cast<size_t>(n)) {
+                kp_runs = std::move(runs);
+            }
+        }
+
         const size_t tri      = static_cast<size_t>(n_grm) * (n_grm + 1) / 2;
         const size_t byte_len = tri * sizeof(float);
         const std::string bin_path = grm_prefix + ".grm.bin";
@@ -1107,8 +1518,12 @@ inline void load_and_subset_grm_upper(
         }
 
         G_out.resize(n, n);
+
+        double tr_K = 0.0;
+        double tr_K2 = 0.0;
+
         const size_t max_elems_per_chunk = std::max<size_t>(1, grm_read_chunk_bytes / sizeof(float));
-        std::vector<float> chunk_buf(max_elems_per_chunk);
+        AlignedRawBuffer<float, 64> chunk_buf(max_elems_per_chunk);
         int row_cursor = 0;
         int j_cursor = 0;
         while (row_cursor < n_grm && j_cursor < n) {
@@ -1126,20 +1541,87 @@ inline void load_and_subset_grm_upper(
             read_exact(fd, chunk_buf.data(), elems_this_chunk * sizeof(float), bin_path);
 
             if (j_end > j_cursor) {
-                #pragma omp parallel for schedule(dynamic, 64)
-                for (int j = j_cursor; j < j_end; ++j) {
-                    const int r_grm = kp[j];
-                    const float* row_ptr = chunk_buf.data() +
-                        (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
-                    Scalar* col_out = G_out.col(j).data();
-                    for (int i = 0; i <= j; ++i)
-                        col_out[i] = static_cast<Scalar>(row_ptr[kp[i]]);
+                if (!kp_runs.empty()) {
+                    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                    for (int j = j_cursor; j < j_end; ++j) {
+                        const int r_grm = kp[j];
+                        const float* __restrict__ row_ptr = chunk_buf.data() +
+                            (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
+                        Scalar* __restrict__ col_out = G_out.col(j).data();
+                        double row_off_sq = 0.0;
+                        for (const KpRun& r : kp_runs) {
+                            if (r.dst_start >= j) break;
+                            const int cnt = std::min(r.len, j - r.dst_start);
+                            const float* __restrict__ src_seg = row_ptr + r.src_start;
+                            Scalar* __restrict__ dst_seg = col_out + r.dst_start;
+                            if constexpr (std::is_same_v<Scalar, float>) {
+                                if (!want_traces) {
+                                    std::memcpy(dst_seg, src_seg, static_cast<size_t>(cnt) * sizeof(float));
+                                } else {
+                                    #pragma omp simd reduction(+:row_off_sq)
+                                    for (int k = 0; k < cnt; ++k) {
+                                        const float v = src_seg[k];
+                                        dst_seg[k] = v;
+                                        const double vd = static_cast<double>(v);
+                                        row_off_sq += vd * vd;
+                                    }
+                                }
+                            } else if (want_traces) {
+                                #pragma omp simd reduction(+:row_off_sq)
+                                for (int k = 0; k < cnt; ++k) {
+                                    const float v = src_seg[k];
+                                    dst_seg[k] = static_cast<Scalar>(v);
+                                    const double vd = static_cast<double>(v);
+                                    row_off_sq += vd * vd;
+                                }
+                            } else {
+                                #pragma omp simd
+                                for (int k = 0; k < cnt; ++k) {
+                                    dst_seg[k] = static_cast<Scalar>(src_seg[k]);
+                                }
+                            }
+                        }
+                        const float diag_v = row_ptr[r_grm];
+                        col_out[j] = static_cast<Scalar>(diag_v);
+                        if (want_traces) {
+                            const double diag_d = static_cast<double>(diag_v);
+                            tr_K  += diag_d;
+                            tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
+                        }
+                    }
+                } else {
+                    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                    for (int j = j_cursor; j < j_end; ++j) {
+                        const int r_grm = kp[j];
+                        const float* row_ptr = chunk_buf.data() +
+                            (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
+                        Scalar* col_out = G_out.col(j).data();
+                        double row_off_sq = 0.0;
+                        for (int i = 0; i < j; ++i) {
+                            const float v = row_ptr[kp[i]];
+                            col_out[i] = static_cast<Scalar>(v);
+                            if (want_traces) {
+                                const double vd = static_cast<double>(v);
+                                row_off_sq += vd * vd;
+                            }
+                        }
+                        const float diag_v = row_ptr[r_grm];
+                        col_out[j] = static_cast<Scalar>(diag_v);
+                        if (want_traces) {
+                            const double diag_d = static_cast<double>(diag_v);
+                            tr_K  += diag_d;
+                            tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
+                        }
+                    }
                 }
                 j_cursor = j_end;
             }
             row_cursor = row_end;
         }
         ::close(fd);
+        if (trace_K_out)  *trace_K_out  = tr_K;
+        if (trace_K2_out) *trace_K2_out = tr_K2;
+
         LOGGER.i(0, "The .grm.bin fill took " + std::to_string(LOGGER.tp("grm")) + " seconds.");
         if (m_snps_out < 0.0) {
             LOGGER.i(0, "Skipping SNP count read from .grm.N.bin.");
@@ -1152,15 +1634,32 @@ inline void load_and_subset_grm_upper(
     Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> G_full;
     read_grm_binary(grm_prefix, grm_ids, G_full, m_snps_out, /*upper_only=*/true, grm_read_chunk_bytes);
     G_out.resize(n, n);
-    #pragma omp parallel for schedule(dynamic, 64)
+    double tr_K = 0.0;
+    double tr_K2 = 0.0;
+    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
     for (int j = 0; j < n; ++j) {
         const int src_col = kp[j];
-        for (int i = 0; i <= j; ++i) {
+        double row_off_sq = 0.0;
+        for (int i = 0; i < j; ++i) {
             const int r = kp[i], c = src_col;
-            G_out(i, j) = (r <= c) ? G_full(r, c) : G_full(c, r);
+            const Scalar v = (r <= c) ? G_full(r, c) : G_full(c, r);
+            G_out(i, j) = v;
+            if (want_traces) {
+                const double vd = static_cast<double>(v);
+                row_off_sq += vd * vd;
+            }
+        }
+        const Scalar diag_v = G_full(src_col, src_col);
+        G_out(j, j) = diag_v;
+        if (want_traces) {
+            const double diag_d = static_cast<double>(diag_v);
+            tr_K  += diag_d;
+            tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
         }
     }
     G_full.resize(0, 0);
+    if (trace_K_out)  *trace_K_out  = tr_K;
+    if (trace_K2_out) *trace_K2_out = tr_K2;
 }
 
 inline void merge_grms(
@@ -1175,10 +1674,6 @@ inline void merge_grms(
     const int n = static_cast<int>(ids.size());
     if (n == 0) LOGGER.e(0, "GRM id file [" + prefixes[0] + ".grm.id] is empty.");
 
-    // Validate every input shares the exact same sample order — cheap (a
-    // handful of small text-file reads), and the alternative (silently
-    // merging misaligned GRMs) produces a confidently wrong result with no
-    // symptom, which is a far worse failure mode than refusing to start.
     for (size_t f = 1; f < prefixes.size(); ++f) {
         const std::vector<std::string> other_ids = Pheno::read_sublist(prefixes[f] + ".grm.id");
         if (other_ids != ids)
@@ -1192,11 +1687,6 @@ inline void merge_grms(
     const int    K        = static_cast<int>(prefixes.size());
     const size_t num_buffers = static_cast<size_t>(2 * K + 2);
 
-    // Sizing chunk_elems: the packed lower triangle has tri = n(n+1)/2 floats.
-    // Every element is independent in the N-weighted merge, so chunking by a
-    // fixed number of float elements (rather than a fixed number of rows)
-    // keeps memory strictly constant across iterations, avoids vector reallocations,
-    // and eliminates the quadratic growth of row-based buffers at large n.
     size_t chunk_elems = 0;
     if (memory_budget_gb > 0.0) {
         const double budget_bytes = memory_budget_gb * 1e9;
@@ -1208,7 +1698,6 @@ inline void merge_grms(
                     std::to_string((num_buffers * chunk_elems * sizeof(float)) >> 20) +
                     " MB total buffer memory, budget=" + std::to_string(memory_budget_gb) + "GB).");
     } else {
-        // Default: 16 MiB (4M floats) per stream buffer, capped at 512 MiB total across all 2K+2 buffers.
         constexpr size_t default_target_elems = 4 * 1024 * 1024;
         constexpr size_t max_total_bytes = 512ull << 20;
         const size_t max_elems_from_cap = max_total_bytes / (num_buffers * sizeof(float));
@@ -1223,7 +1712,7 @@ inline void merge_grms(
 
     struct OpenGrmFile {
         int fd = -1;
-        std::string path;  // kept for read_exact's error messages
+        std::string path;
     };
     auto open_checked = [&](const std::string& path) -> OpenGrmFile {
         OpenGrmFile of;
@@ -1254,9 +1743,8 @@ inline void merge_grms(
         LOGGER.e(0, "cannot open [" + out_n_path + "] for writing: " + std::string(std::strerror(errno)));
     }
 
-    // Allocate all stream buffers once up front. No reallocations occur in the streaming loop.
-    std::vector<float> out_val_buf(chunk_elems), out_n_buf(chunk_elems);
-    std::vector<std::vector<float>> val_block_bufs(K), n_block_bufs(K);
+    AlignedRawBuffer<float, 64> out_val_buf(chunk_elems), out_n_buf(chunk_elems);
+    std::vector<AlignedRawBuffer<float, 64>> val_block_bufs(K), n_block_bufs(K);
     for (int f = 0; f < K; ++f) {
         val_block_bufs[f].resize(chunk_elems);
         n_block_bufs[f].resize(chunk_elems);
@@ -1266,24 +1754,16 @@ inline void merge_grms(
         const size_t elems_this_chunk = std::min(chunk_elems, tri - offset);
         const size_t bytes_this_chunk = elems_this_chunk * sizeof(float);
 
-        // Pull this block from input files in parallel across all 2K input streams
-        // (.grm.bin and .grm.N.bin for each input). Every stream has an independent
-        // file descriptor and advances sequentially block by block.
         const int max_io_threads = std::min(omp_get_max_threads(), 8);
-        // read_exact throws (via LOGGER.e) on failure; letting that escape a
-        // parallel region is undefined behaviour (likely std::terminate()
-        // instead of the intended error message). Catch per-thread, defer
-        // to a single LOGGER.e() call after the region ends, same pattern
-        // as read_grm_N_mean's parallel diagonal read elsewhere in this file.
         std::string io_error;
         bool io_failed = false;
         #pragma omp parallel for schedule(dynamic, 1) num_threads(max_io_threads)
         for (int f = 0; f < K; ++f) {
             try {
                 read_exact(val_files[f].fd, val_block_bufs[f].data(),
-                        bytes_this_chunk, val_files[f].path);
+                           bytes_this_chunk, val_files[f].path);
                 read_exact(n_files[f].fd, n_block_bufs[f].data(),
-                        bytes_this_chunk, n_files[f].path);
+                           bytes_this_chunk, n_files[f].path);
             } catch (const std::exception& e) {
                 #pragma omp critical
                 {
@@ -1294,8 +1774,6 @@ inline void merge_grms(
         if (io_failed)
             LOGGER.e(0, "merge_grms: " + io_error);
 
-        // Compute the N-weighted average across all elements in this chunk.
-        // Tiled in L1-cache-sized blocks (4096 floats = 32KB per stack tile)
         constexpr size_t TILE_SIZE = 4096;
         #pragma omp parallel for schedule(static)
         for (size_t t_start = 0; t_start < elems_this_chunk; t_start += TILE_SIZE) {
@@ -1326,7 +1804,6 @@ inline void merge_grms(
             }
         }
 
-        // Write the two independent output files in parallel.
         std::string write_error;
         bool write_failed = false;
         #pragma omp parallel sections
@@ -1357,17 +1834,9 @@ inline void merge_grms(
     ::close(out_bin_fd);
     ::close(out_n_fd);
 
-    for (auto& f : val_files) ::close(f.fd);
-    for (auto& f : n_files)   ::close(f.fd);
+    for (auto& f : val_files) { ::close(f.fd); }
+    for (auto& f : n_files)   { ::close(f.fd); }
 
-    // .grm.id is identical across inputs (already validated) — copy it once.
-    // dst << src.rdbuf() has no built-in error signalling: an unopenable
-    // source or a write failure (disk full, permissions) both produce a
-    // silently truncated or empty output .grm.id with no exception and no
-    // nonzero exit -- exactly the "confidently wrong result with no
-    // symptom" failure mode this function already refuses to risk for the
-    // sample-order check above. Check explicitly rather than trust the
-    // stream state implicitly.
     {
         const std::string id_src_path = prefixes[0] + ".grm.id";
         const std::string id_dst_path = out_prefix + ".grm.id";

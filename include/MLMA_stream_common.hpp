@@ -442,9 +442,11 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
     if (use_fast_i8) {
         q_uk = build_quantized_woodbury_uk(wb, w_sqrt, unit_weights, S_w2, fast_mlma);
         // Free float32 Uk_f immediately after quantization to cut resident memory
-        // before allocating AOCL pre-reordered Q buffers.
+        // before optional AOCL pre-reordered Q buffers.
         const_cast<WoodburyMLMACache&>(wb).Uk_f.resize(0, 0);
-        reorder_quantized_woodbury_uk(q_uk);
+        if (std::getenv("GCTA_MLMA_REORDER_Q") != nullptr) {
+            reorder_quantized_woodbury_uk(q_uk);
+        }
         std::string reord_msg;
         if (q_uk.total_q_reordered_bytes() > 0) {
             reord_msg = ", Q_reordered_mem=" + std::format("{:.3f}",
@@ -537,9 +539,6 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
     std::vector<int32_t> P_i32;
     std::vector<float> scratch_A_f32, scratch_B_f32, scratch_C_f32;
     std::vector<double> ukx_norm_sq(static_cast<size_t>(BLOCK), 0.0);
-    if (!use_fast_i8) {
-        UkX_scratch.resize(std::min<Eigen::Index>(wb.Uk_f.rows(), 2048), BLOCK);
-    }
 
     int snp_done = 0;
     int last_pct = -1;
@@ -741,9 +740,8 @@ inline void run_mlma_stream_association(RemlState& state,
         }
     }
     const int raw_n = static_cast<int>(geno->getRawSampleCT());
-    const int wb_k  = (use_wb && fast_mlma == FastMlmaMode::Off)
-        ? (use_int8_wb ? std::min<int>(static_cast<int>(wb.Uk_f.rows()), 2048)
-                       : static_cast<int>(wb.Uk_f.rows()))
+    const int wb_k  = (use_wb && !use_int8_wb)
+        ? static_cast<int>(wb.Uk_f.rows())
         : 0;
     const int align_tile = use_int8_wb ? 2048 : 0;
     const int BLOCK = resolve_mlma_block_size(n, block_mem_budget_gb, use_int8_wb, raw_n, wb_k,

@@ -256,6 +256,7 @@ inline Eigen::MatrixXf dense_upper_symm_f32(
 {
     const int n = static_cast<int>(K.rows());
     const int cols = static_cast<int>(X.cols());
+    use_bf16 = use_bf16 && (cols >= 128);
     Eigen::MatrixXf Y(n, cols);
     if (n == 0 || cols == 0) return Y;
 
@@ -274,7 +275,7 @@ inline Eigen::MatrixXf dense_upper_symm_f32(
             return Y;
         }
         constexpr int kTile = kDefaultColTile;
-        if (n <= kTile) {
+        if (n <= kTile || cols < 128) {
             cblas_ssymm(CblasColMajor, CblasLeft, CblasUpper,
                         static_cast<gcta_blas_int>(n), static_cast<gcta_blas_int>(cols),
                         1.0f, K_ptr, ldK, X_ptr, ldX, 0.0f, Y_ptr, ldY);
@@ -471,6 +472,7 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
     bool use_bf16 = false)
 {
     const int cols = static_cast<int>(X.cols());
+    use_bf16 = use_bf16 && (cols >= 128);
     Eigen::MatrixXf Y(n, cols);
     if (n == 0 || cols == 0) {
         if (trace_K_out) *trace_K_out = 0.0;

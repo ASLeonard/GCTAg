@@ -162,19 +162,11 @@ int resolve_threads(const gcta_cli::ParsedCli& parsed, bool& is_threaded, bool& 
 }
 
 void configure_threading(int thread_num, bool explicit_threads) {
-#if defined(GCTA_USE_AOCL) && !defined(GCTA_LAPACKE_IS_MKL)
-    // Short spin prevents microsecond futex storms between back-to-back
-    // BLIS/AOCL-DLP/OMP regions while still sleeping during disk I/O.
-    // overwrite=0 respects explicit user overrides (e.g. KMP_BLOCKTIME=0).
-    setenv("KMP_BLOCKTIME", "5", 0);
-    setenv("GOMP_SPINCOUNT", "50000", 0);
-#else
     // Make OMP worker threads sleep immediately after a parallel region ends,
     // rather than spin-waiting. Spinning threads consume memory bandwidth and
-    // starve BLAS (MKL/OpenBLAS/Accelerate) calls that follow parallel regions.
+    // starve BLAS (AOCL/MKL/OpenBLAS/Accelerate) calls that follow parallel regions.
     setenv("KMP_BLOCKTIME", "0", 0);   // 0 = don't override user setting
     setenv("GOMP_SPINCOUNT", "0", 0);
-#endif
 
     const string thread_str = to_string(thread_num);
     setenv("OMP_NUM_THREADS", thread_str.c_str(), 1);

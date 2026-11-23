@@ -519,11 +519,11 @@ inline int pad_kmajor_ldk(int k) noexcept {
 
 struct EngineConfig {
     int strip_rows = 4096;
-    gcta_cli::GrmStripLayout layout = gcta_cli::GrmStripLayout::ColMajor;
-    gcta_cli::GrmDiagMode diag_mode = gcta_cli::GrmDiagMode::Syrk;
+    gcta_cli::GrmStripLayout layout = gcta_cli::GrmStripLayout::RowMajor;
+    gcta_cli::GrmDiagMode diag_mode = gcta_cli::GrmDiagMode::Fused;
     int diag_block = 1024;
-    int gemm_col_chunk = 4096;
-    size_t io_slot_bytes = gcta_grm_io::kDefaultGrmIoSlotBytes;
+    int gemm_col_chunk = 0;
+    size_t io_slot_bytes = gcta_grm_io::kMaxAsyncGrmSlotBytes;
     int n_marker_block = 1024;
     bool profile = false;
 };
@@ -971,13 +971,13 @@ private:
         }
         allow_i32_mode_ = (all_locs_.size() <= kMaxInt32Markers);
 
-        // Engine config (Commit 1 defaults match baseline 77cbefc geometry)
+        // Engine config defaults (RowMajor strips, fused diagonal, unchunked GEMM, 256 MiB I/O slots)
         cfg_.strip_rows = opts_.strip_rows.value_or(4096);
-        cfg_.layout = opts_.strip_layout.value_or(gcta_cli::GrmStripLayout::ColMajor);
-        cfg_.diag_mode = opts_.diag_mode.value_or(gcta_cli::GrmDiagMode::Syrk);
+        cfg_.layout = opts_.strip_layout.value_or(gcta_cli::GrmStripLayout::RowMajor);
+        cfg_.diag_mode = opts_.diag_mode.value_or(gcta_cli::GrmDiagMode::Fused);
         cfg_.diag_block = opts_.diag_block.value_or(1024);
-        cfg_.gemm_col_chunk = opts_.gemm_col_chunk.value_or(4096);
-        cfg_.io_slot_bytes = static_cast<size_t>(opts_.io_slot_mb.value_or(64)) << 20;
+        cfg_.gemm_col_chunk = opts_.gemm_col_chunk.value_or(0);
+        cfg_.io_slot_bytes = static_cast<size_t>(opts_.io_slot_mb.value_or(256)) << 20;
         cfg_.profile = opts_.profile;
 
         if (opts_.n_markers.has_value()) {

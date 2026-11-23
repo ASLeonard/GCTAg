@@ -37,7 +37,7 @@ namespace gcta_grm_io {
 // total for 2 slots): 16-32x larger than Lustre/GPFS 1-4 MiB stripes while
 // keeping pipeline fill/drain latency negligible and bounce RAM bounded.
 inline constexpr size_t kDefaultGrmIoSlotBytes = 64ULL << 20;
-inline constexpr size_t kMaxAsyncGrmSlotBytes  = 128ULL << 20;
+inline constexpr size_t kMaxAsyncGrmSlotBytes  = 256ULL << 20;
 
 // ---------------------------------------------------------------------------
 // IEEE 754 binary16 (FP16) storage & conversion helpers

@@ -27,7 +27,10 @@
 #include "Cli.hpp"
 #include "Logger.h"
 #include "GenoBackend.h"     // GenoBlock, GenoBackend
+#include "bed_simd.hpp"      // native PLINK1 .bed kernels
 #include <functional>
+
+struct SNPInfo;              // third_party/Pgenlib/PgenReader.h
 
 // Forward declarations for the three concrete backends (needed for friend).
 class BedBackend;
@@ -45,6 +48,13 @@ typedef struct GenoBufItem{
     double *geno_ptr = nullptr;          // optional external genotype buffer (length >= keepSampleCT)
     float  *geno_f32_ptr = nullptr;      // optional external float32 genotype buffer (length >= keepSampleCT)
     int8_t *geno_i8_ptr = nullptr;       // optional external int8 raw {0,1,2} genotype buffer (length >= keepSampleCT)
+    // BED only: when true and the marker has no missing call among the kept
+    // samples (nValidN == keepSampleCT), `missing` is left untouched instead of
+    // being zero-filled.  Callers must then gate reads of `missing` on nValidN.
+    bool lazy_missing = false;
+    // BED only: compute counts / af / mean / sd / validity (including the
+    // sd < 1e-50 check) but skip the genotype decode.
+    bool stats_only = false;
 
     // out
     bool valid = false;
@@ -64,6 +74,20 @@ typedef struct GenoBufItem{
     uint32_t nValidN = 0;
     uint32_t nValidAllele = 0;
 } GenoBufItem;
+
+// Optional fused side-outputs for Geno::getGenoInt8_bed (BED additive MLMA):
+// exact genotype counts plus weighted sums computed during the single decode
+// pass, so callers never re-scan the int8 column.
+struct BedI8Fused {
+    // in
+    const float*  vw = nullptr;          ///< per-kept-sample float weights (e.g. V^-1 y), or nullptr
+    const double* w2 = nullptr;          ///< per-kept-sample double weights (e.g. w_sqrt^2), or nullptr
+    std::vector<int>* miss_list = nullptr; ///< receives ascending missing sample indices when cmiss > 0
+    // out
+    uint32_t c0 = 0, c1 = 0, c2 = 0, cmiss = 0;  ///< exact counts of values 0/1/2/missing
+    double dot_vw = 0.0, miss_vw = 0.0;           ///< sum g*vw, sum_{missing} vw
+    double dot_w2 = 0.0, dot2_w2 = 0.0, miss_w2 = 0.0; ///< sum g*w2, sum g^2*w2, sum_{missing} w2
+};
 
 
 class Geno {
@@ -102,12 +126,23 @@ public:
 
     // Direct uncentered int8 genotype decode for BED additive MLMA streaming:
     // writes n int8 values {0, 1, 2} (missing -> 0) into dest[], and populates
-    // miss_out bitmask when nValidN_out < keepSampleCT.
+    // miss_out bitmask when nValidN_out < keepSampleCT (left untouched
+    // otherwise).  Single fused pass (bed_simd): counts, optional weighted
+    // sums and sparse missing indices are produced alongside the decode.
     void getGenoInt8_bed(uintptr_t *buf, int idx, int8_t *dest,
                          float &af_out, float &additive_af_out,
                          double &mu_out, uint32_t &nValidN_out,
                          uintptr_t *miss_out, bool &valid_out,
-                         uint32_t extractedMarkerIndex);
+                         uint32_t extractedMarkerIndex,
+                         BedI8Fused *fused = nullptr);
+
+    // BED int8 GRM: decode block-local markers markerIdx[0..K) for kept samples
+    // [0, n_rows) straight from the raw .bed records into the sample-major
+    // (K-contiguous) matrix kmajor (row stride ldK), fused with
+    // r_raw[s] = sum_m g(s, m) * mu[m] (accumulated in ascending m), using a
+    // cache-blocked 64x64 decode+transpose.  No intermediate marker-major buffer.
+    void decodeBedI8KMajor(uintptr_t *buf, const int *markerIdx, int K, int n_rows,
+                           int8_t *kmajor, int ldK, const double *mu, double *r_raw);
 
     bool canUseInt8Mlma() const {
         return genoFormat == "BED" &&
@@ -241,7 +276,7 @@ private:
     void getGenoDouble_pgen(uintptr_t *buf, int idx, GenoBufItem* gbuf);
 
     // Float-native decode helpers: write directly into a caller-supplied float*.
-    // getGenoFloat_bed: uses the 256×4 float lookup table (GenoarrLookup256x4bx4).
+    // getGenoFloat_bed: bed_simd register-table decode (VPERMPS on AVX-512).
     // getGenoFloat_pgen / getGenoFloat_bgen: share the frequency/filter logic
     //   of their double counterparts, then cast the dosage array to float.
     void getGenoFloat_bed(uintptr_t *buf, int idx, float *dest,
@@ -258,27 +293,37 @@ private:
     GetGenoFloatFunc getGenoFloatFunc = nullptr;
  
     //BED
-    int bedRawGenoBuf1PtrSize; // how many 64bit geno of raw sample save 
+    int bedRawGenoBuf1PtrSize; // uintptr_t words per raw .bed record slot (64-byte padded)
     int maskPtrSize;
     int missPtrSize;
     uint32_t rawSampleCT;
     uint32_t keepSampleCT;
 
+    // 1-bit-per-raw-sample masks (bed_simd::build_keep_mask layout), owned by BedBackend.
     uintptr_t *keepMaskPtr = NULL;
-    uintptr_t *keepMaskInterPtr = NULL; 
     
     uint32_t keepSexSampleCT;
     uint32_t keepHeterogameticSampleCT;
 
     vector<uint32_t> keepSexIndex;  // in the raw index of fam
-    uintptr_t *sexMaskPtr = NULL;
-    uintptr_t *sexMaskInterPtr = NULL;
 
     vector<uint32_t> keepHeterogameticIndex; // in raw index of fam
     vector<uint32_t> keepHeterogameticExtractIndex;
     uintptr_t *heterogameticMaskPtr = NULL;
-    uintptr_t *heterogameticMaskInterPtr = NULL; 
-    //uintptr_t *heterogameticMaskExtractPtr = NULL;
+
+    // Native BED helpers (bed_simd).
+    const uint8_t *bedRecord(const uintptr_t *buf, int idx) const {
+        return reinterpret_cast<const uint8_t *>(buf + static_cast<std::size_t>(idx) *
+                                                           static_cast<std::size_t>(bedRawGenoBuf1PtrSize));
+    }
+    const uint64_t *bedKeepMask() const {
+        return keepSampleCT == rawSampleCT ? nullptr : reinterpret_cast<const uint64_t *>(keepMaskPtr);
+    }
+    // Counts over the kept samples (+ heterogametic subset on homogametic
+    // chromosomes) and the SNPInfo exactly as PgenReader::CountHardFreqMissExt(X).
+    bed_simd::Counts bedSnpInfo(const uint8_t *raw, uint8_t sexChromType, SNPInfo *snpinfo) const;
+    void bedSnpInfoFromCounts(const uint8_t *raw, const bed_simd::Counts &c, uint8_t sexChromType,
+                              SNPInfo *snpinfo) const;
 
     //BGEN
     int bgenRawGenoBuf1PtrSize;

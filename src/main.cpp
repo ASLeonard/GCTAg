@@ -119,9 +119,10 @@ string compute_log_prefix(const gcta_cli::ParsedCli& parsed, bool& out_was_expli
     return base;
 }
 
-int resolve_threads(const gcta_cli::ParsedCli& parsed, bool& is_threaded) {
+int resolve_threads(const gcta_cli::ParsedCli& parsed, bool& is_threaded, bool& explicit_threads) {
     int thread_num = 1;
     is_threaded = false;
+    explicit_threads = false;
 
     if (const char* env_threads = std::getenv("OMP_NUM_THREADS")) {
         try {
@@ -137,6 +138,7 @@ int resolve_threads(const gcta_cli::ParsedCli& parsed, bool& is_threaded) {
     if (parsed.global.threads.has_value()) {
         thread_num = *parsed.global.threads;
         is_threaded = true;
+        explicit_threads = true;
         return thread_num;
     }
 
@@ -148,6 +150,7 @@ int resolve_threads(const gcta_cli::ParsedCli& parsed, bool& is_threaded) {
                     if (v > 0) {
                         thread_num = v;
                         is_threaded = true;
+                        explicit_threads = true;
                     }
                 } catch (...) {
                 }
@@ -158,13 +161,22 @@ int resolve_threads(const gcta_cli::ParsedCli& parsed, bool& is_threaded) {
     return thread_num;
 }
 
-void configure_threading(int thread_num) {
+void configure_threading(int thread_num, bool explicit_threads) {
     // Make OMP worker threads sleep immediately after a parallel region ends,
     // rather than spin-waiting. Spinning threads consume memory bandwidth and
-    // starve BLAS (MKL/OpenBLAS) calls that follow parallel regions.
+    // starve BLAS (AOCL/MKL/OpenBLAS/Accelerate) calls that follow parallel regions.
     setenv("KMP_BLOCKTIME", "0", 0);   // 0 = don't override user setting
     setenv("GOMP_SPINCOUNT", "0", 0);
-    setenv("OMP_NUM_THREADS", to_string(thread_num).c_str(), 1);
+
+    const string thread_str = to_string(thread_num);
+    setenv("OMP_NUM_THREADS", thread_str.c_str(), 1);
+#if defined(GCTA_USE_AOCL)
+    const int aocl_overwrite = explicit_threads ? 1 : 0;
+    setenv("BLIS_NUM_THREADS", thread_str.c_str(), aocl_overwrite);
+    setenv("DLP_NUM_THREADS", thread_str.c_str(), aocl_overwrite);
+#else
+    (void)explicit_threads;
+#endif
 #if defined(GCTA_USE_MKL) || defined(GCTA_LAPACKE_IS_MKL)
     // libmkl_rt.so reads MKL_THREADING_LAYER lazily on first call; match the
     // OpenMP runtime linked by this compiler while respecting user overrides.
@@ -237,8 +249,9 @@ int main(int argc, char* argv[]) {
     }
 
     bool is_threaded = false;
-    const int thread_num = resolve_threads(parsed, is_threaded);
-    configure_threading(thread_num);
+    bool explicit_threads = false;
+    const int thread_num = resolve_threads(parsed, is_threaded, explicit_threads);
+    configure_threading(thread_num, explicit_threads);
 
     LOGGER.open(log_prefix + ".log");
     out_ver(true);

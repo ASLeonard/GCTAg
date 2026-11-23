@@ -1,13 +1,19 @@
 #ifndef GCTA_CPU_H
 #define GCTA_CPU_H
 
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <limits>
+#include <type_traits>
 #include <vector>
 #include "Logger.h"
 
 #if defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)) || defined(__amd64)
   #define GCTA_CPU_x86 1
+  #include <immintrin.h>
 #else
   #define GCTA_CPU_x86 0
 #endif
@@ -308,25 +314,167 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, double* Y, 
     return 0;
 }
 
-// Mixed-precision CholeskyQR2 for float32 m x k subspace matrices:
-// O(m * k^2) SYRK and TRSM run in float32 (cblas_ssyrk / cblas_strsm), while
-// the tiny k x k Gram Cholesky factorization runs in double (gcta_dpotrf) to
-// avoid premature single-precision breakdown on squared condition numbers.
+namespace gcta_cpu_detail {
+
+// Parallelized lower-triangle cast float -> double (k x k, col-major, ld = k).
+inline void copy_lower_f2d(gcta_blas_int k, const float* src, double* dst) noexcept {
+    #pragma omp parallel for schedule(guided) if (k >= 256)
+    for (gcta_blas_int j = 0; j < k; ++j) {
+        const float* s = src + static_cast<size_t>(j) * k + j;
+        double* d = dst + static_cast<size_t>(j) * k + j;
+        const gcta_blas_int len = k - j;
+        for (gcta_blas_int i = 0; i < len; ++i) {
+            d[i] = static_cast<double>(s[i]);
+        }
+    }
+}
+
+// Parallelized lower-triangle cast double -> float (k x k, col-major, ld = k).
+inline void copy_lower_d2f(gcta_blas_int k, const double* src, float* dst) noexcept {
+    #pragma omp parallel for schedule(guided) if (k >= 256)
+    for (gcta_blas_int j = 0; j < k; ++j) {
+        const double* s = src + static_cast<size_t>(j) * k + j;
+        float* d = dst + static_cast<size_t>(j) * k + j;
+        const gcta_blas_int len = k - j;
+        for (gcta_blas_int i = 0; i < len; ++i) {
+            d[i] = static_cast<float>(s[i]);
+        }
+    }
+}
+
+// Write upper-triangular R (k x k, col-major, ldR) = G_lower^T and zero strict lower triangle.
+inline void copy_lower_transpose_to_upper(
+    gcta_blas_int k, const double* G_lower, double* R, gcta_blas_int ldR) noexcept
+{
+    #pragma omp parallel for schedule(static) if (k >= 256)
+    for (gcta_blas_int j = 0; j < k; ++j) {
+        double* dst_col = R + static_cast<size_t>(j) * ldR;
+        for (gcta_blas_int i = 0; i <= j; ++i) {
+            dst_col[i] = G_lower[j + static_cast<size_t>(i) * k];
+        }
+        for (gcta_blas_int i = j + 1; i < k; ++i) {
+            dst_col[i] = 0.0;
+        }
+    }
+}
+
+// Extract upper triangle of float A (post-sgeqrf, col-major, ldA) into double R (ldR)
+// with strict lower triangle zeroed.
+inline void extract_upper_f2d(
+    gcta_blas_int k, const float* A, gcta_blas_int ldA, double* R, gcta_blas_int ldR) noexcept
+{
+    #pragma omp parallel for schedule(static) if (k >= 256)
+    for (gcta_blas_int j = 0; j < k; ++j) {
+        const float* src_col = A + static_cast<size_t>(j) * ldA;
+        double* dst_col = R + static_cast<size_t>(j) * ldR;
+        for (gcta_blas_int i = 0; i <= j; ++i) {
+            dst_col[i] = static_cast<double>(src_col[i]);
+        }
+        for (gcta_blas_int i = j + 1; i < k; ++i) {
+            dst_col[i] = 0.0;
+        }
+    }
+}
+
+// Shifted Cholesky recovery (Fukaya et al. 2020): attempts dpotrf(G_f + s*I)
+// with up to 3 escalating diagonal shifts s before giving up to Householder QR.
+inline int try_shifted_dpotrf(
+    gcta_blas_int m, gcta_blas_int k, const float* G_f, double* G) noexcept
+{
+    double trace_G = 0.0;
+    double max_diag = 0.0;
+    for (gcta_blas_int j = 0; j < k; ++j) {
+        const double d = static_cast<double>(G_f[j + static_cast<size_t>(j) * k]);
+        if (!std::isfinite(d)) return -1;
+        if (d > 0.0) trace_G += d;
+        if (d > max_diag) max_diag = d;
+    }
+    if (trace_G <= 0.0 || max_diag <= 0.0 || !std::isfinite(trace_G)) {
+        return -1;
+    }
+
+    const double eps_f32 = static_cast<double>(std::numeric_limits<float>::epsilon());
+    double s = std::max(11.0 * eps_f32 * trace_G,
+                        11.0 * std::sqrt(static_cast<double>(m)) * eps_f32 * max_diag);
+    const double s_cap = 0.5 * trace_G;
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const double cur_s = std::min(s, s_cap);
+        copy_lower_f2d(k, G_f, G);
+        for (gcta_blas_int j = 0; j < k; ++j) {
+            G[j + static_cast<size_t>(j) * k] += cur_s;
+        }
+        if (gcta_dpotrf(k, G, k) == 0) {
+            return 0;
+        }
+        if (cur_s >= s_cap) {
+            break;
+        }
+        s *= 16.0;
+    }
+    return -1;
+}
+
+}  // namespace gcta_cpu_detail
+
+// Mixed-precision Shifted CholeskyQR3 for float32 m x k subspace matrices:
+//   - Column L2 pre-normalization balances wildly scaled power-iteration columns.
+//   - O(m * k^2) SYRK and TRSM run in float32 (cblas_ssyrk / cblas_strsm), while
+//     the tiny k x k Gram Cholesky factorization runs in double (gcta_dpotrf).
+//   - If pass-0 dpotrf fails due to float32 Gram rounding on an ill-conditioned Y,
+//     attempts shifted Cholesky G + s*I recovery followed by two unshifted
+//     CholeskyQR passes (Shifted CholeskyQR3) before falling back to Householder
+//     sgeqrf/sorgqr (keeping O(m*k^2) fully Level-3 BLAS across all cores).
 inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, gcta_blas_int ldY,
                                     Eigen::MatrixXd* workspace = nullptr) {
+    if (m <= 0 || k <= 0) return 0;
+
+    // Column L2 pre-normalization (preserves col(Y), reduces artificial kappa(Y)).
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int j = 0; j < k; ++j) {
+        float* col = Y + static_cast<size_t>(j) * ldY;
+        double norm2 = 0.0;
+        for (gcta_blas_int i = 0; i < m; ++i) {
+            const double v = static_cast<double>(col[i]);
+            norm2 += v * v;
+        }
+        if (norm2 > 0.0 && std::isfinite(norm2)) {
+            const float inv_norm = static_cast<float>(1.0 / std::sqrt(norm2));
+            for (gcta_blas_int i = 0; i < m; ++i) {
+                col[i] *= inv_norm;
+            }
+        }
+    }
+
     Eigen::MatrixXd local_G;
     Eigen::MatrixXd& G = workspace ? *workspace : local_G;
     G.resize(k, k);
     Eigen::MatrixXf G_f(k, k);
-    for (int pass = 0; pass < 2; ++pass) {
+
+    bool used_shift = false;
+    int max_passes = 2;
+    for (int pass = 0; pass < max_passes; ++pass) {
         cblas_ssyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0f, Y, ldY, 0.0f, G_f.data(), k);
-        G.triangularView<Eigen::Lower>() = G_f.cast<double>();
+        gcta_cpu_detail::copy_lower_f2d(k, G_f.data(), G.data());
         const int info = gcta_dpotrf(k, G.data(), k);
         if (info != 0) {
-            if (pass != 0) break;  // pass 0's Q already orthonormal; skip the refinement.
-            return gcta_qr_thin_Q(m, k, Y, ldY);
+            if (pass == 0) {
+                if (gcta_cpu_detail::try_shifted_dpotrf(m, k, G_f.data(), G.data()) == 0) {
+                    used_shift = true;
+                    max_passes = 3;
+                } else {
+                    return gcta_qr_thin_Q(m, k, Y, ldY);
+                }
+            } else if (used_shift && pass == 1) {
+                // Shifted pass-0 Y_1 is not orthonormal yet; unshifted pass-1 failure
+                // indicates genuine rank deficiency or extreme ill-conditioning.
+                return gcta_qr_thin_Q(m, k, Y, ldY);
+            } else {
+                // Previous unshifted pass already produced an orthonormal Q; skip refinement.
+                break;
+            }
         }
-        G_f.triangularView<Eigen::Lower>() = G.cast<float>();
+        gcta_cpu_detail::copy_lower_d2f(k, G.data(), G_f.data());
         cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
                     m, k, 1.0f, G_f.data(), k, Y, ldY);
     }
@@ -337,12 +485,11 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, g
 // triangular factor R (k x k, column-major, leading dimension ldR) such that
 // the original Y equals Q*R. Used by callers (Nystrom) that need R for a
 // follow-on small eigendecomposition and can't afford an extra
-// n x k copy of Y to recover it afterwards as Q^T*Y_original. Falls back to
-// gcta_qr_thin_Q's dgeqrf/dorgqr (R read off its upper triangle) if the first
-// DPOTRF fails; a rare second-pass failure just keeps the first pass's
-// already-valid Q/R and skips the refinement.
+// n x k copy of Y to recover it afterwards as Q^T*Y_original. Composes
+// R <- L_pass^T * R in place via cblas_dtrmm (Level-3 BLAS, zero extra copy).
 inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, double* Y, gcta_blas_int ldY,
                                      double* R, gcta_blas_int ldR, Eigen::MatrixXd* workspace = nullptr) {
+    if (m <= 0 || k <= 0) return 0;
     Eigen::Map<Eigen::MatrixXd, 0, Eigen::OuterStride<>> Rmat(R, k, k, Eigen::OuterStride<>(ldR));
     Eigen::MatrixXd local_G;
     Eigen::MatrixXd& G = workspace ? *workspace : local_G;
@@ -359,55 +506,187 @@ inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, double* Y,
                        .triangularView<Eigen::Upper>();
             return gcta_dorgqr(m, k, Y, ldY, tau.data());
         }
-        const Eigen::MatrixXd R_pass = Eigen::MatrixXd(G.triangularView<Eigen::Lower>()).transpose();
         cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
                     m, k, 1.0, G.data(), k, Y, ldY);
-        Rmat = (pass == 0) ? R_pass : Eigen::MatrixXd(R_pass * Rmat);
+        if (pass == 0) {
+            gcta_cpu_detail::copy_lower_transpose_to_upper(k, G.data(), R, ldR);
+        } else {
+            cblas_dtrmm(CblasColMajor, CblasLeft, CblasLower, CblasTrans, CblasNonUnit,
+                        k, k, 1.0, G.data(), k, R, ldR);
+        }
     }
     return 0;
 }
 
 inline int gcta_cholesky_qr_thin_QR(gcta_blas_int m, gcta_blas_int k, float* Y, gcta_blas_int ldY,
                                      double* R, gcta_blas_int ldR, Eigen::MatrixXd* workspace = nullptr) {
-    Eigen::Map<Eigen::MatrixXd, 0, Eigen::OuterStride<>> Rmat(R, k, k, Eigen::OuterStride<>(ldR));
+    if (m <= 0 || k <= 0) return 0;
     Eigen::MatrixXd local_G;
     Eigen::MatrixXd& G = workspace ? *workspace : local_G;
     G.resize(k, k);
     Eigen::MatrixXf G_f(k, k);
-    for (int pass = 0; pass < 2; ++pass) {
+
+    bool used_shift = false;
+    int max_passes = 2;
+    for (int pass = 0; pass < max_passes; ++pass) {
         cblas_ssyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0f, Y, ldY, 0.0f, G_f.data(), k);
-        G.triangularView<Eigen::Lower>() = G_f.cast<double>();
+        gcta_cpu_detail::copy_lower_f2d(k, G_f.data(), G.data());
         const int info = gcta_dpotrf(k, G.data(), k);
         if (info != 0) {
-            if (pass != 0) break;  // pass 0's Q/R already valid; skip the refinement.
-            Eigen::VectorXf tau(k);
-            const int info_qr = gcta_sgeqrf(m, k, Y, ldY, tau.data());
-            if (info_qr != 0) return info_qr;
-            Rmat = Eigen::Map<Eigen::MatrixXf, 0, Eigen::OuterStride<>>(Y, k, k, Eigen::OuterStride<>(ldY))
-                       .triangularView<Eigen::Upper>()
-                       .toDenseMatrix()
-                       .cast<double>();
-            return gcta_sorgqr(m, k, Y, ldY, tau.data());
+            if (pass == 0) {
+                if (gcta_cpu_detail::try_shifted_dpotrf(m, k, G_f.data(), G.data()) == 0) {
+                    used_shift = true;
+                    max_passes = 3;
+                } else {
+                    Eigen::VectorXf tau(k);
+                    const int info_qr = gcta_sgeqrf(m, k, Y, ldY, tau.data());
+                    if (info_qr != 0) return info_qr;
+                    gcta_cpu_detail::extract_upper_f2d(k, Y, ldY, R, ldR);
+                    return gcta_sorgqr(m, k, Y, ldY, tau.data());
+                }
+            } else if (used_shift && pass == 1) {
+                // Y currently holds Y_1 = Y_orig * R_0^{-1} and R holds R_0.
+                // Factor Y_1 = Q * R_hh via Householder and compose R = R_hh * R_0.
+                Eigen::VectorXf tau(k);
+                const int info_qr = gcta_sgeqrf(m, k, Y, ldY, tau.data());
+                if (info_qr != 0) return info_qr;
+                gcta_cpu_detail::extract_upper_f2d(k, Y, ldY, G.data(), k);
+                cblas_dtrmm(CblasColMajor, CblasLeft, CblasUpper, CblasNoTrans, CblasNonUnit,
+                            k, k, 1.0, G.data(), k, R, ldR);
+                return gcta_sorgqr(m, k, Y, ldY, tau.data());
+            } else {
+                // Previous unshifted pass's Q/R already valid; skip refinement.
+                break;
+            }
         }
-        const Eigen::MatrixXd R_pass = Eigen::MatrixXd(G.triangularView<Eigen::Lower>()).transpose();
-        G_f.triangularView<Eigen::Lower>() = G.cast<float>();
+        gcta_cpu_detail::copy_lower_d2f(k, G.data(), G_f.data());
         cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
                     m, k, 1.0f, G_f.data(), k, Y, ldY);
-        Rmat = (pass == 0) ? R_pass : Eigen::MatrixXd(R_pass * Rmat);
+        if (pass == 0) {
+            gcta_cpu_detail::copy_lower_transpose_to_upper(k, G.data(), R, ldR);
+        } else {
+            cblas_dtrmm(CblasColMajor, CblasLeft, CblasLower, CblasTrans, CblasNonUnit,
+                        k, k, 1.0, G.data(), k, R, ldR);
+        }
     }
     return 0;
 }
 
 #if defined(GCTA_USE_AOCL_DLP) || (defined(GCTA_USE_AOCL) && defined(BLIS_ENABLE_ADDON_AOCL_GEMM))
   #define GCTA_HAS_AOCL_S8_GEMM 1
+  #define GCTA_HAS_AOCL_BF16_GEMM 1
 #else
   #define GCTA_HAS_AOCL_S8_GEMM 0
+  #define GCTA_HAS_AOCL_BF16_GEMM 0
 #endif
+
+namespace gcta_cpu_detail {
+
+#if GCTA_HAS_AOCL_S8_GEMM
+// Compile-time arity dispatch for AOCL-DLP 6.0 / AOCL-BLIS 5.1+ (trailing metadata/post_op
+// pointer) vs AOCL-BLIS <= 5.0 (no trailing pointer) without macro fragility.
+template <typename Fn>
+inline size_t call_aocl_get_reorder_buf_size(
+    Fn fn, char order, char trans, char mat_type, gcta_blas_int k, gcta_blas_int n)
+{
+    if constexpr (requires { fn(order, trans, mat_type, k, n, nullptr); }) {
+        return static_cast<size_t>(fn(order, trans, mat_type, k, n, nullptr));
+    } else {
+        return static_cast<size_t>(fn(order, trans, mat_type, k, n));
+    }
+}
+
+template <typename Fn, typename SrcPtr, typename DstPtr>
+inline void call_aocl_reorder(
+    Fn fn, char order, char trans, char mat_type,
+    SrcPtr src, DstPtr dst, gcta_blas_int k, gcta_blas_int n, gcta_blas_int ldb)
+{
+    if constexpr (requires { fn(order, trans, mat_type, src, dst, k, n, ldb, nullptr); }) {
+        fn(order, trans, mat_type, src, dst, k, n, ldb, nullptr);
+    } else {
+        fn(order, trans, mat_type, src, dst, k, n, ldb);
+    }
+}
+#endif
+
+#if GCTA_HAS_AOCL_BF16_GEMM
+// Extract exact parameter pointer types from the installed header's declaration of
+// aocl_gemm_bf16bf16f32of32 (handles int16_t / uint16_t / bfloat16 / aocl_bf16 typedefs).
+template <typename Fn>
+struct AoclGemm17Traits;
+
+template <typename R,
+          typename OrderT, typename TransAT, typename TransBT,
+          typename MT, typename NT, typename KT,
+          typename AlphaT,
+          typename APtrT, typename LdaT, typename MemAT,
+          typename BPtrT, typename LdbT, typename MemBT,
+          typename BetaT,
+          typename CPtrT, typename LdcT,
+          typename MetaT>
+struct AoclGemm17Traits<R(*)(OrderT, TransAT, TransBT,
+                             MT, NT, KT,
+                             AlphaT,
+                             APtrT, LdaT, MemAT,
+                             BPtrT, LdbT, MemBT,
+                             BetaT,
+                             CPtrT, LdcT,
+                             MetaT)> {
+    using a_ptr_t = APtrT;
+    using b_ptr_t = BPtrT;
+};
+#endif
+
+inline void f32_to_bf16_rne_scalar(const float* src, uint16_t* dst, size_t n) noexcept {
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t u = 0;
+        std::memcpy(&u, src + i, sizeof(u));
+        const bool is_nan = (u & 0x7FFFFFFFu) > 0x7F800000u;
+        const uint32_t rne = (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+        const uint32_t qnan = (u >> 16) | 0x0040u;
+        dst[i] = static_cast<uint16_t>(is_nan ? qnan : rne);
+    }
+}
+
+#if GCTA_CPU_x86 && (defined(__GNUC__) || defined(__clang__))
+#if defined(__AVX512BF16__) && defined(__AVX512F__)
+inline void f32_to_bf16_rne_avx512bf16(const float* src, uint16_t* dst, size_t n) noexcept {
+#else
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16"), noinline))
+inline void f32_to_bf16_rne_avx512bf16(const float* src, uint16_t* dst, size_t n) noexcept {
+#endif
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        const __m512 lo = _mm512_loadu_ps(src + i);
+        const __m512 hi = _mm512_loadu_ps(src + i + 16);
+        // Intel SDM VCVTNE2PS2BF16(hi, lo): lo -> dst[0..15], hi -> dst[16..31].
+        const __m512bh bh = _mm512_cvtne2ps_pbh(hi, lo);
+        std::memcpy(dst + i, &bh, 64);
+    }
+    if (i + 16 <= n) {
+        const __m512 v = _mm512_loadu_ps(src + i);
+        const __m256bh bh = _mm512_cvtneps_pbh(v);
+        std::memcpy(dst + i, &bh, 32);
+        i += 16;
+    }
+    for (; i < n; ++i) {
+        uint32_t u = 0;
+        std::memcpy(&u, src + i, sizeof(u));
+        const bool is_nan = (u & 0x7FFFFFFFu) > 0x7F800000u;
+        const uint32_t rne = (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+        const uint32_t qnan = (u >> 16) | 0x0040u;
+        dst[i] = static_cast<uint16_t>(is_nan ? qnan : rne);
+    }
+}
+#endif
+
+}  // namespace gcta_cpu_detail
 
 // Compute C(rows x cols, column-major, leading dim ldc) = A(rows x K, lda) * B(cols x K, ldb)^T
 // where A and B are column-major int8_t matrices in {0, 1, 2} and C is a column-major int32_t matrix.
-// On AOCL with BLIS_ENABLE_ADDON_AOCL_GEMM, dispatches directly to Zen 4 AVX-512 VNNI
-// aocl_gemm_s8s8s32os32 via row-major transpose equivalence:
+// On AOCL (AOCL-DLP 6.0 or BLIS addon), dispatches directly to Zen 4 AVX-512 VNNI
+// aocl_gemm_u8s8s32os32 (bit-exact for {0,1,2} inputs, avoiding s8s8s32's +128 bias/colsum overhead)
+// via row-major transpose equivalence:
 //   C_colmajor(rows x cols, ldc) == C_rowmajor(cols x rows, ldc) = B_rowmajor^T(cols x K) * A_rowmajor(K x rows).
 // On other BLAS backends (where K <= 1024 and A, B in {0, 1, 2} so every dot product is <= 4096,
 // well below float32's exact integer limit 2^24 = 16,777,216), converts the tile panels A and B
@@ -426,10 +705,10 @@ inline void gcta_gemm_s8s8s32_colmajor_nt(
     (void)scratch_A_f32;
     (void)scratch_B_f32;
     (void)scratch_C_f32;
-    aocl_gemm_s8s8s32os32('r', 't', 'n',
+    aocl_gemm_u8s8s32os32('r', 't', 'n',
                           cols, rows, K,
                           1,
-                          B, ldb, 'n',
+                          reinterpret_cast<const uint8_t*>(B), ldb, 'n',
                           A, lda, 'n',
                           0,
                           C, ldc,
@@ -479,9 +758,9 @@ inline void gcta_gemm_s8s8s32_colmajor_nt(
 //   beta * C + A(rows x K, lda) * B(K x cols, ldb)
 // where A has signed int8_t values in [-127, 127], B has int8_t values in {0, 1, 2},
 // and C is int32_t.
-// On AOCL with BLIS_ENABLE_ADDON_AOCL_GEMM, dispatches directly to Zen 4 AVX-512 VNNI
-// aocl_gemm_s8s8s32os32 via row-major transpose equivalence:
-//   C_colmajor(rows x cols) == C_rowmajor(cols x rows) = B_col_as_row(cols x K) * A_col_as_row(K x rows).
+// On AOCL (AOCL-DLP 6.0 or BLIS addon), dispatches directly to Zen 4 AVX-512 VNNI
+// aocl_gemm_u8s8s32os32 via row-major transpose equivalence:
+//   C_colmajor(rows x cols) == C_rowmajor(cols x rows) = B_col_as_row(cols x K, u8) * A_col_as_row(K x rows, s8).
 // On other BLAS backends (for K <= 8192 where |dot| <= 2 * 127 * 8192 = 2,080,768 < 2^24),
 // converts A and B to float32 scratch panels and executes cblas_sgemm, recovering exact integers.
 inline void gcta_gemm_s8s8s32_colmajor_nn(
@@ -499,10 +778,10 @@ inline void gcta_gemm_s8s8s32_colmajor_nn(
     (void)scratch_A_f32;
     (void)scratch_B_f32;
     (void)scratch_C_f32;
-    aocl_gemm_s8s8s32os32('r', 'n', 'n',
+    aocl_gemm_u8s8s32os32('r', 'n', 'n',
                           cols, rows, K,
                           1,
-                          B, ldb, 'n',
+                          reinterpret_cast<const uint8_t*>(B), ldb, 'n',
                           A, lda, 'n',
                           beta,
                           C, ldc,
@@ -558,7 +837,90 @@ inline void gcta_gemm_s8s8s32_colmajor_nn(
 #endif
 }
 
-// Compute the lower triangle of C(cols x cols, column-major, leading dim ldc) = A(cols x K, lda) * A(cols x K, lda)^T.
+// Query byte size required to pre-reorder A_col(rows x K, col-major signed int8_t)
+// as the static Matrix-B operand for gcta_gemm_u8s8s32_colmajor_nn_reordered.
+// Under row-major transpose equivalence, A_col(rows x K) is AOCL-DLP's row-major
+// Matrix B of shape (K x rows), so AOCL receives (k=K, n=rows).
+// Returns 0 when !GCTA_HAS_AOCL_S8_GEMM.
+inline size_t gcta_u8s8s32_reorder_b_size(gcta_blas_int rows, gcta_blas_int K) {
+#if GCTA_HAS_AOCL_S8_GEMM
+    if (rows <= 0 || K <= 0) return 0;
+    return gcta_cpu_detail::call_aocl_get_reorder_buf_size(
+        &aocl_get_reorder_buf_size_u8s8s32os32, 'r', 'n', 'b', K, rows);
+#else
+    (void)rows;
+    (void)K;
+    return 0;
+#endif
+}
+
+// Pack A_col(rows x K, col-major signed int8_t, lda >= rows) into dst_reordered
+// (allocated to >= gcta_u8s8s32_reorder_b_size(rows, K) bytes) for reuse across
+// repeated gcta_gemm_u8s8s32_colmajor_nn_reordered calls. No-op when !GCTA_HAS_AOCL_S8_GEMM.
+inline void gcta_u8s8s32_reorder_b(
+    gcta_blas_int rows, gcta_blas_int K,
+    const int8_t* A_col, gcta_blas_int lda,
+    int8_t* dst_reordered)
+{
+#if GCTA_HAS_AOCL_S8_GEMM
+    if (rows <= 0 || K <= 0 || A_col == nullptr || dst_reordered == nullptr) return;
+    gcta_cpu_detail::call_aocl_reorder(
+        &aocl_reorder_u8s8s32os32, 'r', 'n', 'b',
+        A_col, dst_reordered, K, rows, lda);
+#else
+    (void)rows;
+    (void)K;
+    (void)A_col;
+    (void)lda;
+    (void)dst_reordered;
+#endif
+}
+
+// Compute C(rows x cols, col-major, ldc) = beta * C + A_col(rows x K) * B_col(K x cols, ldb)
+// using pre-reordered A_reordered (from gcta_u8s8s32_reorder_b) when GCTA_HAS_AOCL_S8_GEMM
+// and A_reordered != nullptr, otherwise safely falling back to gcta_gemm_s8s8s32_colmajor_nn
+// with A_fallback_col. B_col must have values in {0, 1, 2}.
+inline void gcta_gemm_u8s8s32_colmajor_nn_reordered(
+    gcta_blas_int rows, gcta_blas_int cols, gcta_blas_int K,
+    const int8_t* A_reordered, const int8_t* A_fallback_col, gcta_blas_int lda,
+    const int8_t* B, gcta_blas_int ldb,
+    int32_t* C, gcta_blas_int ldc,
+    int32_t beta,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_B_f32,
+    std::vector<float>& scratch_C_f32)
+{
+    if (rows <= 0 || cols <= 0 || K <= 0) return;
+#if GCTA_HAS_AOCL_S8_GEMM
+    if (A_reordered != nullptr) {
+        (void)A_fallback_col;
+        (void)scratch_A_f32;
+        (void)scratch_B_f32;
+        (void)scratch_C_f32;
+        aocl_gemm_u8s8s32os32('r', 'n', 'n',
+                              cols, rows, K,
+                              1,
+                              reinterpret_cast<const uint8_t*>(B), ldb, 'n',
+                              A_reordered, lda, 'r',
+                              beta,
+                              C, ldc,
+                              nullptr);
+        return;
+    }
+#else
+    (void)A_reordered;
+#endif
+    gcta_gemm_s8s8s32_colmajor_nn(
+        rows, cols, K,
+        A_fallback_col, lda,
+        B, ldb,
+        C, ldc,
+        beta,
+        scratch_A_f32, scratch_B_f32, scratch_C_f32);
+}
+
+// Compute the lower triangle of C(cols x cols, column-major, leading dim ldc) = A(cols x K, lda) * A(cols x K, lda)^T
+// where A has values in {0, 1, 2}. Uses b=1024 diagonal SYRK sub-tiling under AOCL-DLP.
 inline void gcta_syrk_s8s8s32_lower_colmajor_nt(
     gcta_blas_int cols, gcta_blas_int K,
     const int8_t* A, gcta_blas_int lda,
@@ -570,14 +932,31 @@ inline void gcta_syrk_s8s8s32_lower_colmajor_nt(
 #if GCTA_HAS_AOCL_S8_GEMM
     (void)scratch_A_f32;
     (void)scratch_C_f32;
-    aocl_gemm_s8s8s32os32('r', 't', 'n',
-                          cols, cols, K,
-                          1,
-                          A, lda, 'n',
-                          A, lda, 'n',
-                          0,
-                          C, ldc,
-                          nullptr);
+    constexpr gcta_blas_int kDiagBlock = 1024;
+    for (gcta_blas_int j = 0; j < cols; j += kDiagBlock) {
+        const gcta_blas_int jb = std::min(kDiagBlock, cols - j);
+        const int8_t* A_j = A + j;
+        aocl_gemm_u8s8s32os32('r', 't', 'n',
+                              jb, jb, K,
+                              1,
+                              reinterpret_cast<const uint8_t*>(A_j), lda, 'n',
+                              A_j, lda, 'n',
+                              0,
+                              C + j + static_cast<size_t>(j) * ldc, ldc,
+                              nullptr);
+        const gcta_blas_int rem = cols - (j + jb);
+        if (rem > 0) {
+            const int8_t* A_below = A + (j + jb);
+            aocl_gemm_u8s8s32os32('r', 't', 'n',
+                                  jb, rem, K,
+                                  1,
+                                  reinterpret_cast<const uint8_t*>(A_j), lda, 'n',
+                                  A_below, lda, 'n',
+                                  0,
+                                  C + (j + jb) + static_cast<size_t>(j) * ldc, ldc,
+                                  nullptr);
+        }
+    }
 #else
     const size_t size_A = static_cast<size_t>(cols) * static_cast<size_t>(K);
     if (scratch_A_f32.size() < size_A) scratch_A_f32.resize(size_A);
@@ -609,16 +988,19 @@ inline void gcta_syrk_s8s8s32_lower_colmajor_nt(
 #endif
 }
 
-// Compute C(rows x cols, column-major, leading dim ldc) = A_kmajor(rows x K, ldK) * B_kmajor(cols x K, ldK)^T
-// where A_kmajor and B_kmajor store K markers contiguously per sample (row-major with stride ldK >= K).
-// Under AOCL VNNI (GCTA_HAS_AOCL_S8_GEMM):
-//   C_colmajor(rows x cols, ldc) == C_rowmajor(cols x rows, ldc) = B_kmajor(cols x K) * A_kmajor(rows x K)^T.
-// Eliminates large-sample-stride TLB/gather overhead during BLIS panel packing across tiles.
-inline void gcta_gemm_s8s8s32_kmajor_nt(
+// Compute C(rows x cols, column-major, leading dim ldc) =
+//   beta * C + A_kmajor(rows x K, ldK) * B_kmajor(cols x K, ldK)^T
+// where A_kmajor and B_kmajor store K markers contiguously per sample in {0, 1, 2}
+// (row-major with stride ldK >= K).
+// Under AOCL VNNI (GCTA_HAS_AOCL_S8_GEMM), dispatches directly to aocl_gemm_u8s8s32os32:
+//   C_colmajor(rows x cols, ldc) == C_rowmajor(cols x rows, ldc) = B_kmajor(cols x K, u8) * A_kmajor(rows x K, s8)^T.
+// Supports arbitrary beta (0 for overwrite, 1 for in-place int32_t GRM accumulation).
+inline void gcta_gemm_u8s8s32_kmajor_nt_beta(
     gcta_blas_int rows, gcta_blas_int cols, gcta_blas_int K,
     const int8_t* A_kmajor, gcta_blas_int ldK,
     const int8_t* B_kmajor,
     int32_t* C, gcta_blas_int ldc,
+    int32_t beta,
     std::vector<float>& scratch_A_f32,
     std::vector<float>& scratch_B_f32,
     std::vector<float>& scratch_C_f32)
@@ -628,61 +1010,181 @@ inline void gcta_gemm_s8s8s32_kmajor_nt(
     (void)scratch_A_f32;
     (void)scratch_B_f32;
     (void)scratch_C_f32;
-    aocl_gemm_s8s8s32os32('r', 'n', 't',
+    aocl_gemm_u8s8s32os32('r', 'n', 't',
                           cols, rows, K,
                           1,
-                          B_kmajor, ldK, 'n',
+                          reinterpret_cast<const uint8_t*>(B_kmajor), ldK, 'n',
                           A_kmajor, ldK, 'n',
-                          0,
+                          beta,
                           C, ldc,
                           nullptr);
 #else
-    const size_t size_A = static_cast<size_t>(rows) * static_cast<size_t>(K);
-    if (scratch_A_f32.size() < size_A) scratch_A_f32.resize(size_A);
-    #pragma omp parallel for schedule(static)
-    for (gcta_blas_int r = 0; r < rows; ++r) {
-        const int8_t* src = A_kmajor + static_cast<size_t>(r) * ldK;
-        float* dst = scratch_A_f32.data() + static_cast<size_t>(r) * K;
-        for (gcta_blas_int k = 0; k < K; ++k) {
-            dst[k] = static_cast<float>(src[k]);
+    constexpr gcta_blas_int kMaxTile = 4096;
+    for (gcta_blas_int c0 = 0; c0 < cols; c0 += kMaxTile) {
+        const gcta_blas_int cb = std::min(kMaxTile, cols - c0);
+        const size_t size_B = static_cast<size_t>(cb) * static_cast<size_t>(K);
+        if (scratch_B_f32.size() < size_B) scratch_B_f32.resize(size_B);
+        #pragma omp parallel for schedule(static)
+        for (gcta_blas_int c = 0; c < cb; ++c) {
+            const int8_t* src = B_kmajor + static_cast<size_t>(c0 + c) * ldK;
+            float* dst = scratch_B_f32.data() + static_cast<size_t>(c) * K;
+            for (gcta_blas_int k = 0; k < K; ++k) {
+                dst[k] = static_cast<float>(src[k]);
+            }
         }
-    }
-    const size_t size_B = static_cast<size_t>(cols) * static_cast<size_t>(K);
-    if (scratch_B_f32.size() < size_B) scratch_B_f32.resize(size_B);
-    #pragma omp parallel for schedule(static)
-    for (gcta_blas_int c = 0; c < cols; ++c) {
-        const int8_t* src = B_kmajor + static_cast<size_t>(c) * ldK;
-        float* dst = scratch_B_f32.data() + static_cast<size_t>(c) * K;
-        for (gcta_blas_int k = 0; k < K; ++k) {
-            dst[k] = static_cast<float>(src[k]);
-        }
-    }
-    const size_t size_C = static_cast<size_t>(rows) * static_cast<size_t>(cols);
-    if (scratch_C_f32.size() < size_C) scratch_C_f32.resize(size_C);
-    cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans,
-                rows, cols, K,
-                1.0f,
-                scratch_A_f32.data(), K,
-                scratch_B_f32.data(), K,
-                0.0f,
-                scratch_C_f32.data(), rows);
-    #pragma omp parallel for schedule(static)
-    for (gcta_blas_int c = 0; c < cols; ++c) {
-        const float* src = scratch_C_f32.data() + static_cast<size_t>(c) * rows;
-        int32_t* dst = C + static_cast<size_t>(c) * ldc;
-        for (gcta_blas_int r = 0; r < rows; ++r) {
-            dst[r] = static_cast<int32_t>(src[r]);
+        for (gcta_blas_int r0 = 0; r0 < rows; r0 += kMaxTile) {
+            const gcta_blas_int rb = std::min(kMaxTile, rows - r0);
+            const size_t size_A = static_cast<size_t>(rb) * static_cast<size_t>(K);
+            if (scratch_A_f32.size() < size_A) scratch_A_f32.resize(size_A);
+            #pragma omp parallel for schedule(static)
+            for (gcta_blas_int r = 0; r < rb; ++r) {
+                const int8_t* src = A_kmajor + static_cast<size_t>(r0 + r) * ldK;
+                float* dst = scratch_A_f32.data() + static_cast<size_t>(r) * K;
+                for (gcta_blas_int k = 0; k < K; ++k) {
+                    dst[k] = static_cast<float>(src[k]);
+                }
+            }
+            const size_t size_C = static_cast<size_t>(rb) * static_cast<size_t>(cb);
+            if (scratch_C_f32.size() < size_C) scratch_C_f32.resize(size_C);
+            cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans,
+                        rb, cb, K,
+                        1.0f,
+                        scratch_A_f32.data(), K,
+                        scratch_B_f32.data(), K,
+                        0.0f,
+                        scratch_C_f32.data(), rb);
+            #pragma omp parallel for schedule(static)
+            for (gcta_blas_int c = 0; c < cb; ++c) {
+                const float* src = scratch_C_f32.data() + static_cast<size_t>(c) * rb;
+                int32_t* dst = C + r0 + static_cast<size_t>(c0 + c) * ldc;
+                if (beta == 0) {
+                    for (gcta_blas_int r = 0; r < rb; ++r) {
+                        dst[r] = static_cast<int32_t>(src[r]);
+                    }
+                } else if (beta == 1) {
+                    for (gcta_blas_int r = 0; r < rb; ++r) {
+                        dst[r] += static_cast<int32_t>(src[r]);
+                    }
+                } else {
+                    for (gcta_blas_int r = 0; r < rb; ++r) {
+                        dst[r] = beta * dst[r] + static_cast<int32_t>(src[r]);
+                    }
+                }
+            }
         }
     }
 #endif
 }
 
+inline void gcta_gemm_s8s8s32_kmajor_nt(
+    gcta_blas_int rows, gcta_blas_int cols, gcta_blas_int K,
+    const int8_t* A_kmajor, gcta_blas_int ldK,
+    const int8_t* B_kmajor,
+    int32_t* C, gcta_blas_int ldc,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_B_f32,
+    std::vector<float>& scratch_C_f32)
+{
+    gcta_gemm_u8s8s32_kmajor_nt_beta(
+        rows, cols, K, A_kmajor, ldK, B_kmajor, C, ldc, 0,
+        scratch_A_f32, scratch_B_f32, scratch_C_f32);
+}
+
+// Query byte size required to pre-reorder transposed row-major A_kmajor(rows x K, ldK)
+// as the static Matrix-B operand (trans='t', shape K x rows after transpose) for
+// gcta_gemm_u8s8s32_kmajor_nt_beta_reordered (e.g., GRM r0-outer strip pre-packing).
+// Returns 0 when !GCTA_HAS_AOCL_S8_GEMM.
+inline size_t gcta_u8s8s32_reorder_bt_size(gcta_blas_int rows, gcta_blas_int K) {
+#if GCTA_HAS_AOCL_S8_GEMM
+    if (rows <= 0 || K <= 0) return 0;
+    return gcta_cpu_detail::call_aocl_get_reorder_buf_size(
+        &aocl_get_reorder_buf_size_u8s8s32os32, 'r', 't', 'b', K, rows);
+#else
+    (void)rows;
+    (void)K;
+    return 0;
+#endif
+}
+
+// Pack transposed row-major A_kmajor(rows x K, stride ldK >= K) into dst_reordered
+// (allocated to >= gcta_u8s8s32_reorder_bt_size(rows, K) bytes) for repeated
+// gcta_gemm_u8s8s32_kmajor_nt_beta_reordered calls. No-op when !GCTA_HAS_AOCL_S8_GEMM.
+inline void gcta_u8s8s32_reorder_bt(
+    gcta_blas_int rows, gcta_blas_int K,
+    const int8_t* A_kmajor, gcta_blas_int ldK,
+    int8_t* dst_reordered)
+{
+#if GCTA_HAS_AOCL_S8_GEMM
+    if (rows <= 0 || K <= 0 || A_kmajor == nullptr || dst_reordered == nullptr) return;
+    gcta_cpu_detail::call_aocl_reorder(
+        &aocl_reorder_u8s8s32os32, 'r', 't', 'b',
+        A_kmajor, dst_reordered, K, rows, ldK);
+#else
+    (void)rows;
+    (void)K;
+    (void)A_kmajor;
+    (void)ldK;
+    (void)dst_reordered;
+#endif
+}
+
+// Compute C(rows x cols, col-major, ldc) =
+//   beta * C + A_kmajor(rows x K, ldK) * B_kmajor(cols x K, ldK)^T
+// using pre-reordered A_reordered (from gcta_u8s8s32_reorder_bt) when GCTA_HAS_AOCL_S8_GEMM
+// and A_reordered != nullptr; otherwise falls back to gcta_gemm_u8s8s32_kmajor_nt_beta
+// with A_fallback_kmajor. Note: AOCL-DLP validates ldb against transb before inspecting
+// mem_format_b='r', so transb='t' and ldb=ldK match the reorder call ('r','t','b',K,rows,ldK).
+inline void gcta_gemm_u8s8s32_kmajor_nt_beta_reordered(
+    gcta_blas_int rows, gcta_blas_int cols, gcta_blas_int K,
+    const int8_t* A_reordered, const int8_t* A_fallback_kmajor, gcta_blas_int ldK,
+    const int8_t* B_kmajor,
+    int32_t* C, gcta_blas_int ldc,
+    int32_t beta,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_B_f32,
+    std::vector<float>& scratch_C_f32)
+{
+    if (rows <= 0 || cols <= 0 || K <= 0) return;
+#if GCTA_HAS_AOCL_S8_GEMM
+    if (A_reordered != nullptr) {
+        (void)A_fallback_kmajor;
+        (void)scratch_A_f32;
+        (void)scratch_B_f32;
+        (void)scratch_C_f32;
+        aocl_gemm_u8s8s32os32('r', 'n', 't',
+                              cols, rows, K,
+                              1,
+                              reinterpret_cast<const uint8_t*>(B_kmajor), ldK, 'n',
+                              A_reordered, ldK, 'r',
+                              beta,
+                              C, ldc,
+                              nullptr);
+        return;
+    }
+#else
+    (void)A_reordered;
+#endif
+    gcta_gemm_u8s8s32_kmajor_nt_beta(
+        rows, cols, K,
+        A_fallback_kmajor, ldK,
+        B_kmajor,
+        C, ldc,
+        beta,
+        scratch_A_f32, scratch_B_f32, scratch_C_f32);
+}
+
 // Compute the lower triangle of C(cols x cols, column-major, leading dim ldc) =
-//   A_kmajor(cols x K, ldK) * A_kmajor(cols x K, ldK)^T.
-inline void gcta_syrk_s8s8s32_lower_kmajor_nt(
+//   beta * C + A_kmajor(cols x K, ldK) * A_kmajor(cols x K, ldK)^T
+// where A_kmajor stores K markers contiguously per sample in {0, 1, 2}.
+// Under AOCL VNNI (GCTA_HAS_AOCL_S8_GEMM), sub-tiles the lower triangle with b=1024
+// diagonal blocks + below-diagonal rectangular panels via aocl_gemm_u8s8s32os32,
+// cutting diagonal-tile FLOPs nearly in half (~1.78x on 8192x8192) and keeping
+// upper-triangle pages of C untouched outside the narrow 1024-wide diagonal band.
+inline void gcta_syrk_u8s8s32_lower_kmajor_nt_beta(
     gcta_blas_int cols, gcta_blas_int K,
     const int8_t* A_kmajor, gcta_blas_int ldK,
     int32_t* C, gcta_blas_int ldc,
+    int32_t beta,
     std::vector<float>& scratch_A_f32,
     std::vector<float>& scratch_C_f32)
 {
@@ -690,43 +1192,316 @@ inline void gcta_syrk_s8s8s32_lower_kmajor_nt(
 #if GCTA_HAS_AOCL_S8_GEMM
     (void)scratch_A_f32;
     (void)scratch_C_f32;
-    aocl_gemm_s8s8s32os32('r', 'n', 't',
-                          cols, cols, K,
-                          1,
-                          A_kmajor, ldK, 'n',
-                          A_kmajor, ldK, 'n',
-                          0,
-                          C, ldc,
-                          nullptr);
-#else
-    const size_t size_A = static_cast<size_t>(cols) * static_cast<size_t>(K);
-    if (scratch_A_f32.size() < size_A) scratch_A_f32.resize(size_A);
-    #pragma omp parallel for schedule(static)
-    for (gcta_blas_int c = 0; c < cols; ++c) {
-        const int8_t* src = A_kmajor + static_cast<size_t>(c) * ldK;
-        float* dst = scratch_A_f32.data() + static_cast<size_t>(c) * K;
-        for (gcta_blas_int k = 0; k < K; ++k) {
-            dst[k] = static_cast<float>(src[k]);
+    constexpr gcta_blas_int kDiagBlock = 1024;
+    for (gcta_blas_int j = 0; j < cols; j += kDiagBlock) {
+        const gcta_blas_int jb = std::min(kDiagBlock, cols - j);
+        const int8_t* A_j = A_kmajor + static_cast<size_t>(j) * ldK;
+        // Diagonal jb x jb sub-tile
+        aocl_gemm_u8s8s32os32('r', 'n', 't',
+                              jb, jb, K,
+                              1,
+                              reinterpret_cast<const uint8_t*>(A_j), ldK, 'n',
+                              A_j, ldK, 'n',
+                              beta,
+                              C + j + static_cast<size_t>(j) * ldc, ldc,
+                              nullptr);
+        // Below-diagonal (cols - (j + jb)) x jb rectangular panel (strictly lower triangle)
+        const gcta_blas_int rem = cols - (j + jb);
+        if (rem > 0) {
+            const int8_t* A_below = A_kmajor + static_cast<size_t>(j + jb) * ldK;
+            aocl_gemm_u8s8s32os32('r', 'n', 't',
+                                  jb, rem, K,
+                                  1,
+                                  reinterpret_cast<const uint8_t*>(A_j), ldK, 'n',
+                                  A_below, ldK, 'n',
+                                  beta,
+                                  C + (j + jb) + static_cast<size_t>(j) * ldc, ldc,
+                                  nullptr);
         }
     }
-    const size_t size_C = static_cast<size_t>(cols) * static_cast<size_t>(cols);
-    if (scratch_C_f32.size() < size_C) scratch_C_f32.resize(size_C);
-    cblas_ssyrk(CblasColMajor, CblasLower, CblasTrans,
-                cols, K,
-                1.0f,
-                scratch_A_f32.data(), K,
-                0.0f,
-                scratch_C_f32.data(), cols);
-    #pragma omp parallel for schedule(guided)
-    for (gcta_blas_int c = 0; c < cols; ++c) {
-        const float* src = scratch_C_f32.data() + c + static_cast<size_t>(c) * cols;
-        int32_t* dst = C + c + static_cast<size_t>(c) * ldc;
-        const gcta_blas_int len = cols - c;
-        for (gcta_blas_int r = 0; r < len; ++r) {
-            dst[r] = static_cast<int32_t>(src[r]);
+#else
+    constexpr gcta_blas_int kMaxTile = 4096;
+    std::vector<float> scratch_B_f32;
+    for (gcta_blas_int j0 = 0; j0 < cols; j0 += kMaxTile) {
+        const gcta_blas_int jb = std::min(kMaxTile, cols - j0);
+        const size_t size_Aj = static_cast<size_t>(jb) * static_cast<size_t>(K);
+        if (scratch_A_f32.size() < size_Aj) scratch_A_f32.resize(size_Aj);
+        #pragma omp parallel for schedule(static)
+        for (gcta_blas_int c = 0; c < jb; ++c) {
+            const int8_t* src = A_kmajor + static_cast<size_t>(j0 + c) * ldK;
+            float* dst = scratch_A_f32.data() + static_cast<size_t>(c) * K;
+            for (gcta_blas_int k = 0; k < K; ++k) {
+                dst[k] = static_cast<float>(src[k]);
+            }
+        }
+        const size_t size_Cdiag = static_cast<size_t>(jb) * static_cast<size_t>(jb);
+        if (scratch_C_f32.size() < size_Cdiag) scratch_C_f32.resize(size_Cdiag);
+        cblas_ssyrk(CblasColMajor, CblasLower, CblasTrans,
+                    jb, K,
+                    1.0f,
+                    scratch_A_f32.data(), K,
+                    0.0f,
+                    scratch_C_f32.data(), jb);
+        #pragma omp parallel for schedule(guided)
+        for (gcta_blas_int c = 0; c < jb; ++c) {
+            const float* src = scratch_C_f32.data() + c + static_cast<size_t>(c) * jb;
+            int32_t* dst = C + (j0 + c) + static_cast<size_t>(j0 + c) * ldc;
+            const gcta_blas_int len = jb - c;
+            if (beta == 0) {
+                for (gcta_blas_int r = 0; r < len; ++r) {
+                    dst[r] = static_cast<int32_t>(src[r]);
+                }
+            } else if (beta == 1) {
+                for (gcta_blas_int r = 0; r < len; ++r) {
+                    dst[r] += static_cast<int32_t>(src[r]);
+                }
+            } else {
+                for (gcta_blas_int r = 0; r < len; ++r) {
+                    dst[r] = beta * dst[r] + static_cast<int32_t>(src[r]);
+                }
+            }
+        }
+
+        // Below-diagonal rectangular panels (when cols > kMaxTile)
+        for (gcta_blas_int i0 = j0 + jb; i0 < cols; i0 += kMaxTile) {
+            const gcta_blas_int ib = std::min(kMaxTile, cols - i0);
+            const size_t size_Ai = static_cast<size_t>(ib) * static_cast<size_t>(K);
+            if (scratch_B_f32.size() < size_Ai) scratch_B_f32.resize(size_Ai);
+            #pragma omp parallel for schedule(static)
+            for (gcta_blas_int r = 0; r < ib; ++r) {
+                const int8_t* src = A_kmajor + static_cast<size_t>(i0 + r) * ldK;
+                float* dst = scratch_B_f32.data() + static_cast<size_t>(r) * K;
+                for (gcta_blas_int k = 0; k < K; ++k) {
+                    dst[k] = static_cast<float>(src[k]);
+                }
+            }
+            const size_t size_Crect = static_cast<size_t>(ib) * static_cast<size_t>(jb);
+            if (scratch_C_f32.size() < size_Crect) scratch_C_f32.resize(size_Crect);
+            cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans,
+                        ib, jb, K,
+                        1.0f,
+                        scratch_B_f32.data(), K,
+                        scratch_A_f32.data(), K,
+                        0.0f,
+                        scratch_C_f32.data(), ib);
+            #pragma omp parallel for schedule(static)
+            for (gcta_blas_int c = 0; c < jb; ++c) {
+                const float* src = scratch_C_f32.data() + static_cast<size_t>(c) * ib;
+                int32_t* dst = C + i0 + static_cast<size_t>(j0 + c) * ldc;
+                if (beta == 0) {
+                    for (gcta_blas_int r = 0; r < ib; ++r) {
+                        dst[r] = static_cast<int32_t>(src[r]);
+                    }
+                } else if (beta == 1) {
+                    for (gcta_blas_int r = 0; r < ib; ++r) {
+                        dst[r] += static_cast<int32_t>(src[r]);
+                    }
+                } else {
+                    for (gcta_blas_int r = 0; r < ib; ++r) {
+                        dst[r] = beta * dst[r] + static_cast<int32_t>(src[r]);
+                    }
+                }
+            }
         }
     }
 #endif
+}
+
+inline void gcta_syrk_s8s8s32_lower_kmajor_nt(
+    gcta_blas_int cols, gcta_blas_int K,
+    const int8_t* A_kmajor, gcta_blas_int ldK,
+    int32_t* C, gcta_blas_int ldc,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_C_f32)
+{
+    gcta_syrk_u8s8s32_lower_kmajor_nt_beta(
+        cols, K, A_kmajor, ldK, C, ldc, 0, scratch_A_f32, scratch_C_f32);
+}
+
+// ---------------------------------------------------------------------------
+// BFloat16 conversion & GEMM helpers (Zen 4 AVX-512 BF16 / AOCL-DLP + portable fallback)
+// ---------------------------------------------------------------------------
+
+// Convert n float32 values to IEEE bfloat16 (stored as uint16_t bit patterns)
+// with Round-to-Nearest-Even (RNE) and quiet-NaN preservation.
+// Uses AVX-512 vcvtne2ps2bf16 directly under -march=znver4, or via runtime
+// CPUID dispatch on x86_64 builds targeting x86-64-v3.
+inline void gcta_f32_to_bf16_rne(const float* src, uint16_t* dst, size_t n) noexcept {
+    if (n == 0) return;
+#if GCTA_CPU_x86 && (defined(__GNUC__) || defined(__clang__))
+  #if defined(__AVX512BF16__) && defined(__AVX512F__)
+    gcta_cpu_detail::f32_to_bf16_rne_avx512bf16(src, dst, n);
+  #else
+    static const bool has_avx512bf16 =
+        __builtin_cpu_supports("avx512f") &&
+        __builtin_cpu_supports("avx512bw") &&
+        __builtin_cpu_supports("avx512vl") &&
+        __builtin_cpu_supports("avx512bf16");
+    if (has_avx512bf16) {
+        gcta_cpu_detail::f32_to_bf16_rne_avx512bf16(src, dst, n);
+        return;
+    }
+    gcta_cpu_detail::f32_to_bf16_rne_scalar(src, dst, n);
+  #endif
+#else
+    gcta_cpu_detail::f32_to_bf16_rne_scalar(src, dst, n);
+#endif
+}
+
+// Convert n bfloat16 values (uint16_t bit patterns) to float32 (exact zero-extension).
+inline void gcta_bf16_to_f32(const uint16_t* src, float* dst, size_t n) noexcept {
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t u = static_cast<uint32_t>(src[i]) << 16;
+        std::memcpy(dst + i, &u, sizeof(u));
+    }
+}
+
+// Compute column-major C_f32(m x n, ldc) = alpha * opA(A_bf16) * opB(B_bf16) + beta * C_f32
+// where transA, transB are 'N'/'n' or 'T'/'t'.
+// Under GCTA_HAS_AOCL_BF16_GEMM, dispatches directly to Zen 4 AVX-512 BF16
+// aocl_gemm_bf16bf16f32of32 via row-major transpose equivalence:
+//   C_row(n x m, ldc) = alpha * opB(B_row) * opA(A_row) + beta * C_row.
+// Otherwise upcasts bounded tiles to float32 and calls cblas_sgemm.
+inline void gcta_gemm_bf16bf16f32_colmajor(
+    char transA, char transB,
+    gcta_blas_int m, gcta_blas_int n, gcta_blas_int k,
+    float alpha,
+    const uint16_t* A_bf16, gcta_blas_int lda,
+    const uint16_t* B_bf16, gcta_blas_int ldb,
+    float beta,
+    float* C_f32, gcta_blas_int ldc)
+{
+    if (m <= 0 || n <= 0) return;
+    if (k <= 0) {
+        if (beta == 0.0f) {
+            #pragma omp parallel for schedule(static) if (static_cast<size_t>(m) * n >= 65536)
+            for (gcta_blas_int j = 0; j < n; ++j) {
+                std::memset(C_f32 + static_cast<size_t>(j) * ldc, 0, static_cast<size_t>(m) * sizeof(float));
+            }
+        } else if (beta != 1.0f) {
+            #pragma omp parallel for schedule(static) if (static_cast<size_t>(m) * n >= 65536)
+            for (gcta_blas_int j = 0; j < n; ++j) {
+                float* col = C_f32 + static_cast<size_t>(j) * ldc;
+                for (gcta_blas_int i = 0; i < m; ++i) {
+                    col[i] *= beta;
+                }
+            }
+        }
+        return;
+    }
+
+    const bool tA = (transA == 'T' || transA == 't');
+    const bool tB = (transB == 'T' || transB == 't');
+
+#if GCTA_HAS_AOCL_BF16_GEMM
+    using Traits = gcta_cpu_detail::AoclGemm17Traits<decltype(&aocl_gemm_bf16bf16f32of32)>;
+    using a_ptr_t = typename Traits::a_ptr_t;
+    using b_ptr_t = typename Traits::b_ptr_t;
+    static_assert(sizeof(std::remove_cv_t<std::remove_pointer_t<a_ptr_t>>) == sizeof(uint16_t),
+                  "aocl_gemm_bf16bf16f32of32 A element size must be 2 bytes");
+    static_assert(sizeof(std::remove_cv_t<std::remove_pointer_t<b_ptr_t>>) == sizeof(uint16_t),
+                  "aocl_gemm_bf16bf16f32of32 B element size must be 2 bytes");
+    aocl_gemm_bf16bf16f32of32('r',
+                              tB ? 't' : 'n',
+                              tA ? 't' : 'n',
+                              n, m, k,
+                              alpha,
+                              reinterpret_cast<a_ptr_t>(B_bf16), ldb, 'n',
+                              reinterpret_cast<b_ptr_t>(A_bf16), lda, 'n',
+                              beta,
+                              C_f32, ldc,
+                              nullptr);
+#else
+    constexpr gcta_blas_int kBlock = 2048;
+    constexpr gcta_blas_int mBlock = 4096;
+    constexpr gcta_blas_int nBlock = 4096;
+    const gcta_blas_int max_mb = std::min(m, mBlock);
+    const gcta_blas_int max_nb = std::min(n, nBlock);
+    const gcta_blas_int max_kb = std::min(k, kBlock);
+    std::vector<float> buf_A(static_cast<size_t>(max_mb) * static_cast<size_t>(max_kb));
+    std::vector<float> buf_B(static_cast<size_t>(max_nb) * static_cast<size_t>(max_kb));
+
+    for (gcta_blas_int j0 = 0; j0 < n; j0 += nBlock) {
+        const gcta_blas_int nb = std::min(nBlock, n - j0);
+        for (gcta_blas_int i0 = 0; i0 < m; i0 += mBlock) {
+            const gcta_blas_int mb = std::min(mBlock, m - i0);
+            for (gcta_blas_int k0 = 0; k0 < k; k0 += kBlock) {
+                const gcta_blas_int kb = std::min(kBlock, k - k0);
+                gcta_blas_int ldA_sub = mb;
+                if (!tA) {
+                    // A is col-major (m x k, lda): copy kb columns of length mb
+                    #pragma omp parallel for schedule(static) if (static_cast<size_t>(mb) * kb >= 65536)
+                    for (gcta_blas_int kk = 0; kk < kb; ++kk) {
+                        gcta_bf16_to_f32(
+                            A_bf16 + i0 + static_cast<size_t>(k0 + kk) * lda,
+                            buf_A.data() + static_cast<size_t>(kk) * mb,
+                            static_cast<size_t>(mb));
+                    }
+                    ldA_sub = mb;
+                } else {
+                    // A is col-major (k x m, lda): copy mb columns of length kb
+                    #pragma omp parallel for schedule(static) if (static_cast<size_t>(mb) * kb >= 65536)
+                    for (gcta_blas_int ii = 0; ii < mb; ++ii) {
+                        gcta_bf16_to_f32(
+                            A_bf16 + k0 + static_cast<size_t>(i0 + ii) * lda,
+                            buf_A.data() + static_cast<size_t>(ii) * kb,
+                            static_cast<size_t>(kb));
+                    }
+                    ldA_sub = kb;
+                }
+
+                gcta_blas_int ldB_sub = kb;
+                if (!tB) {
+                    // B is col-major (k x n, ldb): copy nb columns of length kb
+                    #pragma omp parallel for schedule(static) if (static_cast<size_t>(nb) * kb >= 65536)
+                    for (gcta_blas_int jj = 0; jj < nb; ++jj) {
+                        gcta_bf16_to_f32(
+                            B_bf16 + k0 + static_cast<size_t>(j0 + jj) * ldb,
+                            buf_B.data() + static_cast<size_t>(jj) * kb,
+                            static_cast<size_t>(kb));
+                    }
+                    ldB_sub = kb;
+                } else {
+                    // B is col-major (n x k, ldb): copy kb columns of length nb
+                    #pragma omp parallel for schedule(static) if (static_cast<size_t>(nb) * kb >= 65536)
+                    for (gcta_blas_int kk = 0; kk < kb; ++kk) {
+                        gcta_bf16_to_f32(
+                            B_bf16 + j0 + static_cast<size_t>(k0 + kk) * ldb,
+                            buf_B.data() + static_cast<size_t>(kk) * nb,
+                            static_cast<size_t>(nb));
+                    }
+                    ldB_sub = nb;
+                }
+
+                const float cur_beta = (k0 == 0) ? beta : 1.0f;
+                cblas_sgemm(CblasColMajor,
+                            tA ? CblasTrans : CblasNoTrans,
+                            tB ? CblasTrans : CblasNoTrans,
+                            mb, nb, kb,
+                            alpha,
+                            buf_A.data(), ldA_sub,
+                            buf_B.data(), ldB_sub,
+                            cur_beta,
+                            C_f32 + i0 + static_cast<size_t>(j0) * ldc, ldc);
+            }
+        }
+    }
+#endif
+}
+
+inline void gcta_gemm_bf16bf16f32_colmajor(
+    CBLAS_TRANSPOSE transA, CBLAS_TRANSPOSE transB,
+    gcta_blas_int m, gcta_blas_int n, gcta_blas_int k,
+    float alpha,
+    const uint16_t* A_bf16, gcta_blas_int lda,
+    const uint16_t* B_bf16, gcta_blas_int ldb,
+    float beta,
+    float* C_f32, gcta_blas_int ldc)
+{
+    gcta_gemm_bf16bf16f32_colmajor(
+        transA == CblasNoTrans ? 'N' : 'T',
+        transB == CblasNoTrans ? 'N' : 'T',
+        m, n, k, alpha, A_bf16, lda, B_bf16, ldb, beta, C_f32, ldc);
 }
 
 #endif  //END GCTA_CPU_H

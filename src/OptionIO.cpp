@@ -1,5 +1,6 @@
 #include "OptionIO.h"
 #include "Logger.h"
+#include "utils.hpp"
 #include <iostream>
 #include <sstream>
 #include <set>
@@ -98,7 +99,7 @@ void addMFileListsOption(string key_store, string append_string, string key_name
 //                                    ncol != 0: head is inconsistent with contents
 // 
 bool getListHeaderNew(std::ifstream *input, bool &ioerr, int &ncol, vector<string> &head, int &nHeader){
-    int startByte = 0;
+    uint64_t startByte = 0;
     ioerr = false;
     ncol = 0;
     string line;
@@ -108,91 +109,138 @@ bool getListHeaderNew(std::ifstream *input, bool &ioerr, int &ncol, vector<strin
         ioerr = true;
         return false;
     }
-    std::size_t found;
+    std::size_t found = std::string::npos;
     int curReadLine = 0;
+    bool got_line = false;
     while(std::getline(*input, line)){
+        got_line = true;
         curReadLine++;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         found = line.find_first_not_of("\r\t ");
         if(found != std::string::npos && line.at(found) == '#'){
             preLine = line;
-            prePos = input->tellg();
+            prePos = static_cast<uint64_t>(input->tellg());
             continue;
         }else{
             break;
         }
     }
 
-    if(line.at(found) == '#' || found == std::string::npos){
+    if(!got_line || found == std::string::npos || line.at(found) == '#'){
         nHeader = curReadLine;
         return false;
     }
 
-    vector<string> line_elements;
-    boost::split(line_elements, line, boost::is_any_of("\t "));
-    int ncol_con = line_elements.size();
+    vector<std::string_view> line_elements;
+    gcta_text_io::split_ws_exact(line, line_elements);
+    int ncol_con = static_cast<int>(line_elements.size());
 
     ncol = ncol_con;
     startByte = prePos;
     nHeader = curReadLine - 1;
 
     if(!preLine.empty()){
-        vector<string> line_elements_head;
-        boost::split(line_elements_head, preLine, boost::is_any_of("\t "));
-        int ncol_head = line_elements_head.size();
-        boost::replace_all(line_elements_head[ncol_head - 1], "\r", "");
+        vector<std::string_view> head_views;
+        gcta_text_io::split_ws_exact(preLine, head_views);
+        int ncol_head = static_cast<int>(head_views.size());
         if(ncol_head != ncol_con){
             return false;
         }else{
-            head = line_elements_head;
+            head.clear();
+            head.reserve(head_views.size());
+            for (const auto sv : head_views) head.emplace_back(sv);
         }
     }
     input->clear();
-    input->seekg(startByte);
+    input->seekg(static_cast<std::streamoff>(startByte));
     return true;
 }
 
 bool readTxtList(string fileName, int minFields, vector<string> &head, int &nHeader, map<int, vector<string>> &lists){
-    std::ifstream input(fileName.c_str());
-    int ncol;
-    bool ioerr;
-    if(getListHeaderNew(&input, ioerr, ncol, head, nHeader)){
-        if(ncol < minFields){
-            LOGGER.e(0, "the number of fields in [" + fileName + "] is less than " + to_string(minFields) + ".");
-        }
-        //init the list;
-        for(int i = 0; i < ncol; i++){
-            lists[i] = {};
-        }
-        string line;
-        int line_number = nHeader;
-        while(std::getline(input, line)){
-            line_number++;
-            vector<string> line_elements;
-            boost::split(line_elements, line, boost::is_any_of("\t "));
-            boost::replace_all(line_elements[line_elements.size() - 1], "\r", "");
-            if(line_elements.size() < ncol){
-                LOGGER.e(0, "the file [" + fileName + "] contains different number of elements in line " + to_string(line_number) + ".");
-            }else if(line_elements.size() > ncol){
-                LOGGER.w(0, "the file [" + fileName + "] contains extra number of elements in line " + to_string(line_number) + ".");
-            }
-            for(int i = 0; i < ncol; i++){
-                lists[i].emplace_back(line_elements[i]);
-            }
-        }
-        input.close();
-        return true;
-    }else{
-        if(ioerr){
-            LOGGER.e(0, "can't read [" + fileName + "].");
-        }
-        if(ncol == 0){
-            LOGGER.e(0, "blank header line or no valid text data.");
-        }else{
-            LOGGER.e(0, "data are inconsistent with the headers.");
-        }
-        input.close();
+    gcta_text_io::FastLineReader reader;
+    if (!reader.open(fileName)) {
+        LOGGER.e(0, "can't read [" + fileName + "].");
         return false;
     }
+
+    std::string_view line;
+    std::string preLine;
+    int curReadLine = 0;
+    bool found_data = false;
+    while (reader.next_line(line)) {
+        curReadLine++;
+        const size_t first_non_ws = line.find_first_not_of("\r\t ");
+        if (first_non_ws != std::string_view::npos && line[first_non_ws] == '#') {
+            preLine.assign(line);
+            continue;
+        }
+        if (first_non_ws == std::string_view::npos) {
+            nHeader = curReadLine;
+            LOGGER.e(0, "blank header line or no valid text data.");
+            return false;
+        }
+        found_data = true;
+        break;
+    }
+
+    if (!found_data) {
+        nHeader = curReadLine;
+        LOGGER.e(0, "blank header line or no valid text data.");
+        return false;
+    }
+
+    std::vector<std::string_view> toks;
+    toks.reserve(16);
+    gcta_text_io::split_ws_exact(line, toks);
+    const int ncol = static_cast<int>(toks.size());
+    nHeader = curReadLine - 1;
+
+    head.clear();
+    if (!preLine.empty()) {
+        std::vector<std::string_view> head_toks;
+        gcta_text_io::split_ws_exact(preLine, head_toks);
+        if (static_cast<int>(head_toks.size()) != ncol) {
+            LOGGER.e(0, "data are inconsistent with the headers.");
+            return false;
+        }
+        head.reserve(head_toks.size());
+        for (const auto sv : head_toks) head.emplace_back(sv);
+    }
+
+    if (ncol < minFields) {
+        LOGGER.e(0, "the number of fields in [" + fileName + "] is less than " + to_string(minFields) + ".");
+    }
+
+    const size_t est_rows = (reader.file_size() > 0)
+        ? static_cast<size_t>(reader.file_size() / std::max<size_t>(line.size() + 1, 8)) + 16
+        : 0;
+    lists.clear();
+    std::vector<std::vector<std::string>*> col_ptrs(static_cast<size_t>(ncol));
+    for (int i = 0; i < ncol; ++i) {
+        auto& col = lists[i];
+        if (est_rows > 0) col.reserve(est_rows);
+        col_ptrs[static_cast<size_t>(i)] = &col;
+    }
+
+    int line_number = nHeader;
+    auto push_row = [&]() {
+        line_number++;
+        if (static_cast<int>(toks.size()) < ncol) {
+            LOGGER.e(0, "the file [" + fileName + "] contains different number of elements in line " + to_string(line_number) + ".");
+        } else if (static_cast<int>(toks.size()) > ncol) {
+            LOGGER.w(0, "the file [" + fileName + "] contains extra number of elements in line " + to_string(line_number) + ".");
+        }
+        for (int i = 0; i < ncol; ++i) {
+            col_ptrs[static_cast<size_t>(i)]->emplace_back(toks[static_cast<size_t>(i)]);
+        }
+    };
+
+    push_row();
+    while (reader.next_line(line)) {
+        gcta_text_io::split_ws_exact(line, toks);
+        push_row();
+    }
+    return true;
 }
 
 bool checkFileReadable(string filename){

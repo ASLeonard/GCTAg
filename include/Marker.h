@@ -17,6 +17,7 @@
 #ifndef GCTA2_MARKER_H
 #define GCTA2_MARKER_H
 #include <string>
+#include <string_view>
 #include <vector>
 #include <map>
 #include <set>
@@ -92,7 +93,9 @@ private:
     bool isHeterogameticChr(const std::string& chr_label) const;
     static bool isPositiveIntegerChrLabel(const std::string& chr_label);
     bool isAllowedChrLabel(const std::string& chr_label) const;
+    bool isAllowedChrLabelView(std::string_view chr_label) const;
     static std::string normalizeChrLabel(const std::string& chr_label);
+    static void normalizeChrLabelInto(std::string_view chr_label, std::string& out);
     void loadSexChromosomeFile(const std::string& file_path);
 
     std::vector<string> chr;

@@ -652,6 +652,7 @@ target_sources(GCTAg PRIVATE
         src/pca_stream.cpp
         src/RemlEngine.cpp
         src/GRM.cpp
+        src/GrmBedInt8.cpp
         src/Geno.cpp
         src/GenoBackend.cpp
         src/BedBackend.cpp

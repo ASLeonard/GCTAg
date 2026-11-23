@@ -122,6 +122,10 @@ Counts decode_f64(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint
 void decode_i8_range(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
                      uint32_t r_begin, uint32_t n_out, int8_t* out);
 
+/// Int8 decode skipping redundant popcnt summary counts.
+void decode_i8_nocount(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_keep,
+                       int8_t* out, I8Opts* opts = nullptr);
+
 }  // namespace bed_simd
 
 #endif  // GCTA_BED_SIMD_HPP

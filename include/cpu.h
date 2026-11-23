@@ -1186,13 +1186,14 @@ inline void gcta_syrk_u8s8s32_lower_kmajor_nt_beta(
     int32_t* C, gcta_blas_int ldc,
     int32_t beta,
     std::vector<float>& scratch_A_f32,
-    std::vector<float>& scratch_C_f32)
+    std::vector<float>& scratch_C_f32,
+    gcta_blas_int diag_block = 1024)
 {
     if (cols <= 0 || K <= 0) return;
 #if GCTA_HAS_AOCL_S8_GEMM
     (void)scratch_A_f32;
     (void)scratch_C_f32;
-    constexpr gcta_blas_int kDiagBlock = 1024;
+    const gcta_blas_int kDiagBlock = std::max<gcta_blas_int>(64, diag_block);
     for (gcta_blas_int j = 0; j < cols; j += kDiagBlock) {
         const gcta_blas_int jb = std::min(kDiagBlock, cols - j);
         const int8_t* A_j = A_kmajor + static_cast<size_t>(j) * ldK;
@@ -1302,6 +1303,195 @@ inline void gcta_syrk_u8s8s32_lower_kmajor_nt_beta(
                     }
                 }
             }
+        }
+    }
+#endif
+#if !GCTA_HAS_AOCL_S8_GEMM
+    (void)diag_block;
+#endif
+}
+
+// Compute C(rows x cols, row-major, leading dim ldc >= cols) =
+//   beta * C + A_kmajor(rows x K, ldK) * B_kmajor(cols x K, ldK)^T
+// where A_kmajor and B_kmajor store K markers contiguously per sample in {0, 1, 2}
+// (row-major with stride ldK >= K).
+// Under AOCL VNNI (GCTA_HAS_AOCL_S8_GEMM), dispatches directly with M=rows and
+// N=cols so N sits in BLIS/DLP's outermost JC loop and M x NC C-slabs stay L3-resident.
+inline void gcta_gemm_u8s8s32_kmajor_nt_rowmajor_beta(
+    gcta_blas_int rows, gcta_blas_int cols, gcta_blas_int K,
+    const int8_t* A_kmajor, gcta_blas_int ldK,
+    const int8_t* B_kmajor,
+    int32_t* C, gcta_blas_int ldc,
+    int32_t beta,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_B_f32,
+    std::vector<float>& scratch_C_f32)
+{
+    if (rows <= 0 || cols <= 0 || K <= 0) return;
+#if GCTA_HAS_AOCL_S8_GEMM
+    (void)scratch_A_f32;
+    (void)scratch_B_f32;
+    (void)scratch_C_f32;
+    aocl_gemm_u8s8s32os32('r', 'n', 't',
+                          rows, cols, K,
+                          1,
+                          reinterpret_cast<const uint8_t*>(A_kmajor), ldK, 'n',
+                          B_kmajor, ldK, 'n',
+                          beta,
+                          C, ldc,
+                          nullptr);
+#else
+    constexpr gcta_blas_int kMaxTile = 4096;
+    for (gcta_blas_int r0 = 0; r0 < rows; r0 += kMaxTile) {
+        const gcta_blas_int rb = std::min(kMaxTile, rows - r0);
+        const size_t size_A = static_cast<size_t>(rb) * static_cast<size_t>(K);
+        if (scratch_A_f32.size() < size_A) scratch_A_f32.resize(size_A);
+        #pragma omp parallel for schedule(static)
+        for (gcta_blas_int r = 0; r < rb; ++r) {
+            const int8_t* src = A_kmajor + static_cast<size_t>(r0 + r) * ldK;
+            float* dst = scratch_A_f32.data() + static_cast<size_t>(r) * K;
+            for (gcta_blas_int k = 0; k < K; ++k) {
+                dst[k] = static_cast<float>(src[k]);
+            }
+        }
+        for (gcta_blas_int c0 = 0; c0 < cols; c0 += kMaxTile) {
+            const gcta_blas_int cb = std::min(kMaxTile, cols - c0);
+            const size_t size_B = static_cast<size_t>(cb) * static_cast<size_t>(K);
+            if (scratch_B_f32.size() < size_B) scratch_B_f32.resize(size_B);
+            #pragma omp parallel for schedule(static)
+            for (gcta_blas_int c = 0; c < cb; ++c) {
+                const int8_t* src = B_kmajor + static_cast<size_t>(c0 + c) * ldK;
+                float* dst = scratch_B_f32.data() + static_cast<size_t>(c) * K;
+                for (gcta_blas_int k = 0; k < K; ++k) {
+                    dst[k] = static_cast<float>(src[k]);
+                }
+            }
+            const size_t size_C = static_cast<size_t>(rb) * static_cast<size_t>(cb);
+            if (scratch_C_f32.size() < size_C) scratch_C_f32.resize(size_C);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        rb, cb, K,
+                        1.0f,
+                        scratch_A_f32.data(), K,
+                        scratch_B_f32.data(), K,
+                        0.0f,
+                        scratch_C_f32.data(), cb);
+            #pragma omp parallel for schedule(static)
+            for (gcta_blas_int r = 0; r < rb; ++r) {
+                const float* src = scratch_C_f32.data() + static_cast<size_t>(r) * cb;
+                int32_t* dst = C + static_cast<size_t>(r0 + r) * ldc + c0;
+                if (beta == 0) {
+                    for (gcta_blas_int c = 0; c < cb; ++c) {
+                        dst[c] = static_cast<int32_t>(src[c]);
+                    }
+                } else if (beta == 1) {
+                    for (gcta_blas_int c = 0; c < cb; ++c) {
+                        dst[c] += static_cast<int32_t>(src[c]);
+                    }
+                } else {
+                    for (gcta_blas_int c = 0; c < cb; ++c) {
+                        dst[c] = beta * dst[c] + static_cast<int32_t>(src[c]);
+                    }
+                }
+            }
+        }
+    }
+#endif
+}
+
+// Compute the lower triangle of C(dim x dim, row-major, leading dim ldc >= dim) =
+//   beta * C + A_kmajor(dim x K, ldK) * A_kmajor(dim x K, ldK)^T
+// where A_kmajor stores K markers contiguously per sample in {0, 1, 2}.
+inline void gcta_syrk_u8s8s32_lower_kmajor_nt_rowmajor_beta(
+    gcta_blas_int dim, gcta_blas_int K,
+    const int8_t* A_kmajor, gcta_blas_int ldK,
+    int32_t* C, gcta_blas_int ldc,
+    int32_t beta,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_B_f32,
+    std::vector<float>& scratch_C_f32,
+    gcta_blas_int diag_block = 1024)
+{
+    if (dim <= 0 || K <= 0) return;
+#if GCTA_HAS_AOCL_S8_GEMM
+    (void)scratch_A_f32;
+    (void)scratch_B_f32;
+    (void)scratch_C_f32;
+    const gcta_blas_int kDiagBlock = std::max<gcta_blas_int>(64, diag_block);
+    for (gcta_blas_int j = 0; j < dim; j += kDiagBlock) {
+        const gcta_blas_int jb = std::min(kDiagBlock, dim - j);
+        const int8_t* A_j = A_kmajor + static_cast<size_t>(j) * ldK;
+        aocl_gemm_u8s8s32os32('r', 'n', 't',
+                              jb, jb, K,
+                              1,
+                              reinterpret_cast<const uint8_t*>(A_j), ldK, 'n',
+                              A_j, ldK, 'n',
+                              beta,
+                              C + static_cast<size_t>(j) * ldc + j, ldc,
+                              nullptr);
+        const gcta_blas_int rem = dim - (j + jb);
+        if (rem > 0) {
+            const int8_t* A_below = A_kmajor + static_cast<size_t>(j + jb) * ldK;
+            aocl_gemm_u8s8s32os32('r', 'n', 't',
+                                  rem, jb, K,
+                                  1,
+                                  reinterpret_cast<const uint8_t*>(A_below), ldK, 'n',
+                                  A_j, ldK, 'n',
+                                  beta,
+                                  C + static_cast<size_t>(j + jb) * ldc + j, ldc,
+                                  nullptr);
+        }
+    }
+#else
+    (void)diag_block;
+    constexpr gcta_blas_int kMaxTile = 4096;
+    for (gcta_blas_int j0 = 0; j0 < dim; j0 += kMaxTile) {
+        const gcta_blas_int jb = std::min(kMaxTile, dim - j0);
+        const size_t size_Aj = static_cast<size_t>(jb) * static_cast<size_t>(K);
+        if (scratch_A_f32.size() < size_Aj) scratch_A_f32.resize(size_Aj);
+        #pragma omp parallel for schedule(static)
+        for (gcta_blas_int r = 0; r < jb; ++r) {
+            const int8_t* src = A_kmajor + static_cast<size_t>(j0 + r) * ldK;
+            float* dst = scratch_A_f32.data() + static_cast<size_t>(r) * K;
+            for (gcta_blas_int k = 0; k < K; ++k) {
+                dst[k] = static_cast<float>(src[k]);
+            }
+        }
+        const size_t size_Cdiag = static_cast<size_t>(jb) * static_cast<size_t>(jb);
+        if (scratch_C_f32.size() < size_Cdiag) scratch_C_f32.resize(size_Cdiag);
+        cblas_ssyrk(CblasRowMajor, CblasLower, CblasNoTrans,
+                    jb, K,
+                    1.0f,
+                    scratch_A_f32.data(), K,
+                    0.0f,
+                    scratch_C_f32.data(), jb);
+        #pragma omp parallel for schedule(guided)
+        for (gcta_blas_int r = 0; r < jb; ++r) {
+            const float* src = scratch_C_f32.data() + static_cast<size_t>(r) * jb;
+            int32_t* dst = C + static_cast<size_t>(j0 + r) * ldc + j0;
+            const gcta_blas_int len = r + 1;
+            if (beta == 0) {
+                for (gcta_blas_int c = 0; c < len; ++c) {
+                    dst[c] = static_cast<int32_t>(src[c]);
+                }
+            } else if (beta == 1) {
+                for (gcta_blas_int c = 0; c < len; ++c) {
+                    dst[c] += static_cast<int32_t>(src[c]);
+                }
+            } else {
+                for (gcta_blas_int c = 0; c < len; ++c) {
+                    dst[c] = beta * dst[c] + static_cast<int32_t>(src[c]);
+                }
+            }
+        }
+        const gcta_blas_int rem = dim - (j0 + jb);
+        if (rem > 0) {
+            gcta_gemm_u8s8s32_kmajor_nt_rowmajor_beta(
+                rem, jb, K,
+                A_kmajor + static_cast<size_t>(j0 + jb) * ldK, ldK,
+                A_kmajor + static_cast<size_t>(j0) * ldK,
+                C + static_cast<size_t>(j0 + jb) * ldc + j0, ldc,
+                beta,
+                scratch_A_f32, scratch_B_f32, scratch_C_f32);
         }
     }
 #endif

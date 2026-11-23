@@ -18,6 +18,8 @@ using ::RemlAlg;
 using ::WoodburyBasisSpec;
 
 enum class GrmAlg : int { Standard = 0, VanRaden = 1 };
+enum class GrmStripLayout : uint8_t { ColMajor = 0, RowMajor = 1 };
+enum class GrmDiagMode : uint8_t { Syrk = 0, Fused = 1 };
 enum class PcaApprox : uint8_t { Lanczos = 1, rSVD = 2 };
 enum class SvdMethod : uint8_t { Power = 0, Nystrom = 1 };
 enum class GenoModel : uint8_t { Additive = 0, Dominance = 1, NonAdditive = 2 };
@@ -145,6 +147,16 @@ struct GrmMakeOptions {
     std::optional<double> tile_budget_gb;
     std::optional<int> n_markers;
     std::optional<double> sparse_cutoff;
+
+    // Hidden developer tuning options (group("") in CLI)
+    std::optional<int> strip_rows;
+    std::optional<GrmStripLayout> strip_layout;
+    std::optional<int> gemm_col_chunk;
+    std::optional<GrmDiagMode> diag_mode;
+    std::optional<int> diag_block;
+    std::optional<int> io_slot_mb;
+    bool legacy_engine = false;
+    bool profile = false;
 };
 
 struct GrmMergeOptions {

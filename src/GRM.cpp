@@ -17,6 +17,7 @@
 */
 
 #include "GRM.h"
+#include "GrmBedInt8.hpp"
 #include "Logger.h"
 #include "OptionIO.h"
 #include "cpu.h"
@@ -3955,6 +3956,20 @@ void GRM::runMake(const gcta_cli::GrmMakeOptions& opts, const std::string& out_p
     Marker marker(opts.geno, opts.sample_filter, opts.marker_filter,
                   /*default_autosome=*/!opts.homogametic && !has_explicit_chr,
                   /*force_chr_homogametic=*/opts.homogametic && !has_explicit_chr);
+
+    const bool use_clean_bed_int8 =
+        !opts.legacy_engine &&
+        opts.alg == gcta_cli::GrmAlg::VanRaden &&
+        !opts.dominance &&
+        !opts.homogametic &&
+        (!opts.geno.bfile.empty() || !opts.geno.mbfile.empty()) &&
+        opts.geno.update_freq.empty() &&
+        (std::getenv("GCTA_DISABLE_INT8_GRM") == nullptr);
+    if (use_clean_bed_int8) {
+        gcta_grm::run_bed_int8_grm(pheno, marker, opts, out_prefix);
+        return;
+    }
+
     GRM grm(&pheno, &marker, opts, out_prefix);
     grm.processMakeGRM(opts.homogametic);
 }

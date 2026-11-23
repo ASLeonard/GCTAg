@@ -656,7 +656,7 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
                          "Soft memory budget (GB) for automatic single-call GRM tiling")
         ->check(CLI::PositiveNumber)->type_name("GB")->group("GRM Build");
     grm_make->add_option("--n-markers,--nMarkers", grm_make_opts.n_markers,
-                         "Markers per BLAS block (default: 1024)")
+                         "Markers per BLAS block (default: auto for BED VanRaden, 1024 otherwise)")
         ->check(CLI::PositiveNumber)->group("GRM Build");
     auto* gm_sparse = grm_make->add_option("--sparse-cutoff", grm_make_opts.sparse_cutoff,
                          "Emit sparse GRM entries above cutoff [default: 0.05]")
@@ -669,6 +669,54 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
                        "Hyperscale fast preset: VanRaden INT8 (--alg 1) + native FP16 GRM (--grm-fp16)")
         ->group("GRM Build");
     gm_fp16->excludes(gm_sparse, gm_part);
+
+    // Hidden developer tuning options (omitted from --help via group(""))
+    const CLI::Validator mult_of_64_validator(
+        [](const std::string& input) -> std::string {
+            try {
+                size_t idx = 0;
+                const long long v = std::stoll(input, &idx, 10);
+                if (idx != input.size() || v <= 0 || (v % 64) != 0) {
+                    return "Value must be a positive multiple of 64";
+                }
+            } catch (...) {
+                return "Value must be a positive multiple of 64";
+            }
+            return {};
+        },
+        "POSITIVE_MULT_64");
+    grm_make->add_option("--grm-strip-rows", grm_make_opts.strip_rows,
+                         "Dev: GRM strip height in rows (multiple of 64)")
+        ->check(CLI::PositiveNumber)->check(mult_of_64_validator)->group("");
+    grm_make->add_option("--grm-layout", grm_make_opts.strip_layout,
+                         "Dev: GRM accumulator strip layout {rowmajor,colmajor}")
+        ->transform(make_enum_transformer<GrmStripLayout>(
+            {{"colmajor", GrmStripLayout::ColMajor}, {"rowmajor", GrmStripLayout::RowMajor}},
+            "{rowmajor,colmajor}",
+            /*allow_numeric=*/false))
+        ->group("");
+    grm_make->add_option("--grm-gemm-col-chunk", grm_make_opts.gemm_col_chunk,
+                         "Dev: Max columns per off-diagonal strip GEMM call (0 = unchunked)")
+        ->check(CLI::NonNegativeNumber)->group("");
+    grm_make->add_option("--grm-diag-mode", grm_make_opts.diag_mode,
+                         "Dev: Strip diagonal accumulation mode {fused,syrk}")
+        ->transform(make_enum_transformer<GrmDiagMode>(
+            {{"syrk", GrmDiagMode::Syrk}, {"fused", GrmDiagMode::Fused}},
+            "{fused,syrk}",
+            /*allow_numeric=*/false))
+        ->group("");
+    grm_make->add_option("--grm-diag-block", grm_make_opts.diag_block,
+                         "Dev: SYRK diagonal sub-block size")
+        ->check(CLI::PositiveNumber)->group("");
+    grm_make->add_option("--grm-io-slot-mb", grm_make_opts.io_slot_mb,
+                         "Dev: AsyncSeqWriter output slot size in MiB")
+        ->check(CLI::PositiveNumber)->group("");
+    grm_make->add_flag("--grm-legacy-engine", grm_make_opts.legacy_engine,
+                       "Dev: Bypass clean-room BED INT8 engine and use legacy GRM::processMakeGRM")
+        ->group("");
+    grm_make->add_flag("--grm-profile", grm_make_opts.profile,
+                       "Dev: Log detailed phase timing breakdown for grm make")
+        ->group("");
     grm_make->callback([&out, &grm_make_opts, gm_alg]() {
         grm_make_opts.alg_explicit = (gm_alg->count() > 0);
         if (grm_make_opts.fast) {

@@ -126,6 +126,18 @@ void decode_i8_range(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
 void decode_i8_nocount(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_keep,
                        int8_t* out, I8Opts* opts = nullptr);
 
+/// Decode K valid markers directly into K-major int8 layout for n_out kept samples
+/// starting at raw sample index r_begin (must be % 4 == 0 when keep == nullptr):
+///   kmajor_out[s * ldK + m] in {0, 1, 2} for s in [0, n_out), m in [0, K).
+/// If mu != nullptr && r_out != nullptr, overwrites r_out[s] with
+///   sum_{m=0..K-1} (double)kmajor_out[s * ldK + m] * mu[m] (in marker order).
+void decode_i8_kmajor_band(const uint8_t* raw_base, size_t rec_bytes,
+                           const int* valid_idx, int K,
+                           const uint64_t* keep, uint32_t n_raw,
+                           uint32_t r_begin, uint32_t n_out,
+                           int8_t* kmajor_out, size_t ldK,
+                           const double* mu, double* r_out);
+
 }  // namespace bed_simd
 
 #endif  // GCTA_BED_SIMD_HPP

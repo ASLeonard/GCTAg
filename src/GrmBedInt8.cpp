@@ -1370,44 +1370,23 @@ private:
             }
 
             if (K > 0 && decode_rows > 0) {
-                constexpr int kSampleBlk = 64;
-                constexpr int kMBlk = 64;
-                const int n_groups = (decode_rows + kSampleBlk - 1) / kSampleBlk;
-                alignas(64) int8_t col[kMBlk][kSampleBlk];
-                alignas(64) int8_t tr_blk[kSampleBlk][kMBlk];
-
-                #pragma omp for schedule(static)
-                for (int g = 0; g < n_groups; ++g) {
-                    const int g_i0 = g * kSampleBlk;
-                    const int s_len = std::min(kSampleBlk, decode_rows - g_i0);
+                const int n_chunks64 = (decode_rows + 63) / 64;
+                const int tid = omp_get_thread_num();
+                const int nth = omp_get_num_threads();
+                const int c_beg = (n_chunks64 * tid) / nth;
+                const int c_end = (n_chunks64 * (tid + 1)) / nth;
+                const int s_beg = c_beg * 64;
+                const int s_end = std::min(decode_rows, c_end * 64);
+                if (s_beg < s_end) {
                     const uint32_t start_raw = keep_mask
-                        ? index_keep_[static_cast<size_t>(g_i0)]
-                        : static_cast<uint32_t>(g_i0);
-                    double r_acc[kSampleBlk] = {0.0};
-                    for (int m0 = 0; m0 < K; m0 += kMBlk) {
-                        const int m_len = std::min(kMBlk, K - m0);
-                        for (int dm = 0; dm < m_len; ++dm) {
-                            const int bidx = valid_buf_idx_[static_cast<size_t>(m0 + dm)];
-                            bed_simd::decode_i8_range(raw_base + static_cast<size_t>(bidx) * rb,
-                                                      keep_mask, raw_ct, start_raw,
-                                                      static_cast<uint32_t>(s_len), col[dm]);
-                        }
-                        for (int dm = 0; dm < m_len; ++dm) {
-                            const double mu_m = valid_mu_[static_cast<size_t>(m0 + dm)];
-                            for (int ds = 0; ds < s_len; ++ds) {
-                                const int8_t gv = col[dm][ds];
-                                r_acc[ds] += static_cast<double>(gv) * mu_m;
-                                tr_blk[ds][dm] = gv;
-                            }
-                        }
-                        for (int ds = 0; ds < s_len; ++ds) {
-                            std::memcpy(kmajor_base + static_cast<size_t>(g_i0 + ds) * ldK + m0,
-                                        tr_blk[ds], static_cast<size_t>(m_len));
-                        }
-                    }
-                    for (int ds = 0; ds < s_len; ++ds) {
-                        r_raw_[static_cast<size_t>(g_i0 + ds)] = r_acc[ds];
-                    }
+                        ? index_keep_[static_cast<size_t>(s_beg)]
+                        : static_cast<uint32_t>(s_beg);
+                    bed_simd::decode_i8_kmajor_band(
+                        raw_base, rb, valid_buf_idx_.data(), K,
+                        keep_mask, raw_ct, start_raw, static_cast<uint32_t>(s_end - s_beg),
+                        kmajor_base + static_cast<size_t>(s_beg) * ldK,
+                        static_cast<size_t>(ldK),
+                        valid_mu_.data(), r_raw_.data() + s_beg);
                 }
             }
         }

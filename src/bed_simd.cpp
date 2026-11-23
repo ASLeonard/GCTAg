@@ -116,6 +116,113 @@ struct PackTable {
 };
 alignas(64) static constexpr PackTable kPack{};
 
+struct BandChunk64 {
+    uint32_t r_begin;
+    uint32_t s_len;
+};
+
+static inline uint32_t plan_band_chunks(const uint64_t* keep, uint32_t nw,
+                                        uint32_t& cursor_r_or_w, uint64_t& first,
+                                        uint32_t b_len, BandChunk64 chunks[4]) {
+    const uint32_t n_chunks = (b_len + 63u) >> 6;
+    if (!keep) {
+        for (uint32_t ci = 0; ci < n_chunks; ++ci) {
+            const uint32_t s0 = ci * 64u;
+            const uint32_t want = (b_len - s0) < 64u ? (b_len - s0) : 64u;
+            chunks[ci] = {cursor_r_or_w + s0, want};
+        }
+        cursor_r_or_w += b_len;
+        return n_chunks;
+    }
+    uint32_t out_n = 0u;
+    for (uint32_t ci = 0; ci < n_chunks; ++ci) {
+        const uint32_t s0 = ci * 64u;
+        const uint32_t want = (b_len - s0) < 64u ? (b_len - s0) : 64u;
+        while (cursor_r_or_w < nw && (keep[cursor_r_or_w] & first) == 0u) {
+            ++cursor_r_or_w;
+            first = ~0ull;
+        }
+        if (cursor_r_or_w >= nw) break;
+        const uint32_t chunk_r = (cursor_r_or_w << 6) + ctz64(keep[cursor_r_or_w] & first);
+        uint32_t got = 0u;
+        while (got < want && cursor_r_or_w < nw) {
+            const uint64_t kw = keep[cursor_r_or_w] & first;
+            if (!kw) {
+                ++cursor_r_or_w;
+                first = ~0ull;
+                continue;
+            }
+            const uint32_t cnt = popcnt64(kw);
+            const uint32_t need = want - got;
+            if (cnt <= need) {
+                got += cnt;
+                ++cursor_r_or_w;
+                first = ~0ull;
+            } else {
+                uint64_t t = kw;
+                for (uint32_t u = 0; u < need; ++u) t &= t - 1u;
+                first = t;
+                got += need;
+            }
+        }
+        chunks[out_n++] = {chunk_r, got};
+    }
+    return out_n;
+}
+
+#define BED_DEFINE_KMAJOR_BAND(NAME, ATTR, CHUNK_DECODE)                                       \
+    ATTR static void NAME(const uint8_t* raw_base, size_t rec_bytes, const int* valid_idx,     \
+                          int K, const uint64_t* keep, uint32_t n_raw, uint32_t r_begin,       \
+                          uint32_t n_out, int8_t* kmajor_out, size_t ldK, const double* mu,    \
+                          double* r_out) {                                                     \
+        if (K <= 0 || n_out == 0u) return;                                                     \
+        const bool want_r = (mu != nullptr && r_out != nullptr);                               \
+        if (want_r) {                                                                          \
+            for (uint32_t s = 0; s < n_out; ++s) r_out[s] = 0.0;                               \
+        }                                                                                      \
+        const uint32_t nw = (n_raw + 63u) >> 6;                                                \
+        uint32_t cursor = keep ? (r_begin >> 6) : r_begin;                                     \
+        uint64_t first = keep ? (~0ull << (r_begin & 63u)) : ~0ull;                            \
+        constexpr uint32_t kBand = 256u;                                                       \
+        alignas(64) int8_t col[64][64];                                                        \
+        alignas(64) int8_t tr[64][64];                                                         \
+        for (uint32_t b_off = 0; b_off < n_out; b_off += kBand) {                              \
+            const uint32_t rem = n_out - b_off;                                                \
+            const uint32_t b_len = rem < kBand ? rem : kBand;                                  \
+            BandChunk64 chunks[4];                                                             \
+            const uint32_t n_chunks = plan_band_chunks(keep, nw, cursor, first, b_len, chunks);\
+            for (int m0 = 0; m0 < K; m0 += 64) {                                               \
+                const int m_len = (K - m0) < 64 ? (K - m0) : 64;                               \
+                for (uint32_t ci = 0; ci < n_chunks; ++ci) {                                   \
+                    const uint32_t s0 = ci * 64u;                                              \
+                    const uint32_t s_len = chunks[ci].s_len;                                   \
+                    if (s_len == 0u) continue;                                                 \
+                    for (int dm = 0; dm < m_len; ++dm) {                                       \
+                        const uint8_t* raw = raw_base + (size_t)valid_idx[m0 + dm] * rec_bytes;\
+                        CHUNK_DECODE(raw, keep, n_raw, chunks[ci].r_begin, s_len, col[dm]);    \
+                    }                                                                          \
+                    if (want_r) {                                                              \
+                        for (int dm = 0; dm < m_len; ++dm) {                                   \
+                            const double mu_m = mu[m0 + dm];                                   \
+                            double* rp = r_out + b_off + s0;                                   \
+                            const int8_t* gp = col[dm];                                        \
+                            for (uint32_t ds = 0; ds < s_len; ++ds) {                          \
+                                rp[ds] += (double)gp[ds] * mu_m;                               \
+                            }                                                                  \
+                        }                                                                      \
+                    }                                                                          \
+                    for (uint32_t ds = 0; ds < s_len; ++ds) {                                  \
+                        for (int dm = 0; dm < m_len; ++dm) tr[ds][dm] = col[dm][ds];           \
+                    }                                                                          \
+                    for (uint32_t ds = 0; ds < s_len; ++ds) {                                  \
+                        __builtin_memcpy(kmajor_out + (size_t)(b_off + s0 + ds) * ldK + m0,    \
+                                         tr[ds], (size_t)m_len);                               \
+                    }                                                                          \
+                }                                                                              \
+            }                                                                                  \
+        }                                                                                      \
+    }
+
 namespace scalar {
 
 // Visit output samples [0, n_out) in order: f(out_pos, plink1_code).
@@ -291,6 +398,12 @@ static Counts decode_f64(const uint8_t* raw, const uint64_t* keep, uint32_t n_ra
                          const double* t4, double* out, uint64_t* miss_bits, bool want_counts) {
     return decode_tab<double>(raw, keep, n_raw, n_out, t4, out, miss_bits, want_counts);
 }
+
+static inline void decode_i8_chunk(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
+                                   uint32_t r_begin, uint32_t n_out, int8_t* out) {
+    decode_i8(raw, keep, n_raw, r_begin, n_out, out, nullptr, false);
+}
+BED_DEFINE_KMAJOR_BAND(decode_i8_kmajor_band, , decode_i8_chunk)
 
 }  // namespace scalar
 
@@ -652,6 +765,12 @@ static Counts decode_f64(const uint8_t* raw, const uint64_t* keep, uint32_t n_ra
     return c;
 }
 
+static inline void decode_i8_chunk(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
+                                   uint32_t r_begin, uint32_t n_out, int8_t* out) {
+    decode_i8(raw, keep, n_raw, r_begin, n_out, out, nullptr, false);
+}
+BED_DEFINE_KMAJOR_BAND(decode_i8_kmajor_band, , decode_i8_chunk)
+
 }  // namespace neon
 #endif  // BED_ARM64
 
@@ -882,6 +1001,26 @@ BED_T256 static Counts decode_f64(const uint8_t* raw, const uint64_t* keep, uint
     return c;
 }
 
+BED_T256 static inline void decode_i8_chunk(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
+                                            uint32_t r_begin, uint32_t s_len, int8_t* out) {
+    if (!keep) {
+        const uint32_t rem_raw = n_raw - r_begin;
+        const uint32_t n_vis = s_len < rem_raw ? s_len : rem_raw;
+        const uint32_t b0 = r_begin >> 2;
+        const uint32_t nb = (n_vis + 3u) >> 2;
+        alignas(32) uint8_t tmp[64];
+        const uint32_t nb0 = nb < 8u ? nb : 8u;
+        _mm256_store_si256((__m256i*)tmp, codes32(raw + b0, nb0));
+        if (nb > 8u) {
+            _mm256_store_si256((__m256i*)(tmp + 32), codes32(raw + b0 + 8u, nb - 8u));
+        }
+        map_i8(tmp, n_vis, out);
+        return;
+    }
+    decode_i8(raw, keep, n_raw, r_begin, s_len, out, nullptr, false);
+}
+BED_DEFINE_KMAJOR_BAND(decode_i8_kmajor_band, BED_T256, decode_i8_chunk)
+
 }  // namespace avx2
 
 // AVX-512 kernels (shared with the emulator-based unit test).
@@ -912,15 +1051,17 @@ struct Kernels {
     Counts (*i8)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, uint32_t, int8_t*, I8Opts*, bool);
     Counts (*f32)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, const float*, float*, uint64_t*, bool);
     Counts (*f64)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, const double*, double*, uint64_t*, bool);
+    void (*i8_kmajor_band)(const uint8_t*, size_t, const int*, int, const uint64_t*, uint32_t,
+                           uint32_t, uint32_t, int8_t*, size_t, const double*, double*);
 };
 
-static const Kernels kScalar = {Isa::Scalar, &count_scalar, &scalar::decode_i8, &scalar::decode_f32, &scalar::decode_f64};
+static const Kernels kScalar = {Isa::Scalar, &count_scalar, &scalar::decode_i8, &scalar::decode_f32, &scalar::decode_f64, &scalar::decode_i8_kmajor_band};
 #if BED_ARM64
-static const Kernels kNeon = {Isa::Neon, &neon::count, &neon::decode_i8, &neon::decode_f32, &neon::decode_f64};
+static const Kernels kNeon = {Isa::Neon, &neon::count, &neon::decode_i8, &neon::decode_f32, &neon::decode_f64, &neon::decode_i8_kmajor_band};
 #endif
 #if BED_X86
-static const Kernels kAvx2 = {Isa::Avx2, &count_popcnt, &avx2::decode_i8, &avx2::decode_f32, &avx2::decode_f64};
-static const Kernels kAvx512 = {Isa::Avx512, &avx512::count, &avx512::decode_i8, &avx512_decode_f32_wrap, &avx512_decode_f64_wrap};
+static const Kernels kAvx2 = {Isa::Avx2, &count_popcnt, &avx2::decode_i8, &avx2::decode_f32, &avx2::decode_f64, &avx2::decode_i8_kmajor_band};
+static const Kernels kAvx512 = {Isa::Avx512, &avx512::count, &avx512::decode_i8, &avx512_decode_f32_wrap, &avx512_decode_f64_wrap, &avx512::decode_i8_kmajor_band};
 
 static bool cpu_has_avx512() {
 #if BED_STATIC_AVX512
@@ -1080,6 +1221,16 @@ void decode_i8_range(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
                      uint32_t r_begin, uint32_t n_out, int8_t* out) {
     if (n_out == 0) return;
     K().i8(raw, keep, n_raw, r_begin, n_out, out, nullptr, false);
+}
+
+void decode_i8_kmajor_band(const uint8_t* raw_base, size_t rec_bytes,
+                           const int* valid_idx, int K,
+                           const uint64_t* keep, uint32_t n_raw,
+                           uint32_t r_begin, uint32_t n_out,
+                           int8_t* kmajor_out, size_t ldK,
+                           const double* mu, double* r_out) {
+    detail::K().i8_kmajor_band(raw_base, rec_bytes, valid_idx, K, keep, n_raw, r_begin, n_out,
+                               kmajor_out, ldK, mu, r_out);
 }
 
 }  // namespace bed_simd

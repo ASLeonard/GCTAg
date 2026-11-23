@@ -514,7 +514,9 @@ inline int pad_strip_ld_f64(int min_ld) noexcept {
 }
 
 inline int pad_kmajor_ldk(int k) noexcept {
-    return std::max(64, ((k + 63) / 64) * 64);
+    int ldk = std::max(64, ((k + 63) / 64) * 64);
+    if ((ldk & 4095) == 0) ldk += 64; // avoid 4 KiB / 32 KiB L1D stride aliasing
+    return ldk;
 }
 
 struct EngineConfig {
@@ -988,7 +990,7 @@ private:
             const uint64_t k_by_kmajor = kTargetKMajorBytes / std::max<uint64_t>(1ULL, static_cast<uint64_t>(grm_n_));
             const uint64_t k_by_bed = kTargetBedSlotBytes / std::max<uint64_t>(1ULL, static_cast<uint64_t>(rec_bytes_));
             const uint64_t raw_k = std::min(k_by_kmajor, k_by_bed);
-            cfg_.n_marker_block = static_cast<int>(std::clamp<uint64_t>((raw_k / 64ULL) * 64ULL, 1024ULL, 4096ULL));
+            cfg_.n_marker_block = static_cast<int>(std::clamp<uint64_t>((raw_k / 64ULL) * 64ULL, 1024ULL, 12288ULL));
         }
 
         if (opts_.fast) {

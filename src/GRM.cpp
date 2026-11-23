@@ -51,7 +51,8 @@ using std::to_string;
 
 namespace gcta_grm_detail {
 
-constexpr size_t kMaxPosixIoChunk = 1ULL << 30; // 1 GiB (safe on macOS & Linux)
+constexpr size_t kMaxPosixIoChunk = gcta_io::kMaxIoChunkBytes;
+constexpr size_t kGrmAsyncSlotBytes = gcta_grm_io::kDefaultGrmIoSlotBytes; // 64 MiB
 
 class GrmUniqueFd {
 public:
@@ -69,6 +70,11 @@ public:
         return *this;
     }
     int get() const noexcept { return fd_; }
+    int release() noexcept {
+        int r = fd_;
+        fd_ = -1;
+        return r;
+    }
     explicit operator bool() const noexcept { return fd_ >= 0; }
     void reset(int new_fd = -1) noexcept {
         if (fd_ >= 0) ::close(fd_);
@@ -114,27 +120,6 @@ inline bool write_exact_posix(int fd, const void* buf, size_t count, int& err_ou
     return true;
 }
 
-inline bool read_exact_posix(int fd, void* buf, size_t count, int& err_out, bool& eof_out) noexcept {
-    char* p = static_cast<char*>(buf);
-    size_t done = 0;
-    eof_out = false;
-    while (done < count) {
-        const size_t step = std::min(kMaxPosixIoChunk, count - done);
-        const ssize_t r = ::read(fd, p + done, step);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            err_out = errno;
-            return false;
-        }
-        if (r == 0) {
-            eof_out = true;
-            return false;
-        }
-        done += static_cast<size_t>(r);
-    }
-    return true;
-}
-
 inline std::pair<int, int> lower_tri_col_range(int cols, int tid, int nthreads) noexcept {
     if (cols <= 0 || nthreads <= 0) return {0, 0};
     if (nthreads == 1) return {0, cols};
@@ -151,9 +136,6 @@ inline std::pair<int, int> lower_tri_col_range(int cols, int tid, int nthreads) 
 
 // Finds the largest `re` in (rs, full_re] such that a GRM tile spanning rows
 // [rs, re) fits within budget_elems *actually touched* elements.
-//
-// Solved as the positive root of re^2 + re - (2*budget_elems + rs*(rs+1)) = 0
-// in floating-point arithmetic, then floored and clamped to full_re.
 inline int solve_tile_budget_end(int rs, int full_re, double budget_elems) {
     const double drs = rs;
     const double disc = 1.0 + 4.0 * (2.0 * budget_elems + drs * (drs + 1.0));
@@ -169,44 +151,50 @@ inline bool grm_tile_budget_covers_whole(int full_rs, int full_re, double budget
     return whole_elems <= budget_elems;
 }
 
+inline bool prefix_has_readable_grm(const std::string& pfx, bool require_n_for_f32) {
+    if (!checkFileReadable(pfx + ".grm.id")) return false;
+    if (checkFileReadable(pfx + ".grm.f16")) return true;
+    if (checkFileReadable(pfx + ".grm.bin")) {
+        return !require_n_for_f32 || checkFileReadable(pfx + ".grm.N.bin");
+    }
+    return false;
+}
+
 } // namespace gcta_grm_detail
 
+// ---------------------------------------------------------------------------
+// GRM reader-mode constructor (grm prune / grm sparse / grm merge / subtract / unify)
+// ---------------------------------------------------------------------------
 GRM::GRM(const std::string& grm_prefix, const std::string& keep, const std::string& remove,
-         const std::string& out_prefix, bool detail)
-    : o_name(out_prefix), keep_file(keep), remove_file(remove), cutoff_detail(detail) {
+         const std::string& out_prefix, bool detail, bool out_fp16)
+    : write_fp16_(out_fp16), o_name(out_prefix), keep_file(keep), remove_file(remove), cutoff_detail(detail) {
     if (!grm_prefix.empty()) {
         this->grm_file = grm_prefix;
-        grm_ids = Pheno::read_sublist(grm_file + ".grm.id");
+        const gcta_grm_io::ResolvedGrmInput resolved =
+            gcta_grm_io::resolve_grm_input(grm_file, /*prefer_fp16=*/out_fp16);
+        input_grm_format_    = resolved.format;
+        input_grm_data_path_ = resolved.data_path;
+        input_has_n_file_    = resolved.has_n_file;
+
+        grm_ids = Pheno::read_sublist(resolved.id_path);
         num_subjects = grm_ids.size();
+        const uint64_t expected_tri = num_subjects * (num_subjects + 1ULL) / 2ULL;
 
-        uint64_t num_grm = num_subjects * (num_subjects + 1) / 2;
-        UniqueFile file = open_file(grm_file + ".grm.bin", "rb");
-        if (!file) {
-            LOGGER.error(0, "can't open {}.grm.bin", grm_file);
+        const int fd = gcta_grm_io::open_readonly_checked(input_grm_data_path_);
+        if (input_grm_format_ == gcta_grm_io::GrmDiskFormat::F16) {
+            Eigen::VectorXf diag_vec;
+            gcta_grm_io::read_grm_f16_header_and_diag(fd, input_grm_data_path_, grm_ids, input_f16_hdr_, diag_vec);
+            ::close(fd);
+            input_f16_diag_.assign(diag_vec.data(), diag_vec.data() + diag_vec.size());
+        } else {
+            struct stat st{};
+            if (::fstat(fd, &st) != 0 || st.st_size < 0 ||
+                static_cast<uint64_t>(st.st_size) != expected_tri * sizeof(float)) {
+                ::close(fd);
+                LOGGER.e(0, "The IDs in GRM and the IDs in the GRM binary file do not match [" + grm_file + "]");
+            }
+            ::close(fd);
         }
-        const auto grm_file_size = getFileByteSize(file.get());
-        if (!grm_file_size) {
-            LOGGER.e(0, "Failed to read GRM binary size for [" + grm_file + "]: " + std::string(getUtilsErrorMessage(grm_file_size.error())));
-        }
-        if (num_grm * 4 != grm_file_size.value()) {
-            LOGGER.e(0, "The IDs in GRM and the IDs in the GRM binary file do not match [" + grm_file + "]");
-        }
-
-        uint64_t num_grm_byte = num_grm * 4;
-        uint64_t num_parts = (num_grm_byte + num_byte_GRM_read - 1) / num_byte_GRM_read;
-        vector<uint32_t> parts = divide_parts(0, num_subjects - 1, num_parts);
-        index_grm_pairs.reserve(parts.size());
-        byte_part_grms.reserve(parts.size());
-
-        index_grm_pairs.push_back(std::make_pair(0, static_cast<int>(parts[0])));
-        byte_part_grms.push_back((static_cast<uint64_t>(parts[0]) + 2ULL) * (static_cast<uint64_t>(parts[0]) + 1ULL) / 2ULL);
-        for(size_t index = 1; index != parts.size(); index++){
-            index_grm_pairs.push_back(std::make_pair(static_cast<int>(parts[index - 1] + 1), static_cast<int>(parts[index])));
-            byte_part_grms.push_back((static_cast<uint64_t>(parts[index - 1]) + static_cast<uint64_t>(parts[index]) + 3ULL)
-                                     * (static_cast<uint64_t>(parts[index]) - static_cast<uint64_t>(parts[index - 1])) / 2ULL);
-        }
-
-        num_byte_buffer = *std::max_element(byte_part_grms.begin(), byte_part_grms.end());
 
         index_keep.resize(num_subjects);
         std::iota(index_keep.begin(), index_keep.end(), 0);
@@ -225,264 +213,626 @@ GRM::GRM(const std::string& grm_prefix, const std::string& keep, const std::stri
     }
 }
 
-void GRM::subtract_grm(string mgrm_file, string out_file){
-   std::ifstream mgrm(mgrm_file.c_str());
-    if(!mgrm){
+// ---------------------------------------------------------------------------
+// GRM::subtract_grm — HPC-safe single-stream double-buffered LOCO subtraction
+// Supports .grm.bin, .grm.f16 (zero-missing scalar N fast path), and mixed inputs.
+// ---------------------------------------------------------------------------
+void GRM::subtract_grm(string mgrm_file, string out_file, bool out_fp16){
+    std::ifstream mgrm(mgrm_file.c_str());
+    if (!mgrm) {
         LOGGER.e(0, "can't open " + mgrm_file + " to read.");
     }
     string line;
     vector<string> files;
     vector<string> err_files;
-    while(getline(mgrm, line)){
+    while (getline(mgrm, line)) {
         boost::trim(line);
-        if(!line.empty()){
-            if(checkFileReadable(line+".grm.id") && checkFileReadable(line+".grm.bin") && checkFileReadable(line + ".grm.N.bin")){
+        if (!line.empty()) {
+            if (gcta_grm_detail::prefix_has_readable_grm(line, /*require_n_for_f32=*/true)) {
                 files.push_back(line);
-            }else{
+            } else {
                 err_files.push_back(line);
             }
         }
     }
 
-    if(err_files.size() != 0){
-        string out_err = "can't read GRM (*.grm.id, *.grm.bin) in ";
+    if (!err_files.empty()) {
+        string out_err = "can't read GRM (*.grm.id, *.grm.bin/.grm.f16) in ";
         out_err += boost::algorithm::join(err_files, ", ");
         out_err += ".";
         LOGGER.e(0, out_err);
     }
-    if(files.size() != 2){
+    if (files.size() != 2) {
         LOGGER.e(0, "only 2 GRMs are supported currently.");
     }
 
-    LOGGER.i(0, "Reading [" + files[0] + ".grm.id]...");
-    vector<string> common_id = Pheno::read_sublist(files[0] + ".grm.id");
+    const std::string id0_path = files[0] + ".grm.id";
+    const std::string id1_path = files[1] + ".grm.id";
+    LOGGER.i(0, "Reading [" + id0_path + "]...");
+    vector<string> common_id = Pheno::read_sublist(id0_path);
     LOGGER << common_id.size() << " samples have been read." << std::endl;
-    LOGGER.i(0, "Reading [" + files[1] + ".grm.id]...");
-    vector<string> common_id2 = Pheno::read_sublist(files[1] + ".grm.id");
-    if(common_id != common_id2){
-        LOGGER.e(0, "The sample IDs in the two GRMs are not same. You may try --unify-grm first.");
+    if (!gcta_grm_io::files_byte_identical(id0_path, id1_path)) {
+        LOGGER.i(0, "Reading [" + id1_path + "]...");
+        vector<string> common_id2 = Pheno::read_sublist(id1_path);
+        if (common_id != common_id2) {
+            LOGGER.e(0, "The sample IDs in the two GRMs are not same. You may try 'grm unify' first.");
+        }
     }
-    std::ofstream o_id(out_file + ".grm.id");
-    if(!o_id) LOGGER.e(0, "can't write to [" + out_file + ".grm.id]");
-    LOGGER.i(2, "Saving " + to_string(common_id.size()) + " individual IDs");
-    std::ranges::copy(common_id, std::ostream_iterator<string>(o_id, "\n"));
-    o_id.close();
+    gcta_grm_io::copy_file_posix(id0_path, out_file + ".grm.id");
 
     const uint64_t n_sub = static_cast<uint64_t>(common_id.size());
     const uint64_t grm_size = (1ULL + n_sub) * n_sub / 2ULL;
-    const uint64_t grm_file_size = grm_size * sizeof(float);
+    const uint64_t grm_f32_size = grm_size * sizeof(float);
 
-    const std::string p_grm1  = files[0] + ".grm.bin";
-    const std::string p_grmN1 = files[0] + ".grm.N.bin";
-    const std::string p_grm2  = files[1] + ".grm.bin";
-    const std::string p_grmN2 = files[1] + ".grm.N.bin";
-
-    auto fd_grm1  = gcta_grm_detail::open_posix_read(p_grm1);
-    auto fd_grmN1 = gcta_grm_detail::open_posix_read(p_grmN1);
-    auto fd_grm2  = gcta_grm_detail::open_posix_read(p_grm2);
-    auto fd_grmN2 = gcta_grm_detail::open_posix_read(p_grmN2);
-
-    auto check_fd_size = [&](const gcta_grm_detail::GrmUniqueFd& ufd, const std::string& path) {
-        struct stat st{};
-        if (!ufd || ::fstat(ufd.get(), &st) != 0 || st.st_size < 0 ||
-            static_cast<uint64_t>(st.st_size) != grm_file_size) {
-            LOGGER.e(0, "The size of [" + path + "] is not correct.");
-        }
+    struct SubInput {
+        gcta_grm_detail::GrmUniqueFd val_fd;
+        gcta_grm_detail::GrmUniqueFd n_fd;
+        std::string val_path;
+        std::string n_path;
+        bool is_fp16 = false;
+        bool zero_missing = false;
+        off_t body_off = 0;
+        double const_n = 0.0;
+        uint64_t valid_markers = 0;
+        Eigen::VectorXf diag_f32;
+        gcta_grm_io::GrmFp16Header hdr{};
     };
-    check_fd_size(fd_grm1,  p_grm1);
-    check_fd_size(fd_grmN1, p_grmN1);
-    check_fd_size(fd_grm2,  p_grm2);
-    check_fd_size(fd_grmN2, p_grmN2);
 
-    constexpr uint64_t kChunkElems = 26214400ULL; // 100 MiB per buffer
-    const uint64_t alloc_elems = std::min(grm_size, kChunkElems);
-    AlignedRawBuffer<float, 64> buf1(alloc_elems);
-    AlignedRawBuffer<float, 64> buf2(alloc_elems);
-    AlignedRawBuffer<float, 64> bufN1(alloc_elems);
-    AlignedRawBuffer<float, 64> bufN2(alloc_elems);
+    std::array<SubInput, 2> in;
+    for (int f = 0; f < 2; ++f) {
+        const auto res = gcta_grm_io::resolve_grm_input(files[static_cast<size_t>(f)], out_fp16);
+        in[static_cast<size_t>(f)].val_path = res.data_path;
+        in[static_cast<size_t>(f)].n_path   = res.n_path;
+        in[static_cast<size_t>(f)].is_fp16  = (res.format == gcta_grm_io::GrmDiskFormat::F16);
+        in[static_cast<size_t>(f)].val_fd   = gcta_grm_detail::open_posix_read(res.data_path);
+        if (!in[static_cast<size_t>(f)].val_fd) {
+            LOGGER.e(0, "can't open [" + res.data_path + "].");
+        }
+        if (in[static_cast<size_t>(f)].is_fp16) {
+            gcta_grm_io::read_grm_f16_header_and_diag(
+                in[static_cast<size_t>(f)].val_fd.get(), res.data_path, common_id,
+                in[static_cast<size_t>(f)].hdr, in[static_cast<size_t>(f)].diag_f32);
+            in[static_cast<size_t>(f)].body_off = static_cast<off_t>(in[static_cast<size_t>(f)].hdr.body_offset);
+            in[static_cast<size_t>(f)].zero_missing =
+                ((in[static_cast<size_t>(f)].hdr.flags & gcta_grm_io::kGrmF16FlagZeroMissing) != 0);
+            in[static_cast<size_t>(f)].valid_markers = in[static_cast<size_t>(f)].hdr.valid_markers;
+            if (in[static_cast<size_t>(f)].zero_missing) {
+                in[static_cast<size_t>(f)].const_n = (in[static_cast<size_t>(f)].hdr.valid_markers > 0)
+                    ? static_cast<double>(in[static_cast<size_t>(f)].hdr.valid_markers)
+                    : in[static_cast<size_t>(f)].hdr.m_snps_mean;
+            } else {
+                in[static_cast<size_t>(f)].n_fd = gcta_grm_detail::open_posix_read(res.n_path);
+                struct stat st{};
+                if (!in[static_cast<size_t>(f)].n_fd || ::fstat(in[static_cast<size_t>(f)].n_fd.get(), &st) != 0 ||
+                    st.st_size < 0 || static_cast<uint64_t>(st.st_size) != grm_f32_size) {
+                    LOGGER.e(0, "The size of [" + res.n_path + "] is not correct.");
+                }
+            }
+        } else {
+            struct stat st{};
+            if (::fstat(in[static_cast<size_t>(f)].val_fd.get(), &st) != 0 ||
+                st.st_size < 0 || static_cast<uint64_t>(st.st_size) != grm_f32_size) {
+                LOGGER.e(0, "The size of [" + res.data_path + "] is not correct.");
+            }
+            in[static_cast<size_t>(f)].n_fd = gcta_grm_detail::open_posix_read(res.n_path);
+            if (!in[static_cast<size_t>(f)].n_fd || ::fstat(in[static_cast<size_t>(f)].n_fd.get(), &st) != 0 ||
+                st.st_size < 0 || static_cast<uint64_t>(st.st_size) != grm_f32_size) {
+                LOGGER.e(0, "The size of [" + res.n_path + "] is not correct.");
+            }
+        }
+    }
 
-    const uint64_t loop_num = (grm_size + kChunkElems - 1ULL) / kChunkElems;
-    const uint64_t remain_item = grm_size % kChunkElems;
-    LOGGER.i(0, "Subtracting GRMs...");
-    const std::string po_grm  = out_file + ".grm.bin";
+    const bool write_fp16 = out_fp16 || (in[0].is_fp16 && in[1].is_fp16);
+    const bool both_zero_missing = in[0].zero_missing && in[1].zero_missing;
+    const bool write_n_file = !(write_fp16 && both_zero_missing);
+
+    if (both_zero_missing && in[0].const_n < in[1].const_n) {
+        LOGGER.e(0, "subtract_grm: the first GRM [" + files[0] + "] has fewer markers than "
+                    "the second [" + files[1] + "]. The larger (all-chromosome) GRM must be listed first.");
+    }
+
+    constexpr uint64_t kChunkElems = 16ULL << 20; // 16M elems (64 MiB f32 / 32 MiB f16)
+    const size_t chunk_elems = static_cast<size_t>(std::max<uint64_t>(1, std::min(grm_size, kChunkElems)));
+
+    LOGGER.i(0, "Subtracting GRMs (single-stream async, output=" +
+                std::string(write_fp16 ? ".grm.f16" : ".grm.bin") + ")...");
+
+    const std::string po_grm  = out_file + (write_fp16 ? ".grm.f16" : ".grm.bin");
     const std::string po_grmN = out_file + ".grm.N.bin";
-    auto fdo_grm  = gcta_grm_detail::open_posix_write_trunc(po_grm);
-    auto fdo_grmN = gcta_grm_detail::open_posix_write_trunc(po_grmN);
-    if (!fdo_grm) {
-        LOGGER.error(0, "can't write to [{}].", po_grm);
-    }
-    if (!fdo_grmN) {
-        LOGGER.error(0, "can't write to [{}].", po_grmN);
+    const uint64_t out_body_off = write_fp16 ? gcta_grm_io::grm_f16_body_offset(n_sub) : 0ULL;
+
+    auto fdo_grm = gcta_grm_detail::open_posix_write_trunc(po_grm);
+    if (!fdo_grm) LOGGER.error(0, "can't write to [{}].", po_grm);
+    gcta_grm_detail::GrmUniqueFd fdo_grmN;
+    if (write_n_file) {
+        fdo_grmN = gcta_grm_detail::open_posix_write_trunc(po_grmN);
+        if (!fdo_grmN) LOGGER.error(0, "can't write to [{}].", po_grmN);
     }
 
-    for (uint64_t i = 0; i < loop_num; i++) {
-        const uint64_t cur_items = (i == loop_num - 1 && remain_item != 0) ? remain_item : kChunkElems;
-        const size_t cur_bytes = static_cast<size_t>(cur_items) * sizeof(float);
+    if (write_fp16) {
+        gcta_grm_io::GrmFp16Header draft{};
+        std::memcpy(draft.magic, gcta_grm_io::kGrmF16MagicDraft, sizeof(draft.magic));
+        draft.version = gcta_grm_io::kGrmF16Version;
+        draft.dtype = gcta_grm_io::kGrmF16DtypeFp16;
+        draft.header_bytes = gcta_grm_io::kGrmF16HeaderSize;
+        draft.n = n_sub;
+        draft.diag_offset = gcta_grm_io::kGrmF16HeaderSize;
+        draft.body_offset = out_body_off;
+        draft.part_row_start = 0;
+        draft.part_row_end = n_sub;
+        std::vector<char> prefix(static_cast<size_t>(out_body_off), 0);
+        std::memcpy(prefix.data(), &draft, sizeof(draft));
+        try {
+            gcta_io::write_exact_throwing(fdo_grm.get(), prefix.data(), prefix.size(), po_grm);
+        } catch (const std::exception& e) {
+            LOGGER.e(0, std::string("subtract_grm: ") + e.what());
+        }
+    }
 
-        bool ok_r1 = true, ok_r2 = true, ok_rn1 = true, ok_rn2 = true;
-        int err_r1 = 0, err_r2 = 0, err_rn1 = 0, err_rn2 = 0;
-        bool eof_r1 = false, eof_r2 = false, eof_rn1 = false, eof_rn2 = false;
-        #pragma omp parallel sections num_threads(4)
+    // Double-buffered 1-thread sequential reader
+    struct SubInSlot {
+        AlignedRawBuffer<char, 64> g1, g2;
+        AlignedRawBuffer<float, 64> n1, n2;
+        size_t elems = 0;
+        size_t offset = 0;
+    };
+    std::array<SubInSlot, 2> rslots;
+    for (int s = 0; s < 2; ++s) {
+        rslots[static_cast<size_t>(s)].g1.resize(chunk_elems * (in[0].is_fp16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float)));
+        rslots[static_cast<size_t>(s)].g2.resize(chunk_elems * (in[1].is_fp16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float)));
+        if (!in[0].zero_missing) rslots[static_cast<size_t>(s)].n1.resize(chunk_elems);
+        if (!in[1].zero_missing) rslots[static_cast<size_t>(s)].n2.resize(chunk_elems);
+    }
+
+    std::mutex rmu;
+    std::condition_variable_any r_ready_cv, r_free_cv;
+    std::array<bool, 2> r_busy{false, false};
+    std::array<int, 2> r_ring{0, 0};
+    int r_head = 0, r_tail = 0, r_count = 0;
+    bool r_failed = false;
+    std::exception_ptr r_err;
+
+    std::jthread reader([&](std::stop_token st) {
+        try {
+            size_t seq = 0;
+            for (size_t offset = 0; offset < grm_size && !st.stop_requested(); offset += chunk_elems) {
+                const size_t elems = static_cast<size_t>(std::min<uint64_t>(chunk_elems, grm_size - offset));
+                const int slot = static_cast<int>(seq & 1u);
+                ++seq;
+                {
+                    std::unique_lock<std::mutex> lock(rmu);
+                    r_free_cv.wait(lock, st, [&]() { return !r_busy[static_cast<size_t>(slot)]; });
+                    if (st.stop_requested()) return;
+                    r_busy[static_cast<size_t>(slot)] = true;
+                }
+                auto& rs = rslots[static_cast<size_t>(slot)];
+                const size_t b0 = elems * (in[0].is_fp16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float));
+                const size_t b1 = elems * (in[1].is_fp16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float));
+                gcta_io::read_exact_at_throwing(in[0].val_fd.get(), rs.g1.data(), b0,
+                    in[0].body_off + static_cast<off_t>(offset * (in[0].is_fp16 ? 2u : 4u)), in[0].val_path);
+                if (!in[0].zero_missing) {
+                    gcta_io::read_exact_at_throwing(in[0].n_fd.get(), rs.n1.data(), elems * sizeof(float),
+                        static_cast<off_t>(offset * sizeof(float)), in[0].n_path);
+                }
+                gcta_io::read_exact_at_throwing(in[1].val_fd.get(), rs.g2.data(), b1,
+                    in[1].body_off + static_cast<off_t>(offset * (in[1].is_fp16 ? 2u : 4u)), in[1].val_path);
+                if (!in[1].zero_missing) {
+                    gcta_io::read_exact_at_throwing(in[1].n_fd.get(), rs.n2.data(), elems * sizeof(float),
+                        static_cast<off_t>(offset * sizeof(float)), in[1].n_path);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(rmu);
+                    rs.elems = elems;
+                    rs.offset = offset;
+                    r_ring[static_cast<size_t>(r_tail)] = slot;
+                    r_tail = (r_tail + 1) & 1;
+                    ++r_count;
+                }
+                r_ready_cv.notify_one();
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(rmu);
+                r_err = std::current_exception();
+                r_failed = true;
+            }
+            r_ready_cv.notify_all();
+        }
+    });
+
+    // Double-buffered 1-thread sequential writer (writes grm then N sequentially)
+    struct SubOutSlot {
+        AlignedRawBuffer<char, 64> g;
+        AlignedRawBuffer<float, 64> n;
+        size_t g_bytes = 0;
+        size_t n_bytes = 0;
+    };
+    const size_t out_g_bpe = write_fp16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
+    std::array<SubOutSlot, 2> wslots;
+    for (int s = 0; s < 2; ++s) {
+        wslots[static_cast<size_t>(s)].g.resize(chunk_elems * out_g_bpe);
+        if (write_n_file) wslots[static_cast<size_t>(s)].n.resize(chunk_elems);
+    }
+
+    std::mutex wmu;
+    std::condition_variable_any w_work_cv, w_space_cv;
+    std::array<bool, 2> w_queued{false, false};
+    std::array<int, 2> w_ring{0, 0};
+    int w_head = 0, w_tail = 0, w_count = 0;
+    bool w_closing = false, w_abort = false, w_failed = false;
+    std::exception_ptr w_err;
+
+    std::jthread writer([&](std::stop_token st) {
+        while (true) {
+            int slot = -1;
+            {
+                std::unique_lock<std::mutex> lock(wmu);
+                w_work_cv.wait(lock, st, [&]() { return w_count > 0 || w_closing || w_abort || w_failed; });
+                if (w_abort || w_failed) return;
+                if (w_count == 0) {
+                    if (w_closing || st.stop_requested()) return;
+                    continue;
+                }
+                slot = w_ring[static_cast<size_t>(w_head)];
+                w_head = (w_head + 1) & 1;
+                --w_count;
+            }
+            try {
+                const auto& ws = wslots[static_cast<size_t>(slot)];
+                if (ws.g_bytes > 0) gcta_io::write_exact_throwing(fdo_grm.get(), ws.g.data(), ws.g_bytes, po_grm);
+                if (write_n_file && ws.n_bytes > 0) gcta_io::write_exact_throwing(fdo_grmN.get(), ws.n.data(), ws.n_bytes, po_grmN);
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(wmu);
+                    w_err = std::current_exception();
+                    w_failed = true;
+                    w_queued[static_cast<size_t>(slot)] = false;
+                }
+                w_space_cv.notify_all();
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(wmu);
+                w_queued[static_cast<size_t>(slot)] = false;
+            }
+            w_space_cv.notify_all();
+        }
+    });
+
+    std::vector<float> out_diag_f32;
+    if (write_fp16) out_diag_f32.assign(static_cast<size_t>(n_sub), 0.0f);
+    double tr_K = 0.0, tr_K2 = 0.0, diag_n_sum = 0.0;
+    uint64_t next_diag_row = 0;
+    std::vector<std::pair<uint64_t, size_t>> chunk_diags;
+    int next_wslot = 0;
+
+    auto abort_threads = [&]() {
+        reader.request_stop();
+        r_free_cv.notify_all();
+        if (reader.joinable()) reader.join();
         {
-            #pragma omp section
-            { ok_r1  = gcta_grm_detail::read_exact_posix(fd_grm1.get(),  buf1.data(),  cur_bytes, err_r1,  eof_r1); }
-            #pragma omp section
-            { ok_r2  = gcta_grm_detail::read_exact_posix(fd_grm2.get(),  buf2.data(),  cur_bytes, err_r2,  eof_r2); }
-            #pragma omp section
-            { ok_rn1 = gcta_grm_detail::read_exact_posix(fd_grmN1.get(), bufN1.data(), cur_bytes, err_rn1, eof_rn1); }
-            #pragma omp section
-            { ok_rn2 = gcta_grm_detail::read_exact_posix(fd_grmN2.get(), bufN2.data(), cur_bytes, err_rn2, eof_rn2); }
+            std::lock_guard<std::mutex> lock(wmu);
+            w_abort = true;
+            w_closing = true;
         }
-        if (!ok_r1 || !ok_r2 || !ok_rn1 || !ok_rn2) {
-            LOGGER.e(0, "subtract_grm: failed reading input GRM files.");
-        }
+        writer.request_stop();
+        w_work_cv.notify_all();
+        if (writer.joinable()) writer.join();
+    };
 
-        // On the first chunk, check that file[0] has at least as many markers as file[1].
-        // A negative N_diff means the files are in the wrong order (chr GRM listed first).
-        if (i == 0 && cur_items > 0 && bufN1[0] < bufN2[0]) {
-            LOGGER.e(0, "subtract_grm: the first GRM [" + files[0] + "] has fewer markers than "
+    try {
+        for (size_t offset = 0; offset < grm_size; offset += chunk_elems) {
+            int rslot = -1;
+            {
+                std::unique_lock<std::mutex> lock(rmu);
+                r_ready_cv.wait(lock, [&]() { return r_failed || r_count > 0; });
+                if (r_failed) std::rethrow_exception(r_err);
+                rslot = r_ring[static_cast<size_t>(r_head)];
+                r_head = (r_head + 1) & 1;
+                --r_count;
+            }
+            const auto& rs = rslots[static_cast<size_t>(rslot)];
+            const size_t elems = rs.elems;
+
+            if (offset == 0 && elems > 0) {
+                const double n1_0 = in[0].zero_missing ? in[0].const_n : static_cast<double>(rs.n1[0]);
+                const double n2_0 = in[1].zero_missing ? in[1].const_n : static_cast<double>(rs.n2[0]);
+                if (n1_0 < n2_0) {
+                    throw std::runtime_error(
+                        "subtract_grm: the first GRM [" + files[0] + "] has fewer markers than "
                         "the second [" + files[1] + "] in the first pair. "
                         "The larger (all-chromosome) GRM must be listed first.");
+                }
+            }
+
+            chunk_diags.clear();
+            while (next_diag_row < n_sub) {
+                const uint64_t dpos = next_diag_row * (next_diag_row + 1ULL) / 2ULL + next_diag_row;
+                if (dpos >= offset + elems) break;
+                chunk_diags.emplace_back(next_diag_row, static_cast<size_t>(dpos - offset));
+                ++next_diag_row;
+            }
+
+            int wslot = -1;
+            {
+                std::unique_lock<std::mutex> lock(wmu);
+                w_space_cv.wait(lock, [&]() { return w_failed || !w_queued[0] || !w_queued[1]; });
+                if (w_failed) std::rethrow_exception(w_err);
+                wslot = !w_queued[static_cast<size_t>(next_wslot)] ? next_wslot : (1 - next_wslot);
+                next_wslot = 1 - wslot;
+            }
+            auto& ws = wslots[static_cast<size_t>(wslot)];
+
+            const bool g1_f16 = in[0].is_fp16;
+            const bool g2_f16 = in[1].is_fp16;
+            const bool n1_const = in[0].zero_missing;
+            const bool n2_const = in[1].zero_missing;
+            const double cn1 = in[0].const_n;
+            const double cn2 = in[1].const_n;
+
+            const auto* p1_f16 = g1_f16 ? reinterpret_cast<const gcta_grm_io::GrmFp16*>(rs.g1.data()) : nullptr;
+            const auto* p1_f32 = g1_f16 ? nullptr : reinterpret_cast<const float*>(rs.g1.data());
+            const auto* p2_f16 = g2_f16 ? reinterpret_cast<const gcta_grm_io::GrmFp16*>(rs.g2.data()) : nullptr;
+            const auto* p2_f32 = g2_f16 ? nullptr : reinterpret_cast<const float*>(rs.g2.data());
+            const float* pn1 = n1_const ? nullptr : rs.n1.data();
+            const float* pn2 = n2_const ? nullptr : rs.n2.data();
+
+            if (write_fp16) {
+                auto* og = reinterpret_cast<gcta_grm_io::GrmFp16*>(ws.g.data());
+                float* on = write_n_file ? ws.n.data() : nullptr;
+                double chunk_all_sq = 0.0;
+                #pragma omp parallel for reduction(+:chunk_all_sq) schedule(static)
+                for (size_t j = 0; j < elems; ++j) {
+                    const double v1 = g1_f16 ? static_cast<double>(gcta_grm_io::fp16_to_f32(p1_f16[j]))
+                                             : static_cast<double>(p1_f32[j]);
+                    const double v2 = g2_f16 ? static_cast<double>(gcta_grm_io::fp16_to_f32(p2_f16[j]))
+                                             : static_cast<double>(p2_f32[j]);
+                    const double nn1 = n1_const ? cn1 : static_cast<double>(pn1[j]);
+                    const double nn2 = n2_const ? cn2 : static_cast<double>(pn2[j]);
+                    const double nd = nn1 - nn2;
+                    const float res = (nd > 0.0) ? static_cast<float>((v1 * nn1 - v2 * nn2) / nd) : 0.0f;
+                    og[j] = gcta_grm_io::f32_to_fp16(res);
+                    if (on) on[j] = static_cast<float>(nd);
+                    const double rd = static_cast<double>(res);
+                    chunk_all_sq += rd * rd;
+                }
+                double diag_sq_old = 0.0;
+                double diag_sq_new = 0.0;
+                for (const auto& [r, loc] : chunk_diags) {
+                    const double v1_q = g1_f16 ? static_cast<double>(gcta_grm_io::fp16_to_f32(p1_f16[loc]))
+                                               : static_cast<double>(p1_f32[loc]);
+                    const double v2_q = g2_f16 ? static_cast<double>(gcta_grm_io::fp16_to_f32(p2_f16[loc]))
+                                               : static_cast<double>(p2_f32[loc]);
+                    const double v1_e = g1_f16 ? static_cast<double>(in[0].diag_f32[static_cast<Eigen::Index>(r)]) : v1_q;
+                    const double v2_e = g2_f16 ? static_cast<double>(in[1].diag_f32[static_cast<Eigen::Index>(r)]) : v2_q;
+                    const double nn1 = n1_const ? cn1 : static_cast<double>(pn1[loc]);
+                    const double nn2 = n2_const ? cn2 : static_cast<double>(pn2[loc]);
+                    const double nd = nn1 - nn2;
+                    const float old_d = (nd > 0.0) ? static_cast<float>((v1_q * nn1 - v2_q * nn2) / nd) : 0.0f;
+                    const float exact_d = (nd > 0.0) ? static_cast<float>((v1_e * nn1 - v2_e * nn2) / nd) : 0.0f;
+                    og[loc] = gcta_grm_io::f32_to_fp16(exact_d);
+                    out_diag_f32[static_cast<size_t>(r)] = exact_d;
+                    diag_n_sum += nd;
+                    tr_K += static_cast<double>(exact_d);
+                    diag_sq_old += static_cast<double>(old_d) * static_cast<double>(old_d);
+                    diag_sq_new += static_cast<double>(exact_d) * static_cast<double>(exact_d);
+                }
+                tr_K2 += 2.0 * (chunk_all_sq - diag_sq_old) + diag_sq_new;
+                ws.g_bytes = elems * sizeof(gcta_grm_io::GrmFp16);
+                ws.n_bytes = write_n_file ? (elems * sizeof(float)) : 0;
+            } else {
+                auto* og = reinterpret_cast<float*>(ws.g.data());
+                float* on = ws.n.data();
+                #pragma omp parallel for schedule(static)
+                for (size_t j = 0; j < elems; ++j) {
+                    const double v1 = g1_f16 ? static_cast<double>(gcta_grm_io::fp16_to_f32(p1_f16[j]))
+                                             : static_cast<double>(p1_f32[j]);
+                    const double v2 = g2_f16 ? static_cast<double>(gcta_grm_io::fp16_to_f32(p2_f16[j]))
+                                             : static_cast<double>(p2_f32[j]);
+                    const float fn1 = n1_const ? static_cast<float>(cn1) : pn1[j];
+                    const float fn2 = n2_const ? static_cast<float>(cn2) : pn2[j];
+                    const float fnd = fn1 - fn2;
+                    on[j] = fnd;
+                    og[j] = (fnd > 0.0f)
+                        ? static_cast<float>((v1 * static_cast<double>(fn1) - v2 * static_cast<double>(fn2)) /
+                                             static_cast<double>(fnd))
+                        : 0.0f;
+                }
+                for (const auto& [r, loc] : chunk_diags) {
+                    if (g1_f16 || g2_f16) {
+                        const double v1 = g1_f16 ? static_cast<double>(in[0].diag_f32[static_cast<Eigen::Index>(r)])
+                                                 : static_cast<double>(p1_f32[loc]);
+                        const double v2 = g2_f16 ? static_cast<double>(in[1].diag_f32[static_cast<Eigen::Index>(r)])
+                                                 : static_cast<double>(p2_f32[loc]);
+                        const float fn1 = n1_const ? static_cast<float>(cn1) : pn1[loc];
+                        const float fn2 = n2_const ? static_cast<float>(cn2) : pn2[loc];
+                        const float fnd = fn1 - fn2;
+                        og[loc] = (fnd > 0.0f)
+                            ? static_cast<float>((v1 * static_cast<double>(fn1) - v2 * static_cast<double>(fn2)) /
+                                                 static_cast<double>(fnd))
+                            : 0.0f;
+                    }
+                }
+                ws.g_bytes = elems * sizeof(float);
+                ws.n_bytes = elems * sizeof(float);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(rmu);
+                r_busy[static_cast<size_t>(rslot)] = false;
+            }
+            r_free_cv.notify_one();
+
+            {
+                std::lock_guard<std::mutex> lock(wmu);
+                if (w_failed) std::rethrow_exception(w_err);
+                w_queued[static_cast<size_t>(wslot)] = true;
+                w_ring[static_cast<size_t>(w_tail)] = wslot;
+                w_tail = (w_tail + 1) & 1;
+                ++w_count;
+            }
+            w_work_cv.notify_one();
         }
 
-        float* __restrict__ p1  = buf1.data();
-        const float* __restrict__ p2  = buf2.data();
-        float* __restrict__ pn1 = bufN1.data();
-        const float* __restrict__ pn2 = bufN2.data();
-        #pragma omp parallel for schedule(static)
-        for (uint64_t j = 0; j < cur_items; j++) {
-            const float n1 = pn1[j];
-            const float n2 = pn2[j];
-            const float nd = n1 - n2;
-            pn1[j] = nd;
-            // Guard against zero denominator: a pair where all markers in the subtracted
-            // GRM are also missing in the full GRM (N_all == N_chr for that pair).
-            p1[j] = (nd > 0.0f)
-                ? static_cast<float>((static_cast<double>(p1[j]) * static_cast<double>(n1)
-                                    - static_cast<double>(p2[j]) * static_cast<double>(n2))
-                                   / static_cast<double>(nd))
-                : 0.0f;
-        }
+        if (reader.joinable()) reader.join();
+        if (r_failed) std::rethrow_exception(r_err);
 
-        bool ok_wg = true, ok_wn = true;
-        int err_wg = 0, err_wn = 0;
-        #pragma omp parallel sections num_threads(2)
         {
-            #pragma omp section
-            { ok_wg = gcta_grm_detail::write_exact_posix(fdo_grm.get(),  buf1.data(),  cur_bytes, err_wg); }
-            #pragma omp section
-            { ok_wn = gcta_grm_detail::write_exact_posix(fdo_grmN.get(), bufN1.data(), cur_bytes, err_wn); }
+            std::lock_guard<std::mutex> lock(wmu);
+            w_closing = true;
         }
-        if (!ok_wg) {
-            LOGGER.e(0, "can't write to [" + po_grm + "]: " + std::string(std::strerror(err_wg)));
+        w_work_cv.notify_all();
+        if (writer.joinable()) writer.join();
+        if (w_failed) std::rethrow_exception(w_err);
+
+        if (write_fp16) {
+            gcta_grm_io::GrmFp16Header final_hdr{};
+            std::memcpy(final_hdr.magic, gcta_grm_io::kGrmF16MagicFinal, sizeof(final_hdr.magic));
+            final_hdr.version = gcta_grm_io::kGrmF16Version;
+            final_hdr.dtype = gcta_grm_io::kGrmF16DtypeFp16;
+            final_hdr.header_bytes = gcta_grm_io::kGrmF16HeaderSize;
+            final_hdr.flags = gcta_grm_io::kGrmF16FlagFinalized | gcta_grm_io::kGrmF16FlagHasTraces |
+                              gcta_grm_io::kGrmF16FlagHasDiagF32 |
+                              (both_zero_missing ? gcta_grm_io::kGrmF16FlagZeroMissing : 0u);
+            final_hdr.n = n_sub;
+            final_hdr.m_snps_mean = both_zero_missing
+                ? std::max(0.0, in[0].const_n - in[1].const_n)
+                : (n_sub > 0 ? diag_n_sum / static_cast<double>(n_sub) : 0.0);
+            const uint64_t diff_vm = (in[0].valid_markers >= in[1].valid_markers)
+                ? (in[0].valid_markers - in[1].valid_markers)
+                : 0ULL;
+            final_hdr.valid_markers = (diff_vm > 0)
+                ? diff_vm
+                : (final_hdr.m_snps_mean > 0.0
+                       ? static_cast<uint64_t>(std::llround(final_hdr.m_snps_mean))
+                       : 0ULL);
+            final_hdr.id_hash = gcta_io::hash_sample_ids(common_id);
+            final_hdr.trace_K = tr_K;
+            final_hdr.trace_K2 = tr_K2;
+            final_hdr.diag_offset = gcta_grm_io::kGrmF16HeaderSize;
+            final_hdr.body_offset = out_body_off;
+            final_hdr.part_row_start = 0;
+            final_hdr.part_row_end = n_sub;
+            final_hdr.mtd_weight = 1.0;
+
+            if (n_sub > 0) {
+                gcta_io::pwrite_exact_throwing(
+                    fdo_grm.get(), out_diag_f32.data(),
+                    static_cast<size_t>(n_sub) * sizeof(float),
+                    static_cast<off_t>(final_hdr.diag_offset), po_grm);
+            }
+            gcta_io::pwrite_exact_throwing(fdo_grm.get(), &final_hdr, sizeof(final_hdr), 0, po_grm);
         }
-        if (!ok_wn) {
-            LOGGER.e(0, "can't write to [" + po_grmN + "]: " + std::string(std::strerror(err_wn)));
-        }
+    } catch (const std::exception& e) {
+        abort_threads();
+        LOGGER.e(0, std::string("subtract_grm: ") + e.what());
     }
+
     fdo_grm.reset();
     fdo_grmN.reset();
-    LOGGER.i(0, "The subtracted GRM has been written to [" + out_file + ".grm.bin, .grm.N.bin].");
+    LOGGER.i(0, "The subtracted GRM has been written to [" + po_grm +
+                (write_n_file ? ", " + po_grmN : " (zero-missing; .grm.N.bin omitted)") + "].");
 }
 
-void GRM::merge_grm(string mgrm_file, string out_file, int memory_budget_gb){
+void GRM::merge_grm(string mgrm_file, string out_file, int memory_budget_gb, bool out_fp16){
     std::ifstream mgrm(mgrm_file.c_str());
-    if(!mgrm){
+    if (!mgrm) {
         LOGGER.e(0, "can't open " + mgrm_file + " to read.");
     }
 
     string line;
     vector<string> files;
     vector<string> err_files;
-    while(getline(mgrm, line)){
+    while (getline(mgrm, line)) {
         boost::trim(line);
-        if(!line.empty()){
-            if(checkFileReadable(line + ".grm.id") &&
-               checkFileReadable(line + ".grm.bin") &&
-               checkFileReadable(line + ".grm.N.bin")){
+        if (!line.empty()) {
+            if (gcta_grm_detail::prefix_has_readable_grm(line, /*require_n_for_f32=*/true)) {
                 files.push_back(line);
-            }else{
+            } else {
                 err_files.push_back(line);
             }
         }
     }
 
-    if(err_files.size() != 0){
-        string out_err = "can't read GRM (*.grm.id, *.grm.bin, *.grm.N.bin) in ";
+    if (!err_files.empty()) {
+        string out_err = "can't read GRM (*.grm.id, *.grm.bin/.grm.f16, *.grm.N.bin) in ";
         out_err += boost::algorithm::join(err_files, ", ");
         out_err += ".";
         LOGGER.e(0, out_err);
     }
-    if(files.size() < 2){
+    if (files.size() < 2) {
         LOGGER.e(0, "streaming merge needs at least two GRMs in --mgrm.");
     }
 
-    gcta_grm_io::merge_grms(files, out_file, memory_budget_gb);
+    gcta_grm_io::merge_grms(files, out_file, memory_budget_gb, out_fp16);
 }
 
-
-void GRM::unify_grm(string mgrm_file, string out_file){
+// ---------------------------------------------------------------------------
+// GRM::unify_grm — HPC-safe sequential unification (zero multi-file OMP storm,
+// zero O(N^2) 4-byte fseeko+fread seeks, zero std::endl flushes, .grm.f16 aware).
+// ---------------------------------------------------------------------------
+void GRM::unify_grm(string mgrm_file, string out_file, bool out_fp16){
     std::ifstream mgrm(mgrm_file.c_str());
-    if(!mgrm){
+    if (!mgrm) {
         LOGGER.e(0, "can't open " + mgrm_file + " to read.");
     }
     string line;
     vector<string> files;
     vector<string> err_files;
-    while(getline(mgrm, line)){
+    while (getline(mgrm, line)) {
         boost::trim(line);
-        if(!line.empty()){
-            if(checkFileReadable(line+".grm.id") && checkFileReadable(line+".grm.bin")){
+        if (!line.empty()) {
+            if (gcta_grm_detail::prefix_has_readable_grm(line, /*require_n_for_f32=*/false)) {
                 files.push_back(line);
-            }else{
+            } else {
                 err_files.push_back(line);
             }
         }
     }
 
-    if(err_files.size() != 0){
-        string out_err = "can't read GRM (*.grm.id, *.grm.bin) in ";
+    if (!err_files.empty()) {
+        string out_err = "can't read GRM (*.grm.id, *.grm.bin/.grm.f16) in ";
         out_err += boost::algorithm::join(err_files, ", ");
         out_err += ".";
         LOGGER.e(0, out_err);
     }
-    if(files.size() < 2){
+    if (files.size() < 2) {
         LOGGER.e(0, "not enough valid GRMs to be unified.");
     }
 
     LOGGER.i(0, "Reading [" + files[0] + ".grm.id]...");
     vector<string> common_id = Pheno::read_sublist(files[0] + ".grm.id");
     LOGGER << common_id.size() << " samples have been read." << std::endl;
-    vector<vector<string>> ids;
-    ids.resize(files.size());
-    
+    vector<vector<string>> ids(files.size());
     ids[0] = common_id;
-    for(int i = 1; i < files.size(); i++){
+    for (size_t i = 1; i < files.size(); i++) {
         string cur_file = files[i] + ".grm.id";
         LOGGER.i(0, "Reading [" + cur_file + "]...");
         ids[i] = Pheno::read_sublist(cur_file);
         LOGGER << ids[i].size() << " samples have been read." << std::endl;
         vector<uint32_t> index1, index2;
-        vector_commonIndex_sorted1(common_id, ids[i], index1, index2); 
+        vector_commonIndex_sorted1(common_id, ids[i], index1, index2);
         vector<string> temp_common_id(index1.size());
-        std::ranges::transform(index1, temp_common_id.begin(), [&common_id](uint32_t v){
-                return common_id[v];});
-        common_id = temp_common_id;
+        std::ranges::transform(index1, temp_common_id.begin(), [&common_id](uint32_t v) {
+            return common_id[v];
+        });
+        common_id = std::move(temp_common_id);
         LOGGER << common_id.size() << " common samples in GRMs" << std::endl;
     }
-    if(!keep_file.empty()){
+    if (!keep_file.empty()) {
         LOGGER.i(0, "Keeping individuals listed in [" + keep_file + "]...");
         vector<string> keep_id = Pheno::read_sublist(keep_file);
         LOGGER << keep_id.size() << " samples have been read." << std::endl;
         vector<uint32_t> index1, index2;
         vector_commonIndex_sorted1(common_id, keep_id, index1, index2);
         vector<string> temp_common_id(index1.size());
-        std::ranges::transform(index1, temp_common_id.begin(), [&common_id](uint32_t v){
-                return common_id[v];});
-        common_id = temp_common_id;
+        std::ranges::transform(index1, temp_common_id.begin(), [&common_id](uint32_t v) {
+            return common_id[v];
+        });
+        common_id = std::move(temp_common_id);
         LOGGER << common_id.size() << " common samples after merging." << std::endl;
     }
-    if(!remove_file.empty()){
+    if (!remove_file.empty()) {
         LOGGER.i(0, "Excluding individuals listed in [" + remove_file + "]...");
         vector<string> remove_id = Pheno::read_sublist(remove_file);
         LOGGER << remove_id.size() << " samples have been read." << std::endl;
@@ -493,470 +843,1156 @@ void GRM::unify_grm(string mgrm_file, string out_file){
         vector<uint32_t> remain_index;
         std::set_difference(keeps.begin(), keeps.end(), index1.begin(), index1.end(), std::back_inserter(remain_index));
         vector<string> remain_ids(remain_index.size());
-        std::ranges::transform(remain_index, remain_ids.begin(), [&common_id](uint32_t v){
-                return common_id[v];});
-        common_id = remain_ids;
+        std::ranges::transform(remain_index, remain_ids.begin(), [&common_id](uint32_t v) {
+            return common_id[v];
+        });
+        common_id = std::move(remain_ids);
         LOGGER << common_id.size() << " common samples after merging." << std::endl;
     }
+
     vector<vector<uint32_t>> grm_indices(files.size());
-    //produce output file names
     vector<string> output_fileNames;
     const string& out_string = out_file;
     const auto basename_out_result = getFileName(out_string);
-    if(!basename_out_result){
+    if (!basename_out_result) {
         LOGGER.e(0, "Invalid output path [" + out_string + "]: " + std::string(getUtilsErrorMessage(basename_out_result.error())));
     }
     const auto path_out_result = getPathName(out_string);
-    if(!path_out_result){
+    if (!path_out_result) {
         LOGGER.e(0, "Invalid output path [" + out_string + "]: " + std::string(getUtilsErrorMessage(path_out_result.error())));
     }
     const string basename_out = basename_out_result.value();
     const string path_out = path_out_result.value();
-    for(auto & filename : files){
+    for (auto& filename : files) {
         const auto basename_result = getFileName(filename);
-        if(!basename_result){
+        if (!basename_result) {
             LOGGER.e(0, "Invalid GRM file path [" + filename + "]: " + std::string(getUtilsErrorMessage(basename_result.error())));
         }
         const auto output_path_result = joinPath(path_out, basename_result.value() + "_" + basename_out);
-        if(!output_path_result){
+        if (!output_path_result) {
             LOGGER.e(0, "Failed to compose output path for [" + filename + "]: " + std::string(getUtilsErrorMessage(output_path_result.error())));
         }
         output_fileNames.push_back(output_path_result.value());
     }
 
-    #pragma omp parallel for
-    for(int i = 0; i < files.size(); i++){
+    // Compute per-file mappings and write .grm.id sequentially (zero std::endl).
+    for (size_t i = 0; i < files.size(); i++) {
         string id_file_name = output_fileNames[i] + ".grm.id";
         vector<uint32_t> index1;
         vector_commonIndex_sorted1(common_id, ids[i], index1, grm_indices[i]);
-        std::ofstream out_id(id_file_name.c_str());
-        for(auto & index: grm_indices[i]){
-            out_id << ids[i][index] << std::endl;
+        vector<string> out_ids;
+        out_ids.reserve(grm_indices[i].size());
+        for (uint32_t idx : grm_indices[i]) {
+            out_ids.push_back(ids[i][idx]);
         }
-        out_id.close();
+        gcta_grm_io::write_id_file_buffered(id_file_name, out_ids);
         LOGGER.i(0, "Unified individual IDs have been saved to [" + id_file_name + "].");
     }
 
-    LOGGER.i(0, "Writing unified GRM in binary format...");
-    #pragma omp parallel for
-    for(int i = 0; i < grm_indices.size(); i++){
-        vector<uint32_t> &p_index = grm_indices[i];
-        uint32_t size_grm = p_index.size();
-        uint32_t largest_grm_size = ids[i].size();
-        string file_name = files[i] + ".grm.bin";
-        string wfile_name = output_fileNames[i] + ".grm.bin";
-        UniqueFile h_grm = open_file(file_name, "rb");
-        if (!h_grm) {
-            LOGGER.e(0, "can't read " + file_name + ".");
+    LOGGER.i(0, "Writing unified GRMs sequentially...");
+    const uint64_t common_id_hash = gcta_io::hash_sample_ids(common_id);
+
+    // Process one GRM at a time (strictly <= 1 sequential reader + <= 1 sequential writer).
+    for (size_t i = 0; i < grm_indices.size(); i++) {
+        const vector<uint32_t>& p_index = grm_indices[i];
+        const int size_grm = static_cast<int>(p_index.size());
+        const int largest_grm_size = static_cast<int>(ids[i].size());
+
+        const auto resolved = gcta_grm_io::resolve_grm_input(files[i], out_fp16);
+        const bool in_is_f16 = (resolved.format == gcta_grm_io::GrmDiskFormat::F16);
+        const bool emit_f16 = out_fp16 || in_is_f16;
+        const size_t in_bpe = in_is_f16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
+        const size_t out_bpe = emit_f16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
+
+        const int in_fd = gcta_grm_io::open_readonly_checked(resolved.data_path);
+        gcta_grm_io::GrmFp16Header in_hdr{};
+        Eigen::VectorXf in_diag;
+        off_t in_body_off = 0;
+        if (in_is_f16) {
+            gcta_grm_io::read_grm_f16_header_and_diag(in_fd, resolved.data_path, ids[i], in_hdr, in_diag);
+            in_body_off = static_cast<off_t>(in_hdr.body_offset);
+        } else {
+            gcta_grm_io::detail::validate_f32_bin_size(in_fd, resolved.data_path, largest_grm_size);
         }
 
-        UniqueFile h_wgrm = open_file(wfile_name, "wb");
-        if (!h_wgrm) {
-            LOGGER.e(0, "can't write to " + wfile_name + ".");
-        }
+        const string wfile_name = output_fileNames[i] + (emit_f16 ? ".grm.f16" : ".grm.bin");
+        const uint64_t out_body_off = emit_f16 ? gcta_grm_io::grm_f16_body_offset(static_cast<uint64_t>(size_grm)) : 0ULL;
 
-        std::vector<float> buf(largest_grm_size);
-        std::vector<float> wbuf(size_grm);
-
-        vector<uint64_t> start_pos(largest_grm_size);
-        for(uint64_t j = 0; j < largest_grm_size; j++){
-            uint64_t byte_start_grm = (1ULL + j) * j / 2ULL * sizeof(float);
-            start_pos[j] = byte_start_grm;
-        }
-
-        for(uint32_t j = 0; j < size_grm; j++){
-            uint64_t grm_index = p_index[j];
-            uint64_t num_grm = grm_index + 1;
-            uint64_t byte_start_grm = start_pos[grm_index];
-            fseeko(h_grm.get(), static_cast<off_t>(byte_start_grm), SEEK_SET);
-            if(fread(buf.data(), sizeof(float), num_grm, h_grm.get()) != num_grm){
-                LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(ftello(h_grm.get())), ".");
+        std::vector<int> kp(static_cast<size_t>(size_grm));
+        bool is_monotonic = true;
+        for (int j = 0; j < size_grm; ++j) {
+            kp[static_cast<size_t>(j)] = static_cast<int>(p_index[static_cast<size_t>(j)]);
+            if (j > 0 && kp[static_cast<size_t>(j)] <= kp[static_cast<size_t>(j - 1)]) {
+                is_monotonic = false;
             }
-            uint64_t size_write = static_cast<uint64_t>(j) + 1ULL;
-            for(uint64_t k = 0; k < size_write; k++){
-                uint32_t cur_index = p_index[k];
-                float grm_value;
-                if(cur_index < num_grm){
-                    grm_value = buf[cur_index];
-                }else{
-                    //fill the other parts
-                    uint64_t bytes_offset = start_pos[cur_index] + grm_index * sizeof(float);
-                    fseeko(h_grm.get(), static_cast<off_t>(bytes_offset), SEEK_SET);
-                    if(fread(&grm_value, sizeof(float), 1, h_grm.get()) != 1){
-                        LOGGER.e(0, "error in reading [" + file_name + "], in position " + to_string(bytes_offset), ".");
+        }
+
+        std::vector<float> out_diag;
+        if (emit_f16) out_diag.assign(static_cast<size_t>(size_grm), 0.0f);
+        double tr_K = 0.0, tr_K2 = 0.0;
+
+        try {
+            gcta_io::AsyncSeqWriter writer(wfile_name, gcta_grm_detail::kGrmAsyncSlotBytes,
+                                           static_cast<off_t>(out_body_off));
+            if (emit_f16) {
+                gcta_grm_io::write_grm_f16_draft_prefix(writer, static_cast<uint64_t>(size_grm));
+            }
+
+            if (is_monotonic && size_grm > 0) {
+                const bool is_identity = (size_grm == largest_grm_size && kp.front() == 0 && kp.back() == size_grm - 1);
+                std::vector<gcta_grm_io::KpRun> kp_runs;
+                if (!is_identity) {
+                    auto runs = gcta_grm_io::build_kp_runs(kp);
+                    if (runs.size() * 2 < static_cast<size_t>(size_grm)) {
+                        kp_runs = std::move(runs);
                     }
                 }
-                wbuf[k] = grm_value;
-            }
-            //last element
-            //*(wbuf + j) = *(buf + grm_index);
 
-            if(size_write != fwrite(wbuf.data(), sizeof(float), size_write, h_wgrm.get())){
-                LOGGER.e(0, "error in writing to [" + wfile_name + "], pos: " + std::to_string(ftello(h_wgrm.get())) + ".");
+                const size_t max_in_elems = std::max<size_t>(1, gcta_grm_detail::kGrmAsyncSlotBytes / in_bpe);
+                std::vector<gcta_grm_io::detail::RowChunkPlan> plans;
+                std::vector<std::pair<off_t, size_t>> io_chunks;
+                gcta_grm_io::detail::build_row_chunk_plan(
+                    largest_grm_size, &kp, is_identity, max_in_elems,
+                    in_body_off, in_bpe, plans, io_chunks);
+
+                gcta_io::AsyncSeqReader reader(in_fd, resolved.data_path, std::move(io_chunks),
+                                               /*max_slot_bytes=*/0, /*take_ownership=*/false);
+                const char* raw_ptr = nullptr;
+                size_t raw_len = 0;
+                size_t pidx = 0;
+                while (reader.next_slot(raw_ptr, raw_len)) {
+                    const auto& plan = plans[pidx++];
+                    const size_t in_base = static_cast<size_t>(plan.row_lo) * (plan.row_lo + 1) / 2;
+                    const int j_lo = plan.j_lo;
+                    const int j_hi = plan.j_hi;
+                    const size_t out_base = static_cast<size_t>(j_lo) * (j_lo + 1) / 2;
+                    const size_t out_end  = static_cast<size_t>(j_hi) * (j_hi + 1) / 2;
+                    const size_t out_elems = out_end - out_base;
+                    const size_t out_bytes = out_elems * out_bpe;
+
+                    AlignedRawBuffer<char, 64>& wslot = writer.acquire_slot();
+                    if (wslot.size() < out_bytes) wslot.resize(out_bytes);
+
+                    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                    for (int j = j_lo; j < j_hi; ++j) {
+                        const int r_in = is_identity ? j : kp[static_cast<size_t>(j)];
+                        const size_t src_off = static_cast<size_t>(r_in) * (r_in + 1) / 2 - in_base;
+                        const size_t dst_off = static_cast<size_t>(j) * (j + 1) / 2 - out_base;
+                        double row_off_sq = 0.0;
+
+                        auto read_elem = [&](int c_in) -> float {
+                            if (in_is_f16) {
+                                const auto* p = reinterpret_cast<const gcta_grm_io::GrmFp16*>(raw_ptr) + src_off;
+                                return gcta_grm_io::fp16_to_f32(p[c_in]);
+                            }
+                            const auto* p = reinterpret_cast<const float*>(raw_ptr) + src_off;
+                            return p[c_in];
+                        };
+
+                        const float diag_v = in_is_f16 ? in_diag[r_in] : read_elem(r_in);
+                        if (emit_f16) {
+                            auto* dst = reinterpret_cast<gcta_grm_io::GrmFp16*>(wslot.data()) + dst_off;
+                            if (is_identity && in_is_f16) {
+                                const auto* src = reinterpret_cast<const gcta_grm_io::GrmFp16*>(raw_ptr) + src_off;
+                                std::memcpy(dst, src, static_cast<size_t>(j + 1) * sizeof(gcta_grm_io::GrmFp16));
+                                #pragma omp simd reduction(+:row_off_sq)
+                                for (int c = 0; c < j; ++c) {
+                                    const double vd = static_cast<double>(gcta_grm_io::fp16_to_f32(src[c]));
+                                    row_off_sq += vd * vd;
+                                }
+                            } else if (!kp_runs.empty()) {
+                                for (const auto& run : kp_runs) {
+                                    if (run.dst_start >= j) break;
+                                    const int cnt = std::min(run.len, j - run.dst_start);
+                                    for (int k = 0; k < cnt; ++k) {
+                                        const float v = read_elem(run.src_start + k);
+                                        dst[run.dst_start + k] = gcta_grm_io::f32_to_fp16(v);
+                                        const double vd = static_cast<double>(v);
+                                        row_off_sq += vd * vd;
+                                    }
+                                }
+                                dst[j] = gcta_grm_io::f32_to_fp16(diag_v);
+                            } else {
+                                for (int c = 0; c < j; ++c) {
+                                    const float v = read_elem(is_identity ? c : kp[static_cast<size_t>(c)]);
+                                    dst[c] = gcta_grm_io::f32_to_fp16(v);
+                                    const double vd = static_cast<double>(v);
+                                    row_off_sq += vd * vd;
+                                }
+                                dst[j] = gcta_grm_io::f32_to_fp16(diag_v);
+                            }
+                            out_diag[static_cast<size_t>(j)] = diag_v;
+                            const double dd = static_cast<double>(diag_v);
+                            tr_K  += dd;
+                            tr_K2 += dd * dd + 2.0 * row_off_sq;
+                        } else {
+                            auto* dst = reinterpret_cast<float*>(wslot.data()) + dst_off;
+                            if (is_identity && !in_is_f16) {
+                                const auto* src = reinterpret_cast<const float*>(raw_ptr) + src_off;
+                                std::memcpy(dst, src, static_cast<size_t>(j + 1) * sizeof(float));
+                            } else if (!kp_runs.empty() && !in_is_f16) {
+                                const auto* src = reinterpret_cast<const float*>(raw_ptr) + src_off;
+                                for (const auto& run : kp_runs) {
+                                    if (run.dst_start >= j) break;
+                                    const int cnt = std::min(run.len, j - run.dst_start);
+                                    std::memcpy(dst + run.dst_start, src + run.src_start,
+                                                static_cast<size_t>(cnt) * sizeof(float));
+                                }
+                                dst[j] = diag_v;
+                            } else {
+                                for (int c = 0; c < j; ++c) {
+                                    dst[c] = read_elem(is_identity ? c : kp[static_cast<size_t>(c)]);
+                                }
+                                dst[j] = diag_v;
+                            }
+                        }
+                    }
+                    reader.release_slot();
+                    writer.submit_slot(out_bytes);
+                }
+                reader.stop();
+            } else if (size_grm > 0) {
+                // Non-monotonic (permuted) IDs: bounded-RAM 2D banded sequential streaming.
+                // Zero random 4-byte fseeko+fread seeks.
+                constexpr size_t kBandMemBudget = 512ULL << 20; // 512 MiB band buffer
+                const int rows_per_band = std::clamp<int>(
+                    static_cast<int>(kBandMemBudget / std::max<size_t>(1, static_cast<size_t>(size_grm) * sizeof(float))),
+                    64, size_grm);
+
+                std::vector<int> in_to_out_col(static_cast<size_t>(largest_grm_size), -1);
+                for (int j = 0; j < size_grm; ++j) {
+                    in_to_out_col[static_cast<size_t>(kp[static_cast<size_t>(j)])] = j;
+                }
+                std::vector<int> in_to_band_row(static_cast<size_t>(largest_grm_size), -1);
+                std::vector<int> active_in_cols;
+                active_in_cols.reserve(static_cast<size_t>(size_grm));
+                for (int r = 0; r < largest_grm_size; ++r) {
+                    if (in_to_out_col[static_cast<size_t>(r)] >= 0) active_in_cols.push_back(r);
+                }
+
+                const size_t max_in_elems = std::max<size_t>(1, gcta_grm_detail::kGrmAsyncSlotBytes / in_bpe);
+                std::vector<gcta_grm_io::detail::RowChunkPlan> full_plans;
+                std::vector<std::pair<off_t, size_t>> full_chunks;
+                gcta_grm_io::detail::build_row_chunk_plan(
+                    largest_grm_size, nullptr, /*is_identity=*/true, max_in_elems,
+                    in_body_off, in_bpe, full_plans, full_chunks);
+
+                AlignedRawBuffer<float, 64> band_buf(static_cast<size_t>(rows_per_band) * static_cast<size_t>(size_grm));
+
+                for (int out_r0 = 0; out_r0 < size_grm; out_r0 += rows_per_band) {
+                    const int out_r1 = std::min(size_grm, out_r0 + rows_per_band);
+                    const int bh = out_r1 - out_r0;
+
+                    std::fill(in_to_band_row.begin(), in_to_band_row.end(), -1);
+                    std::vector<std::pair<int, int>> band_in_sorted;
+                    band_in_sorted.reserve(static_cast<size_t>(bh));
+                    for (int b = 0; b < bh; ++b) {
+                        const int r_in = kp[static_cast<size_t>(out_r0 + b)];
+                        in_to_band_row[static_cast<size_t>(r_in)] = b;
+                        band_in_sorted.emplace_back(r_in, b);
+                    }
+                    std::sort(band_in_sorted.begin(), band_in_sorted.end());
+
+                    gcta_io::AsyncSeqReader reader(in_fd, resolved.data_path, full_chunks,
+                                                   /*max_slot_bytes=*/0, /*take_ownership=*/false);
+                    const char* raw_ptr = nullptr;
+                    size_t raw_len = 0;
+                    size_t pidx = 0;
+                    while (reader.next_slot(raw_ptr, raw_len)) {
+                        const auto& plan = full_plans[pidx++];
+                        const size_t in_base = static_cast<size_t>(plan.row_lo) * (plan.row_lo + 1) / 2;
+
+                        #pragma omp parallel for schedule(dynamic, 64)
+                        for (int r_in = plan.row_lo; r_in < plan.row_hi; ++r_in) {
+                            const int b_r = in_to_band_row[static_cast<size_t>(r_in)];
+                            const int o_c = in_to_out_col[static_cast<size_t>(r_in)];
+                            if (b_r < 0 && o_c < 0) continue;
+
+                            const size_t row_off = static_cast<size_t>(r_in) * (r_in + 1) / 2 - in_base;
+                            auto get_v = [&](int c_in) -> float {
+                                if (in_is_f16) {
+                                    if (c_in == r_in) return in_diag[r_in];
+                                    const auto* p = reinterpret_cast<const gcta_grm_io::GrmFp16*>(raw_ptr) + row_off;
+                                    return gcta_grm_io::fp16_to_f32(p[c_in]);
+                                }
+                                const auto* p = reinterpret_cast<const float*>(raw_ptr) + row_off;
+                                return p[c_in];
+                            };
+
+                            if (b_r >= 0) {
+                                const int out_r = out_r0 + b_r;
+                                float* dst_row = band_buf.data() + static_cast<size_t>(b_r) * static_cast<size_t>(size_grm);
+                                for (int c_in : active_in_cols) {
+                                    if (c_in > r_in) break;
+                                    const int o_j = in_to_out_col[static_cast<size_t>(c_in)];
+                                    if (o_j <= out_r) {
+                                        dst_row[o_j] = get_v(c_in);
+                                    }
+                                }
+                            }
+                            if (o_c >= 0) {
+                                for (const auto& [b_in, b] : band_in_sorted) {
+                                    if (b_in >= r_in) break;
+                                    const int out_r = out_r0 + b;
+                                    if (o_c <= out_r) {
+                                        band_buf[static_cast<size_t>(b) * static_cast<size_t>(size_grm) +
+                                                 static_cast<size_t>(o_c)] = get_v(b_in);
+                                    }
+                                }
+                            }
+                        }
+                        reader.release_slot();
+                    }
+                    reader.stop();
+
+                    // Flush band [out_r0, out_r1) sequentially through AsyncSeqWriter.
+                    const size_t max_out_elems = std::max<size_t>(1, gcta_grm_detail::kGrmAsyncSlotBytes / out_bpe);
+                    int cur = out_r0;
+                    while (cur < out_r1) {
+                        const size_t b0 = static_cast<size_t>(cur) * (cur + 1) / 2;
+                        const int next = gcta_grm_io::row_bound_for_cumulative(b0 + max_out_elems, cur, out_r1);
+                        const size_t b1 = static_cast<size_t>(next) * (next + 1) / 2;
+                        const size_t out_bytes = (b1 - b0) * out_bpe;
+
+                        AlignedRawBuffer<char, 64>& wslot = writer.acquire_slot();
+                        if (wslot.size() < out_bytes) wslot.resize(out_bytes);
+
+                        #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                        for (int r = cur; r < next; ++r) {
+                            const float* src = band_buf.data() + static_cast<size_t>(r - out_r0) * static_cast<size_t>(size_grm);
+                            const size_t dst_off = static_cast<size_t>(r) * (r + 1) / 2 - b0;
+                            if (emit_f16) {
+                                auto* dst = reinterpret_cast<gcta_grm_io::GrmFp16*>(wslot.data()) + dst_off;
+                                double off_sq = 0.0;
+                                #pragma omp simd reduction(+:off_sq)
+                                for (int c = 0; c < r; ++c) {
+                                    const float v = src[c];
+                                    dst[c] = gcta_grm_io::f32_to_fp16(v);
+                                    const double vd = static_cast<double>(v);
+                                    off_sq += vd * vd;
+                                }
+                                const float dv = src[r];
+                                dst[r] = gcta_grm_io::f32_to_fp16(dv);
+                                out_diag[static_cast<size_t>(r)] = dv;
+                                const double dd = static_cast<double>(dv);
+                                tr_K  += dd;
+                                tr_K2 += dd * dd + 2.0 * off_sq;
+                            } else {
+                                auto* dst = reinterpret_cast<float*>(wslot.data()) + dst_off;
+                                std::memcpy(dst, src, static_cast<size_t>(r + 1) * sizeof(float));
+                            }
+                        }
+                        writer.submit_slot(out_bytes);
+                        cur = next;
+                    }
+                }
             }
+
+            if (emit_f16) {
+                gcta_grm_io::GrmFp16Header final_hdr{};
+                std::memcpy(final_hdr.magic, gcta_grm_io::kGrmF16MagicFinal, sizeof(final_hdr.magic));
+                final_hdr.version = gcta_grm_io::kGrmF16Version;
+                final_hdr.dtype = gcta_grm_io::kGrmF16DtypeFp16;
+                final_hdr.header_bytes = gcta_grm_io::kGrmF16HeaderSize;
+                final_hdr.flags = gcta_grm_io::kGrmF16FlagFinalized | gcta_grm_io::kGrmF16FlagHasTraces |
+                                  gcta_grm_io::kGrmF16FlagHasDiagF32 |
+                                  (in_is_f16 ? (in_hdr.flags & (gcta_grm_io::kGrmF16FlagZeroMissing |
+                                                                gcta_grm_io::kGrmF16FlagVanRaden |
+                                                                gcta_grm_io::kGrmF16FlagDominance |
+                                                                gcta_grm_io::kGrmF16FlagHomogametic)) : 0u);
+                final_hdr.n = static_cast<uint64_t>(size_grm);
+                final_hdr.valid_markers = in_is_f16 ? in_hdr.valid_markers : 0ULL;
+                final_hdr.m_snps_mean = in_is_f16 ? in_hdr.m_snps_mean : 0.0;
+                final_hdr.id_hash = common_id_hash;
+                final_hdr.trace_K = tr_K;
+                final_hdr.trace_K2 = tr_K2;
+                final_hdr.diag_offset = gcta_grm_io::kGrmF16HeaderSize;
+                final_hdr.body_offset = out_body_off;
+                final_hdr.part_row_start = 0;
+                final_hdr.part_row_end = static_cast<uint64_t>(size_grm);
+                final_hdr.mtd_weight = in_is_f16 ? in_hdr.mtd_weight : 1.0;
+                gcta_grm_io::finalize_grm_f16_file(writer, final_hdr, out_diag.data(), static_cast<uint64_t>(size_grm));
+            } else {
+                writer.finish();
+            }
+        } catch (const std::exception& e) {
+            ::close(in_fd);
+            LOGGER.e(0, std::string("unify_grm failed on [") + resolved.data_path + "]: " + e.what());
         }
-        h_grm.reset();
-        h_wgrm.reset();
+
+        ::close(in_fd);
         LOGGER.i(0, "GRM has been written to [" + wfile_name + "].");
     }
-
 }
 
+// ---------------------------------------------------------------------------
+// GRM::prune_fam — grm sparse (sparse .grm.sp or --dense binary GRM)
+// HPC-safe single-stream AsyncSeqReader + AsyncSeqWriter, zero std::endl,
+// native .grm.f16 support.
+// ---------------------------------------------------------------------------
 void GRM::prune_fam(float thresh, bool isSparse, float *value){
-    LOGGER.i(0, "Pruning the GRM to a sparse matrix with a cutoff of " + to_string(thresh) + "...");
-    LOGGER.i(0, "Total number of parts to be processed: " + to_string(index_grm_pairs.size()));
-    UniqueFile grmFile = open_file(grm_file + ".grm.bin", "rb");
-    if (!grmFile) LOGGER.error(0, "can't read [{}.grm.bin]", grm_file);
+    LOGGER.i(0, "Pruning the GRM to a " + std::string(isSparse ? "sparse" : "thresholded dense") +
+                " matrix with a cutoff of " + to_string(thresh) + "...");
 
-    std::ofstream o_id((o_name + ".grm.id").c_str());
-    if(!o_id) LOGGER.e(0, "can't write to [" + o_name + ".grm.id]");
-    std::ofstream o_fam;
-    UniqueFile o_bk;
-    if(isSparse){
-        o_fam.open((o_name + ".grm.sp").c_str());
-        if(!o_fam) LOGGER.e(0, "can't write to [" + o_name + ".grm.sp]");
-    }else{
-        o_bk = open_file(o_name + ".grm.bin", "wb");
-        if (!o_bk) LOGGER.error(0, "can't write to [{}.grm.bin]", o_name);
+    const int n_in = static_cast<int>(num_subjects);
+    const int n_out = static_cast<int>(index_keep.size());
+    std::vector<int> kp(static_cast<size_t>(n_out));
+    std::vector<string> keep_ID;
+    keep_ID.reserve(static_cast<size_t>(n_out));
+    bool is_identity = (n_in == n_out);
+    for (int i = 0; i < n_out; ++i) {
+        kp[static_cast<size_t>(i)] = static_cast<int>(index_keep[static_cast<size_t>(i)]);
+        if (kp[static_cast<size_t>(i)] != i) is_identity = false;
+        keep_ID.emplace_back(grm_ids[index_keep[static_cast<size_t>(i)]]);
     }
 
-    //Save the kept IDs, which may change by --keep and --remove
-    vector<string> keep_ID;
-    keep_ID.reserve(index_keep.size());
-    for(auto & index : index_keep){
-        keep_ID.emplace_back(grm_ids[index]);
-    }
     LOGGER.i(2, "Saving " + to_string(keep_ID.size()) + " individual IDs");
-    std::ranges::copy(keep_ID, std::ostream_iterator<string>(o_id, "\n"));
-    o_id.close();
+    gcta_grm_io::write_id_file_buffered(o_name + ".grm.id", keep_ID);
+    const uint64_t out_id_hash = gcta_io::hash_sample_ids(keep_ID);
     keep_ID.clear();
     keep_ID.shrink_to_fit();
 
+    const bool in_is_f16 = (input_grm_format_ == gcta_grm_io::GrmDiskFormat::F16);
+    const size_t in_bpe = in_is_f16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
+    const off_t in_body_off = in_is_f16 ? static_cast<off_t>(input_f16_hdr_.body_offset) : 0;
 
-    // Save pair1 par2 GRM
-    std::unordered_set<int> keeps_ori(index_keep.begin(), index_keep.end());
-    std::vector<float> grm_buf(num_byte_buffer);
-    float cur_grm, *cur_grm_pos0;
-    vector<float> rm_grm;
-    vector<int> rm_grm_ID1, rm_grm_ID2;
-    std::vector<float> out_grm_buf(num_byte_buffer);
-    float *cur_grm_buf;
-    int new_id1 = 0;
-    for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
-        if(fread(grm_buf.data(), sizeof(float), byte_part_grms[part_index], grmFile.get()) != byte_part_grms[part_index]){
-            LOGGER.e(0, "Failed to read GRM between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
-                        + to_string(index_grm_pairs[part_index].second + 1));
-        };
-        if(part_index % 50 == 0){
-            LOGGER.i(2, "Processing part " + to_string(part_index + 1));
+    std::vector<gcta_grm_io::KpRun> kp_runs;
+    if (!is_identity && n_out > 0) {
+        auto runs = gcta_grm_io::build_kp_runs(kp);
+        if (runs.size() * 2 < static_cast<size_t>(n_out)) {
+            kp_runs = std::move(runs);
         }
-        cur_grm_pos0 = grm_buf.data();
-        cur_grm_buf = out_grm_buf.data();
-
-        for(int id1 = index_grm_pairs[part_index].first; id1 != index_grm_pairs[part_index].second + 1; id1++){
-            if (keeps_ori.find(id1) == keeps_ori.end()) {
-                cur_grm_pos0 += id1 + 1;
-                continue;
-            }
-            int new_id2 = 0;
-            if(value){
-                for(int id2 : index_keep){
-                    if(id2 > id1) break;
-                    cur_grm = *(cur_grm_pos0 + id2);
-                    if(cur_grm > thresh){
-                        rm_grm_ID1.push_back(new_id1);
-                        rm_grm_ID2.push_back(new_id2);
-                        rm_grm.push_back(*value);
-                        *(cur_grm_buf++) = (*value);
-                    }else{
-                        *(cur_grm_buf++) = 0.0;
-                    }
-                    new_id2++;
-                }
- 
-            }else{
-                for(int id2 : index_keep){
-                    if(id2 > id1) break;
-                    cur_grm = *(cur_grm_pos0 + id2);
-                    if(cur_grm > thresh){
-                        rm_grm_ID1.push_back(new_id1);
-                        rm_grm_ID2.push_back(new_id2);
-                        rm_grm.push_back(cur_grm);
-                        *(cur_grm_buf++) = cur_grm;
-                    }else{
-                        *(cur_grm_buf++) = 0.0;
-                    }
-                    new_id2++;
-                }
-            }
-            new_id1++;
-            cur_grm_pos0 += id1 + 1;
-        }
-        if(!isSparse){
-            const size_t write_items = static_cast<size_t>(cur_grm_buf - out_grm_buf.data());
-            if(fwrite(out_grm_buf.data(), sizeof(float), write_items, o_bk.get()) != write_items){
-                LOGGER.e(0, "Failed to write the output"); 
-            }
-        }
-
     }
-    grmFile.reset();
-    o_bk.reset();
 
-    if(isSparse){
-        LOGGER.i(0, "Saving the sparse GRM (" + to_string(rm_grm.size()) + " pairs) to [" + o_name + ".grm.sp]");
-        //    auto sorted_index = sort_indexes(rm_grm_ID2, rm_grm_ID1);
-        //    for(auto index : sorted_index){
-        o_fam << std::setprecision( std::numeric_limits<float>::digits10+2);
-        for(int index = 0; index != rm_grm.size(); index++){
-            o_fam << rm_grm_ID1[index] << "\t" << rm_grm_ID2[index] << "\t" << rm_grm[index] << std::endl;
+    const size_t max_in_elems = std::max<size_t>(1, gcta_grm_detail::kGrmAsyncSlotBytes / in_bpe);
+    std::vector<gcta_grm_io::detail::RowChunkPlan> plans;
+    std::vector<std::pair<off_t, size_t>> io_chunks;
+    gcta_grm_io::detail::build_row_chunk_plan(n_in, &kp, is_identity, max_in_elems,
+                                              in_body_off, in_bpe, plans, io_chunks);
+
+    const int in_fd = gcta_grm_io::open_readonly_checked(input_grm_data_path_);
+
+    if (isSparse) {
+        const std::string sp_path = o_name + ".grm.sp";
+        auto sp_fd = gcta_grm_detail::open_posix_write_trunc(sp_path);
+        if (!sp_fd) {
+            ::close(in_fd);
+            LOGGER.e(0, "can't write to [" + sp_path + "]");
         }
-        o_fam.close();
+        const bool has_replace = (value != nullptr);
+        const float rep_val = has_replace ? *value : 0.0f;
+        uint64_t total_pairs = 0;
+
+        try {
+            gcta_io::AsyncSeqReader reader(in_fd, input_grm_data_path_, std::move(io_chunks),
+                                           /*max_slot_bytes=*/0, /*take_ownership=*/true);
+            const int n_thr = std::max(1, omp_get_max_threads());
+            std::vector<std::string> thr_bufs(static_cast<size_t>(n_thr));
+            std::string flush_buf;
+            flush_buf.reserve(4ULL << 20);
+            constexpr size_t kFlushBytes = 4ULL << 20;
+
+            const char* raw_ptr = nullptr;
+            size_t raw_len = 0;
+            size_t pidx = 0;
+            while (reader.next_slot(raw_ptr, raw_len)) {
+                const auto& plan = plans[pidx++];
+                const size_t in_base = static_cast<size_t>(plan.row_lo) * (plan.row_lo + 1) / 2;
+                const int j_lo = plan.j_lo;
+                const int j_hi = plan.j_hi;
+                const int rows = j_hi - j_lo;
+
+                const int active_nt = (rows >= 64) ? std::min(n_thr, rows) : 1;
+                uint64_t chunk_pairs = 0;
+                #pragma omp parallel num_threads(active_nt) reduction(+:chunk_pairs)
+                {
+                    const int tid = omp_get_thread_num();
+                    const int nt  = omp_get_num_threads();
+                    const int r0 = j_lo + (rows * tid) / nt;
+                    const int r1 = j_lo + (rows * (tid + 1)) / nt;
+                    std::string& local = thr_bufs[static_cast<size_t>(tid)];
+                    local.clear();
+
+                    for (int j = r0; j < r1; ++j) {
+                        const int r_in = is_identity ? j : kp[static_cast<size_t>(j)];
+                        const size_t row_off = static_cast<size_t>(r_in) * (r_in + 1) / 2 - in_base;
+                        auto get_v = [&](int c_in) -> float {
+                            if (in_is_f16) {
+                                if (c_in == r_in) return input_f16_diag_[static_cast<size_t>(r_in)];
+                                const auto* p = reinterpret_cast<const gcta_grm_io::GrmFp16*>(raw_ptr) + row_off;
+                                return gcta_grm_io::fp16_to_f32(p[c_in]);
+                            }
+                            const auto* p = reinterpret_cast<const float*>(raw_ptr) + row_off;
+                            return p[c_in];
+                        };
+
+                        for (int c = 0; c <= j; ++c) {
+                            const int c_in = is_identity ? c : kp[static_cast<size_t>(c)];
+                            const float v = get_v(c_in);
+                            if (v > thresh) {
+                                const float out_v = has_replace ? rep_val : v;
+                                std::format_to(std::back_inserter(local), "{}\t{}\t{:.{}g}\n",
+                                               j, c, out_v, std::numeric_limits<float>::digits10 + 2);
+                                ++chunk_pairs;
+                            }
+                        }
+                    }
+                }
+                total_pairs += chunk_pairs;
+                reader.release_slot();
+
+                for (int t = 0; t < active_nt; ++t) {
+                    const std::string& tb = thr_bufs[static_cast<size_t>(t)];
+                    if (tb.empty()) continue;
+                    if (flush_buf.size() + tb.size() >= kFlushBytes) {
+                        if (!flush_buf.empty()) {
+                            gcta_io::write_exact_throwing(sp_fd.get(), flush_buf.data(), flush_buf.size(), sp_path);
+                            flush_buf.clear();
+                        }
+                        if (tb.size() >= kFlushBytes) {
+                            gcta_io::write_exact_throwing(sp_fd.get(), tb.data(), tb.size(), sp_path);
+                        } else {
+                            flush_buf.append(tb);
+                        }
+                    } else {
+                        flush_buf.append(tb);
+                    }
+                }
+            }
+            reader.stop();
+            if (!flush_buf.empty()) {
+                gcta_io::write_exact_throwing(sp_fd.get(), flush_buf.data(), flush_buf.size(), sp_path);
+            }
+        } catch (const std::exception& e) {
+            LOGGER.e(0, std::string("prune_fam failed: ") + e.what());
+        }
+
+        sp_fd.reset();
+        LOGGER.i(0, "Saving the sparse GRM (" + to_string(total_pairs) + " pairs) to [" + sp_path + "]");
         LOGGER.i(0, "Success:", "finished generating a sparse GRM");
         return;
-    }else{
-        LOGGER.i(0, "GRM has been saved to [" + o_name + ".grm.bin]");
     }
 
-    UniqueFile NFile  = open_file(grm_file + ".grm.N.bin", "rb");
-    UniqueFile ONFile = open_file(o_name + ".grm.N.bin", "wb");
-    if (!NFile || !ONFile) {
-        LOGGER.error(0, "can't open [{}.grm.N.bin] or [{}.grm.N.bin]", grm_file, o_name);
-    }
-    std::vector<float> N_buf(num_byte_buffer);
-    float *cur_N_pos0;
-    std::vector<float> out_N_buf(num_byte_buffer);
-    float *cur_N_buf;
-    for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
-        if(fread(N_buf.data(), sizeof(float), byte_part_grms[part_index], NFile.get()) != byte_part_grms[part_index]){
-            LOGGER.w(0, "Reading GRM N failed between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
-                        + to_string(index_grm_pairs[part_index].second + 1));
-            LOGGER.i(0, "Stop pruning the GRM N");
-            break;
-        };
-        if(part_index % 50 == 0){
-            LOGGER.i(2, "Processing part " + to_string(part_index + 1));
-        }
-        cur_N_pos0 = N_buf.data();
-        cur_N_buf = out_N_buf.data();
+    // Dense thresholded output (--dense)
+    const bool emit_f16 = write_fp16_ || in_is_f16;
+    const size_t out_bpe = emit_f16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
+    const std::string out_path = o_name + (emit_f16 ? ".grm.f16" : ".grm.bin");
+    const uint64_t out_body_off = emit_f16 ? gcta_grm_io::grm_f16_body_offset(static_cast<uint64_t>(n_out)) : 0ULL;
+    const bool has_replace = (value != nullptr);
+    const float rep_val = has_replace ? *value : 0.0f;
 
-        for(int id1 = index_grm_pairs[part_index].first; id1 != index_grm_pairs[part_index].second + 1; id1++){
-            if (keeps_ori.find(id1) == keeps_ori.end()) {
-                cur_N_pos0 += id1 + 1;
-                continue;
-            }
-            for(int id2 : index_keep){
-                if(id2 > id1) break;
-                *(cur_N_buf++) = *(cur_N_pos0 + id2);
-            }
-            cur_N_pos0 += id1 + 1;
+    std::vector<float> out_diag;
+    if (emit_f16) out_diag.assign(static_cast<size_t>(n_out), 0.0f);
+    double tr_K = 0.0, tr_K2 = 0.0;
+
+    try {
+        gcta_io::AsyncSeqReader reader(in_fd, input_grm_data_path_, std::move(io_chunks),
+                                       /*max_slot_bytes=*/0, /*take_ownership=*/true);
+        gcta_io::AsyncSeqWriter writer(out_path, gcta_grm_detail::kGrmAsyncSlotBytes,
+                                       static_cast<off_t>(out_body_off));
+        if (emit_f16) {
+            gcta_grm_io::write_grm_f16_draft_prefix(writer, static_cast<uint64_t>(n_out));
         }
 
-        const size_t write_items = static_cast<size_t>(cur_N_buf - out_N_buf.data());
-        if(fwrite(out_N_buf.data(), sizeof(float), write_items, ONFile.get()) != write_items){
-            LOGGER.e(0, "Failed to write the GRM N"); 
-        }
+        const char* raw_ptr = nullptr;
+        size_t raw_len = 0;
+        size_t pidx = 0;
+        while (reader.next_slot(raw_ptr, raw_len)) {
+            const auto& plan = plans[pidx++];
+            const size_t in_base = static_cast<size_t>(plan.row_lo) * (plan.row_lo + 1) / 2;
+            const int j_lo = plan.j_lo;
+            const int j_hi = plan.j_hi;
+            const size_t out_base = static_cast<size_t>(j_lo) * (j_lo + 1) / 2;
+            const size_t out_end  = static_cast<size_t>(j_hi) * (j_hi + 1) / 2;
+            const size_t out_bytes = (out_end - out_base) * out_bpe;
 
-    }
-    ONFile.reset();
-    NFile.reset();
-    LOGGER.i(0, "GRM N has been saved to [" + o_name + ".grm.N.bin]");
-}
+            AlignedRawBuffer<char, 64>& wslot = writer.acquire_slot();
+            if (wslot.size() < out_bytes) wslot.resize(out_bytes);
 
+            #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+            for (int j = j_lo; j < j_hi; ++j) {
+                const int r_in = is_identity ? j : kp[static_cast<size_t>(j)];
+                const size_t src_off = static_cast<size_t>(r_in) * (r_in + 1) / 2 - in_base;
+                const size_t dst_off = static_cast<size_t>(j) * (j + 1) / 2 - out_base;
+                auto get_v = [&](int c_in) -> float {
+                    if (in_is_f16) {
+                        if (c_in == r_in) return input_f16_diag_[static_cast<size_t>(r_in)];
+                        const auto* p = reinterpret_cast<const gcta_grm_io::GrmFp16*>(raw_ptr) + src_off;
+                        return gcta_grm_io::fp16_to_f32(p[c_in]);
+                    }
+                    const auto* p = reinterpret_cast<const float*>(raw_ptr) + src_off;
+                    return p[c_in];
+                };
 
-
-void GRM::cut_rel(float thresh, bool no_grm){
-    LOGGER.i(0, "Pruning the GRM with a cutoff of " + to_string(thresh) + "...");
-    LOGGER.i(0, "Total number of parts to be processed: " + to_string(index_grm_pairs.size()));
-    UniqueFile grmFile = open_file(grm_file + ".grm.bin", "rb");
-    if (!grmFile) LOGGER.error(0, "can't read [{}.grm.bin]", grm_file);
-    // put this first to avoid unwritable disk
-    std::ofstream o_keep;
-    if(!no_grm){
-        o_keep.open((o_name + ".grm.id").c_str());
-        if((!o_keep)){
-            LOGGER.e(0, "can't write to [" + o_name + ".grm.id]");
-        }
-    }
-
-    const bool detail_flag = cutoff_detail;
-    std::ofstream out_fam, o_single;
-    if(detail_flag){
-        out_fam.open((o_name + ".family.txt").c_str());
-        o_single.open((o_name + ".singleton.txt").c_str());
-        if((!out_fam) || (!o_single)){
-            LOGGER.e(0, "can't write to [" + o_name + ".family.txt, .singleton.txt]");
-        }
-    }
- 
-
-    std::unordered_set<int> keeps_ori(index_keep.begin(), index_keep.end());
-
-    std::vector<float> grm_buf(num_byte_buffer);
-    float cur_grm, *cur_grm_pos0;
-    vector<float> rm_grm;
-    vector<int> rm_grm_ID1, rm_grm_ID2;
-    for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
-        if(fread(grm_buf.data(), sizeof(float), byte_part_grms[part_index], grmFile.get()) != byte_part_grms[part_index]){
-            LOGGER.e(0, "Failed to read GRM between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
-                        + to_string(index_grm_pairs[part_index].second + 1));
-        };
-        if(part_index % 50 == 0){
-            LOGGER.i(2, "Processing part " + to_string(part_index + 1));
-        }
-        cur_grm_pos0 = grm_buf.data();
-        for(int id1 = index_grm_pairs[part_index].first; id1 != index_grm_pairs[part_index].second + 1; id1++){
-            if (keeps_ori.find(id1) == keeps_ori.end()) {
-                cur_grm_pos0 += id1 + 1;
-                continue;
-            }
-            for(int id2 : index_keep){
-                if(id2 >= id1) break;
-                cur_grm = *(cur_grm_pos0 + id2);
-                if(cur_grm > thresh){
-                    rm_grm_ID1.push_back(id1);
-                    rm_grm_ID2.push_back(id2);
-                    rm_grm.push_back(cur_grm);
+                if (emit_f16) {
+                    auto* dst = reinterpret_cast<gcta_grm_io::GrmFp16*>(wslot.data()) + dst_off;
+                    double off_sq = 0.0;
+                    for (int c = 0; c < j; ++c) {
+                        const float raw_v = get_v(is_identity ? c : kp[static_cast<size_t>(c)]);
+                        const float v = (raw_v > thresh) ? (has_replace ? rep_val : raw_v) : 0.0f;
+                        dst[c] = gcta_grm_io::f32_to_fp16(v);
+                        const double vd = static_cast<double>(v);
+                        off_sq += vd * vd;
+                    }
+                    const float raw_d = get_v(r_in);
+                    const float dv = (raw_d > thresh) ? (has_replace ? rep_val : raw_d) : 0.0f;
+                    dst[j] = gcta_grm_io::f32_to_fp16(dv);
+                    out_diag[static_cast<size_t>(j)] = dv;
+                    const double dd = static_cast<double>(dv);
+                    tr_K  += dd;
+                    tr_K2 += dd * dd + 2.0 * off_sq;
+                } else {
+                    auto* dst = reinterpret_cast<float*>(wslot.data()) + dst_off;
+                    for (int c = 0; c <= j; ++c) {
+                        const float raw_v = get_v(is_identity ? c : kp[static_cast<size_t>(c)]);
+                        dst[c] = (raw_v > thresh) ? (has_replace ? rep_val : raw_v) : 0.0f;
+                    }
                 }
             }
-            cur_grm_pos0 += id1 + 1;
+            reader.release_slot();
+            writer.submit_slot(out_bytes);
+        }
+        reader.stop();
+
+        if (emit_f16) {
+            const bool zero_miss = in_is_f16 && ((input_f16_hdr_.flags & gcta_grm_io::kGrmF16FlagZeroMissing) != 0);
+            gcta_grm_io::GrmFp16Header final_hdr{};
+            std::memcpy(final_hdr.magic, gcta_grm_io::kGrmF16MagicFinal, sizeof(final_hdr.magic));
+            final_hdr.version = gcta_grm_io::kGrmF16Version;
+            final_hdr.dtype = gcta_grm_io::kGrmF16DtypeFp16;
+            final_hdr.header_bytes = gcta_grm_io::kGrmF16HeaderSize;
+            final_hdr.flags = gcta_grm_io::kGrmF16FlagFinalized | gcta_grm_io::kGrmF16FlagHasTraces |
+                              gcta_grm_io::kGrmF16FlagHasDiagF32 |
+                              (zero_miss ? gcta_grm_io::kGrmF16FlagZeroMissing : 0u);
+            final_hdr.n = static_cast<uint64_t>(n_out);
+            final_hdr.valid_markers = in_is_f16 ? input_f16_hdr_.valid_markers : 0ULL;
+            final_hdr.m_snps_mean = in_is_f16 ? input_f16_hdr_.m_snps_mean : 0.0;
+            final_hdr.id_hash = out_id_hash;
+            final_hdr.trace_K = tr_K;
+            final_hdr.trace_K2 = tr_K2;
+            final_hdr.diag_offset = gcta_grm_io::kGrmF16HeaderSize;
+            final_hdr.body_offset = out_body_off;
+            final_hdr.part_row_start = 0;
+            final_hdr.part_row_end = static_cast<uint64_t>(n_out);
+            final_hdr.mtd_weight = in_is_f16 ? input_f16_hdr_.mtd_weight : 1.0;
+            gcta_grm_io::finalize_grm_f16_file(writer, final_hdr, out_diag.data(), static_cast<uint64_t>(n_out));
+        } else {
+            writer.finish();
+        }
+    } catch (const std::exception& e) {
+        LOGGER.e(0, std::string("prune_fam dense write failed: ") + e.what());
+    }
+    LOGGER.i(0, "GRM has been saved to [" + out_path + "]");
+
+    // Subset .grm.N.bin sequentially ONLY if needed (skip when emitting zero-missing .grm.f16).
+    const bool in_zero_miss = in_is_f16 && ((input_f16_hdr_.flags & gcta_grm_io::kGrmF16FlagZeroMissing) != 0);
+    if (emit_f16 && in_zero_miss) {
+        return;
+    }
+    if (!input_has_n_file_) {
+        if (!emit_f16) {
+            LOGGER.error(0, "can't open [{}.grm.N.bin]", grm_file);
+        }
+        return;
+    }
+
+    const std::string in_n_path  = grm_file + ".grm.N.bin";
+    const std::string out_n_path = o_name + ".grm.N.bin";
+    const int n_in_fd = gcta_grm_io::open_readonly_checked(in_n_path);
+    gcta_grm_io::detail::validate_f32_bin_size(n_in_fd, in_n_path, n_in);
+
+    std::vector<gcta_grm_io::detail::RowChunkPlan> n_plans;
+    std::vector<std::pair<off_t, size_t>> n_chunks;
+    gcta_grm_io::detail::build_row_chunk_plan(n_in, &kp, is_identity,
+                                              gcta_grm_detail::kGrmAsyncSlotBytes / sizeof(float),
+                                              0, sizeof(float), n_plans, n_chunks);
+    try {
+        gcta_io::AsyncSeqReader n_reader(n_in_fd, in_n_path, std::move(n_chunks),
+                                         /*max_slot_bytes=*/0, /*take_ownership=*/true);
+        gcta_io::AsyncSeqWriter n_writer(out_n_path, gcta_grm_detail::kGrmAsyncSlotBytes);
+        const char* raw_ptr = nullptr;
+        size_t raw_len = 0;
+        size_t pidx = 0;
+        while (n_reader.next_slot(raw_ptr, raw_len)) {
+            const auto& plan = n_plans[pidx++];
+            const auto* src_f32 = reinterpret_cast<const float*>(raw_ptr);
+            const size_t in_base = static_cast<size_t>(plan.row_lo) * (plan.row_lo + 1) / 2;
+            const size_t out_base = static_cast<size_t>(plan.j_lo) * (plan.j_lo + 1) / 2;
+            const size_t out_end  = static_cast<size_t>(plan.j_hi) * (plan.j_hi + 1) / 2;
+            const size_t out_bytes = (out_end - out_base) * sizeof(float);
+
+            AlignedRawBuffer<char, 64>& wslot = n_writer.acquire_slot();
+            if (wslot.size() < out_bytes) wslot.resize(out_bytes);
+            auto* dst_f32 = reinterpret_cast<float*>(wslot.data());
+
+            #pragma omp parallel for schedule(dynamic, 64)
+            for (int j = plan.j_lo; j < plan.j_hi; ++j) {
+                const int r_in = is_identity ? j : kp[static_cast<size_t>(j)];
+                const float* srow = src_f32 + (static_cast<size_t>(r_in) * (r_in + 1) / 2 - in_base);
+                float* drow = dst_f32 + (static_cast<size_t>(j) * (j + 1) / 2 - out_base);
+                if (is_identity) {
+                    std::memcpy(drow, srow, static_cast<size_t>(j + 1) * sizeof(float));
+                } else if (!kp_runs.empty()) {
+                    for (const auto& run : kp_runs) {
+                        if (run.dst_start > j) break;
+                        const int cnt = std::min(run.len, j + 1 - run.dst_start);
+                        std::memcpy(drow + run.dst_start, srow + run.src_start,
+                                    static_cast<size_t>(cnt) * sizeof(float));
+                    }
+                } else {
+                    for (int c = 0; c <= j; ++c) drow[c] = srow[kp[static_cast<size_t>(c)]];
+                }
+            }
+            n_reader.release_slot();
+            n_writer.submit_slot(out_bytes);
+        }
+        n_reader.stop();
+        n_writer.finish();
+    } catch (const std::exception& e) {
+        LOGGER.e(0, std::string("Failed writing pruned GRM N: ") + e.what());
+    }
+    LOGGER.i(0, "GRM N has been saved to [" + out_n_path + "]");
+}
+
+// ---------------------------------------------------------------------------
+// GRM::cut_rel & write_pruned_grm_output — grm prune
+// Fixes: O(U*E) std::count hang -> O(E) degree array, std::endl storm -> 4 MiB
+// buffered writes, single-stream AsyncSeqReader/Writer, native .grm.f16 support.
+// ---------------------------------------------------------------------------
+void GRM::cut_rel(float thresh, bool no_grm){
+    LOGGER.i(0, "Pruning the GRM with a cutoff of " + to_string(thresh) + "...");
+
+    const int n_in = static_cast<int>(num_subjects);
+    const int n_keep = static_cast<int>(index_keep.size());
+    std::vector<int> kp(static_cast<size_t>(n_keep));
+    bool is_identity = (n_in == n_keep);
+    for (int i = 0; i < n_keep; ++i) {
+        kp[static_cast<size_t>(i)] = static_cast<int>(index_keep[static_cast<size_t>(i)]);
+        if (kp[static_cast<size_t>(i)] != i) is_identity = false;
+    }
+
+    const bool in_is_f16 = (input_grm_format_ == gcta_grm_io::GrmDiskFormat::F16);
+    const size_t in_bpe = in_is_f16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
+    const off_t in_body_off = in_is_f16 ? static_cast<off_t>(input_f16_hdr_.body_offset) : 0;
+
+    const size_t max_in_elems = std::max<size_t>(1, gcta_grm_detail::kGrmAsyncSlotBytes / in_bpe);
+    std::vector<gcta_grm_io::detail::RowChunkPlan> plans;
+    std::vector<std::pair<off_t, size_t>> io_chunks;
+    gcta_grm_io::detail::build_row_chunk_plan(n_in, &kp, is_identity, max_in_elems,
+                                              in_body_off, in_bpe, plans, io_chunks);
+
+    vector<int> rm_grm_ID1, rm_grm_ID2;
+    vector<float> rm_grm;
+
+    const int in_fd = gcta_grm_io::open_readonly_checked(input_grm_data_path_);
+    try {
+        gcta_io::AsyncSeqReader reader(in_fd, input_grm_data_path_, std::move(io_chunks),
+                                       /*max_slot_bytes=*/0, /*take_ownership=*/true);
+        const int n_thr = std::max(1, omp_get_max_threads());
+        std::vector<std::vector<int>> t_id1(static_cast<size_t>(n_thr));
+        std::vector<std::vector<int>> t_id2(static_cast<size_t>(n_thr));
+        std::vector<std::vector<float>> t_val(static_cast<size_t>(n_thr));
+
+        const char* raw_ptr = nullptr;
+        size_t raw_len = 0;
+        size_t pidx = 0;
+        while (reader.next_slot(raw_ptr, raw_len)) {
+            const auto& plan = plans[pidx++];
+            const size_t in_base = static_cast<size_t>(plan.row_lo) * (plan.row_lo + 1) / 2;
+            const int j_lo = plan.j_lo;
+            const int j_hi = plan.j_hi;
+            const int rows = j_hi - j_lo;
+            const int active_nt = (rows >= 64) ? std::min(n_thr, rows) : 1;
+
+            #pragma omp parallel num_threads(active_nt)
+            {
+                const int tid = omp_get_thread_num();
+                const int nt  = omp_get_num_threads();
+                const int r0 = j_lo + (rows * tid) / nt;
+                const int r1 = j_lo + (rows * (tid + 1)) / nt;
+                auto& l1 = t_id1[static_cast<size_t>(tid)];
+                auto& l2 = t_id2[static_cast<size_t>(tid)];
+                auto& lv = t_val[static_cast<size_t>(tid)];
+                l1.clear(); l2.clear(); lv.clear();
+
+                for (int j = r0; j < r1; ++j) {
+                    const int id1 = is_identity ? j : kp[static_cast<size_t>(j)];
+                    const size_t row_off = static_cast<size_t>(id1) * (id1 + 1) / 2 - in_base;
+                    if (in_is_f16) {
+                        const auto* row = reinterpret_cast<const gcta_grm_io::GrmFp16*>(raw_ptr) + row_off;
+                        for (int c = 0; c < j; ++c) {
+                            const int id2 = is_identity ? c : kp[static_cast<size_t>(c)];
+                            const float v = gcta_grm_io::fp16_to_f32(row[id2]);
+                            if (v > thresh) {
+                                l1.push_back(id1);
+                                l2.push_back(id2);
+                                lv.push_back(v);
+                            }
+                        }
+                    } else {
+                        const auto* row = reinterpret_cast<const float*>(raw_ptr) + row_off;
+                        for (int c = 0; c < j; ++c) {
+                            const int id2 = is_identity ? c : kp[static_cast<size_t>(c)];
+                            const float v = row[id2];
+                            if (v > thresh) {
+                                l1.push_back(id1);
+                                l2.push_back(id2);
+                                lv.push_back(v);
+                            }
+                        }
+                    }
+                }
+            }
+            reader.release_slot();
+
+            for (int t = 0; t < active_nt; ++t) {
+                rm_grm_ID1.insert(rm_grm_ID1.end(), t_id1[static_cast<size_t>(t)].begin(), t_id1[static_cast<size_t>(t)].end());
+                rm_grm_ID2.insert(rm_grm_ID2.end(), t_id2[static_cast<size_t>(t)].begin(), t_id2[static_cast<size_t>(t)].end());
+                rm_grm.insert(rm_grm.end(), t_val[static_cast<size_t>(t)].begin(), t_val[static_cast<size_t>(t)].end());
+            }
+        }
+        reader.stop();
+    } catch (const std::exception& e) {
+        LOGGER.e(0, std::string("cut_rel scan failed: ") + e.what());
+    }
+
+    if (cutoff_detail) {
+        const std::string fam_path = o_name + ".family.txt";
+        auto fam_fd = gcta_grm_detail::open_posix_write_trunc(fam_path);
+        if (!fam_fd) {
+            LOGGER.e(0, "can't write to [" + fam_path + "]");
+        }
+        constexpr size_t kFlushBytes = 4ULL << 20;
+        std::string buf;
+        buf.reserve(std::min<size_t>(kFlushBytes + 4096, rm_grm.size() * 48 + 4096));
+        try {
+            for (size_t idx = 0; idx < rm_grm.size(); ++idx) {
+                std::format_to(std::back_inserter(buf), "{}\t{}\t{:g}\n",
+                               grm_ids[static_cast<size_t>(rm_grm_ID1[idx])],
+                               grm_ids[static_cast<size_t>(rm_grm_ID2[idx])],
+                               rm_grm[idx]);
+                if (buf.size() >= kFlushBytes) {
+                    gcta_io::write_exact_throwing(fam_fd.get(), buf.data(), buf.size(), fam_path);
+                    buf.clear();
+                }
+            }
+            if (!buf.empty()) {
+                gcta_io::write_exact_throwing(fam_fd.get(), buf.data(), buf.size(), fam_path);
+            }
+        } catch (const std::exception& e) {
+            LOGGER.e(0, std::string("cut_rel failed writing [") + fam_path + "]: " + e.what());
+        }
+        fam_fd.reset();
+        LOGGER.i(0, "Related family pairs have been saved to " + fam_path);
+    }
+
+    // O(E) degree histogram (replaces O(U*E) std::count scan from legacy GCTA 1.26; exact same tie behavior).
+    std::vector<int> deg(static_cast<size_t>(num_subjects), 0);
+    for (size_t i = 0; i < rm_grm_ID1.size(); ++i) {
+        deg[static_cast<size_t>(rm_grm_ID1[i])]++;
+        deg[static_cast<size_t>(rm_grm_ID2[i])]++;
+    }
+    for (size_t i = 0; i < rm_grm_ID1.size(); ++i) {
+        if (deg[static_cast<size_t>(rm_grm_ID1[i])] < deg[static_cast<size_t>(rm_grm_ID2[i])]) {
+            std::swap(rm_grm_ID1[i], rm_grm_ID2[i]);
         }
     }
 
-    if(detail_flag){
-        for(int index = 0; index != rm_grm.size(); index++){
-            out_fam << grm_ids[rm_grm_ID1[index]] << "\t" <<  grm_ids[rm_grm_ID2[index]] << "\t" << rm_grm[index] << std::endl;
-        }
-        out_fam.close();
-        LOGGER.i(0, "Related family pairs have been saved to " + o_name + ".family.txt");
-    }
+    std::sort(rm_grm_ID1.begin(), rm_grm_ID1.end());
+    rm_grm_ID1.erase(std::unique(rm_grm_ID1.begin(), rm_grm_ID1.end()), rm_grm_ID1.end());
 
-    int i_buf;
-    // copy from GCTA 1.26
-    vector<int> rm_uni_ID(rm_grm_ID1);
-    rm_uni_ID.insert(rm_uni_ID.end(), rm_grm_ID2.begin(), rm_grm_ID2.end());
-    stable_sort(rm_uni_ID.begin(), rm_uni_ID.end());
-    rm_uni_ID.erase(unique(rm_uni_ID.begin(), rm_uni_ID.end()), rm_uni_ID.end());
-    std::map<int, int> rm_uni_ID_count;
-    for (int i = 0; i < rm_uni_ID.size(); i++) {
-        i_buf = count(rm_grm_ID1.begin(), rm_grm_ID1.end(), rm_uni_ID[i]) + count(rm_grm_ID2.begin(), rm_grm_ID2.end(), rm_uni_ID[i]);
-        rm_uni_ID_count.insert(std::pair<int, int>(rm_uni_ID[i], i_buf));
-    }
-
-    // swapping
-    std::map<int, int>::iterator iter1, iter2;
-    for (int i = 0; i < rm_grm_ID1.size(); i++) {
-        iter1 = rm_uni_ID_count.find(rm_grm_ID1[i]);
-        iter2 = rm_uni_ID_count.find(rm_grm_ID2[i]);
-        if (iter1->second < iter2->second) {
-            i_buf = rm_grm_ID1[i];
-            rm_grm_ID1[i] = rm_grm_ID2[i];
-            rm_grm_ID2[i] = i_buf;
-        }
-    }
-
-    stable_sort(rm_grm_ID1.begin(), rm_grm_ID1.end());
-    rm_grm_ID1.erase(unique(rm_grm_ID1.begin(), rm_grm_ID1.end()), rm_grm_ID1.end());
-    vector<string> removed_ID;
-    removed_ID.reserve(rm_grm_ID1.size());
-    for (auto &index : rm_grm_ID1) removed_ID.push_back(grm_ids[index]);
-
-    auto diff = [&rm_grm_ID1](int value) ->bool{
-        return std::binary_search(rm_grm_ID1.begin(), rm_grm_ID1.end(), value);
+    auto diff = [&rm_grm_ID1](uint32_t value) -> bool {
+        return std::binary_search(rm_grm_ID1.begin(), rm_grm_ID1.end(), static_cast<int>(value));
     };
     std::erase_if(index_keep, diff);
 
     vector<string> keep_ID;
     keep_ID.reserve(index_keep.size());
-    for(auto & index : index_keep){
-        keep_ID.emplace_back(grm_ids[index]);
+    for (uint32_t idx : index_keep) {
+        keep_ID.emplace_back(grm_ids[idx]);
     }
 
-    LOGGER.i(0, "After pruning the GRM, there are " + to_string(keep_ID.size()) + " individuals (" + to_string(removed_ID.size()) + " individuals removed).");
-    if(!no_grm){
-        std::ranges::copy(keep_ID, std::ostream_iterator<string>(o_keep, "\n"));
-        o_keep.close();
+    LOGGER.i(0, "After pruning the GRM, there are " + to_string(keep_ID.size()) +
+                " individuals (" + to_string(rm_grm_ID1.size()) + " individuals removed).");
+    if (!no_grm) {
+        gcta_grm_io::write_id_file_buffered(o_name + ".grm.id", keep_ID);
         LOGGER.i(2, "Pruned unrelated IDs have been saved to " + o_name + ".grm.id");
     }
-
-    if(detail_flag){
-        std::ranges::copy(keep_ID, std::ostream_iterator<string>(o_single, "\n"));
-        o_single.close();
+    if (cutoff_detail) {
+        gcta_grm_io::write_id_file_buffered(o_name + ".singleton.txt", keep_ID);
         LOGGER.i(2, "Pruned singleton IDs have been saved to " + o_name + ".singleton.txt");
     }
 
-    if(no_grm) {
+    if (no_grm) {
         return;
     }
 
-    LOGGER.i(0, "Pruning GRM values, total parts " + std::to_string(index_grm_pairs.size()));
-    UniqueFile grm_out_file = open_file(o_name + ".grm.bin", "wb");
-    if(!grm_out_file){
-        LOGGER.e(0, "can't open [" + o_name + ".grm.bin] to write");
-    }
-    fseek(grmFile.get(), 0, SEEK_SET);
-    outBinFile(grmFile.get(), grm_out_file.get());
-    grmFile.reset();
-    grm_out_file.reset();
-    LOGGER.i(2, "GRM values have been saved to [" + o_name + ".grm.bin]");
-
-    LOGGER.i(0, "Pruning number of SNPs to calculate GRM, total parts " + std::to_string(index_grm_pairs.size()));
-    UniqueFile NFile = open_file(grm_file + ".grm.N.bin", "rb");
-    if(!NFile){
-        LOGGER.w(2, "There is no [" + grm_file + ".grm.N.bin]");
-        return;
-    }
-    UniqueFile N_out_file = open_file(o_name + ".grm.N.bin", "wb");
-    if(!N_out_file){
-        LOGGER.w(2, "can't open [" + o_name + ".grm.N.bin] to write. Ignore this step");
-        return;
-    }
-    outBinFile(NFile.get(), N_out_file.get());
-    NFile.reset();
-    N_out_file.reset();
-    LOGGER.i(2, "Number of SNPs has been saved to [" + o_name + ".grm.N.bin]");
+    const bool emit_f16 = write_fp16_ || in_is_f16;
+    write_pruned_grm_output(emit_f16);
 }
 
-void GRM::outBinFile(FILE *sFile, FILE *dFile) {
-    std::unordered_set<int> keeps(index_keep.begin(), index_keep.end());
-    std::vector<float> grm_buf(num_byte_buffer);
-    std::vector<float> grm_out_buffer(num_byte_buffer);
-    float *cur_grm_pos, *cur_out_pos;
-    for(int part_index = 0; part_index != index_grm_pairs.size(); part_index++){
-        if(fread(grm_buf.data(), sizeof(float), byte_part_grms[part_index], sFile) != byte_part_grms[part_index]){
-            LOGGER.e(0, "Failed to read GRM between line " + to_string(index_grm_pairs[part_index].first + 1) + " and "
-                        + to_string(index_grm_pairs[part_index].second + 1));
-        };
-        if(part_index % 50 == 0){
-            LOGGER.i(2, "Processing part " + to_string(part_index + 1));
-        }
-        cur_grm_pos = grm_buf.data();
-        cur_out_pos = grm_out_buffer.data();
-        for(int id1 = index_grm_pairs[part_index].first; id1 != index_grm_pairs[part_index].second + 1; id1++) {
-            if (keeps.find(id1) == keeps.end()) {
-                cur_grm_pos += id1 + 1;
-                continue;
-            }
-            for (int id2 : index_keep) {
-                if(id2 > id1) break;
-                *(cur_out_pos++) = *(cur_grm_pos + id2);
-            }
-            cur_grm_pos += id1 + 1;
-        }
-        uint64_t size_write = cur_out_pos - grm_out_buffer.data();
-        if(fwrite(grm_out_buffer.data(), sizeof(float), size_write, dFile) != size_write){
-            LOGGER.e(0, "Failed to write the output file, please check the disk condition or permission");
-        };
+void GRM::write_pruned_grm_output(bool out_fp16) {
+    const int n_in = static_cast<int>(num_subjects);
+    const int n_out = static_cast<int>(index_keep.size());
+    std::vector<int> kp(static_cast<size_t>(n_out));
+    std::vector<string> keep_ids;
+    keep_ids.reserve(static_cast<size_t>(n_out));
+    bool is_identity = (n_in == n_out);
+    for (int i = 0; i < n_out; ++i) {
+        kp[static_cast<size_t>(i)] = static_cast<int>(index_keep[static_cast<size_t>(i)]);
+        if (kp[static_cast<size_t>(i)] != i) is_identity = false;
+        keep_ids.push_back(grm_ids[index_keep[static_cast<size_t>(i)]]);
     }
+    const uint64_t out_id_hash = gcta_io::hash_sample_ids(keep_ids);
+
+    std::vector<gcta_grm_io::KpRun> kp_runs;
+    if (!is_identity && n_out > 0) {
+        auto runs = gcta_grm_io::build_kp_runs(kp);
+        if (runs.size() * 2 < static_cast<size_t>(n_out)) {
+            kp_runs = std::move(runs);
+        }
+    }
+
+    const bool in_is_f16 = (input_grm_format_ == gcta_grm_io::GrmDiskFormat::F16);
+    const size_t in_bpe = in_is_f16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
+    const size_t out_bpe = out_fp16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
+    const off_t in_body_off = in_is_f16 ? static_cast<off_t>(input_f16_hdr_.body_offset) : 0;
+    const std::string out_path = o_name + (out_fp16 ? ".grm.f16" : ".grm.bin");
+    const uint64_t out_body_off = out_fp16 ? gcta_grm_io::grm_f16_body_offset(static_cast<uint64_t>(n_out)) : 0ULL;
+
+    std::vector<gcta_grm_io::detail::RowChunkPlan> plans;
+    std::vector<std::pair<off_t, size_t>> io_chunks;
+    gcta_grm_io::detail::build_row_chunk_plan(n_in, &kp, is_identity,
+                                              gcta_grm_detail::kGrmAsyncSlotBytes / in_bpe,
+                                              in_body_off, in_bpe, plans, io_chunks);
+
+    std::vector<float> out_diag;
+    if (out_fp16) out_diag.assign(static_cast<size_t>(n_out), 0.0f);
+    double tr_K = 0.0, tr_K2 = 0.0;
+
+    LOGGER.i(0, "Writing pruned GRM values to [" + out_path + "]...");
+    const int in_fd = gcta_grm_io::open_readonly_checked(input_grm_data_path_);
+    try {
+        gcta_io::AsyncSeqReader reader(in_fd, input_grm_data_path_, std::move(io_chunks),
+                                       /*max_slot_bytes=*/0, /*take_ownership=*/true);
+        gcta_io::AsyncSeqWriter writer(out_path, gcta_grm_detail::kGrmAsyncSlotBytes,
+                                       static_cast<off_t>(out_body_off));
+        if (out_fp16) {
+            gcta_grm_io::write_grm_f16_draft_prefix(writer, static_cast<uint64_t>(n_out));
+        }
+
+        const char* raw_ptr = nullptr;
+        size_t raw_len = 0;
+        size_t pidx = 0;
+        while (reader.next_slot(raw_ptr, raw_len)) {
+            const auto& plan = plans[pidx++];
+            const size_t in_base = static_cast<size_t>(plan.row_lo) * (plan.row_lo + 1) / 2;
+            const size_t out_base = static_cast<size_t>(plan.j_lo) * (plan.j_lo + 1) / 2;
+            const size_t out_end  = static_cast<size_t>(plan.j_hi) * (plan.j_hi + 1) / 2;
+            const size_t out_bytes = (out_end - out_base) * out_bpe;
+
+            AlignedRawBuffer<char, 64>& wslot = writer.acquire_slot();
+            if (wslot.size() < out_bytes) wslot.resize(out_bytes);
+
+            #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+            for (int j = plan.j_lo; j < plan.j_hi; ++j) {
+                const int r_in = is_identity ? j : kp[static_cast<size_t>(j)];
+                const size_t src_off = static_cast<size_t>(r_in) * (r_in + 1) / 2 - in_base;
+                const size_t dst_off = static_cast<size_t>(j) * (j + 1) / 2 - out_base;
+
+                if (out_fp16) {
+                    auto* dst = reinterpret_cast<gcta_grm_io::GrmFp16*>(wslot.data()) + dst_off;
+                    double off_sq = 0.0;
+                    if (in_is_f16) {
+                        const auto* srow = reinterpret_cast<const gcta_grm_io::GrmFp16*>(raw_ptr) + src_off;
+                        if (is_identity) {
+                            std::memcpy(dst, srow, static_cast<size_t>(j + 1) * sizeof(gcta_grm_io::GrmFp16));
+                            #pragma omp simd reduction(+:off_sq)
+                            for (int c = 0; c < j; ++c) {
+                                const double vd = static_cast<double>(gcta_grm_io::fp16_to_f32(srow[c]));
+                                off_sq += vd * vd;
+                            }
+                        } else if (!kp_runs.empty()) {
+                            for (const auto& run : kp_runs) {
+                                if (run.dst_start >= j) break;
+                                const int cnt = std::min(run.len, j - run.dst_start);
+                                std::memcpy(dst + run.dst_start, srow + run.src_start,
+                                            static_cast<size_t>(cnt) * sizeof(gcta_grm_io::GrmFp16));
+                                #pragma omp simd reduction(+:off_sq)
+                                for (int k = 0; k < cnt; ++k) {
+                                    const double vd = static_cast<double>(gcta_grm_io::fp16_to_f32(srow[run.src_start + k]));
+                                    off_sq += vd * vd;
+                                }
+                            }
+                            dst[j] = srow[r_in];
+                        } else {
+                            for (int c = 0; c < j; ++c) {
+                                const auto h = srow[kp[static_cast<size_t>(c)]];
+                                dst[c] = h;
+                                const double vd = static_cast<double>(gcta_grm_io::fp16_to_f32(h));
+                                off_sq += vd * vd;
+                            }
+                            dst[j] = srow[r_in];
+                        }
+                        const float dv = input_f16_diag_[static_cast<size_t>(r_in)];
+                        out_diag[static_cast<size_t>(j)] = dv;
+                        const double dd = static_cast<double>(dv);
+                        tr_K  += dd;
+                        tr_K2 += dd * dd + 2.0 * off_sq;
+                    } else {
+                        const auto* srow = reinterpret_cast<const float*>(raw_ptr) + src_off;
+                        for (int c = 0; c < j; ++c) {
+                            const float v = srow[is_identity ? c : kp[static_cast<size_t>(c)]];
+                            dst[c] = gcta_grm_io::f32_to_fp16(v);
+                            const double vd = static_cast<double>(v);
+                            off_sq += vd * vd;
+                        }
+                        const float dv = srow[r_in];
+                        dst[j] = gcta_grm_io::f32_to_fp16(dv);
+                        out_diag[static_cast<size_t>(j)] = dv;
+                        const double dd = static_cast<double>(dv);
+                        tr_K  += dd;
+                        tr_K2 += dd * dd + 2.0 * off_sq;
+                    }
+                } else {
+                    auto* dst = reinterpret_cast<float*>(wslot.data()) + dst_off;
+                    if (in_is_f16) {
+                        const auto* srow = reinterpret_cast<const gcta_grm_io::GrmFp16*>(raw_ptr) + src_off;
+                        for (int c = 0; c < j; ++c) {
+                            dst[c] = gcta_grm_io::fp16_to_f32(srow[is_identity ? c : kp[static_cast<size_t>(c)]]);
+                        }
+                        dst[j] = input_f16_diag_[static_cast<size_t>(r_in)];
+                    } else {
+                        const auto* srow = reinterpret_cast<const float*>(raw_ptr) + src_off;
+                        if (is_identity) {
+                            std::memcpy(dst, srow, static_cast<size_t>(j + 1) * sizeof(float));
+                        } else if (!kp_runs.empty()) {
+                            for (const auto& run : kp_runs) {
+                                if (run.dst_start > j) break;
+                                const int cnt = std::min(run.len, j + 1 - run.dst_start);
+                                std::memcpy(dst + run.dst_start, srow + run.src_start,
+                                            static_cast<size_t>(cnt) * sizeof(float));
+                            }
+                        } else {
+                            for (int c = 0; c <= j; ++c) dst[c] = srow[kp[static_cast<size_t>(c)]];
+                        }
+                    }
+                }
+            }
+            reader.release_slot();
+            writer.submit_slot(out_bytes);
+        }
+        reader.stop();
+
+        if (out_fp16) {
+            const bool zero_miss = in_is_f16 && ((input_f16_hdr_.flags & gcta_grm_io::kGrmF16FlagZeroMissing) != 0);
+            gcta_grm_io::GrmFp16Header final_hdr{};
+            std::memcpy(final_hdr.magic, gcta_grm_io::kGrmF16MagicFinal, sizeof(final_hdr.magic));
+            final_hdr.version = gcta_grm_io::kGrmF16Version;
+            final_hdr.dtype = gcta_grm_io::kGrmF16DtypeFp16;
+            final_hdr.header_bytes = gcta_grm_io::kGrmF16HeaderSize;
+            final_hdr.flags = gcta_grm_io::kGrmF16FlagFinalized | gcta_grm_io::kGrmF16FlagHasTraces |
+                              gcta_grm_io::kGrmF16FlagHasDiagF32 |
+                              (zero_miss ? gcta_grm_io::kGrmF16FlagZeroMissing : 0u);
+            final_hdr.n = static_cast<uint64_t>(n_out);
+            final_hdr.valid_markers = in_is_f16 ? input_f16_hdr_.valid_markers : 0ULL;
+            final_hdr.m_snps_mean = in_is_f16 ? input_f16_hdr_.m_snps_mean : 0.0;
+            final_hdr.id_hash = out_id_hash;
+            final_hdr.trace_K = tr_K;
+            final_hdr.trace_K2 = tr_K2;
+            final_hdr.diag_offset = gcta_grm_io::kGrmF16HeaderSize;
+            final_hdr.body_offset = out_body_off;
+            final_hdr.part_row_start = 0;
+            final_hdr.part_row_end = static_cast<uint64_t>(n_out);
+            final_hdr.mtd_weight = in_is_f16 ? input_f16_hdr_.mtd_weight : 1.0;
+            gcta_grm_io::finalize_grm_f16_file(writer, final_hdr, out_diag.data(), static_cast<uint64_t>(n_out));
+        } else {
+            writer.finish();
+        }
+    } catch (const std::exception& e) {
+        LOGGER.e(0, std::string("write_pruned_grm_output failed: ") + e.what());
+    }
+    LOGGER.i(2, "GRM values have been saved to [" + out_path + "]");
+
+    const bool in_zero_miss = in_is_f16 && ((input_f16_hdr_.flags & gcta_grm_io::kGrmF16FlagZeroMissing) != 0);
+    if (out_fp16 && in_zero_miss) {
+        return;
+    }
+    if (!input_has_n_file_) {
+        if (!out_fp16) LOGGER.w(2, "There is no [" + grm_file + ".grm.N.bin]");
+        return;
+    }
+
+    const std::string in_n_path  = grm_file + ".grm.N.bin";
+    const std::string out_n_path = o_name + ".grm.N.bin";
+    const int n_in_fd = gcta_grm_io::open_readonly_checked(in_n_path);
+    gcta_grm_io::detail::validate_f32_bin_size(n_in_fd, in_n_path, n_in);
+
+    std::vector<gcta_grm_io::detail::RowChunkPlan> n_plans;
+    std::vector<std::pair<off_t, size_t>> n_chunks;
+    gcta_grm_io::detail::build_row_chunk_plan(n_in, &kp, is_identity,
+                                              gcta_grm_detail::kGrmAsyncSlotBytes / sizeof(float),
+                                              0, sizeof(float), n_plans, n_chunks);
+    try {
+        gcta_io::AsyncSeqReader n_reader(n_in_fd, in_n_path, std::move(n_chunks),
+                                         /*max_slot_bytes=*/0, /*take_ownership=*/true);
+        gcta_io::AsyncSeqWriter n_writer(out_n_path, gcta_grm_detail::kGrmAsyncSlotBytes);
+        const char* raw_ptr = nullptr;
+        size_t raw_len = 0;
+        size_t pidx = 0;
+        while (n_reader.next_slot(raw_ptr, raw_len)) {
+            const auto& plan = n_plans[pidx++];
+            const auto* src_f32 = reinterpret_cast<const float*>(raw_ptr);
+            const size_t in_base = static_cast<size_t>(plan.row_lo) * (plan.row_lo + 1) / 2;
+            const size_t out_base = static_cast<size_t>(plan.j_lo) * (plan.j_lo + 1) / 2;
+            const size_t out_end  = static_cast<size_t>(plan.j_hi) * (plan.j_hi + 1) / 2;
+            const size_t out_bytes = (out_end - out_base) * sizeof(float);
+
+            AlignedRawBuffer<char, 64>& wslot = n_writer.acquire_slot();
+            if (wslot.size() < out_bytes) wslot.resize(out_bytes);
+            auto* dst_f32 = reinterpret_cast<float*>(wslot.data());
+
+            #pragma omp parallel for schedule(dynamic, 64)
+            for (int j = plan.j_lo; j < plan.j_hi; ++j) {
+                const int r_in = is_identity ? j : kp[static_cast<size_t>(j)];
+                const float* srow = src_f32 + (static_cast<size_t>(r_in) * (r_in + 1) / 2 - in_base);
+                float* drow = dst_f32 + (static_cast<size_t>(j) * (j + 1) / 2 - out_base);
+                if (is_identity) {
+                    std::memcpy(drow, srow, static_cast<size_t>(j + 1) * sizeof(float));
+                } else if (!kp_runs.empty()) {
+                    for (const auto& run : kp_runs) {
+                        if (run.dst_start > j) break;
+                        const int cnt = std::min(run.len, j + 1 - run.dst_start);
+                        std::memcpy(drow + run.dst_start, srow + run.src_start,
+                                    static_cast<size_t>(cnt) * sizeof(float));
+                    }
+                } else {
+                    for (int c = 0; c <= j; ++c) drow[c] = srow[kp[static_cast<size_t>(c)]];
+                }
+            }
+            n_reader.release_slot();
+            n_writer.submit_slot(out_bytes);
+        }
+        n_reader.stop();
+        n_writer.finish();
+    } catch (const std::exception& e) {
+        LOGGER.e(0, std::string("Failed writing pruned GRM N: ") + e.what());
+    }
+    LOGGER.i(2, "Number of SNPs has been saved to [" + out_n_path + "]");
 }
 
-
+// ---------------------------------------------------------------------------
+// GRM builder-mode constructor (grm make)
+// ---------------------------------------------------------------------------
 GRM::GRM(Pheno* pheno, Marker* marker, const gcta_cli::GrmMakeOptions& opts, const std::string& out_prefix) {
     n_markers_explicit_ = opts.n_markers.has_value();
+    write_fp16_         = opts.grm_fp16;
+    fast_preset_        = opts.fast;
+    is_homogametic_     = opts.homogametic;
+
     this->pheno = pheno;
     this->marker = marker;
     this->geno = std::make_unique<Geno>(pheno, marker, opts.geno, opts.marker_filter, out_prefix);
-    // Pay attention to not reflect the newest changes of keep;
     this->index_keep = pheno->get_index_keep();
     this->num_parts = opts.part ? static_cast<uint32_t>(opts.part->first) : 1u;
     this->part = opts.part ? static_cast<uint32_t>(opts.part->second) : 1u;
@@ -981,7 +2017,6 @@ GRM::GRM(Pheno* pheno, Marker* marker, const gcta_cli::GrmMakeOptions& opts, con
 
     this->num_count_handle = 2;
 
-    // GRM dimensions for this part
     num_individual = part_keep_indices.second - part_keep_indices.first + 1;
     num_grm = ((uint64_t) part_keep_indices.first + part_keep_indices.second + 2) * num_individual / 2;
 
@@ -992,40 +2027,37 @@ GRM::GRM(Pheno* pheno, Marker* marker, const gcta_cli::GrmMakeOptions& opts, con
         sparse_cutoff = static_cast<float>(*opts.sparse_cutoff);
     }
 
-    // +64 pads sub_miss past the last valid index by one full cache line (64 × sizeof(uint32_t) = 256 bytes).
-    // This prevents OMP threads from writing to adjacent cache lines when two threads operate on
-    // neighbouring sample indices near the end of the array (false-sharing guard).
     sub_miss.assign(index_keep.size() + 64, 0);
 
-    //calculate each index in pair thread;
     int num_thread = omp_get_max_threads();
     index_grm_pairs.reserve(num_thread);
     vector<uint32_t> thread_parts = divide_parts(part_keep_indices.first, part_keep_indices.second, num_thread);
-    if(num_thread != static_cast<int>(thread_parts.size())){
+    if (num_thread != static_cast<int>(thread_parts.size())) {
         LOGGER.w(0, "cannot run in " + to_string(num_thread) + " threads. Use " + to_string(thread_parts.size()) + " instead");
     }
 
     index_grm_pairs.push_back(std::make_pair(static_cast<int>(part_keep_indices.first), static_cast<int>(thread_parts[0])));
-    for(size_t index = 1; index != thread_parts.size(); index++){
+    for (size_t index = 1; index != thread_parts.size(); index++) {
         index_grm_pairs.push_back(std::make_pair(static_cast<int>(thread_parts[index - 1] + 1), static_cast<int>(thread_parts[index])));
     }
 
     isDominance = opts.dominance;
     isMtd = (opts.alg == gcta_cli::GrmAlg::VanRaden);
 
-    // Cache constants derived from part_keep_indices
+    if (fast_preset_) {
+        std::string msg = "Using --fast preset:";
+        if (!opts.alg_explicit && isMtd) msg += " --alg vanraden (INT8 VNNI)";
+        if (write_fp16_) msg += " --grm-fp16 (native .grm.f16, exact float32 diagonal, zero-missing .grm.N.bin omitted)";
+        LOGGER.i(0, msg + ".");
+    }
+
     grm_n = static_cast<int>(part_keep_indices.second) + 1;
     grm_m = static_cast<int>(part_keep_indices.second) - static_cast<int>(part_keep_indices.first) + 1;
     grm_s_n = grm_n - grm_m;
     grm_bytes_std_geno = sizeof(float) * static_cast<size_t>(grm_n);
-    // Round up to a multiple of 64 elements so every column of stdGeno / stdGeno_i8
-    // is 64-byte aligned and has capacity >= index_keep.size() (for --make-grm-part).
     const int ld_base = std::max(grm_n, static_cast<int>(index_keep.size()));
     stdGenoLD = (ld_base + 63) / 64 * 64;
 
-    // Auto-size default nMarkerBlock for VanRaden INT8 BED GRM (when --n-markers is not
-    // explicitly passed): target <= 2 GiB for stdGeno_i8_kmajor_, clamped to [1024, 4096].
-    // Keeps peak RSS modest while lifting VNNI GEMM arithmetic intensity well past the DRAM wall.
     const bool auto_use_int8 = bBLAS && isMtd && !isDominance && !opts.homogametic
                                && (geno->getGenoFormat() == "BED")
                                && (std::getenv("GCTA_DISABLE_INT8_GRM") == nullptr);
@@ -1039,8 +2071,6 @@ GRM::GRM(Pheno* pheno, Marker* marker, const gcta_cli::GrmMakeOptions& opts, con
         GRM::nMarkerBlock = 1024;
     }
 
-    // Pre-allocate small scratch buffer; grm/grm_i32/N/sampleMissBuf are allocated in
-    // processMakeGRM (and N/sampleMissBuf lazily only when missing genotypes occur).
     validIndexBuf.reserve(static_cast<size_t>(nMarkerBlock));
 
     string fstring = bBLAS ? " v2 " : " ";
@@ -1050,130 +2080,154 @@ GRM::GRM(Pheno* pheno, Marker* marker, const gcta_cli::GrmMakeOptions& opts, con
     LOGGER.i(1, to_string(num_individual) + " samples, " + to_string(marker->count_extract()) + " markers, " + to_string(num_grm) + " GRM elements");
 
     o_name = out_prefix;
-
-    if(isDominance){
+    if (isDominance) {
         o_name += ".d";
     }
 
     output_id();
 }
 
-
 void GRM::output_id() {
     vector<string> out_id = pheno->get_id(part_keep_indices.first, part_keep_indices.second);
-
-    string o_grm_id = o_name + ".grm.id";
-    std::ofstream grm_id(o_grm_id.c_str());
-
-    if (!grm_id) { LOGGER.e(0, "cannot open the file [" + o_grm_id + "] to write"); }
-    std::copy(out_id.begin(), out_id.end(), std::ostream_iterator<string>(grm_id, "\n"));
-    grm_id.close();
+    grm_id_hash_ = gcta_io::hash_sample_ids(out_id);
+    const string o_grm_id = o_name + ".grm.id";
+    gcta_grm_io::write_id_file_buffered(o_grm_id, out_id);
     LOGGER.i(0, "IDs for the GRM file have been saved in the file [" + o_grm_id + "]");
+}
 
+// ---------------------------------------------------------------------------
+// 4096-row strip-packed GRM allocation, strip-by-strip promotion & unified packed N
+// ---------------------------------------------------------------------------
+void GRM::reset_grm_strips() {
+    grm_strips_.clear();
+    grm_i32_strips_.clear();
+}
+
+void GRM::allocate_grm_strips(bool as_i32) {
+    reset_grm_strips();
+    const int num_strips = (grm_tile_rows + kGrmStripRows - 1) / kGrmStripRows;
+    if (as_i32) {
+        grm_i32_strips_.resize(static_cast<size_t>(num_strips));
+        for (int s = 0; s < num_strips; ++s) {
+            const int r0 = s * kGrmStripRows;
+            const int rows_s = std::min(kGrmStripRows, grm_tile_rows - r0);
+            const int cols_s = grm_tile_rs + r0 + rows_s;
+            const size_t elems = static_cast<size_t>(rows_s) * static_cast<size_t>(cols_s);
+            grm_i32_strips_[static_cast<size_t>(s)] = make_aligned_uninitialized<int32_t, 64>(elems);
+            if (!grm_i32_strips_[static_cast<size_t>(s)]) {
+                reset_grm_strips();
+                LOGGER.error(0, "can't allocate enough memory for strip-packed int32 GRM (strip {}/{}).", s + 1, num_strips);
+            }
+        }
+    } else {
+        grm_strips_.resize(static_cast<size_t>(num_strips));
+        for (int s = 0; s < num_strips; ++s) {
+            const int r0 = s * kGrmStripRows;
+            const int rows_s = std::min(kGrmStripRows, grm_tile_rows - r0);
+            const int cols_s = grm_tile_rs + r0 + rows_s;
+            const size_t elems = static_cast<size_t>(rows_s) * static_cast<size_t>(cols_s);
+            grm_strips_[static_cast<size_t>(s)] = make_aligned_uninitialized<double, 64>(elems);
+            if (!grm_strips_[static_cast<size_t>(s)]) {
+                reset_grm_strips();
+                LOGGER.error(0, "can't allocate enough memory for strip-packed double GRM (strip {}/{}).", s + 1, num_strips);
+            }
+        }
+    }
 }
 
 void GRM::ensure_N_allocated() {
     if (N) return;
-    if (grm_tiling_enabled) {
-        const size_t tile_rect_elems = static_cast<size_t>(grm_tile_rows) * static_cast<size_t>(grm_tile_cols);
-        N = make_aligned_uninitialized<uint32_t, 64>(tile_rect_elems);
-        if (!N) {
-            LOGGER.error(0, "Can't allocate N tile buffer: {:.2f}GB required.",
-                         tile_rect_elems * sizeof(uint32_t) / (1024.0 * 1024.0 * 1024.0));
-        }
-        // Parallel zero first-touch matching index_grm_pairs; upper-triangle pages remain unfaulted.
-        uint32_t* const N_ptr = std::assume_aligned<64>(N.get());
-        #pragma omp parallel for schedule(static)
-        for (int idx = 0; idx < static_cast<int>(index_grm_pairs.size()); ++idx) {
-            const auto [p_from, p_to] = index_grm_pairs[idx];
-            for (int pair1 = p_from; pair1 <= p_to; ++pair1) {
-                const int r = pair1 - grm_tile_rs;
-                std::memset(N_ptr + static_cast<size_t>(r) * grm_tile_cols, 0,
-                            static_cast<size_t>(pair1 + 1) * sizeof(uint32_t));
-            }
-        }
-    } else {
-        const uint64_t fill_N = (num_grm + num_count_handle - 1) / num_count_handle * num_count_handle;
-        N = make_aligned_uninitialized<uint32_t, 64>(fill_N);
-        if (!N) {
-            LOGGER.error(0, "can't allocate enough memory to store (parted) N: {:.2f}GB required.",
-                         fill_N * sizeof(uint32_t) / (1024.0 * 1024.0 * 1024.0));
-        }
-        uint32_t* const N_ptr = std::assume_aligned<64>(N.get());
-        #pragma omp parallel for schedule(static)
-        for (int idx = 0; idx < static_cast<int>(index_grm_pairs.size()); ++idx) {
-            const auto [p_from, p_to] = index_grm_pairs[idx];
-            const uint64_t off_start = (static_cast<uint64_t>(p_from) + 1ULL + part_keep_indices.first)
-                                     * static_cast<uint64_t>(p_from - static_cast<int>(part_keep_indices.first)) / 2ULL;
-            const uint64_t off_end   = (static_cast<uint64_t>(p_to) + 2ULL + part_keep_indices.first)
-                                     * static_cast<uint64_t>(p_to + 1 - static_cast<int>(part_keep_indices.first)) / 2ULL;
-            std::memset(N_ptr + off_start, 0, static_cast<size_t>(off_end - off_start) * sizeof(uint32_t));
-        }
-        if (fill_N > num_grm) {
-            std::memset(N_ptr + num_grm, 0, static_cast<size_t>(fill_N - num_grm) * sizeof(uint32_t));
-        }
+    // Unified packed lower-triangular layout for [grm_tile_rs, grm_tile_re) in BOTH tiled and dense paths.
+    const uint64_t tile_tri =
+        (static_cast<uint64_t>(grm_tile_re) + static_cast<uint64_t>(grm_tile_rs) + 1ULL) *
+        static_cast<uint64_t>(grm_tile_rows) / 2ULL;
+    const uint64_t fill_N = (tile_tri + static_cast<uint64_t>(num_count_handle) - 1ULL) /
+                            static_cast<uint64_t>(num_count_handle) * static_cast<uint64_t>(num_count_handle);
+    N = make_aligned_uninitialized<uint32_t, 64>(fill_N);
+    if (!N) {
+        LOGGER.error(0, "can't allocate enough memory to store packed N: {:.2f}GB required.",
+                     fill_N * sizeof(uint32_t) / (1024.0 * 1024.0 * 1024.0));
+    }
+    uint32_t* const N_ptr = std::assume_aligned<64>(N.get());
+    const uint64_t rs_u = static_cast<uint64_t>(grm_tile_rs);
+    #pragma omp parallel for schedule(static)
+    for (int idx = 0; idx < static_cast<int>(index_grm_pairs.size()); ++idx) {
+        const auto [p_from, p_to] = index_grm_pairs[static_cast<size_t>(idx)];
+        const uint64_t off_start = (static_cast<uint64_t>(p_from) + 1ULL + rs_u)
+                                 * static_cast<uint64_t>(p_from - grm_tile_rs) / 2ULL;
+        const uint64_t off_end   = (static_cast<uint64_t>(p_to) + 2ULL + rs_u)
+                                 * static_cast<uint64_t>(p_to + 1 - grm_tile_rs) / 2ULL;
+        std::memset(N_ptr + off_start, 0, static_cast<size_t>(off_end - off_start) * sizeof(uint32_t));
+    }
+    if (fill_N > tile_tri) {
+        std::memset(N_ptr + tile_tri, 0, static_cast<size_t>(fill_N - tile_tri) * sizeof(uint32_t));
     }
 }
 
 void GRM::promote_i32_to_f64() {
     if (!grm_is_i32_) return;
-    const size_t tile_rect_elems = static_cast<size_t>(grm_tile_rows) * static_cast<size_t>(grm_tile_cols);
+    const int num_strips = (grm_tile_rows + kGrmStripRows - 1) / kGrmStripRows;
     if (grm_first_accum) {
-        // Nothing accumulated into grm_i32 yet: free it first so peak RSS stays bounded.
-        grm_i32.reset();
-        grm = make_aligned_uninitialized<double, 64>(tile_rect_elems);
-        if (!grm) {
-            LOGGER.error(0, "can't allocate enough memory to promote GRM buffer to double: {:.2f}GB required.",
-                         tile_rect_elems * sizeof(double) / (1024.0 * 1024.0 * 1024.0));
-        }
+        // Nothing accumulated into grm_i32_strips_ yet: free first so peak RSS stays bounded.
+        grm_i32_strips_.clear();
+        allocate_grm_strips(/*as_i32=*/false);
     } else {
-        grm = make_aligned_uninitialized<double, 64>(tile_rect_elems);
-        if (!grm) {
-            LOGGER.error(0, "can't allocate enough memory to promote GRM buffer to double: {:.2f}GB required.",
-                         tile_rect_elems * sizeof(double) / (1024.0 * 1024.0 * 1024.0));
-        }
-        const int32_t* const src_base = std::assume_aligned<64>(grm_i32.get());
-        double* const dst_base        = std::assume_aligned<64>(grm.get());
-        const double* const R_ptr     = R_total_.data();
-        const double* const R_row     = R_ptr + grm_tile_rs;
-        const double S_tot            = S_total_;
-        const int tile_rs             = grm_tile_rs;
-        const int tile_rows           = grm_tile_rows;
+        // Strip-by-strip promotion: allocate double strip s, convert from int32 strip s,
+        // and immediately release int32 strip s (eliminates transient 12 B/elem peak RSS spike!).
+        grm_strips_.resize(static_cast<size_t>(num_strips));
+        const double* const R_ptr = R_total_.data();
+        const double S_tot = S_total_;
 
-        // Left off-diagonal rectangle: cols [0, tile_rs), all rows [0, tile_rows)
-        if (tile_rs > 0) {
-            #pragma omp parallel for schedule(static)
-            for (int c = 0; c < tile_rs; ++c) {
-                const int32_t* __restrict__ src_col = src_base + static_cast<size_t>(c) * tile_rows;
-                double* __restrict__ dst_col        = dst_base + static_cast<size_t>(c) * tile_rows;
-                const double r_j_plus_S = S_tot - R_ptr[c];
-                #pragma omp simd
-                for (int r = 0; r < tile_rows; ++r) {
-                    dst_col[r] = static_cast<double>(src_col[r]) - R_row[r] + r_j_plus_S;
+        for (int s = 0; s < num_strips; ++s) {
+            const int r0 = s * kGrmStripRows;
+            const int rows_s = std::min(kGrmStripRows, grm_tile_rows - r0);
+            const int global_r0 = grm_tile_rs + r0;
+            const int cols_s = global_r0 + rows_s;
+            const size_t elems = static_cast<size_t>(rows_s) * static_cast<size_t>(cols_s);
+
+            grm_strips_[static_cast<size_t>(s)] = make_aligned_uninitialized<double, 64>(elems);
+            if (!grm_strips_[static_cast<size_t>(s)]) {
+                LOGGER.error(0, "can't allocate enough memory to promote strip {} to double.", s);
+            }
+
+            const int32_t* const src_base = std::assume_aligned<64>(grm_i32_strips_[static_cast<size_t>(s)].get());
+            double* const dst_base        = std::assume_aligned<64>(grm_strips_[static_cast<size_t>(s)].get());
+            const double* const R_row     = R_ptr + global_r0;
+
+            if (global_r0 > 0) {
+                #pragma omp parallel for schedule(static)
+                for (int c = 0; c < global_r0; ++c) {
+                    const int32_t* __restrict__ src_col = src_base + static_cast<size_t>(c) * rows_s;
+                    double* __restrict__ dst_col        = dst_base + static_cast<size_t>(c) * rows_s;
+                    const double r_j_plus_S = S_tot - R_ptr[c];
+                    #pragma omp simd
+                    for (int r = 0; r < rows_s; ++r) {
+                        dst_col[r] = static_cast<double>(src_col[r]) - R_row[r] + r_j_plus_S;
+                    }
                 }
             }
-        }
-        // Right diagonal lower triangle: cols [tile_rs, tile_rs + tile_rows), rows [c_local, tile_rows)
-        #pragma omp parallel
-        {
-            const int tid = omp_get_thread_num();
-            const int nth = omp_get_num_threads();
-            const auto [c_beg, c_end] = gcta_grm_detail::lower_tri_col_range(tile_rows, tid, nth);
-            for (int c_local = c_beg; c_local < c_end; ++c_local) {
-                const int c = tile_rs + c_local;
-                const int32_t* __restrict__ src_col = src_base + static_cast<size_t>(c) * tile_rows;
-                double* __restrict__ dst_col        = dst_base + static_cast<size_t>(c) * tile_rows;
-                const double r_j_plus_S = S_tot - R_ptr[c];
-                #pragma omp simd
-                for (int r = c_local; r < tile_rows; ++r) {
-                    dst_col[r] = static_cast<double>(src_col[r]) - R_row[r] + r_j_plus_S;
+            #pragma omp parallel
+            {
+                const int tid = omp_get_thread_num();
+                const int nth = omp_get_num_threads();
+                const auto [c_beg, c_end] = gcta_grm_detail::lower_tri_col_range(rows_s, tid, nth);
+                for (int c_local = c_beg; c_local < c_end; ++c_local) {
+                    const int c = global_r0 + c_local;
+                    const int32_t* __restrict__ src_col = src_base + static_cast<size_t>(c) * rows_s;
+                    double* __restrict__ dst_col        = dst_base + static_cast<size_t>(c) * rows_s;
+                    const double r_j_plus_S = S_tot - R_ptr[c];
+                    #pragma omp simd
+                    for (int r = c_local; r < rows_s; ++r) {
+                        dst_col[r] = static_cast<double>(src_col[r]) - R_row[r] + r_j_plus_S;
+                    }
                 }
             }
+            grm_i32_strips_[static_cast<size_t>(s)].reset();
         }
-        grm_i32.reset();
+        grm_i32_strips_.clear();
     }
     grm_is_i32_ = false;
-    const int max_tile_dim = std::min(4096, std::max(1, grm_n));
+    const int max_tile_dim = std::min(kGrmStripRows, std::max(1, grm_n));
     const size_t tile_elems = static_cast<size_t>(max_tile_dim) * static_cast<size_t>(max_tile_dim);
     if (grm_i32_tile_.size() < tile_elems) {
         grm_i32_tile_.resize(tile_elems);
@@ -1182,17 +2236,37 @@ void GRM::promote_i32_to_f64() {
 
 void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerIndex){
     const int num_marker = static_cast<int>(markerIndex.size());
+    const uint32_t full_keep_ct = static_cast<uint32_t>(index_keep.size());
 
-    if (use_int8_grm) {
-        // BED int8 path: counts-only pass (VPOPCNTDQ on Zen 4) to obtain
-        // af / mean / sd / validity over all keepSampleCT samples. The
-        // genotypes themselves are decoded later straight from the raw .bed
-        // records into the K-major GEMM operand (decodeBedI8KMajor), only for
-        // valid markers -- no marker-major stdGeno_i8 staging buffer.
+    if (use_int8_grm && use_tile1_cache_) {
+        // Tiles 2..T cached fast path: skip redundant stats_only VPOPCNTDQ pass completely!
+        if (tile1_cursor_ + static_cast<size_t>(num_marker) > tile1_valid_extract_.size()) {
+            LOGGER.e(0, "Internal error: Tile-1 marker cache cursor overflow.");
+        }
+        validIndexBuf.clear();
+        for (int i = 0; i < num_marker; ++i) {
+            const size_t ci = tile1_cursor_ + static_cast<size_t>(i);
+            if (markerIndex[static_cast<size_t>(i)] != tile1_valid_extract_[ci]) {
+                LOGGER.e(0, "Internal error: Tile-1 marker cache index mismatch.");
+            }
+            GenoBufItem& item = gbufitems[static_cast<size_t>(i)];
+            item.extractedMarkerIndex = markerIndex[static_cast<size_t>(i)];
+            item.geno_ptr = nullptr;
+            item.geno_f32_ptr = nullptr;
+            item.geno_i8_ptr = nullptr;
+            item.valid = true;
+            item.mean = tile1_valid_mean_[ci];
+            item.nValidN = (tile1_valid_has_miss_[ci] != 0)
+                ? (full_keep_ct > 0 ? full_keep_ct - 1u : 0u)
+                : full_keep_ct;
+            validIndexBuf.push_back(i);
+        }
+        tile1_cursor_ += static_cast<size_t>(num_marker);
+    } else if (use_int8_grm) {
         #pragma omp parallel for schedule(static)
-        for(int i = 0; i < num_marker; i++){
-            GenoBufItem &item = gbufitems[i];
-            item.extractedMarkerIndex = markerIndex[i];
+        for (int i = 0; i < num_marker; i++) {
+            GenoBufItem &item = gbufitems[static_cast<size_t>(i)];
+            item.extractedMarkerIndex = markerIndex[static_cast<size_t>(i)];
             item.geno_ptr = nullptr;
             item.geno_f32_ptr = nullptr;
             item.geno_i8_ptr = nullptr;
@@ -1200,25 +2274,30 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             item.lazy_missing = true;
             geno->getGenoDouble(buf, i, &item);
         }
+        validIndexBuf.clear();
+        for (int i = 0; i < num_marker; i++) {
+            if (gbufitems[static_cast<size_t>(i)].valid) {
+                validIndexBuf.push_back(i);
+            }
+        }
     } else {
         float* const std_geno_base = std::assume_aligned<64>(stdGeno.get());
         #pragma omp parallel for schedule(static)
-        for(int i = 0; i < num_marker; i++){
-            GenoBufItem &item = gbufitems[i];
-            item.extractedMarkerIndex = markerIndex[i];
+        for (int i = 0; i < num_marker; i++) {
+            GenoBufItem &item = gbufitems[static_cast<size_t>(i)];
+            item.extractedMarkerIndex = markerIndex[static_cast<size_t>(i)];
             item.geno_ptr = nullptr;
             item.geno_i8_ptr = nullptr;
             item.geno_f32_ptr = std_geno_base + static_cast<size_t>(i) * stdGenoLD;
             item.stats_only = false;
-            item.lazy_missing = true;   // `missing` only valid when nValidN < keep count
+            item.lazy_missing = true;
             geno->getGenoDouble(buf, i, &item);
         }
-    }
-
-    validIndexBuf.clear();
-    for(int i = 0; i < num_marker; i++){
-        if(gbufitems[i].valid){
-            validIndexBuf.push_back(i);
+        validIndexBuf.clear();
+        for (int i = 0; i < num_marker; i++) {
+            if (gbufitems[static_cast<size_t>(i)].valid) {
+                validIndexBuf.push_back(i);
+            }
         }
     }
 
@@ -1231,11 +2310,21 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         return;
     }
 
+    // Record Tile-1 valid markers & stats for Tiles 2..T streaming reuse (INT8 BED path).
+    if (use_int8_grm && grm_tiling_enabled && !grm_skip_global_state) {
+        for (int k = 0; k < curNumValidMarkers; ++k) {
+            const GenoBufItem& it = gbufitems[static_cast<size_t>(validIndexBuf[static_cast<size_t>(k)])];
+            tile1_valid_extract_.push_back(it.extractedMarkerIndex);
+            tile1_valid_mean_.push_back(it.mean);
+            tile1_valid_has_miss_.push_back(it.nValidN < full_keep_ct ? uint8_t{1} : uint8_t{0});
+        }
+    }
+
     // Compact valid columns forward in-place for the FP32 path when any marker failed filters.
     if (!use_int8_grm && curNumValidMarkers < num_marker) {
         float* const std_geno_base = std::assume_aligned<64>(stdGeno.get());
         for (int k = 0; k < curNumValidMarkers; ++k) {
-            const int src_idx = validIndexBuf[k];
+            const int src_idx = validIndexBuf[static_cast<size_t>(k)];
             if (src_idx != k) {
                 std::memcpy(std_geno_base + static_cast<size_t>(k) * stdGenoLD,
                             std_geno_base + static_cast<size_t>(src_idx) * stdGenoLD,
@@ -1243,20 +2332,20 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             }
         }
     }
-    if(!grm_skip_global_state){
-        for(int i = 0; i < curNumValidMarkers; i++){
-            sd.push_back(gbufitems[validIndexBuf[i]].sd);
+    if (!grm_skip_global_state) {
+        for (int i = 0; i < curNumValidMarkers; i++) {
+            sd.push_back(gbufitems[static_cast<size_t>(validIndexBuf[static_cast<size_t>(i)])].sd);
         }
     }
 
-    constexpr int kTile = 4096;
-    const uint32_t full_keep_ct = static_cast<uint32_t>(index_keep.size());
+    constexpr int kTile = kGrmStripRows;
     const int decode_rows = grm_tile_cols;  // == grm_tile_re (tiled) or grm_n (dense)
+    const int num_strips = (grm_tile_rows + kTile - 1) / kTile;
     bool any_missing_full = false;
     bool tile_has_missing = false;
 
     for (int m = 0; m < curNumValidMarkers; ++m) {
-        if (gbufitems[validIndexBuf[m]].nValidN < full_keep_ct) {
+        if (gbufitems[static_cast<size_t>(validIndexBuf[static_cast<size_t>(m)])].nValidN < full_keep_ct) {
             any_missing_full = true;
             break;
         }
@@ -1271,25 +2360,21 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
 
         double S_mu2 = 0.0;
         for (int m = 0; m < curNumValidMarkers; ++m) {
-            const double mu_m = gbufitems[validIndexBuf[m]].mean;
-            mu_vec_[m] = mu_m;
+            const double mu_m = gbufitems[static_cast<size_t>(validIndexBuf[static_cast<size_t>(m)])].mean;
+            mu_vec_[static_cast<size_t>(m)] = mu_m;
             S_mu2 += mu_m * mu_m;
         }
 
-        // Fused cache-blocked (64x64) decode of raw .bed records of valid markers
-        // straight into K-contiguous row-major stdGeno_i8_kmajor_ (decode_rows x ldK)
-        // with per-sample row-sum accumulation r_raw_[i] = sum_m g_{im} * mu_m.
         geno->decodeBedI8KMajor(buf, validIndexBuf.data(), curNumValidMarkers, decode_rows,
                                 kmajor_base, ldK, mu_vec_.data(), r_raw_.data());
 
         marker_miss_idx_.clear();
         if (any_missing_full) {
-            // Decode full int8 column + missing bitmask of each marker with missing calls.
             miss_col_of_.assign(static_cast<size_t>(curNumValidMarkers), -1);
             std::vector<int> miss_markers;
             for (int m = 0; m < curNumValidMarkers; ++m) {
-                if (gbufitems[validIndexBuf[m]].nValidN < full_keep_ct) {
-                    miss_col_of_[m] = static_cast<int>(miss_markers.size());
+                if (gbufitems[static_cast<size_t>(validIndexBuf[static_cast<size_t>(m)])].nValidN < full_keep_ct) {
+                    miss_col_of_[static_cast<size_t>(m)] = static_cast<int>(miss_markers.size());
                     miss_markers.push_back(m);
                 }
             }
@@ -1305,8 +2390,8 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             int8_t* const miss_cols = stdGeno_i8.get();
             #pragma omp parallel for schedule(dynamic, 4)
             for (int j = 0; j < n_miss_cols; ++j) {
-                const int bi = validIndexBuf[miss_markers[j]];
-                GenoBufItem &item = gbufitems[bi];
+                const int bi = validIndexBuf[static_cast<size_t>(miss_markers[static_cast<size_t>(j)])];
+                GenoBufItem &item = gbufitems[static_cast<size_t>(bi)];
                 item.stats_only = false;
                 item.lazy_missing = false;
                 item.geno_i8_ptr = miss_cols + static_cast<size_t>(j) * stdGenoLD;
@@ -1320,9 +2405,9 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                 : ((static_cast<uintptr_t>(1) << (decode_rows % 64)) - 1);
             marker_miss_offset_[0] = 0;
             for (int m = 0; m < curNumValidMarkers; ++m) {
-                const GenoBufItem& item = gbufitems[validIndexBuf[m]];
+                const GenoBufItem& item = gbufitems[static_cast<size_t>(validIndexBuf[static_cast<size_t>(m)])];
                 if (item.nValidN < full_keep_ct && !item.missing.empty()) {
-                    const double mu2 = mu_vec_[m] * mu_vec_[m];
+                    const double mu2 = mu_vec_[static_cast<size_t>(m)] * mu_vec_[static_cast<size_t>(m)];
                     const uintptr_t* miss_words = item.missing.data();
                     for (int w = 0; w < num_words; ++w) {
                         uintptr_t word = miss_words[w];
@@ -1330,40 +2415,37 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                         while (word != 0) {
                             const int bit = std::countr_zero(word);
                             const int s = w * 64 + bit;
-                            r_tilde_[s] += mu2;
+                            r_tilde_[static_cast<size_t>(s)] += mu2;
                             marker_miss_idx_.push_back(s);
                             word &= (word - 1);
                         }
                     }
                 }
-                marker_miss_offset_[m + 1] = static_cast<int>(marker_miss_idx_.size());
+                marker_miss_offset_[static_cast<size_t>(m + 1)] = static_cast<int>(marker_miss_idx_.size());
             }
             tile_has_missing = !marker_miss_idx_.empty();
             if (tile_has_missing) {
-                // Build global per-sample missing-marker CSR once per marker block.
                 std::fill(sample_miss_offset_.begin(), sample_miss_offset_.begin() + decode_rows + 1, 0);
                 for (int s : marker_miss_idx_) {
-                    sample_miss_offset_[s + 1]++;
+                    sample_miss_offset_[static_cast<size_t>(s + 1)]++;
                 }
                 for (int s = 0; s < decode_rows; ++s) {
-                    sample_miss_offset_[s + 1] += sample_miss_offset_[s];
+                    sample_miss_offset_[static_cast<size_t>(s + 1)] += sample_miss_offset_[static_cast<size_t>(s)];
                 }
-                sample_miss_m_.resize(sample_miss_offset_[decode_rows]);
+                sample_miss_m_.resize(static_cast<size_t>(sample_miss_offset_[static_cast<size_t>(decode_rows)]));
                 std::vector<int> write_pos(sample_miss_offset_.begin(),
                                            sample_miss_offset_.begin() + decode_rows);
                 for (int m = 0; m < curNumValidMarkers; ++m) {
-                    const int mb = marker_miss_offset_[m];
-                    const int me = marker_miss_offset_[m + 1];
+                    const int mb = marker_miss_offset_[static_cast<size_t>(m)];
+                    const int me = marker_miss_offset_[static_cast<size_t>(m + 1)];
                     for (int idx = mb; idx < me; ++idx) {
-                        const int s = marker_miss_idx_[idx];
-                        sample_miss_m_[write_pos[s]++] = m;
+                        const int s = marker_miss_idx_[static_cast<size_t>(idx)];
+                        sample_miss_m_[static_cast<size_t>(write_pos[static_cast<size_t>(s)]++)] = m;
                     }
                 }
             }
         }
 
-        // Exactness fallback: promote int32_t -> double if missingness appears in this
-        // tile's samples or if total accumulated markers could approach INT32_MAX / 4.
         if (grm_is_i32_ &&
             (tile_has_missing ||
              static_cast<uint64_t>(grm_tile_i32_markers_) + static_cast<uint64_t>(curNumValidMarkers) > kMaxInt32Markers)) {
@@ -1373,21 +2455,18 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         const bool first_accum = grm_first_accum;
 
         if (grm_is_i32_) {
-            // Zero-missing exact int32_t in-place VNNI GRM accumulation (4 B/elem, beta=0/1).
-            // r0-outer loop pre-packs A_strip once per strip across all c0 column tiles;
-            // diagonal blocks are sub-tiled with a 1024x1024 (4 MiB) L3-resident scratch so
-            // upper-triangle pages of grm_i32 remain 100% unfaulted.
-            int32_t* const grm_i32_base = std::assume_aligned<64>(grm_i32.get());
             const int32_t beta = first_accum ? 0 : 1;
             constexpr int kDiagSub = 1024;
             if (grm_i32_diag_scratch_.size() < static_cast<size_t>(kDiagSub) * kDiagSub) {
                 grm_i32_diag_scratch_.resize(static_cast<size_t>(kDiagSub) * kDiagSub);
             }
 
-            for (int r0 = 0; r0 < grm_tile_rows; r0 += kTile) {
+            for (int s = 0; s < num_strips; ++s) {
+                const int r0 = s * kTile;
                 const int rows = std::min(kTile, grm_tile_rows - r0);
                 const int global_r0 = grm_tile_rs + r0;
                 const int8_t* const A_strip = kmajor_base + static_cast<size_t>(global_r0) * ldK;
+                int32_t* const strip_base = std::assume_aligned<64>(grm_i32_strips_[static_cast<size_t>(s)].get());
 
                 if (global_r0 > 0) {
                     const int8_t* A_reord_ptr = nullptr;
@@ -1406,8 +2485,8 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                             rows, cols, curNumValidMarkers,
                             A_reord_ptr, A_strip, ldK,
                             B_strip,
-                            grm_i32_base + r0 + static_cast<size_t>(c0) * grm_tile_rows,
-                            grm_tile_rows, beta,
+                            strip_base + static_cast<size_t>(c0) * rows,
+                            rows, beta,
                             i8_scratch_A_f32_, i8_scratch_B_f32_, i8_scratch_C_f32_);
                     }
                 }
@@ -1422,8 +2501,8 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                         i8_scratch_A_f32_, i8_scratch_C_f32_);
 
                     const int32_t* const diag_src = grm_i32_diag_scratch_.data();
-                    int32_t* const diag_dst = grm_i32_base + (r0 + d0)
-                                              + static_cast<size_t>(global_r0 + d0) * grm_tile_rows;
+                    int32_t* const diag_dst = strip_base + d0
+                                              + static_cast<size_t>(global_r0 + d0) * rows;
                     #pragma omp parallel if (db >= 256)
                     {
                         const int tid = omp_get_thread_num();
@@ -1431,7 +2510,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                         const auto [c_beg, c_end] = gcta_grm_detail::lower_tri_col_range(db, tid, nth);
                         for (int c = c_beg; c < c_end; ++c) {
                             const int32_t* __restrict__ src_col = diag_src + c + static_cast<size_t>(c) * db;
-                            int32_t* __restrict__ dst_col       = diag_dst + c + static_cast<size_t>(c) * grm_tile_rows;
+                            int32_t* __restrict__ dst_col       = diag_dst + c + static_cast<size_t>(c) * rows;
                             const int len = db - c;
                             if (first_accum) {
                                 std::memcpy(dst_col, src_col, static_cast<size_t>(len) * sizeof(int32_t));
@@ -1450,8 +2529,8 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                             rem, db, curNumValidMarkers,
                             kmajor_base + static_cast<size_t>(global_r0 + d0 + db) * ldK, ldK,
                             A_d,
-                            grm_i32_base + (r0 + d0 + db) + static_cast<size_t>(global_r0 + d0) * grm_tile_rows,
-                            grm_tile_rows, beta,
+                            strip_base + (d0 + db) + static_cast<size_t>(global_r0 + d0) * rows,
+                            rows, beta,
                             i8_scratch_A_f32_, i8_scratch_B_f32_, i8_scratch_C_f32_);
                     }
                 }
@@ -1466,8 +2545,6 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             }
             grm_tile_i32_markers_ += static_cast<uint32_t>(curNumValidMarkers);
         } else {
-            // Double-precision accumulation path (missing genotypes present or > 500M markers).
-            double* const grm_base = std::assume_aligned<64>(grm.get());
             const int max_tile_dim = std::min(kTile, std::max(1, grm_n));
             const size_t need_tile = static_cast<size_t>(max_tile_dim) * static_cast<size_t>(max_tile_dim);
             if (grm_i32_tile_.size() < need_tile) {
@@ -1481,19 +2558,19 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             std::vector<int> row_miss_e;
             std::vector<int> active_row_miss_markers;
             if (block_has_missing) {
-                row_miss_b.resize(curNumValidMarkers);
-                row_miss_e.resize(curNumValidMarkers);
-                active_row_miss_markers.reserve(curNumValidMarkers);
+                row_miss_b.resize(static_cast<size_t>(curNumValidMarkers));
+                row_miss_e.resize(static_cast<size_t>(curNumValidMarkers));
+                active_row_miss_markers.reserve(static_cast<size_t>(curNumValidMarkers));
             }
 
             auto prepare_row_missing = [&](int global_r0, int rows) {
                 if (!block_has_missing) return;
                 #pragma omp parallel for schedule(static) if (curNumValidMarkers >= 256)
                 for (int m = 0; m < curNumValidMarkers; ++m) {
-                    const int mb = marker_miss_offset_[m];
-                    const int me = marker_miss_offset_[m + 1];
+                    const int mb = marker_miss_offset_[static_cast<size_t>(m)];
+                    const int me = marker_miss_offset_[static_cast<size_t>(m + 1)];
                     if (mb == me) {
-                        row_miss_b[m] = row_miss_e[m] = mb;
+                        row_miss_b[static_cast<size_t>(m)] = row_miss_e[static_cast<size_t>(m)] = mb;
                         continue;
                     }
                     const int b = static_cast<int>(std::lower_bound(
@@ -1504,12 +2581,12 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                         marker_miss_idx_.begin() + b,
                         marker_miss_idx_.begin() + me,
                         global_r0 + rows) - marker_miss_idx_.begin());
-                    row_miss_b[m] = b;
-                    row_miss_e[m] = e;
+                    row_miss_b[static_cast<size_t>(m)] = b;
+                    row_miss_e[static_cast<size_t>(m)] = e;
                 }
                 active_row_miss_markers.clear();
                 for (int m = 0; m < curNumValidMarkers; ++m) {
-                    if (row_miss_b[m] < row_miss_e[m]) {
+                    if (row_miss_b[static_cast<size_t>(m)] < row_miss_e[static_cast<size_t>(m)]) {
                         active_row_miss_markers.push_back(m);
                     }
                 }
@@ -1518,7 +2595,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             auto accum_col_with_centering = [&](int j, int row_start, int len,
                                                 const int32_t* __restrict__ src_col,
                                                 double* __restrict__ dst_col) {
-                const double r_j_plus_S = S_mu2 - r_raw_[j];
+                const double r_j_plus_S = S_mu2 - r_raw_[static_cast<size_t>(j)];
                 const double* __restrict__ r_row_slice = r_row_vec + row_start;
                 if (first_accum) {
                     #pragma omp simd
@@ -1533,35 +2610,33 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                 }
                 if (!block_has_missing) return;
 
-                // Step 2: markers missing in column j (indexed directly from block-level CSR)
-                const int cm_b = sample_miss_offset_[j];
-                const int cm_e = sample_miss_offset_[j + 1];
+                const int cm_b = sample_miss_offset_[static_cast<size_t>(j)];
+                const int cm_e = sample_miss_offset_[static_cast<size_t>(j + 1)];
                 for (int idx = cm_b; idx < cm_e; ++idx) {
-                    const int m = sample_miss_m_[idx];
-                    const double mu_m = mu_vec_[m];
+                    const int m = sample_miss_m_[static_cast<size_t>(idx)];
+                    const double mu_m = mu_vec_[static_cast<size_t>(m)];
                     const double neg_mu2 = -mu_m * mu_m;
                     const int8_t* __restrict__ col_m = stdGeno_i8.get()
-                                          + static_cast<size_t>(miss_col_of_[m]) * stdGenoLD + row_start;
+                                          + static_cast<size_t>(miss_col_of_[static_cast<size_t>(m)]) * stdGenoLD + row_start;
                     #pragma omp simd
                     for (int r = 0; r < len; ++r) {
                         dst_col[r] += static_cast<double>(col_m[r]) * mu_m + neg_mu2;
                     }
-                    for (int r_idx = row_miss_b[m]; r_idx < row_miss_e[m]; ++r_idx) {
-                        const int s = marker_miss_idx_[r_idx];
+                    for (int r_idx = row_miss_b[static_cast<size_t>(m)]; r_idx < row_miss_e[static_cast<size_t>(m)]; ++r_idx) {
+                        const int s = marker_miss_idx_[static_cast<size_t>(r_idx)];
                         if (s >= row_start) {
                             dst_col[s - row_start] -= neg_mu2;
                         }
                     }
                 }
 
-                // Step 3: markers missing in rows [row_start, row_start + len)
                 const int8_t* __restrict__ row_j_kmajor = kmajor_base + static_cast<size_t>(j) * ldK;
                 for (int m : active_row_miss_markers) {
                     const int8_t g_jm = row_j_kmajor[m];
                     if (g_jm != 0) {
-                        const double corr = mu_vec_[m] * static_cast<double>(g_jm);
-                        for (int r_idx = row_miss_b[m]; r_idx < row_miss_e[m]; ++r_idx) {
-                            const int s = marker_miss_idx_[r_idx];
+                        const double corr = mu_vec_[static_cast<size_t>(m)] * static_cast<double>(g_jm);
+                        for (int r_idx = row_miss_b[static_cast<size_t>(m)]; r_idx < row_miss_e[static_cast<size_t>(m)]; ++r_idx) {
+                            const int s = marker_miss_idx_[static_cast<size_t>(r_idx)];
                             if (s >= row_start) {
                                 dst_col[s - row_start] += corr;
                             }
@@ -1570,11 +2645,12 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                 }
             };
 
-            // r0-outer loop: prepare_row_missing & A_strip reorder once per r0 strip.
-            for (int r0 = 0; r0 < grm_tile_rows; r0 += kTile) {
+            for (int s = 0; s < num_strips; ++s) {
+                const int r0 = s * kTile;
                 const int rows = std::min(kTile, grm_tile_rows - r0);
                 const int global_r0 = grm_tile_rs + r0;
                 const int8_t* const A_strip = kmajor_base + static_cast<size_t>(global_r0) * ldK;
+                double* const strip_base = std::assume_aligned<64>(grm_strips_[static_cast<size_t>(s)].get());
 
                 prepare_row_missing(global_r0, rows);
 
@@ -1600,7 +2676,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
 
                         #pragma omp parallel for schedule(static)
                         for (int c = 0; c < cols; ++c) {
-                            double* dst_col = grm_base + r0 + static_cast<size_t>(c0 + c) * grm_tile_rows;
+                            double* dst_col = strip_base + static_cast<size_t>(c0 + c) * rows;
                             const int32_t* src_col = grm_i32_tile_.data() + static_cast<size_t>(c) * rows;
                             accum_col_with_centering(c0 + c, global_r0, rows, src_col, dst_col);
                         }
@@ -1613,15 +2689,13 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                     grm_i32_tile_.data(), rows, 0,
                     i8_scratch_A_f32_, i8_scratch_C_f32_);
 
-                // Deterministic static equal-area lower-triangle accumulation.
                 #pragma omp parallel
                 {
                     const int tid = omp_get_thread_num();
                     const int nth = omp_get_num_threads();
                     const auto [c_beg, c_end] = gcta_grm_detail::lower_tri_col_range(rows, tid, nth);
                     for (int c = c_beg; c < c_end; ++c) {
-                        double* dst_col = grm_base + (r0 + c)
-                                        + static_cast<size_t>(global_r0 + c) * grm_tile_rows;
+                        double* dst_col = strip_base + c + static_cast<size_t>(global_r0 + c) * rows;
                         const int32_t* src_col = grm_i32_tile_.data() + c + static_cast<size_t>(c) * rows;
                         const int j = global_r0 + c;
                         accum_col_with_centering(j, j, rows - c, src_col, dst_col);
@@ -1631,16 +2705,14 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         }
     } else {
         const float* const std_geno_base = std::assume_aligned<64>(stdGeno.get());
-        double* const grm_base = std::assume_aligned<64>(grm.get());
         const bool first_accum = grm_first_accum;
 
-        // Mixed-precision BLAS3: run cblas_ssyrk / cblas_sgemm (beta=0.0f) on L3-sized
-        // 4096x4096 float32 tiles (grm_f32_tile_buf_), then widen and accumulate into
-        // double* grm. Unified r0-outer loop with deterministic static equal-area diagonal.
-        for (int r0 = 0; r0 < grm_tile_rows; r0 += kTile) {
+        for (int s = 0; s < num_strips; ++s) {
+            const int r0 = s * kTile;
             const int rows = std::min(kTile, grm_tile_rows - r0);
             const int global_r0 = grm_tile_rs + r0;
             const float* const A_strip = std_geno_base + global_r0;
+            double* const strip_base = std::assume_aligned<64>(grm_strips_[static_cast<size_t>(s)].get());
 
             for (int c0 = 0; c0 < global_r0; c0 += kTile) {
                 const int cols = std::min(kTile, global_r0 - c0);
@@ -1654,7 +2726,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
 
                 #pragma omp parallel for schedule(static)
                 for (int c = 0; c < cols; ++c) {
-                    double* __restrict__ dst_col = grm_base + r0 + static_cast<size_t>(c0 + c) * grm_tile_rows;
+                    double* __restrict__ dst_col = strip_base + static_cast<size_t>(c0 + c) * rows;
                     const float* __restrict__ src_col = grm_f32_tile_buf_.data() + static_cast<size_t>(c) * rows;
                     if (first_accum) {
                         #pragma omp simd
@@ -1679,8 +2751,7 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                 const int nth = omp_get_num_threads();
                 const auto [c_beg, c_end] = gcta_grm_detail::lower_tri_col_range(rows, tid, nth);
                 for (int c = c_beg; c < c_end; ++c) {
-                    double* __restrict__ dst_col = grm_base + (r0 + c)
-                                                 + static_cast<size_t>(global_r0 + c) * grm_tile_rows;
+                    double* __restrict__ dst_col = strip_base + c + static_cast<size_t>(global_r0 + c) * rows;
                     const float* __restrict__ src_col = grm_f32_tile_buf_.data() + c + static_cast<size_t>(c) * rows;
                     const int len = rows - c;
                     if (first_accum) {
@@ -1694,17 +2765,16 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             }
         }
 
-        // Check whether any marker has missing bits within [0, decode_rows).
         if (any_missing_full) {
             const int num_words = (decode_rows + 63) / 64;
             const uintptr_t last_word_mask = (decode_rows % 64 == 0)
                 ? ~static_cast<uintptr_t>(0)
                 : ((static_cast<uintptr_t>(1) << (decode_rows % 64)) - 1);
             for (int m = 0; m < curNumValidMarkers && !tile_has_missing; ++m) {
-                const GenoBufItem& it = gbufitems[validIndexBuf[m]];
+                const GenoBufItem& it = gbufitems[static_cast<size_t>(validIndexBuf[static_cast<size_t>(m)])];
                 if (it.nValidN < full_keep_ct && !it.missing.empty()) {
                     for (int w = 0; w < num_words; ++w) {
-                        uintptr_t word = it.missing[w];
+                        uintptr_t word = it.missing[static_cast<size_t>(w)];
                         if (w == num_words - 1) word &= last_word_mask;
                         if (word != 0) {
                             tile_has_missing = true;
@@ -1715,9 +2785,8 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             }
         }
     }
-    grm_first_accum = false;  // every later marker block for this buffer accumulates
+    grm_first_accum = false;
 
-    // Zero-missing fast path: skip bit transposes, popcounts, lazy N, and N_thread completely.
     if (!any_missing_full) {
         if (!grm_skip_global_state) {
             finished_marker += num_marker;
@@ -1726,8 +2795,6 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         return;
     }
 
-    // Missingness exists only outside [0, decode_rows) (e.g. earlier tile or --part):
-    // leave N unallocated for this tile, but still populate global sub_miss on pass 0.
     if (!tile_has_missing) {
         if (!grm_skip_global_state) {
             const int num_words_all = (grm_n + 63) / 64;
@@ -1738,13 +2805,13 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
             for (int w = 0; w < num_words_all; ++w) {
                 const int base_s = w * 64;
                 for (int k = 0; k < curNumValidMarkers; ++k) {
-                    const GenoBufItem& it = gbufitems[validIndexBuf[k]];
+                    const GenoBufItem& it = gbufitems[static_cast<size_t>(validIndexBuf[static_cast<size_t>(k)])];
                     if (it.nValidN < full_keep_ct && !it.missing.empty()) {
-                        uintptr_t word = it.missing[w];
+                        uintptr_t word = it.missing[static_cast<size_t>(w)];
                         if (w == num_words_all - 1) word &= last_mask_all;
                         while (word != 0) {
                             const int bit = std::countr_zero(word);
-                            sub_miss[base_s + bit]++;
+                            sub_miss[static_cast<size_t>(base_s + bit)]++;
                             word &= (word - 1);
                         }
                     }
@@ -1756,7 +2823,6 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         return;
     }
 
-    // Missing genotypes exist in [0, decode_rows): lazily allocate N and sampleMissBuf.
     ensure_N_allocated();
 
     const int markerPerN = static_cast<int>(sizeof(uintptr_t) * CHAR_BIT);
@@ -1769,27 +2835,25 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
         sampleMissBuf.resize(need_miss_words);
     }
 
-    // Each sample block j owns disjoint 64-element slices in both sampleMissBuf
-    // and sub_miss, so transposing and accumulating sub_miss across j is lock-free.
     #pragma omp parallel
     {
         std::array<uintptr_t, 64> transposeInput{};
         alignas(32) plink2::VecW transposeScratch[plink2::kPglBitTransposeBufvecs];
 
         #pragma omp for schedule(static)
-        for(int j = 0; j < numNSampleBlock; j++){
+        for (int j = 0; j < numNSampleBlock; j++) {
             const int baseMissIndex = j * markerPerN;
-            for(int i = 0; i < numNblock; i++){
+            for (int i = 0; i < numNblock; i++) {
                 const int baseMarkerIndex = markerPerN * i;
                 const int lastValidIndex  = std::min(markerPerN * (i + 1), curNumValidMarkers);
                 uintptr_t *block_buf = sampleMissBuf.data() + static_cast<size_t>(i) * blockStride;
                 if (markerPerN == 64) {
-                    for(int k = baseMarkerIndex; k < lastValidIndex; k++){
-                        const GenoBufItem &it = gbufitems[validIndexBuf[k]];
+                    for (int k = baseMarkerIndex; k < lastValidIndex; k++) {
+                        const GenoBufItem &it = gbufitems[static_cast<size_t>(validIndexBuf[static_cast<size_t>(k)])];
                         transposeInput[static_cast<std::size_t>(k - baseMarkerIndex)] =
-                            (it.nValidN < full_keep_ct && !it.missing.empty()) ? it.missing[j] : 0UL;
+                            (it.nValidN < full_keep_ct && !it.missing.empty()) ? it.missing[static_cast<size_t>(j)] : 0UL;
                     }
-                    for(int k = lastValidIndex; k < markerPerN * (i + 1); k++){
+                    for (int k = lastValidIndex; k < markerPerN * (i + 1); k++) {
                         transposeInput[static_cast<std::size_t>(k - baseMarkerIndex)] = 0UL;
                     }
                     plink2::TransposeBitblock(
@@ -1797,35 +2861,34 @@ void GRM::calculate_GRM_blas(uintptr_t *buf, std::span<const uint32_t> markerInd
                         static_cast<uint32_t>(markerPerN), static_cast<uint32_t>(markerPerN),
                         &block_buf[baseMissIndex], transposeScratch);
                 } else {
-                    for(int k = baseMarkerIndex; k < lastValidIndex; k++){
-                        const GenoBufItem &it = gbufitems[validIndexBuf[k]];
+                    for (int k = baseMarkerIndex; k < lastValidIndex; k++) {
+                        const GenoBufItem &it = gbufitems[static_cast<size_t>(validIndexBuf[static_cast<size_t>(k)])];
                         block_buf[baseMissIndex + k - baseMarkerIndex] =
-                            (it.nValidN < full_keep_ct && !it.missing.empty()) ? it.missing[j] : 0UL;
+                            (it.nValidN < full_keep_ct && !it.missing.empty()) ? it.missing[static_cast<size_t>(j)] : 0UL;
                     }
-                    for(int k = lastValidIndex; k < markerPerN * (i + 1); k++){
+                    for (int k = lastValidIndex; k < markerPerN * (i + 1); k++) {
                         block_buf[baseMissIndex + k - baseMarkerIndex] = 0UL;
                     }
                 }
-                if(!grm_skip_global_state){
-                    for(int k = baseMissIndex; k < baseMissIndex + markerPerN; k++){
-                        sub_miss[k] += std::popcount(block_buf[k]);
+                if (!grm_skip_global_state) {
+                    for (int k = baseMissIndex; k < baseMissIndex + markerPerN; k++) {
+                        sub_miss[static_cast<size_t>(k)] += std::popcount(block_buf[k]);
                     }
                 }
             }
         }
 
-        // Reuse the same parallel region: each thread processes its pair range across all blocks.
         #pragma omp for schedule(static)
-        for(int index = 0; index < static_cast<int>(index_grm_pairs.size()); index++){
-            const auto index_pair = index_grm_pairs[index];
-            for(int i = 0; i < numNblock; i++){
+        for (int index = 0; index < static_cast<int>(index_grm_pairs.size()); index++) {
+            const auto index_pair = index_grm_pairs[static_cast<size_t>(index)];
+            for (int i = 0; i < numNblock; i++) {
                 N_thread(index_pair.first, index_pair.second,
                          sampleMissBuf.data() + static_cast<size_t>(i) * blockStride);
             }
         }
     }
 
-    if(!grm_skip_global_state){
+    if (!grm_skip_global_state) {
         finished_marker += num_marker;
         numValidMarkers += static_cast<uint32_t>(curNumValidMarkers);
     }
@@ -1835,90 +2898,151 @@ void GRM::deduce_GRM(){
     LOGGER.i(0, "The GRM computation is completed.");
     float thresh = -99.0f;
     bool isSparse = false;
-    if(sparse_cutoff.has_value()){
+    if (sparse_cutoff.has_value()) {
         thresh = *sparse_cutoff;
         isSparse = true;
         LOGGER.i(0, "Saving sparse GRM with a cutoff " + to_string(thresh) + "...");
-    }else{
+    } else if (write_fp16_) {
+        LOGGER.i(0, "Saving native FP16 GRM...");
+    } else {
         LOGGER.i(0, "Saving GRM...");
     }
 
-    const std::string grm_path = isSparse ? (o_name + ".grm.sp") : (o_name + ".grm.bin");
+    const std::string grm_path = isSparse ? (o_name + ".grm.sp") : (o_name + (write_fp16_ ? ".grm.f16" : ".grm.bin"));
     const std::string N_path   = o_name + ".grm.N.bin";
+    const bool need_N_file = !isSparse && (!write_fp16_ || grm_any_missing_seen_);
+
     UniqueFile sparse_out;
-    gcta_grm_detail::GrmUniqueFd grm_fd;
+    std::unique_ptr<gcta_io::AsyncSeqWriter> grm_writer;
     gcta_grm_detail::GrmUniqueFd N_fd;
-    if(isSparse){
+
+    const uint64_t n_out = static_cast<uint64_t>(num_individual);
+    const uint64_t body_off = write_fp16_ ? gcta_grm_io::grm_f16_body_offset(n_out) : 0ULL;
+
+    if (isSparse) {
         sparse_out = open_file(grm_path, "wb");
-        if(!sparse_out){
-            LOGGER.error(0, "can't open {} to write", grm_path);
-        }
+        if (!sparse_out) LOGGER.error(0, "can't open {} to write", grm_path);
         setvbuf(sparse_out.get(), nullptr, _IOFBF, 4 << 20);
-    }else{
-        grm_fd = gcta_grm_detail::open_posix_write_trunc(grm_path);
-        N_fd   = gcta_grm_detail::open_posix_write_trunc(N_path);
-        if(!grm_fd || !N_fd){
-            LOGGER.error(0, "can't open {}.grm.bin or .grm.N.bin to write", o_name);
+    } else {
+        try {
+            grm_writer = std::make_unique<gcta_io::AsyncSeqWriter>(
+                grm_path, gcta_grm_detail::kGrmAsyncSlotBytes, static_cast<off_t>(body_off));
+            if (write_fp16_) {
+                gcta_grm_io::write_grm_f16_draft_prefix(*grm_writer, n_out);
+                fp16_diag_.assign(static_cast<size_t>(n_out), 0.0f);
+                fp16_trace_K_ = 0.0;
+                fp16_trace_K2_ = 0.0;
+            }
+        } catch (const std::exception& e) {
+            LOGGER.e(0, std::string("deduce_GRM: ") + e.what());
+        }
+        if (need_N_file) {
+            N_fd = gcta_grm_detail::open_posix_write_trunc(N_path);
+            if (!N_fd) LOGGER.error(0, "can't open {} to write", N_path);
         }
     }
 
     double mtd_weight = 1.0;
-    if(isMtd){
+    if (isMtd) {
         double weight = 0.0;
-        if(!isDominance){
-            for(uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i];
-        }else{
-            for(uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i] * sd[i];
+        if (!isDominance) {
+            for (uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i];
+        } else {
+            for (uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i] * sd[i];
         }
-        if(weight > 0.0) mtd_weight = static_cast<double>(numValidMarkers) / weight;
+        if (weight > 0.0) mtd_weight = static_cast<double>(numValidMarkers) / weight;
     }
 
-    // Set tile bounds to cover the entire [part_keep_indices.first, part_keep_indices.second + 1)
-    // pass and delegate to flush_grm_tile (grm_tiling_enabled == false selects packed N[] indexing).
     grm_tile_rs   = static_cast<int>(part_keep_indices.first);
     grm_tile_re   = static_cast<int>(part_keep_indices.second) + 1;
     grm_tile_rows = grm_m;
     grm_tile_cols = grm_n;
 
-    AlignedRawBuffer<float, 64> packed_grm;
-    AlignedRawBuffer<float, 64> packed_N;
     std::vector<float> const_N_buf;
     std::string sparse_buf;
-    flush_grm_tile(grm_fd.get(), N_fd.get(), sparse_out.get(), grm_path, N_path,
-                   thresh, isSparse, mtd_weight,
-                   packed_grm, packed_N, const_N_buf, sparse_buf);
+    flush_grm_tile(grm_writer.get(), N_fd.get(), sparse_out.get(), grm_path, N_path,
+                   thresh, isSparse, mtd_weight, const_N_buf, sparse_buf);
 
-    grm_fd.reset();
+    if (!isSparse) {
+        try {
+            if (write_fp16_) {
+                gcta_grm_io::GrmFp16Header final_hdr{};
+                std::memcpy(final_hdr.magic, gcta_grm_io::kGrmF16MagicFinal, sizeof(final_hdr.magic));
+                final_hdr.version = gcta_grm_io::kGrmF16Version;
+                final_hdr.dtype = gcta_grm_io::kGrmF16DtypeFp16;
+                final_hdr.header_bytes = gcta_grm_io::kGrmF16HeaderSize;
+                final_hdr.flags = gcta_grm_io::kGrmF16FlagFinalized |
+                                  gcta_grm_io::kGrmF16FlagHasTraces |
+                                  gcta_grm_io::kGrmF16FlagHasDiagF32 |
+                                  (!grm_any_missing_seen_ ? gcta_grm_io::kGrmF16FlagZeroMissing : 0u) |
+                                  (isMtd ? gcta_grm_io::kGrmF16FlagVanRaden : 0u) |
+                                  (isDominance ? gcta_grm_io::kGrmF16FlagDominance : 0u) |
+                                  (is_homogametic_ ? gcta_grm_io::kGrmF16FlagHomogametic : 0u);
+                final_hdr.n = n_out;
+                final_hdr.valid_markers = numValidMarkers;
+                if (!grm_any_missing_seen_) {
+                    final_hdr.m_snps_mean = static_cast<double>(numValidMarkers);
+                } else {
+                    double miss_sum = 0.0;
+                    for (uint64_t i = 0; i < n_out; ++i) miss_sum += static_cast<double>(sub_miss[static_cast<size_t>(i)]);
+                    final_hdr.m_snps_mean = (n_out > 0)
+                        ? (static_cast<double>(numValidMarkers) - miss_sum / static_cast<double>(n_out))
+                        : 0.0;
+                }
+                final_hdr.id_hash = grm_id_hash_;
+                final_hdr.trace_K = fp16_trace_K_;
+                final_hdr.trace_K2 = fp16_trace_K2_;
+                final_hdr.diag_offset = gcta_grm_io::kGrmF16HeaderSize;
+                final_hdr.body_offset = body_off;
+                final_hdr.part_row_start = 0;
+                final_hdr.part_row_end = n_out;
+                final_hdr.mtd_weight = mtd_weight;
+                gcta_grm_io::finalize_grm_f16_file(*grm_writer, final_hdr, fp16_diag_.data(), n_out);
+            } else {
+                grm_writer->finish();
+            }
+        } catch (const std::exception& e) {
+            LOGGER.e(0, std::string("Failed finalizing [") + grm_path + "]: " + e.what());
+        }
+    }
+    grm_writer.reset();
     N_fd.reset();
     sparse_out.reset();
-    if(!isSparse){
+
+    if (isSparse) {
+        LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.sp]");
+    } else if (write_fp16_) {
+        LOGGER.i(0, "Native FP16 GRM has been saved in the file [" + grm_path + "]" +
+                    (!grm_any_missing_seen_
+                         ? " (zero missing genotypes; .grm.N.bin omitted, m_snps=" + to_string(numValidMarkers) + " in header)"
+                         : " (missingness present; per-pair counts in [" + N_path + "])"));
+    } else {
         LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.bin]");
         LOGGER.i(0, "Number of SNPs in each pair of individuals has been saved in the file [" + o_name + ".grm.N.bin]");
-    }else{
-        LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.sp]");
     }
 }
 
-
-// Write one tile's (or full non-tiled pass's) normalised lower-triangular rows to already-open
-// output files using a cache-blocked (64x64 / 32x32) packed-row transpose and parallel POSIX I/O.
-//   - Zero-missing fast path (N == nullptr): fuses scaling (and -R[i]-R[j]+S in int32_t mode)
-//     into the 64x64 transpose and writes .grm.N.bin from a pre-filled 16 MiB constant buffer.
-//   - Missing-data path (N != nullptr): reads N exactly once in parallel inside the 32x32 block
-//     transpose to emit both packed_grm and packed_N, then writes both files in parallel.
-void GRM::flush_grm_tile(int grm_fd, int N_fd, FILE *sparse_out,
-                         const std::string& grm_path, const std::string& N_path,
-                         float thresh, bool isSparse, double mtd_weight,
-                         AlignedRawBuffer<float, 64>& packed_grm,
-                         AlignedRawBuffer<float, 64>& packed_N,
+// ---------------------------------------------------------------------------
+// GRM::flush_grm_tile — single-stream AsyncSeqWriter flush from 4096-row strips.
+// Zero concurrent 2-file writes: streams GRM strips asynchronously through
+// grm_writer, then (if N_fd >= 0) drains grm_writer and writes N sequentially.
+// ---------------------------------------------------------------------------
+void GRM::flush_grm_tile(gcta_io::AsyncSeqWriter* grm_writer,
+                         int N_fd,
+                         FILE *sparse_out,
+                         const std::string& grm_path,
+                         const std::string& N_path,
+                         float thresh,
+                         bool isSparse,
+                         double mtd_weight,
                          std::vector<float>& const_N_buf,
                          std::string& sparse_buf){
     const int tile_rs   = grm_tile_rs;
     const int tile_re   = grm_tile_re;
     const int tile_rows = grm_tile_rows;
-    const int tile_cols = grm_tile_cols;   // == tile_re
+    const int tile_cols = grm_tile_cols;
 
-    constexpr size_t kConstNFloats = (16ULL << 20) / sizeof(float); // 16 MiB constant buffer
+    constexpr size_t kConstNFloats = (64ULL << 20) / sizeof(float); // 64 MiB constant buffer
 
     // Edge case: 0 valid markers accumulated (all-missing / all-filtered run).
     if (grm_first_accum || numValidMarkers == 0) {
@@ -1926,42 +3050,34 @@ void GRM::flush_grm_tile(int grm_fd, int N_fd, FILE *sparse_out,
             const uint64_t dre = static_cast<uint64_t>(tile_re);
             const uint64_t drs = static_cast<uint64_t>(tile_rs);
             const size_t total_elems = static_cast<size_t>((dre * (dre + 1ULL) - drs * (drs + 1ULL)) / 2ULL);
-            const size_t total_bytes = total_elems * sizeof(float);
-            const size_t buf_floats = std::min(total_elems, kConstNFloats);
-            if (const_N_buf.size() < buf_floats) const_N_buf.resize(buf_floats);
-            std::fill(const_N_buf.begin(), const_N_buf.begin() + static_cast<std::ptrdiff_t>(buf_floats), 0.0f);
-            const size_t chunk_cap = buf_floats * sizeof(float);
-            bool ok_grm = true, ok_N = true;
-            int err_grm = 0, err_N = 0;
-            #pragma omp parallel sections num_threads(2)
-            {
-                #pragma omp section
-                {
-                    size_t rem = total_bytes;
-                    while (rem > 0) {
-                        const size_t c = std::min(rem, chunk_cap);
-                        if (!gcta_grm_detail::write_exact_posix(grm_fd, const_N_buf.data(), c, err_grm)) {
-                            ok_grm = false;
-                            break;
-                        }
-                        rem -= c;
+            const size_t elem_bytes = write_fp16_ ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
+            const size_t total_grm_bytes = total_elems * elem_bytes;
+            try {
+                size_t rem = total_grm_bytes;
+                while (rem > 0) {
+                    AlignedRawBuffer<char, 64>& slot = grm_writer->acquire_slot();
+                    const size_t c = std::min(rem, slot.size());
+                    std::memset(slot.data(), 0, c);
+                    grm_writer->submit_slot(c);
+                    rem -= c;
+                }
+                if (N_fd >= 0) {
+                    grm_writer->drain();
+                    const size_t total_n_bytes = total_elems * sizeof(float);
+                    const size_t buf_floats = std::min(total_elems, kConstNFloats);
+                    if (const_N_buf.size() < buf_floats) const_N_buf.resize(buf_floats);
+                    std::fill(const_N_buf.begin(), const_N_buf.begin() + static_cast<std::ptrdiff_t>(buf_floats), 0.0f);
+                    size_t n_rem = total_n_bytes;
+                    const size_t chunk_cap = buf_floats * sizeof(float);
+                    while (n_rem > 0) {
+                        const size_t c = std::min(n_rem, chunk_cap);
+                        gcta_io::write_exact_throwing(N_fd, const_N_buf.data(), c, N_path);
+                        n_rem -= c;
                     }
                 }
-                #pragma omp section
-                {
-                    size_t rem = total_bytes;
-                    while (rem > 0) {
-                        const size_t c = std::min(rem, chunk_cap);
-                        if (!gcta_grm_detail::write_exact_posix(N_fd, const_N_buf.data(), c, err_N)) {
-                            ok_N = false;
-                            break;
-                        }
-                        rem -= c;
-                    }
-                }
+            } catch (const std::exception& e) {
+                LOGGER.e(0, std::string("flush_grm_tile zero-marker write failed: ") + e.what());
             }
-            if (!ok_grm) LOGGER.e(0, "write() failed on [" + grm_path + "]: " + std::string(std::strerror(err_grm)));
-            if (!ok_N)   LOGGER.e(0, "write() failed on [" + N_path   + "]: " + std::string(std::strerror(err_N)));
         } else if (0.0f >= thresh) {
             for (int pair1 = tile_rs; pair1 < tile_re; ++pair1) {
                 sparse_buf.clear();
@@ -1978,342 +3094,402 @@ void GRM::flush_grm_tile(int grm_fd, int N_fd, FILE *sparse_out,
 
     const bool zero_missing = (N == nullptr);
     const double inv_scale = mtd_weight / static_cast<double>(numValidMarkers);
+    const size_t out_elem_bytes = write_fp16_ ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
 
-    // Pre-fill constant 16 MiB float(numValidMarkers) buffer for zero-missing .grm.N.bin output.
-    if (!isSparse && zero_missing) {
-        const float n_val = static_cast<float>(numValidMarkers);
-        if (const_N_buf.size() != kConstNFloats || const_N_buf[0] != n_val) {
-            const_N_buf.assign(kConstNFloats, n_val);
-        }
-    }
+    // Target <= 64 MiB packed GRM per AsyncSeqWriter slot (bounded even at N=1,000,000).
+    const size_t kTargetStripElems = gcta_grm_detail::kGrmAsyncSlotBytes / out_elem_bytes;
+    const size_t raw_step = kTargetStripElems / std::max<size_t>(1, static_cast<size_t>(tile_cols));
+    const int sub_step_rows = static_cast<int>(std::clamp<size_t>((raw_step / 64ULL) * 64ULL, 64ULL, 1024ULL));
 
-    // Bound packed_grm strip buffer to <= ~256 MiB (64M floats) even at N=1,000,000.
-    constexpr size_t kTargetStripFloats = 64ULL << 20;
-    const size_t raw_step = kTargetStripFloats / std::max<size_t>(1, static_cast<size_t>(tile_cols));
-    const int strip_rows = static_cast<int>(std::clamp<size_t>((raw_step / 64ULL) * 64ULL, 64ULL, 1024ULL));
-
-    const double* const grm_base       = grm ? std::assume_aligned<64>(grm.get()) : nullptr;
-    const int32_t* const grm_i32_base  = grm_i32 ? std::assume_aligned<64>(grm_i32.get()) : nullptr;
     const uint32_t* const N_base       = N ? std::assume_aligned<64>(N.get()) : nullptr;
     const uint32_t* const sub_miss_ptr = sub_miss.data();
     const double* const R_ptr          = grm_is_i32_ ? R_total_.data() : nullptr;
     const double S_tot                 = S_total_;
 
+    // Unified packed triangular row lookup for N (identical in tiled and dense paths).
     const auto get_N_row = [&](int pair1) -> const uint32_t* {
-        if (grm_tiling_enabled) {
-            return N_base + static_cast<size_t>(pair1 - tile_rs) * tile_cols;
-        }
         const size_t start_pos = static_cast<size_t>(pair1 + 1 + tile_rs) *
                                  static_cast<size_t>(pair1 - tile_rs) / 2;
         return N_base + start_pos;
     };
 
-    std::vector<size_t> row_off(static_cast<size_t>(strip_rows) + 1);
+    std::vector<size_t> row_off(static_cast<size_t>(sub_step_rows) + 1);
+    AlignedRawBuffer<float, 64> sparse_packed_grm; // used only when isSparse == true
 
-    for (int block_start = tile_rs; block_start < tile_re; block_start += strip_rows) {
-        const int block_end         = std::min(block_start + strip_rows, tile_re);
-        const int block_rows        = block_end - block_start;
-        const int local_block_start = block_start - tile_rs;
+    const int num_strips = (tile_rows + kGrmStripRows - 1) / kGrmStripRows;
 
-        size_t total_packed = 0;
-        for (int r = 0; r < block_rows; ++r) {
-            row_off[static_cast<size_t>(r)] = total_packed;
-            total_packed += static_cast<size_t>(block_start + r + 1);
-        }
-        row_off[static_cast<size_t>(block_rows)] = total_packed;
+    try {
+        for (int s = 0; s < num_strips; ++s) {
+            const int strip_local_r0 = s * kGrmStripRows;
+            const int strip_h        = std::min(kGrmStripRows, tile_rows - strip_local_r0);
+            const int strip_global_r0 = tile_rs + strip_local_r0;
+            const int strip_global_r1 = strip_global_r0 + strip_h;
 
-        if (packed_grm.size() < total_packed) {
-            packed_grm.resize(total_packed);
-        }
-        if (!zero_missing && !isSparse && packed_N.size() < total_packed) {
-            packed_N.resize(total_packed);
-        }
+            const double* const strip_f64 = (!grm_is_i32_ && !grm_strips_.empty())
+                ? std::assume_aligned<64>(grm_strips_[static_cast<size_t>(s)].get()) : nullptr;
+            const int32_t* const strip_i32 = (grm_is_i32_ && !grm_i32_strips_.empty())
+                ? std::assume_aligned<64>(grm_i32_strips_[static_cast<size_t>(s)].get()) : nullptr;
 
-        float* const out_grm = packed_grm.data();
-        float* const out_N   = (!zero_missing && !isSparse) ? packed_N.data() : nullptr;
+            for (int block_start = strip_global_r0; block_start < strip_global_r1; block_start += sub_step_rows) {
+                const int block_end    = std::min(block_start + sub_step_rows, strip_global_r1);
+                const int block_rows   = block_end - block_start;
+                const int strip_row_r0 = block_start - strip_global_r0;
 
-        if (zero_missing && grm_is_i32_) {
-            // 64x64 L1-resident cache-blocked transpose: fuses centering (-R[i]-R[j]+S) and * inv_scale.
-            constexpr int kBlk = 64;
-            const int n_cblk = (block_end + kBlk - 1) / kBlk;
-            #pragma omp parallel for schedule(static)
-            for (int cb = 0; cb < n_cblk; ++cb) {
-                const int c0 = cb * kBlk;
-                const int c_len = std::min(kBlk, block_end - c0);
-                alignas(64) float tmp[kBlk][kBlk];
-                for (int r0 = 0; r0 < block_rows; r0 += kBlk) {
-                    const int r_len = std::min(kBlk, block_rows - r0);
-                    const int global_r0 = block_start + r0;
-                    if (c0 >= global_r0 + r_len) continue;
-                    const int local_r0 = local_block_start + r0;
-                    const double* __restrict__ R_row = R_ptr + global_r0;
-                    for (int dc = 0; dc < c_len; ++dc) {
-                        const int c = c0 + dc;
-                        const int dr_start = std::max(0, c - global_r0);
-                        if (dr_start >= r_len) break;
-                        const int32_t* __restrict__ col_src =
-                            grm_i32_base + static_cast<size_t>(c) * tile_rows + local_r0;
-                        const double r_j_plus_S = S_tot - R_ptr[c];
-                        for (int dr = dr_start; dr < r_len; ++dr) {
-                            tmp[dr][dc] = static_cast<float>(
-                                (static_cast<double>(col_src[dr]) - R_row[dr] + r_j_plus_S) * inv_scale);
-                        }
-                    }
-                    for (int dr = 0; dr < r_len; ++dr) {
-                        const int pair1 = global_r0 + dr;
-                        const int valid_c = std::min(c_len, pair1 + 1 - c0);
-                        if (valid_c <= 0) continue;
-                        std::memcpy(out_grm + row_off[static_cast<size_t>(r0 + dr)] + c0,
-                                    tmp[dr], static_cast<size_t>(valid_c) * sizeof(float));
-                    }
+                size_t total_packed = 0;
+                for (int r = 0; r < block_rows; ++r) {
+                    row_off[static_cast<size_t>(r)] = total_packed;
+                    total_packed += static_cast<size_t>(block_start + r + 1);
                 }
-            }
-        } else if (zero_missing) {
-            // 64x64 L1-resident cache-blocked transpose for zero-missing double* grm: fuses * inv_scale.
-            constexpr int kBlk = 64;
-            const int n_cblk = (block_end + kBlk - 1) / kBlk;
-            #pragma omp parallel for schedule(static)
-            for (int cb = 0; cb < n_cblk; ++cb) {
-                const int c0 = cb * kBlk;
-                const int c_len = std::min(kBlk, block_end - c0);
-                alignas(64) float tmp[kBlk][kBlk];
-                for (int r0 = 0; r0 < block_rows; r0 += kBlk) {
-                    const int r_len = std::min(kBlk, block_rows - r0);
-                    const int global_r0 = block_start + r0;
-                    if (c0 >= global_r0 + r_len) continue;
-                    const int local_r0 = local_block_start + r0;
-                    for (int dc = 0; dc < c_len; ++dc) {
-                        const int c = c0 + dc;
-                        const int dr_start = std::max(0, c - global_r0);
-                        if (dr_start >= r_len) break;
-                        const double* __restrict__ col_src =
-                            grm_base + static_cast<size_t>(c) * tile_rows + local_r0;
-                        for (int dr = dr_start; dr < r_len; ++dr) {
-                            tmp[dr][dc] = static_cast<float>(col_src[dr] * inv_scale);
-                        }
-                    }
-                    for (int dr = 0; dr < r_len; ++dr) {
-                        const int pair1 = global_r0 + dr;
-                        const int valid_c = std::min(c_len, pair1 + 1 - c0);
-                        if (valid_c <= 0) continue;
-                        std::memcpy(out_grm + row_off[static_cast<size_t>(r0 + dr)] + c0,
-                                    tmp[dr], static_cast<size_t>(valid_c) * sizeof(float));
-                    }
+                row_off[static_cast<size_t>(block_rows)] = total_packed;
+
+                const size_t strip_bytes = total_packed * out_elem_bytes;
+                char* out_raw = nullptr;
+                if (!isSparse) {
+                    AlignedRawBuffer<char, 64>& slot = grm_writer->acquire_slot();
+                    if (slot.size() < strip_bytes) slot.resize(strip_bytes);
+                    out_raw = slot.data();
+                } else {
+                    if (sparse_packed_grm.size() < total_packed) sparse_packed_grm.resize(total_packed);
+                    out_raw = reinterpret_cast<char*>(sparse_packed_grm.data());
                 }
-            }
-        } else {
-            // 32x32 L1-resident cache-blocked transpose for missing-data path:
-            // reads N once in parallel to produce both packed_grm and packed_N.
-            constexpr int kBlk = 32;
-            const int n_cblk = (block_end + kBlk - 1) / kBlk;
-            const uint32_t valid_m = numValidMarkers;
-            #pragma omp parallel for schedule(static)
-            for (int cb = 0; cb < n_cblk; ++cb) {
-                const int c0 = cb * kBlk;
-                const int c_len = std::min(kBlk, block_end - c0);
-                alignas(64) double tmp_d[kBlk][kBlk];
-                for (int r0 = 0; r0 < block_rows; r0 += kBlk) {
-                    const int r_len = std::min(kBlk, block_rows - r0);
-                    const int global_r0 = block_start + r0;
-                    if (c0 >= global_r0 + r_len) continue;
-                    const int local_r0 = local_block_start + r0;
-                    for (int dc = 0; dc < c_len; ++dc) {
-                        const int c = c0 + dc;
-                        const int dr_start = std::max(0, c - global_r0);
-                        if (dr_start >= r_len) break;
-                        const double* __restrict__ col_src =
-                            grm_base + static_cast<size_t>(c) * tile_rows + local_r0;
-                        for (int dr = dr_start; dr < r_len; ++dr) {
-                            tmp_d[dr][dc] = col_src[dr];
-                        }
-                    }
-                    for (int dr = 0; dr < r_len; ++dr) {
-                        const int pair1 = global_r0 + dr;
-                        const int valid_c = std::min(c_len, pair1 + 1 - c0);
-                        if (valid_c <= 0) continue;
-                        const uint32_t sub_miss1 = valid_m - sub_miss_ptr[pair1];
-                        const uint32_t* __restrict__ N_row = get_N_row(pair1) + c0;
-                        const uint32_t* __restrict__ sm_c  = sub_miss_ptr + c0;
-                        const size_t dst_off = row_off[static_cast<size_t>(r0 + dr)] + static_cast<size_t>(c0);
-                        float* __restrict__ g_dst = out_grm + dst_off;
-                        const double* __restrict__ td_row = tmp_d[dr];
-                        if (out_N) {
-                            float* __restrict__ n_dst = out_N + dst_off;
-                            for (int dc = 0; dc < valid_c; ++dc) {
-                                const uint32_t sub_N = N_row[dc] + sub_miss1 - sm_c[dc];
-                                n_dst[dc] = static_cast<float>(sub_N);
-                                g_dst[dc] = sub_N
-                                    ? static_cast<float>((td_row[dc] / static_cast<double>(sub_N)) * mtd_weight)
-                                    : 0.0f;
+
+                float* const out_f32 = (!write_fp16_ || isSparse) ? reinterpret_cast<float*>(out_raw) : nullptr;
+                gcta_grm_io::GrmFp16* const out_f16 = (write_fp16_ && !isSparse)
+                    ? reinterpret_cast<gcta_grm_io::GrmFp16*>(out_raw) : nullptr;
+
+                double tr_K_strip = 0.0;
+                double tr_K2_strip = 0.0;
+
+                if (zero_missing && grm_is_i32_) {
+                    constexpr int kBlk = 64;
+                    const int n_cblk = (block_end + kBlk - 1) / kBlk;
+                    #pragma omp parallel for reduction(+:tr_K_strip, tr_K2_strip) schedule(static)
+                    for (int cb = 0; cb < n_cblk; ++cb) {
+                        const int c0 = cb * kBlk;
+                        const int c_len = std::min(kBlk, block_end - c0);
+                        alignas(64) float tmp[kBlk][kBlk];
+                        for (int r0 = 0; r0 < block_rows; r0 += kBlk) {
+                            const int r_len = std::min(kBlk, block_rows - r0);
+                            const int global_r0 = block_start + r0;
+                            if (c0 >= global_r0 + r_len) continue;
+                            const int local_r0 = strip_row_r0 + r0;
+                            const double* __restrict__ R_row = R_ptr + global_r0;
+                            for (int dc = 0; dc < c_len; ++dc) {
+                                const int c = c0 + dc;
+                                const int dr_start = std::max(0, c - global_r0);
+                                if (dr_start >= r_len) break;
+                                const int32_t* __restrict__ col_src =
+                                    strip_i32 + static_cast<size_t>(c) * strip_h + local_r0;
+                                const double r_j_plus_S = S_tot - R_ptr[c];
+                                for (int dr = dr_start; dr < r_len; ++dr) {
+                                    tmp[dr][dc] = static_cast<float>(
+                                        (static_cast<double>(col_src[dr]) - R_row[dr] + r_j_plus_S) * inv_scale);
+                                }
                             }
-                        } else {
-                            for (int dc = 0; dc < valid_c; ++dc) {
-                                const uint32_t sub_N = N_row[dc] + sub_miss1 - sm_c[dc];
-                                g_dst[dc] = sub_N
-                                    ? static_cast<float>((td_row[dc] / static_cast<double>(sub_N)) * mtd_weight)
-                                    : 0.0f;
+                            if (out_f16) {
+                                for (int dr = 0; dr < r_len; ++dr) {
+                                    const int pair1 = global_r0 + dr;
+                                    const int valid_c = std::min(c_len, pair1 + 1 - c0);
+                                    if (valid_c <= 0) continue;
+                                    gcta_grm_io::GrmFp16* __restrict__ dst = out_f16 + row_off[static_cast<size_t>(r0 + dr)] + c0;
+                                    const float* __restrict__ src = tmp[dr];
+                                    const bool has_diag = (c0 + valid_c - 1 == pair1);
+                                    const int off_end = has_diag ? (valid_c - 1) : valid_c;
+                                    double off_sq = 0.0;
+                                    #pragma omp simd reduction(+:off_sq)
+                                    for (int dc = 0; dc < off_end; ++dc) {
+                                        const float v = src[dc];
+                                        dst[dc] = gcta_grm_io::f32_to_fp16(v);
+                                        const double vd = static_cast<double>(v);
+                                        off_sq += vd * vd;
+                                    }
+                                    tr_K2_strip += 2.0 * off_sq;
+                                    if (has_diag) {
+                                        const float dv = src[off_end];
+                                        dst[off_end] = gcta_grm_io::f32_to_fp16(dv);
+                                        fp16_diag_[static_cast<size_t>(pair1)] = dv;
+                                        const double dd = static_cast<double>(dv);
+                                        tr_K_strip += dd;
+                                        tr_K2_strip += dd * dd;
+                                    }
+                                }
+                            } else {
+                                for (int dr = 0; dr < r_len; ++dr) {
+                                    const int pair1 = global_r0 + dr;
+                                    const int valid_c = std::min(c_len, pair1 + 1 - c0);
+                                    if (valid_c <= 0) continue;
+                                    std::memcpy(out_f32 + row_off[static_cast<size_t>(r0 + dr)] + c0,
+                                                tmp[dr], static_cast<size_t>(valid_c) * sizeof(float));
+                                }
                             }
                         }
                     }
-                }
-            }
-        }
-
-        if (!isSparse) {
-            const size_t strip_bytes = total_packed * sizeof(float);
-            const size_t const_N_bytes = const_N_buf.size() * sizeof(float);
-            bool ok_grm = true, ok_N = true;
-            int err_grm = 0, err_N = 0;
-            #pragma omp parallel sections num_threads(2)
-            {
-                #pragma omp section
-                {
-                    ok_grm = gcta_grm_detail::write_exact_posix(grm_fd, out_grm, strip_bytes, err_grm);
-                }
-                #pragma omp section
-                {
-                    if (zero_missing) {
-                        size_t rem = strip_bytes;
-                        while (rem > 0) {
-                            const size_t chunk = std::min(rem, const_N_bytes);
-                            if (!gcta_grm_detail::write_exact_posix(N_fd, const_N_buf.data(), chunk, err_N)) {
-                                ok_N = false;
-                                break;
+                } else if (zero_missing) {
+                    constexpr int kBlk = 64;
+                    const int n_cblk = (block_end + kBlk - 1) / kBlk;
+                    #pragma omp parallel for reduction(+:tr_K_strip, tr_K2_strip) schedule(static)
+                    for (int cb = 0; cb < n_cblk; ++cb) {
+                        const int c0 = cb * kBlk;
+                        const int c_len = std::min(kBlk, block_end - c0);
+                        alignas(64) float tmp[kBlk][kBlk];
+                        for (int r0 = 0; r0 < block_rows; r0 += kBlk) {
+                            const int r_len = std::min(kBlk, block_rows - r0);
+                            const int global_r0 = block_start + r0;
+                            if (c0 >= global_r0 + r_len) continue;
+                            const int local_r0 = strip_row_r0 + r0;
+                            for (int dc = 0; dc < c_len; ++dc) {
+                                const int c = c0 + dc;
+                                const int dr_start = std::max(0, c - global_r0);
+                                if (dr_start >= r_len) break;
+                                const double* __restrict__ col_src =
+                                    strip_f64 + static_cast<size_t>(c) * strip_h + local_r0;
+                                for (int dr = dr_start; dr < r_len; ++dr) {
+                                    tmp[dr][dc] = static_cast<float>(col_src[dr] * inv_scale);
+                                }
                             }
-                            rem -= chunk;
+                            if (out_f16) {
+                                for (int dr = 0; dr < r_len; ++dr) {
+                                    const int pair1 = global_r0 + dr;
+                                    const int valid_c = std::min(c_len, pair1 + 1 - c0);
+                                    if (valid_c <= 0) continue;
+                                    gcta_grm_io::GrmFp16* __restrict__ dst = out_f16 + row_off[static_cast<size_t>(r0 + dr)] + c0;
+                                    const float* __restrict__ src = tmp[dr];
+                                    const bool has_diag = (c0 + valid_c - 1 == pair1);
+                                    const int off_end = has_diag ? (valid_c - 1) : valid_c;
+                                    double off_sq = 0.0;
+                                    #pragma omp simd reduction(+:off_sq)
+                                    for (int dc = 0; dc < off_end; ++dc) {
+                                        const float v = src[dc];
+                                        dst[dc] = gcta_grm_io::f32_to_fp16(v);
+                                        const double vd = static_cast<double>(v);
+                                        off_sq += vd * vd;
+                                    }
+                                    tr_K2_strip += 2.0 * off_sq;
+                                    if (has_diag) {
+                                        const float dv = src[off_end];
+                                        dst[off_end] = gcta_grm_io::f32_to_fp16(dv);
+                                        fp16_diag_[static_cast<size_t>(pair1)] = dv;
+                                        const double dd = static_cast<double>(dv);
+                                        tr_K_strip += dd;
+                                        tr_K2_strip += dd * dd;
+                                    }
+                                }
+                            } else {
+                                for (int dr = 0; dr < r_len; ++dr) {
+                                    const int pair1 = global_r0 + dr;
+                                    const int valid_c = std::min(c_len, pair1 + 1 - c0);
+                                    if (valid_c <= 0) continue;
+                                    std::memcpy(out_f32 + row_off[static_cast<size_t>(r0 + dr)] + c0,
+                                                tmp[dr], static_cast<size_t>(valid_c) * sizeof(float));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    constexpr int kBlk = 32;
+                    const int n_cblk = (block_end + kBlk - 1) / kBlk;
+                    const uint32_t valid_m = numValidMarkers;
+                    #pragma omp parallel for reduction(+:tr_K_strip, tr_K2_strip) schedule(static)
+                    for (int cb = 0; cb < n_cblk; ++cb) {
+                        const int c0 = cb * kBlk;
+                        const int c_len = std::min(kBlk, block_end - c0);
+                        alignas(64) double tmp_d[kBlk][kBlk];
+                        for (int r0 = 0; r0 < block_rows; r0 += kBlk) {
+                            const int r_len = std::min(kBlk, block_rows - r0);
+                            const int global_r0 = block_start + r0;
+                            if (c0 >= global_r0 + r_len) continue;
+                            const int local_r0 = strip_row_r0 + r0;
+                            for (int dc = 0; dc < c_len; ++dc) {
+                                const int c = c0 + dc;
+                                const int dr_start = std::max(0, c - global_r0);
+                                if (dr_start >= r_len) break;
+                                const double* __restrict__ col_src =
+                                    strip_f64 + static_cast<size_t>(c) * strip_h + local_r0;
+                                for (int dr = dr_start; dr < r_len; ++dr) {
+                                    tmp_d[dr][dc] = col_src[dr];
+                                }
+                            }
+                            for (int dr = 0; dr < r_len; ++dr) {
+                                const int pair1 = global_r0 + dr;
+                                const int valid_c = std::min(c_len, pair1 + 1 - c0);
+                                if (valid_c <= 0) continue;
+                                const uint32_t sub_miss1 = valid_m - sub_miss_ptr[pair1];
+                                const uint32_t* __restrict__ N_row = get_N_row(pair1) + c0;
+                                const uint32_t* __restrict__ sm_c  = sub_miss_ptr + c0;
+                                const size_t dst_off = row_off[static_cast<size_t>(r0 + dr)] + static_cast<size_t>(c0);
+                                const double* __restrict__ td_row = tmp_d[dr];
+                                if (out_f16) {
+                                    gcta_grm_io::GrmFp16* __restrict__ g_dst = out_f16 + dst_off;
+                                    const bool has_diag = (c0 + valid_c - 1 == pair1);
+                                    const int off_end = has_diag ? (valid_c - 1) : valid_c;
+                                    double off_sq = 0.0;
+                                    for (int dc = 0; dc < off_end; ++dc) {
+                                        const uint32_t sub_N = N_row[dc] + sub_miss1 - sm_c[dc];
+                                        const float v = sub_N
+                                            ? static_cast<float>((td_row[dc] / static_cast<double>(sub_N)) * mtd_weight)
+                                            : 0.0f;
+                                        g_dst[dc] = gcta_grm_io::f32_to_fp16(v);
+                                        const double vd = static_cast<double>(v);
+                                        off_sq += vd * vd;
+                                    }
+                                    tr_K2_strip += 2.0 * off_sq;
+                                    if (has_diag) {
+                                        const uint32_t sub_N = N_row[off_end] + sub_miss1 - sm_c[off_end];
+                                        const float dv = sub_N
+                                            ? static_cast<float>((td_row[off_end] / static_cast<double>(sub_N)) * mtd_weight)
+                                            : 0.0f;
+                                        g_dst[off_end] = gcta_grm_io::f32_to_fp16(dv);
+                                        fp16_diag_[static_cast<size_t>(pair1)] = dv;
+                                        const double dd = static_cast<double>(dv);
+                                        tr_K_strip += dd;
+                                        tr_K2_strip += dd * dd;
+                                    }
+                                } else {
+                                    float* __restrict__ g_dst = out_f32 + dst_off;
+                                    for (int dc = 0; dc < valid_c; ++dc) {
+                                        const uint32_t sub_N = N_row[dc] + sub_miss1 - sm_c[dc];
+                                        g_dst[dc] = sub_N
+                                            ? static_cast<float>((td_row[dc] / static_cast<double>(sub_N)) * mtd_weight)
+                                            : 0.0f;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (out_f16) {
+                    fp16_trace_K_  += tr_K_strip;
+                    fp16_trace_K2_ += tr_K2_strip;
+                }
+
+                if (!isSparse) {
+                    grm_writer->submit_slot(strip_bytes);
+                } else {
+                    const int n_thr = (block_rows >= 64) ? omp_get_max_threads() : 1;
+                    if (n_thr > 1) {
+                        std::vector<std::string> thr_bufs(static_cast<size_t>(n_thr));
+                        #pragma omp parallel num_threads(n_thr)
+                        {
+                            const int tid = omp_get_thread_num();
+                            const int r_beg = (block_rows * tid) / n_thr;
+                            const int r_end = (block_rows * (tid + 1)) / n_thr;
+                            std::string& local_buf = thr_bufs[static_cast<size_t>(tid)];
+                            for (int local_r = r_beg; local_r < r_end; ++local_r) {
+                                const int pair1 = block_start + local_r;
+                                const float* row = out_f32 + row_off[static_cast<size_t>(local_r)];
+                                for (int i = 0; i <= pair1; ++i) {
+                                    if (row[i] >= thresh) {
+                                        std::format_to(std::back_inserter(local_buf),
+                                            "{}\t{}\t{:.{}g}\n",
+                                            pair1, i, row[i],
+                                            std::numeric_limits<float>::digits10 + 2);
+                                    }
+                                }
+                            }
+                        }
+                        for (const auto& tb : thr_bufs) {
+                            if (!tb.empty() && fwrite(tb.data(), 1, tb.size(), sparse_out) != tb.size()) {
+                                LOGGER.e(0, "Failed to write sparse GRM output [" + grm_path + "].");
+                            }
                         }
                     } else {
-                        ok_N = gcta_grm_detail::write_exact_posix(N_fd, out_N, strip_bytes, err_N);
-                    }
-                }
-            }
-            if (!ok_grm) {
-                LOGGER.e(0, "write() failed on [" + grm_path + "]: " + std::string(std::strerror(err_grm)));
-            }
-            if (!ok_N) {
-                LOGGER.e(0, "write() failed on [" + N_path + "]: " + std::string(std::strerror(err_N)));
-            }
-        } else {
-            const int n_thr = (block_rows >= 64) ? omp_get_max_threads() : 1;
-            if (n_thr > 1) {
-                std::vector<std::string> thr_bufs(static_cast<size_t>(n_thr));
-                #pragma omp parallel num_threads(n_thr)
-                {
-                    const int tid = omp_get_thread_num();
-                    const int r_beg = (block_rows * tid) / n_thr;
-                    const int r_end = (block_rows * (tid + 1)) / n_thr;
-                    std::string& local_buf = thr_bufs[static_cast<size_t>(tid)];
-                    for (int local_r = r_beg; local_r < r_end; ++local_r) {
-                        const int pair1 = block_start + local_r;
-                        const float* row = out_grm + row_off[static_cast<size_t>(local_r)];
-                        for (int i = 0; i <= pair1; ++i) {
-                            if (row[i] >= thresh) {
-                                std::format_to(std::back_inserter(local_buf),
-                                    "{}\t{}\t{:.{}g}\n",
-                                    pair1, i, row[i],
-                                    std::numeric_limits<float>::digits10 + 2);
+                        sparse_buf.clear();
+                        for (int local_r = 0; local_r < block_rows; ++local_r) {
+                            const int pair1 = block_start + local_r;
+                            const float* row = out_f32 + row_off[static_cast<size_t>(local_r)];
+                            for (int i = 0; i <= pair1; ++i) {
+                                if (row[i] >= thresh) {
+                                    std::format_to(std::back_inserter(sparse_buf),
+                                        "{}\t{}\t{:.{}g}\n",
+                                        pair1, i, row[i],
+                                        std::numeric_limits<float>::digits10 + 2);
+                                }
                             }
                         }
-                    }
-                }
-                for (const auto& tb : thr_bufs) {
-                    if (!tb.empty() && fwrite(tb.data(), 1, tb.size(), sparse_out) != tb.size()) {
-                        LOGGER.e(0, "Failed to write sparse GRM output [" + grm_path + "].");
-                    }
-                }
-            } else {
-                sparse_buf.clear();
-                for (int local_r = 0; local_r < block_rows; ++local_r) {
-                    const int pair1 = block_start + local_r;
-                    const float* row = out_grm + row_off[static_cast<size_t>(local_r)];
-                    for (int i = 0; i <= pair1; ++i) {
-                        if (row[i] >= thresh) {
-                            std::format_to(std::back_inserter(sparse_buf),
-                                "{}\t{}\t{:.{}g}\n",
-                                pair1, i, row[i],
-                                std::numeric_limits<float>::digits10 + 2);
+                        if (!sparse_buf.empty() && fwrite(sparse_buf.data(), 1, sparse_buf.size(), sparse_out) != sparse_buf.size()) {
+                            LOGGER.e(0, "Failed to write sparse GRM output [" + grm_path + "].");
                         }
                     }
-                }
-                if (!sparse_buf.empty() && fwrite(sparse_buf.data(), 1, sparse_buf.size(), sparse_out) != sparse_buf.size()) {
-                    LOGGER.e(0, "Failed to write sparse GRM output [" + grm_path + "].");
                 }
             }
         }
+
+        // Write .grm.N.bin sequentially AFTER draining grm_writer (strictly 1 active write stream!).
+        if (!isSparse && N_fd >= 0) {
+            grm_writer->drain();
+            const uint64_t dre = static_cast<uint64_t>(tile_re);
+            const uint64_t drs = static_cast<uint64_t>(tile_rs);
+            const size_t tile_total_elems = static_cast<size_t>((dre * (dre + 1ULL) - drs * (drs + 1ULL)) / 2ULL);
+
+            if (zero_missing) {
+                const float n_val = static_cast<float>(numValidMarkers);
+                const size_t buf_floats = std::min(tile_total_elems, kConstNFloats);
+                if (const_N_buf.size() < buf_floats || (buf_floats > 0 && const_N_buf[0] != n_val)) {
+                    const_N_buf.assign(buf_floats, n_val);
+                }
+                size_t rem_bytes = tile_total_elems * sizeof(float);
+                const size_t cap_bytes = buf_floats * sizeof(float);
+                while (rem_bytes > 0) {
+                    const size_t c = std::min(rem_bytes, cap_bytes);
+                    gcta_io::write_exact_throwing(N_fd, const_N_buf.data(), c, N_path);
+                    rem_bytes -= c;
+                }
+            } else {
+                // Missing-data tile: pack row-major triangular N[] into float32 strips via single AsyncSeqWriter.
+                gcta_io::AsyncSeqWriter n_writer(N_fd, N_path, gcta_grm_detail::kGrmAsyncSlotBytes,
+                                                 /*take_ownership=*/false);
+                const uint32_t valid_m = numValidMarkers;
+                const size_t max_n_elems = gcta_grm_detail::kGrmAsyncSlotBytes / sizeof(float);
+                int r_cur = tile_rs;
+                while (r_cur < tile_re) {
+                    const size_t e0 = static_cast<size_t>(r_cur) * (r_cur + 1) / 2;
+                    const int r_end = gcta_grm_io::row_bound_for_cumulative(e0 + max_n_elems, r_cur, tile_re);
+                    const size_t e1 = static_cast<size_t>(r_end) * (r_end + 1) / 2;
+                    const size_t chunk_bytes = (e1 - e0) * sizeof(float);
+
+                    AlignedRawBuffer<char, 64>& slot = n_writer.acquire_slot();
+                    if (slot.size() < chunk_bytes) slot.resize(chunk_bytes);
+                    auto* dst_base = reinterpret_cast<float*>(slot.data());
+
+                    #pragma omp parallel for schedule(dynamic, 64)
+                    for (int pair1 = r_cur; pair1 < r_end; ++pair1) {
+                        const uint32_t sub_miss1 = valid_m - sub_miss_ptr[pair1];
+                        const uint32_t* __restrict__ N_row = get_N_row(pair1);
+                        const size_t dst_off = static_cast<size_t>(pair1) * (pair1 + 1) / 2 - e0;
+                        float* __restrict__ n_dst = dst_base + dst_off;
+                        #pragma omp simd
+                        for (int c = 0; c <= pair1; ++c) {
+                            n_dst[c] = static_cast<float>(N_row[c] + sub_miss1 - sub_miss_ptr[c]);
+                        }
+                    }
+                    n_writer.submit_slot(chunk_bytes);
+                    r_cur = r_end;
+                }
+                n_writer.finish();
+            }
+        }
+    } catch (const std::exception& e) {
+        LOGGER.e(0, std::string("flush_grm_tile failed: ") + e.what());
     }
 }
 
-
-// N_thread: two distinct N[] layouts, selected by grm_tiling_enabled
-// (true when an auto-sized --GRM-tile-budget is active).
-//
-//   grm_tiling_enabled  (tiled path):
-//     N is a RECTANGULAR buffer of shape (grm_tile_rows × grm_tile_cols), allocated in
-//     processMakeGRM with make_aligned_uninitialized and zeroed per tile.
-//     Index: N[(pair1 - grm_tile_rs) * grm_tile_cols + pair2]
-//     pair2 ranges over [0, pair1] (lower triangle), but the stride is grm_tile_cols
-//     (full width), not the triangular row length.  flush_grm_tile reads it the same way.
-//
-//   !grm_tiling_enabled  (non-tiled path):
-//     N is a PACKED TRIANGULAR buffer: row pair1 occupies positions
-//     [tri_offset(pair1), tri_offset(pair1) + pair1].
-//     startPos = (pair1+1+first) * (pair1-first) / 2  is the triangular row offset.
-//     deduce_GRM advances po_N by (pair1+1) after each row, consuming the packed layout.
-//
-// INVARIANT: these two paths must never be mixed.  The tiled path is always active
-// when grm_tiling_enabled; the non-tiled path is the fallback otherwise.
-// If the two code paths are ever merged, this layout difference must be resolved first.
+// Unified packed triangular N_thread (identical layout for tiled and dense paths).
 void GRM::N_thread(int grm_index_from, int grm_index_to, const uintptr_t* cur_cmask){
     uint32_t* const N_base = std::assume_aligned<64>(N.get());
-    if(grm_tiling_enabled){
-        // Rectangular N layout: N[(pair1 - grm_tile_rs) * grm_tile_cols + pair2]
-        uint32_t *po_N_row = N_base + static_cast<size_t>(grm_index_from - grm_tile_rs) * grm_tile_cols;
-        const uintptr_t *p_cmask1 = cur_cmask + grm_index_from;
-        for(int index_pair1 = grm_index_from; index_pair1 != grm_index_to + 1;
-                index_pair1++, po_N_row += grm_tile_cols){
-            uintptr_t cmask1 = *p_cmask1++;
-            if(cmask1){
-                int count = index_pair1 + 1;
-                const uintptr_t *p_cmask2 = cur_cmask;
-                uint32_t *po_N = po_N_row;
-                int index_pair2 = 0;
-                for(; index_pair2 + 3 < count; index_pair2 += 4){
-                    uintptr_t c0 = p_cmask2[0];
-                    uintptr_t c1 = p_cmask2[1];
-                    uintptr_t c2 = p_cmask2[2];
-                    uintptr_t c3 = p_cmask2[3];
-                    po_N[0] += std::popcount(cmask1 & c0);
-                    po_N[1] += std::popcount(cmask1 & c1);
-                    po_N[2] += std::popcount(cmask1 & c2);
-                    po_N[3] += std::popcount(cmask1 & c3);
-                    p_cmask2 += 4;
-                    po_N += 4;
-                }
-                for(; index_pair2 < count; index_pair2++){
-                    uintptr_t cmask = cmask1 & (*p_cmask2++);
-                    if(cmask) *po_N += std::popcount(cmask);
-                    po_N++;
-                }
-            }
-        }
-        return;
-    }
+    const uint64_t rs_u = static_cast<uint64_t>(grm_tile_rs);
+    const uint64_t startPos = (static_cast<uint64_t>(grm_index_from) + 1ULL + rs_u)
+                            * static_cast<uint64_t>(grm_index_from - grm_tile_rs) / 2ULL;
 
-    uint64_t startPos = ((uint64_t)grm_index_from + 1 + part_keep_indices.first) * (grm_index_from - part_keep_indices.first) / 2;
-
-    uint32_t *po_N_start = N_base + startPos;
-    //for(int cur_block = 0; cur_block != Constants::NUM_MARKER_READ / num_cmask_block; cur_block++){
-    //uint64_t *cur_cmask = cmask_buf + cur_block * index_keep.size();
-    uint32_t *po_N = po_N_start;
+    uint32_t *po_N = N_base + startPos;
     const uintptr_t *p_cmask1 = cur_cmask + grm_index_from;
-    for(int index_pair1 = grm_index_from; index_pair1 != grm_index_to + 1; index_pair1++){
+    for (int index_pair1 = grm_index_from; index_pair1 != grm_index_to + 1; index_pair1++) {
         const uintptr_t *p_cmask2 = cur_cmask;
         uintptr_t cmask1 = *p_cmask1++;
-        if(cmask1){
+        if (cmask1) {
             int count = index_pair1 + 1;
             int index_pair2 = 0;
-            // Unrolled: process 4 pairs per iteration
-            for(; index_pair2 + 3 < count; index_pair2 += 4){
+            for (; index_pair2 + 3 < count; index_pair2 += 4) {
                 uintptr_t c0 = p_cmask2[0];
                 uintptr_t c1 = p_cmask2[1];
                 uintptr_t c2 = p_cmask2[2];
@@ -2325,17 +3501,15 @@ void GRM::N_thread(int grm_index_from, int grm_index_to, const uintptr_t* cur_cm
                 p_cmask2 += 4;
                 po_N += 4;
             }
-            // Remainder
-            for(; index_pair2 < count; index_pair2++){
+            for (; index_pair2 < count; index_pair2++) {
                 uintptr_t cmask = cmask1 & (*p_cmask2++);
-                if(cmask) *po_N += std::popcount(cmask);
+                if (cmask) *po_N += std::popcount(cmask);
                 po_N++;
             }
-        }else{
+        } else {
             po_N += index_pair1 + 1;
         }
     }
-    //}
 }
 
 vector<uint32_t> GRM::divide_parts_mem(uint32_t n_sample, uint32_t num_parts){
@@ -2344,10 +3518,8 @@ vector<uint32_t> GRM::divide_parts_mem(uint32_t n_sample, uint32_t num_parts){
     vector<double> n_each_part(parts);
     n_part[0] = 1;
     n_each_part[0] = 1;
-    for(int i = 1; i < parts; i++){
+    for (int i = 1; i < parts; i++) {
         double previous_n = n_part[i - 1];
-        //double cur_n = (sqrt(previous_n * previous_n + 4) - previous_n) / 2.0;
-        //double cur_n = (sqrt(16.0 * previous_n * previous_n + 36.0) - 4.0 * previous_n) / 6.0;
         double cur_n = (sqrt(36.0 * previous_n * previous_n + 100.0) - 6.0 * previous_n) / 10.0;
         n_each_part[i] = cur_n;
         n_part[i] = previous_n + cur_n;
@@ -2356,7 +3528,7 @@ vector<uint32_t> GRM::divide_parts_mem(uint32_t n_sample, uint32_t num_parts){
     double x1 = n_sample / n_part[parts - 1];
     vector<uint32_t> div_parts(parts);
     uint32_t total_num = 0;
-    for(int i = 0 ; i < parts - 1; i++){
+    for (int i = 0; i < parts - 1; i++) {
         uint32_t cur_n = round(n_each_part[i] * x1);
         total_num = cur_n + total_num;
         div_parts[i] = total_num - 1;
@@ -2368,29 +3540,30 @@ vector<uint32_t> GRM::divide_parts_mem(uint32_t n_sample, uint32_t num_parts){
 vector<uint32_t> GRM::divide_parts(uint32_t from, uint32_t to, uint32_t num_parts){
     vector<uint64_t> num_indi_grms;
     num_indi_grms.reserve(to - from + 1);
-    for(uint64_t index = from; index != to + 1; index++){
-        num_indi_grms.push_back((index + 2 + from) * (index + 1 -  from) / 2);
+    for (uint64_t index = from; index != to + 1; index++) {
+        num_indi_grms.push_back((index + 2 + from) * (index + 1 - from) / 2);
     }
 
     uint64_t indi_parts = num_indi_grms[to - from] / num_parts;
     vector<uint32_t> parts;
     parts.reserve(num_parts);
     vector<uint64_t>::iterator upper;
-    for(uint32_t index = 1; index <= num_parts; index++){
+    for (uint32_t index = 1; index <= num_parts; index++) {
         upper = std::upper_bound(num_indi_grms.begin(), num_indi_grms.end(), indi_parts * index);
-        if(upper != num_indi_grms.begin()){
+        if (upper != num_indi_grms.begin()) {
             upper--;
-            if(*upper < indi_parts * index){
+            if (*upper < indi_parts * index) {
                 upper++;
             }
         }
-        parts.push_back(upper - num_indi_grms.begin() + from );
+        parts.push_back(upper - num_indi_grms.begin() + from);
     }
     parts.erase(unique(parts.begin(), parts.end()), parts.end());
     return parts;
 }
 
 void GRM::processMakeGRM(bool is_homogametic){
+    is_homogametic_ = is_homogametic;
     use_int8_grm = bBLAS && isMtd && !isDominance && !is_homogametic
                    && (geno->getGenoFormat() == "BED")
                    && (std::getenv("GCTA_DISABLE_INT8_GRM") == nullptr);
@@ -2404,15 +3577,14 @@ void GRM::processMakeGRM(bool is_homogametic){
 
     gbufitems.assign(static_cast<size_t>(nMarkerBlock), GenoBufItem{});
     validIndexBuf.reserve(static_cast<size_t>(nMarkerBlock));
-    sampleMissBuf.reset(); // lazily allocated only when a block has missing calls
+    sampleMissBuf.reset();
 
-    constexpr int kTile = 4096;
+    constexpr int kTile = kGrmStripRows;
     const int max_tile_dim = std::min(kTile, std::max(1, grm_n));
     const size_t geno_block_elems = static_cast<size_t>(nMarkerBlock) * static_cast<size_t>(stdGenoLD);
 
     if (use_int8_grm) {
         grm_bytes_std_geno = sizeof(int8_t) * static_cast<size_t>(grm_n);
-        // Marker-major int8 columns are only materialised lazily for markers with missing calls.
         stdGeno_i8.reset();
         stdGeno_i8_cols_ = 0;
         const int eff_block_cap = static_cast<int>(std::min<size_t>(
@@ -2424,7 +3596,7 @@ void GRM::processMakeGRM(bool is_homogametic){
         if (!stdGeno_i8_kmajor_) {
             LOGGER.e(0, "can't allocate enough memory for the transposed int8 genotype buffer.");
         }
-        grm_i32_tile_.reset(); // lazily allocated only if promoted to double* grm
+        grm_i32_tile_.reset();
         mu_vec_.resize(static_cast<size_t>(nMarkerBlock));
         r_raw_.resize(static_cast<size_t>(grm_n));
         r_tilde_.resize(static_cast<size_t>(grm_n));
@@ -2453,11 +3625,13 @@ void GRM::processMakeGRM(bool is_homogametic){
     finished_marker = 0;
     grm_any_missing_seen_ = false;
     grm_skip_global_state = false;
+    tile1_valid_extract_.clear();
+    tile1_valid_mean_.clear();
+    tile1_valid_has_miss_.clear();
+    tile1_cursor_ = 0;
+    use_tile1_cache_ = false;
 
     const bool allow_i32_mode = use_int8_grm && (processIndex.size() <= kMaxInt32Markers);
-    // Zero-missing lazy-N accounting: 4 B/elem for VanRaden INT8 (int32_t GRM, no N),
-    // 8 B/elem for FP32/double GRM (no N). If missingness appears mid-run, remaining
-    // tiles dynamically adapt to 12 B/elem (double GRM + uint32_t N).
     const double initial_bpe = allow_i32_mode ? 4.0 : 8.0;
     const int full_rs = static_cast<int>(part_keep_indices.first);
     const int full_re = static_cast<int>(part_keep_indices.second) + 1;
@@ -2473,7 +3647,6 @@ void GRM::processMakeGRM(bool is_homogametic){
     }
 
     if (bBLAS && grm_tiling_enabled) {
-        // ── Block-tiled GRM: cap the active tile buffer to --GRM-tile-budget bytes ──
         float thresh = -99.0f;
         bool isSparse = false;
         if (sparse_cutoff.has_value()) {
@@ -2481,28 +3654,44 @@ void GRM::processMakeGRM(bool is_homogametic){
             isSparse = true;
             LOGGER.i(0, "Computing sparse GRM with a cutoff " + to_string(thresh) + "...");
         } else {
-            LOGGER.i(0, "Computing tiled GRM...");
+            LOGGER.i(0, write_fp16_ ? "Computing tiled native FP16 GRM..." : "Computing tiled GRM...");
         }
 
-        const std::string grm_path = isSparse ? (o_name + ".grm.sp") : (o_name + ".grm.bin");
+        const std::string grm_path = isSparse ? (o_name + ".grm.sp") : (o_name + (write_fp16_ ? ".grm.f16" : ".grm.bin"));
         const std::string N_path   = o_name + ".grm.N.bin";
+        const uint64_t n_out = static_cast<uint64_t>(num_individual);
+        const uint64_t body_off = write_fp16_ ? gcta_grm_io::grm_f16_body_offset(n_out) : 0ULL;
+
         UniqueFile sparse_out;
-        gcta_grm_detail::GrmUniqueFd grm_fd;
+        std::unique_ptr<gcta_io::AsyncSeqWriter> grm_writer;
         gcta_grm_detail::GrmUniqueFd N_fd;
         if (isSparse) {
             sparse_out = open_file(grm_path, "wb");
             if (!sparse_out) LOGGER.error(0, "can't open {} to write", grm_path);
             setvbuf(sparse_out.get(), nullptr, _IOFBF, 4 << 20);
         } else {
-            grm_fd = gcta_grm_detail::open_posix_write_trunc(grm_path);
-            N_fd   = gcta_grm_detail::open_posix_write_trunc(N_path);
-            if (!grm_fd || !N_fd)
-                LOGGER.error(0, "can't open {}.grm.bin or .grm.N.bin to write", o_name);
+            try {
+                grm_writer = std::make_unique<gcta_io::AsyncSeqWriter>(
+                    grm_path, gcta_grm_detail::kGrmAsyncSlotBytes, static_cast<off_t>(body_off));
+                if (write_fp16_) {
+                    gcta_grm_io::write_grm_f16_draft_prefix(*grm_writer, n_out);
+                    fp16_diag_.assign(static_cast<size_t>(n_out), 0.0f);
+                    fp16_trace_K_ = 0.0;
+                    fp16_trace_K2_ = 0.0;
+                }
+            } catch (const std::exception& e) {
+                LOGGER.e(0, std::string("processMakeGRM tiled open failed: ") + e.what());
+            }
+            // For classic .grm.bin, open .grm.N.bin upfront; for .grm.f16, open lazily
+            // after Tile 0 ONLY if missing genotypes were observed across the cohort!
+            if (!write_fp16_) {
+                N_fd = gcta_grm_detail::open_posix_write_trunc(N_path);
+                if (!N_fd) LOGGER.error(0, "can't open {} to write", N_path);
+            }
         }
 
         const int num_thread = omp_get_max_threads();
 
-        // Pre-validate upfront under initial_bpe so an impossibly tiny budget fails before I/O.
         {
             const double budget_elems = grm_tile_budget_bytes / initial_bpe;
             vector<std::pair<int, int>> est_ranges;
@@ -2520,7 +3709,7 @@ void GRM::processMakeGRM(bool is_homogametic){
                 est_ranges.push_back({sim_rs, sim_re});
                 sim_rs = sim_re;
             }
-            LOGGER.info(0, "Block-tiled GRM (memory budget {:.3f} GB, initial {:.0f} B/elem): {} tile(s), rows/tile ranging {}-{}.",
+            LOGGER.info(0, "Block-tiled GRM (strip-packed, budget {:.3f} GB, initial {:.0f} B/elem): {} tile(s), rows/tile ranging {}-{}.",
                         grm_tile_budget_bytes / (1024.0 * 1024.0 * 1024.0),
                         initial_bpe,
                         est_ranges.size(),
@@ -2528,12 +3717,10 @@ void GRM::processMakeGRM(bool is_homogametic){
                         est_ranges.back().second - est_ranges.back().first);
         }
 
-        AlignedRawBuffer<float, 64> flush_packed_grm;
-        AlignedRawBuffer<float, 64> flush_packed_N;
         std::vector<float> flush_const_N;
         std::string flush_sparse_buf;
 
-        double mtd_weight = 1.0;        // computed once, after the first tile's decode
+        double mtd_weight = 1.0;
         bool logged_missing_rebudget = false;
         int rs = full_rs;
 
@@ -2556,7 +3743,7 @@ void GRM::processMakeGRM(bool is_homogametic){
             grm_tile_rs   = rs;
             grm_tile_re   = re;
             grm_tile_rows = re - rs;
-            grm_tile_cols = re;   // lower-triangle: widest row needs cols [0, re-1]
+            grm_tile_cols = re;
 
             bool known_tile_missing = false;
             if (grm_skip_global_state && grm_any_missing_seen_) {
@@ -2569,21 +3756,17 @@ void GRM::processMakeGRM(bool is_homogametic){
             }
             const bool start_i32 = allow_i32_mode && !known_tile_missing;
 
-            const size_t tile_rect_elems = static_cast<size_t>(grm_tile_rows) * static_cast<size_t>(grm_tile_cols);
-            grm.reset();
-            grm_i32.reset();
-            N.reset(); // always lazy!
+            reset_grm_strips();
+            N.reset();
 
             if (start_i32) {
-                grm_i32 = make_aligned_uninitialized<int32_t, 64>(tile_rect_elems);
-                if (!grm_i32) LOGGER.e(0, "Can't allocate int32 GRM tile buffer.");
+                allocate_grm_strips(/*as_i32=*/true);
                 grm_is_i32_ = true;
                 grm_tile_i32_markers_ = 0;
                 R_total_.assign(static_cast<size_t>(grm_tile_cols), 0.0);
                 S_total_ = 0.0;
             } else {
-                grm = make_aligned_uninitialized<double, 64>(tile_rect_elems);
-                if (!grm) LOGGER.e(0, "Can't allocate GRM tile buffer.");
+                allocate_grm_strips(/*as_i32=*/false);
                 grm_is_i32_ = false;
             }
 
@@ -2591,7 +3774,7 @@ void GRM::processMakeGRM(bool is_homogametic){
             const double tile_elems = (dre * (dre + 1.0) - drs * (drs + 1.0)) / 2.0;
             const double est_bpe = start_i32 ? 4.0 : (known_tile_missing ? 12.0 : 8.0);
             const double tile_gb = tile_elems * est_bpe / (1024.0 * 1024.0 * 1024.0);
-            LOGGER.info(0, "  Tile rows {}-{} ({:.2f} GB {})", rs, re - 1, tile_gb,
+            LOGGER.info(0, "  Tile rows {}-{} ({:.2f} GB strip-packed {})", rs, re - 1, tile_gb,
                         start_i32 ? "int32 GRM" : (known_tile_missing ? "double GRM+N" : "double GRM"));
 
             grm_first_accum = true;
@@ -2603,67 +3786,131 @@ void GRM::processMakeGRM(bool is_homogametic){
                 index_grm_pairs.push_back(std::make_pair(static_cast<int>(tile_parts[i-1] + 1), static_cast<int>(tile_parts[i])));
 
             const bool is_first_tile = !grm_skip_global_state;
-            geno->loopDouble(processIndex, nMarkerBlock, true, true, isSTD, true, callBacks);
+            if (is_first_tile) {
+                use_tile1_cache_ = false;
+                if (use_int8_grm) {
+                    tile1_valid_extract_.reserve(processIndex.size());
+                    tile1_valid_mean_.reserve(processIndex.size());
+                    tile1_valid_has_miss_.reserve(processIndex.size());
+                }
+                geno->loopDouble(processIndex, nMarkerBlock, true, true, isSTD, true, callBacks);
+            } else if (numValidMarkers > 0) {
+                if (use_int8_grm && !tile1_valid_extract_.empty()) {
+                    // Tiles 2..T (INT8 BED): stream ONLY valid markers recorded on Tile 1,
+                    // skipping invalid/filtered markers and the redundant stats_only pass!
+                    tile1_cursor_ = 0;
+                    use_tile1_cache_ = true;
+                    geno->loopDouble(tile1_valid_extract_, nMarkerBlock, true, true, isSTD, true, callBacks);
+                    use_tile1_cache_ = false;
+                } else {
+                    // FP32 path (!use_int8_grm): preserve exact batch boundaries so cblas_sgemm
+                    // float32->double widening remains bit-identical to dense GRM.
+                    use_tile1_cache_ = false;
+                    geno->loopDouble(processIndex, nMarkerBlock, true, true, isSTD, true, callBacks);
+                }
+            }
 
             grm_skip_global_state = true;
 
-            if (is_first_tile && isMtd) {
-                double weight = 0.0;
-                if (!isDominance)
-                    for (uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i];
-                else
-                    for (uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i] * sd[i];
-                if (weight > 0.0) mtd_weight = static_cast<double>(numValidMarkers) / weight;
+            if (is_first_tile) {
+                if (isMtd) {
+                    double weight = 0.0;
+                    if (!isDominance)
+                        for (uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i];
+                    else
+                        for (uint32_t i = 0; i < numValidMarkers; i++) weight += sd[i] * sd[i];
+                    if (weight > 0.0) mtd_weight = static_cast<double>(numValidMarkers) / weight;
+                }
+                if (!isSparse && write_fp16_ && grm_any_missing_seen_) {
+                    N_fd = gcta_grm_detail::open_posix_write_trunc(N_path);
+                    if (!N_fd) LOGGER.error(0, "can't open {} to write", N_path);
+                }
             }
 
-            flush_grm_tile(grm_fd.get(), N_fd.get(), sparse_out.get(), grm_path, N_path,
-                           thresh, isSparse, mtd_weight,
-                           flush_packed_grm, flush_packed_N, flush_const_N, flush_sparse_buf);
+            flush_grm_tile(grm_writer.get(), N_fd.get(), sparse_out.get(), grm_path, N_path,
+                           thresh, isSparse, mtd_weight, flush_const_N, flush_sparse_buf);
 
-            grm.reset();
-            grm_i32.reset();
+            reset_grm_strips();
             N.reset();
             rs = re;
         }
 
-        grm_fd.reset();
+        if (!isSparse) {
+            try {
+                if (write_fp16_) {
+                    gcta_grm_io::GrmFp16Header final_hdr{};
+                    std::memcpy(final_hdr.magic, gcta_grm_io::kGrmF16MagicFinal, sizeof(final_hdr.magic));
+                    final_hdr.version = gcta_grm_io::kGrmF16Version;
+                    final_hdr.dtype = gcta_grm_io::kGrmF16DtypeFp16;
+                    final_hdr.header_bytes = gcta_grm_io::kGrmF16HeaderSize;
+                    final_hdr.flags = gcta_grm_io::kGrmF16FlagFinalized |
+                                      gcta_grm_io::kGrmF16FlagHasTraces |
+                                      gcta_grm_io::kGrmF16FlagHasDiagF32 |
+                                      (!grm_any_missing_seen_ ? gcta_grm_io::kGrmF16FlagZeroMissing : 0u) |
+                                      (isMtd ? gcta_grm_io::kGrmF16FlagVanRaden : 0u) |
+                                      (isDominance ? gcta_grm_io::kGrmF16FlagDominance : 0u) |
+                                      (is_homogametic_ ? gcta_grm_io::kGrmF16FlagHomogametic : 0u);
+                    final_hdr.n = n_out;
+                    final_hdr.valid_markers = numValidMarkers;
+                    if (!grm_any_missing_seen_) {
+                        final_hdr.m_snps_mean = static_cast<double>(numValidMarkers);
+                    } else {
+                        double miss_sum = 0.0;
+                        for (uint64_t i = 0; i < n_out; ++i) miss_sum += static_cast<double>(sub_miss[static_cast<size_t>(i)]);
+                        final_hdr.m_snps_mean = (n_out > 0)
+                            ? (static_cast<double>(numValidMarkers) - miss_sum / static_cast<double>(n_out))
+                            : 0.0;
+                    }
+                    final_hdr.id_hash = grm_id_hash_;
+                    final_hdr.trace_K = fp16_trace_K_;
+                    final_hdr.trace_K2 = fp16_trace_K2_;
+                    final_hdr.diag_offset = gcta_grm_io::kGrmF16HeaderSize;
+                    final_hdr.body_offset = body_off;
+                    final_hdr.part_row_start = 0;
+                    final_hdr.part_row_end = n_out;
+                    final_hdr.mtd_weight = mtd_weight;
+                    gcta_grm_io::finalize_grm_f16_file(*grm_writer, final_hdr, fp16_diag_.data(), n_out);
+                } else {
+                    grm_writer->finish();
+                }
+            } catch (const std::exception& e) {
+                LOGGER.e(0, std::string("Failed finalizing [") + grm_path + "]: " + e.what());
+            }
+        }
+        grm_writer.reset();
         N_fd.reset();
         sparse_out.reset();
+
         LOGGER << "  Used " << numValidMarkers << " valid SNPs." << std::endl;
-        if (!isSparse) {
+        if (isSparse) {
+            LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.sp]");
+        } else if (write_fp16_) {
+            LOGGER.i(0, "Native FP16 GRM has been saved in the file [" + grm_path + "]" +
+                        (!grm_any_missing_seen_
+                             ? " (zero missing genotypes; .grm.N.bin omitted, m_snps=" + to_string(numValidMarkers) + " in header)"
+                             : " (missingness present; per-pair counts in [" + N_path + "])"));
+        } else {
             LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.bin]");
             LOGGER.i(0, "Number of SNPs in each pair of individuals has been saved in the file [" + o_name + ".grm.N.bin]");
-        } else {
-            LOGGER.i(0, "GRM has been saved in the file [" + o_name + ".grm.sp]");
         }
     } else {
-        // Non-tiled dense path (!grm_tiling_enabled): single pass.
+        // Non-tiled dense path (!grm_tiling_enabled): single pass with 4096-row strip-packed storage.
         grm_tile_rs   = full_rs;
         grm_tile_re   = full_re;
         grm_tile_rows = grm_m;
         grm_tile_cols = grm_n;
 
-        const size_t dense_rect_elems = static_cast<size_t>(grm_m) * static_cast<size_t>(grm_n);
-        grm.reset();
-        grm_i32.reset();
-        N.reset(); // always lazy!
+        reset_grm_strips();
+        N.reset();
 
         if (allow_i32_mode) {
-            grm_i32 = make_aligned_uninitialized<int32_t, 64>(dense_rect_elems);
-            if (!grm_i32) {
-                LOGGER.error(0, "can't allocate enough memory to store the (parted) int32 GRM: {:.2f}GB required.",
-                             dense_rect_elems * sizeof(int32_t) / (1024.0 * 1024.0 * 1024.0));
-            }
+            allocate_grm_strips(/*as_i32=*/true);
             grm_is_i32_ = true;
             grm_tile_i32_markers_ = 0;
             R_total_.assign(static_cast<size_t>(grm_n), 0.0);
             S_total_ = 0.0;
         } else {
-            grm = make_aligned_uninitialized<double, 64>(dense_rect_elems);
-            if (!grm) {
-                LOGGER.error(0, "can't allocate enough memory to store the (parted) GRM: {:.2f}GB required.",
-                             dense_rect_elems * sizeof(double) / (1024.0 * 1024.0 * 1024.0));
-            }
+            allocate_grm_strips(/*as_i32=*/false);
             grm_is_i32_ = false;
         }
         grm_first_accum = true;
@@ -2672,12 +3919,14 @@ void GRM::processMakeGRM(bool is_homogametic){
         geno->loopDouble(processIndex, nMarkerBlock, true, true, isSTD, true, callBacks);
         LOGGER << "  Used " << numValidMarkers << " valid SNPs." << std::endl;
         deduce_GRM();
-        grm.reset();
-        grm_i32.reset();
+        reset_grm_strips();
         N.reset();
     }
 
     gbufitems.clear();
+    tile1_valid_extract_.clear();
+    tile1_valid_mean_.clear();
+    tile1_valid_has_miss_.clear();
     stdGeno.reset();
     stdGeno_i8.reset();
     stdGeno_i8_cols_ = 0;
@@ -2711,20 +3960,20 @@ void GRM::runMake(const gcta_cli::GrmMakeOptions& opts, const std::string& out_p
 }
 
 void GRM::runMerge(const gcta_cli::GrmMergeOptions& opts, const std::string& out_prefix) {
-    GRM grm("", "", "", out_prefix);
-    grm.merge_grm(opts.mgrm, out_prefix, opts.budget_gb);
+    GRM grm("", "", "", out_prefix, false, opts.grm_fp16);
+    grm.merge_grm(opts.mgrm, out_prefix, opts.budget_gb, opts.grm_fp16);
 }
 
 void GRM::runPrune(const gcta_cli::GrmPruneOptions& opts, const std::string& out_prefix) {
     const bool no_grm = opts.singleton.has_value();
     const float cutoff = static_cast<float>(no_grm ? *opts.singleton : *opts.cutoff);
     const bool detail = no_grm || opts.cutoff_detail;
-    GRM grm(opts.grm, opts.keep, opts.remove, out_prefix, detail);
+    GRM grm(opts.grm, opts.keep, opts.remove, out_prefix, detail, opts.grm_fp16);
     grm.cut_rel(cutoff, no_grm);
 }
 
 void GRM::runSparse(const gcta_cli::GrmSparseOptions& opts, const std::string& out_prefix) {
-    GRM grm(opts.grm, opts.keep, opts.remove, out_prefix);
+    GRM grm(opts.grm, opts.keep, opts.remove, out_prefix, false, opts.grm_fp16);
     float set_val = 0.0f;
     float* p = nullptr;
     if (opts.set_value.has_value()) {
@@ -2735,11 +3984,11 @@ void GRM::runSparse(const gcta_cli::GrmSparseOptions& opts, const std::string& o
 }
 
 void GRM::runSubtract(const gcta_cli::GrmCombineOptions& opts, const std::string& out_prefix) {
-    GRM grm("", opts.keep, opts.remove, out_prefix);
-    grm.subtract_grm(opts.mgrm, out_prefix);
+    GRM grm("", opts.keep, opts.remove, out_prefix, false, opts.grm_fp16);
+    grm.subtract_grm(opts.mgrm, out_prefix, opts.grm_fp16);
 }
 
 void GRM::runUnify(const gcta_cli::GrmCombineOptions& opts, const std::string& out_prefix) {
-    GRM grm("", opts.keep, opts.remove, out_prefix);
-    grm.unify_grm(opts.mgrm, out_prefix);
+    GRM grm("", opts.keep, opts.remove, out_prefix, false, opts.grm_fp16);
+    grm.unify_grm(opts.mgrm, out_prefix, opts.grm_fp16);
 }

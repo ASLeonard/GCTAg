@@ -186,13 +186,17 @@ void ensure_woodbury_subspace_cache(RemlCtx& ctx) {
         for (int i = 0; i < n; ++i) dst[i] = static_cast<float>(src[i]);
     }
 
-    const Eigen::MatrixXf UkTXY_f = ctx.Uk.transpose() * XY_f;  // k x (c + 1)
+    const Eigen::MatrixXf UkTXY_f = ctx.Uk_is_transposed
+        ? (ctx.Uk * XY_f).eval()
+        : (ctx.Uk.transpose() * XY_f).eval();  // k x (c + 1)
     ctx.UkTX = UkTXY_f.leftCols(c).cast<double>();
     ctx.UkTy = UkTXY_f.col(c).cast<double>();
 
     // Explicit perpendicular residuals ensure wb_XtX_perp is PSD even when
     // covariates (e.g. PCs) lie inside span(Uk).
-    const Eigen::MatrixXf proj_f = ctx.Uk * UkTXY_f;            // n x (c + 1)
+    const Eigen::MatrixXf proj_f = ctx.Uk_is_transposed
+        ? (ctx.Uk.transpose() * UkTXY_f).eval()
+        : (ctx.Uk * UkTXY_f).eval();            // n x (c + 1)
     RemlMat X_perp(n, c);
     #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(c) >= 65536)
     for (int j = 0; j < c; ++j) {
@@ -268,21 +272,30 @@ WoodburySubspaceVec wb_y_vec(const RemlCtx& ctx) {
 
 // Woodbury n-vector helpers (retained for any direct non-subspace path)
 RemlMat woodbury_basis_KZ(const RemlCtx& ctx, const RemlMat& Z) {
-    RemlMat UkZ = (ctx.Uk.transpose() * Z.cast<float>()).cast<double>();
+    const Eigen::MatrixXf Zf = Z.cast<float>();
+    RemlMat UkZ = (ctx.Uk_is_transposed ? (ctx.Uk * Zf).eval() : (ctx.Uk.transpose() * Zf).eval()).cast<double>();
     UkZ.array().colwise() *= (ctx.dk.array() - ctx.lambda_tail);
-    return ctx.lambda_tail * Z + (ctx.Uk * UkZ.cast<float>()).cast<double>();
+    const Eigen::MatrixXf UkZf = UkZ.cast<float>();
+    const Eigen::MatrixXf back = ctx.Uk_is_transposed ? (ctx.Uk.transpose() * UkZf).eval() : (ctx.Uk * UkZf).eval();
+    return ctx.lambda_tail * Z + back.cast<double>();
 }
 
 RemlVec woodbury_basis_Viv(const RemlCtx& ctx, const RemlVec& v) {
-    RemlVec Ukv = (ctx.Uk.transpose() * v.cast<float>()).cast<double>();
+    const Eigen::VectorXf vf = v.cast<float>();
+    RemlVec Ukv = (ctx.Uk_is_transposed ? (ctx.Uk * vf).eval() : (ctx.Uk.transpose() * vf).eval()).cast<double>();
     Ukv.array() *= ctx.ck.array();
-    return (v - (ctx.Uk * Ukv.cast<float>()).cast<double>()) / ctx.sigma2_eff;
+    const Eigen::VectorXf Ukvf = Ukv.cast<float>();
+    const Eigen::VectorXf back = ctx.Uk_is_transposed ? (ctx.Uk.transpose() * Ukvf).eval() : (ctx.Uk * Ukvf).eval();
+    return (v - back.cast<double>()) / ctx.sigma2_eff;
 }
 
 RemlMat woodbury_basis_ViZ(const RemlCtx& ctx, const RemlMat& Z) {
-    RemlMat UkZ = (ctx.Uk.transpose() * Z.cast<float>()).cast<double>();
+    const Eigen::MatrixXf Zf = Z.cast<float>();
+    RemlMat UkZ = (ctx.Uk_is_transposed ? (ctx.Uk * Zf).eval() : (ctx.Uk.transpose() * Zf).eval()).cast<double>();
     UkZ.array().colwise() *= ctx.ck.array();
-    return (Z - (ctx.Uk * UkZ.cast<float>()).cast<double>()) / ctx.sigma2_eff;
+    const Eigen::MatrixXf UkZf = UkZ.cast<float>();
+    const Eigen::MatrixXf back = ctx.Uk_is_transposed ? (ctx.Uk.transpose() * UkZf).eval() : (ctx.Uk * UkZf).eval();
+    return (Z - back.cast<double>()) / ctx.sigma2_eff;
 }
 
 // Implicit P*v without materialising n×n P
@@ -797,7 +810,11 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
         ctx.Xt_Vi_X_i.noalias() += inv_s2 * ctx.wb_XtX_perp;
         if (P) {
             const RemlMat ck_UkTX = ctx.ck.asDiagonal() * ctx.UkTX;
-            ctx.Vi_X = (ctx.X - (ctx.Uk * ck_UkTX.cast<float>()).cast<double>()) * inv_s2;
+            const Eigen::MatrixXf ck_UkTX_f = ck_UkTX.cast<float>();
+            const Eigen::MatrixXf back = ctx.Uk_is_transposed
+                ? (ctx.Uk.transpose() * ck_UkTX_f).eval()
+                : (ctx.Uk * ck_UkTX_f).eval();
+            ctx.Vi_X = (ctx.X - back.cast<double>()) * inv_s2;
         }
     } else if (ctx.Vi_use_llt) {
         ctx.Vi_X = ctx.X;
@@ -822,7 +839,11 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
         ctx.Vi.resize(ctx.n, ctx.n);
         ctx.Vi.setIdentity();
         ctx.Vi /= ctx.sigma2_eff;
-        RemlMat Uk_scaled = ctx.Uk.cast<double>();
+        RemlMat Uk_scaled;
+        if (ctx.Uk_is_transposed)
+            Uk_scaled = ctx.Uk.transpose().cast<double>();
+        else
+            Uk_scaled = ctx.Uk.cast<double>();
         for (int j = 0; j < ctx.woodbury_basis_rank_; ++j)
             Uk_scaled.col(j) *= std::sqrt(ctx.ck[j] / ctx.sigma2_eff);
         ctx.Vi.selfadjointView<Eigen::Upper>().rankUpdate(Uk_scaled, -1.0);
@@ -1228,7 +1249,11 @@ void calcu_Hi(RemlCtx& ctx, RemlMat& P, RemlMat& Hi) {
     std::vector<RemlMat> PA(m);
     for (int i = 0; i < m; i++) {
         if (ctx.Vi_use_woodbury_basis && i == 0) {
-            const RemlMat Uk_d = ctx.Uk.cast<double>();
+            RemlMat Uk_d;
+            if (ctx.Uk_is_transposed)
+                Uk_d = ctx.Uk.transpose().cast<double>();
+            else
+                Uk_d = ctx.Uk.cast<double>();
             RemlMat PUk(n, ctx.woodbury_basis_rank_);
             PUk.noalias() = P * Uk_d;
             RemlVec delta_v = ctx.dk.array() - ctx.lambda_tail;
@@ -2410,6 +2435,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
         evec_full.conservativeResize(Eigen::NoChange, k);
     }
     ctx.Uk = std::move(evec_full);
+    ctx.Uk_is_transposed = false;
     ctx.woodbury_basis_rank_ = k;
     ctx.Vi_use_woodbury_basis = true;
     ctx.wb_subspace_ready = false;
@@ -2461,8 +2487,10 @@ void compute(RemlCtx& ctx,
             LOGGER.e(0, "--reml-woodbury-reuse is incompatible with Fisher-scoring REML.");
         if ((int)ctx.r_indx.size() != 2)
             LOGGER.e(0, "--reml-woodbury-reuse supports only single-GRM models.");
-        if (ctx.Uk.rows() != ctx.n || ctx.Uk.cols() != ctx.woodbury_basis_rank_
-                || ctx.dk.size() != ctx.woodbury_basis_rank_)
+        const bool uk_dims_ok = ctx.Uk_is_transposed
+            ? (ctx.Uk.rows() == ctx.woodbury_basis_rank_ && ctx.Uk.cols() == ctx.n)
+            : (ctx.Uk.rows() == ctx.n && ctx.Uk.cols() == ctx.woodbury_basis_rank_);
+        if (!uk_dims_ok || ctx.dk.size() != ctx.woodbury_basis_rank_)
             LOGGER.e(0, "--reml-woodbury-reuse: preloaded basis has inconsistent dimensions.");
         ctx.wb_subspace_ready = false;
         LOGGER << "Woodbury basis reused: k=" << ctx.woodbury_basis_rank_
@@ -2575,36 +2603,43 @@ RemlState build_reml_state(RemlCtx& ctx) {
                             .cast<float>();
 
     if (ctx.Vi_use_woodbury_basis) {
-        // WoodburyMLMACache stores Uk_f as k×n ColMajor for GEMM efficiency.
-        // Cache-block (64x64) the n×k -> k×n float32 transpose to eliminate
-        // 2 MB-stride cache/STLB misses (40-60 s -> ~0.2 s at N=500k, k=20k).
-        const Eigen::Index k = ctx.Uk.cols();
-        const Eigen::Index n = ctx.Uk.rows();
-        rs.wb.Uk_f.resize(k, n);
-        constexpr Eigen::Index kBlock = 64;
-        const float* src_base = ctx.Uk.data();
-        float* dst_base = rs.wb.Uk_f.data();
-        #pragma omp parallel for collapse(2) schedule(static)
-        for (Eigen::Index i0 = 0; i0 < n; i0 += kBlock) {
-            for (Eigen::Index j0 = 0; j0 < k; j0 += kBlock) {
-                const Eigen::Index i1 = std::min(n, i0 + kBlock);
-                const Eigen::Index j1 = std::min(k, j0 + kBlock);
-                alignas(64) float tile[kBlock][kBlock + 4];
-                const Eigen::Index ilen = i1 - i0;
-                const Eigen::Index jlen = j1 - j0;
-                for (Eigen::Index j = 0; j < jlen; ++j) {
-                    const float* src_col = src_base + i0 + static_cast<size_t>(j0 + j) * static_cast<size_t>(n);
+        if (ctx.Uk_is_transposed) {
+            // ctx.Uk is already k×n ColMajor (e.g. from --woodbury-reuse): O(1) swap, zero transpose, zero extra RSS!
+            rs.wb.Uk_f.swap(ctx.Uk);
+            ctx.Uk.resize(0, 0);
+            ctx.Uk_is_transposed = false;
+        } else {
+            // WoodburyMLMACache stores Uk_f as k×n ColMajor for GEMM efficiency.
+            // Cache-block (64x64) the n×k -> k×n float32 transpose to eliminate
+            // 2 MB-stride cache/STLB misses (40-60 s -> ~0.2 s at N=500k, k=20k).
+            const Eigen::Index k = ctx.Uk.cols();
+            const Eigen::Index n = ctx.Uk.rows();
+            rs.wb.Uk_f.resize(k, n);
+            constexpr Eigen::Index kBlock = 64;
+            const float* src_base = ctx.Uk.data();
+            float* dst_base = rs.wb.Uk_f.data();
+            #pragma omp parallel for collapse(2) schedule(static)
+            for (Eigen::Index i0 = 0; i0 < n; i0 += kBlock) {
+                for (Eigen::Index j0 = 0; j0 < k; j0 += kBlock) {
+                    const Eigen::Index i1 = std::min(n, i0 + kBlock);
+                    const Eigen::Index j1 = std::min(k, j0 + kBlock);
+                    alignas(64) float tile[kBlock][kBlock + 4];
+                    const Eigen::Index ilen = i1 - i0;
+                    const Eigen::Index jlen = j1 - j0;
+                    for (Eigen::Index j = 0; j < jlen; ++j) {
+                        const float* src_col = src_base + i0 + static_cast<size_t>(j0 + j) * static_cast<size_t>(n);
+                        for (Eigen::Index i = 0; i < ilen; ++i) {
+                            tile[i][j] = src_col[i];
+                        }
+                    }
                     for (Eigen::Index i = 0; i < ilen; ++i) {
-                        tile[i][j] = src_col[i];
+                        float* dst_col = dst_base + j0 + static_cast<size_t>(i0 + i) * static_cast<size_t>(k);
+                        std::memcpy(dst_col, tile[i], static_cast<size_t>(jlen) * sizeof(float));
                     }
                 }
-                for (Eigen::Index i = 0; i < ilen; ++i) {
-                    float* dst_col = dst_base + j0 + static_cast<size_t>(i0 + i) * static_cast<size_t>(k);
-                    std::memcpy(dst_col, tile[i], static_cast<size_t>(jlen) * sizeof(float));
-                }
             }
+            ctx.Uk.resize(0, 0); // free float32 ctx.Uk immediately now that Uk_f is populated
         }
-        ctx.Uk.resize(0, 0); // free float32 ctx.Uk immediately now that Uk_f is populated
 
         rs.wb.ck_f.resize(ctx.ck.size());
         rs.wb.ck_f.noalias() = ctx.ck.cast<float>();
@@ -2683,6 +2718,7 @@ RemlState build_reml_state(RemlCtx& ctx) {
     ctx.varcmp.clear();
     ctx.b.resize(0);
     ctx.Vi_use_woodbury_basis = false;
+    ctx.Uk_is_transposed = false;
     ctx.Vi_use_llt = false;
 
     return rs;

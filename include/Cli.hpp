@@ -21,6 +21,7 @@ enum class GrmAlg : int { Standard = 0, VanRaden = 1 };
 enum class PcaApprox : uint8_t { Lanczos = 1, rSVD = 2 };
 enum class SvdMethod : uint8_t { Power = 0, Nystrom = 1 };
 enum class GenoModel : uint8_t { Additive = 0, Dominance = 1, NonAdditive = 2 };
+enum class EigenvecFormat : uint8_t { Text = 0, Bin32 = 1, Bin16 = 2, Both = 3 };
 
 constexpr const char* geno_model_name(GenoModel m) {
     switch (m) {
@@ -91,8 +92,11 @@ struct PhenoCovarOptions {
 struct RemlOptions {
     std::string grm;
     std::string woodbury_reuse;
+    std::string woodbury_basis_file;
     std::optional<double> grm_chunked_budget;
     bool grm_fp16 = false;
+    bool fast = false;
+    bool reml_standalone = false;
 
     std::optional<WoodburyBasisSpec> woodbury_basis;
     std::optional<double> woodbury_mp_margin;
@@ -135,6 +139,9 @@ struct GrmMakeOptions {
     bool homogametic = false;
     std::optional<std::pair<int, int>> part;  // {total_parts, cur_part}
     GrmAlg alg = GrmAlg::Standard;
+    bool alg_explicit = false;
+    bool grm_fp16 = false;
+    bool fast = false;
     std::optional<double> tile_budget_gb;
     std::optional<int> n_markers;
     std::optional<double> sparse_cutoff;
@@ -143,6 +150,8 @@ struct GrmMakeOptions {
 struct GrmMergeOptions {
     std::string mgrm;
     int budget_gb = 0;  // 0 = default (~0.5 GB internal)
+    bool grm_fp16 = false;
+    bool fast = false;
 };
 
 struct GrmPruneOptions {
@@ -150,6 +159,8 @@ struct GrmPruneOptions {
     std::optional<double> cutoff;
     std::optional<double> singleton;
     bool cutoff_detail = false;
+    bool grm_fp16 = false;
+    bool fast = false;
     std::string keep;
     std::string remove;
 };
@@ -159,12 +170,16 @@ struct GrmSparseOptions {
     double cutoff = 0.05;
     std::optional<double> set_value;
     bool dense = false;
+    bool grm_fp16 = false;
+    bool fast = false;
     std::string keep;
     std::string remove;
 };
 
 struct GrmCombineOptions {
     std::string mgrm;
+    bool grm_fp16 = false;
+    bool fast = false;
     std::string keep;
     std::string remove;
 };
@@ -177,6 +192,8 @@ struct PcaOptions {
     std::optional<int> svd_power_iter;
     std::optional<double> grm_chunked_budget;
     bool grm_fp16 = false;
+    bool fast = false;
+    std::optional<EigenvecFormat> eigenvec_format;
     std::string keep;
     std::string remove;
     std::optional<uint64_t> seed;
@@ -190,7 +207,9 @@ struct MlmaOptions {
     RemlOptions reml;
 
     std::string load_reml;
+    std::string woodbury_basis_file;
     bool save_reml = false;
+    bool fast = false;
     std::optional<double> stream_budget_gb;
     std::optional<FastMlmaMode> fast_mlma;
     GenoModel model = GenoModel::Additive;

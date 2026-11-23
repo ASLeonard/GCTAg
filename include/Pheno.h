@@ -20,6 +20,7 @@
 #include <string>
 #include <map>
 #include <cstdint>
+#include <Eigen/Dense>
 #include "Cli.hpp"
 using std::map;
 using std::vector;

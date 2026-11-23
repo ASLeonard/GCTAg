@@ -63,12 +63,10 @@ bool common_3vector(vector<string> **idListP, vector<vector<double>> **valueP,
         temp_s1.reserve(remain_size);
         temp_s2.reserve(remain_size);
         std::ranges::transform(sa_index, std::back_inserter(temp_s1), [&s1_index](int pos){return s1_index[pos];});
-        s1_index.resize(remain_size);
-        s1_index = temp_s1;
+        s1_index = std::move(temp_s1);
 
         std::ranges::transform(sa_index, std::back_inserter(temp_s2), [&s2_index](int pos){return s2_index[pos];});
-        s2_index.resize(remain_size);
-        s2_index = temp_s2;
+        s2_index = std::move(temp_s2);
 
         sample_id.clear();
         sample_id.reserve(remain_size);
@@ -89,16 +87,13 @@ bool common_3vector(vector<string> **idListP, vector<vector<double>> **valueP,
             temp_s3.reserve(remain_size);
             
             std::ranges::transform(sc_index, std::back_inserter(temp_s1), [&s1_index](int pos){return s1_index[pos];});
-            s1_index.resize(remain_size);
-            s1_index = temp_s1;
+            s1_index = std::move(temp_s1);
             
             std::ranges::transform(sc_index, std::back_inserter(temp_s2), [&s2_index](int pos){return s2_index[pos];});
-            s2_index.resize(remain_size);
-            s2_index = temp_s2;
+            s2_index = std::move(temp_s2);
             
             std::ranges::transform(sc_index, std::back_inserter(temp_s3), [&s3_index](int pos){return s3_index[pos];});
-            s3_index.resize(remain_size);
-            s3_index = temp_s3;
+            s3_index = std::move(temp_s3);
             
         }
     }
@@ -123,11 +118,11 @@ bool common_3vector(vector<string> **idListP, vector<vector<double>> **valueP,
         auto &temp_value = *(values[i]);
         auto &temp_index = *(indicies[i]);
         auto &temp_target = *(targetvalues[i]);
-        vector<double> t_value(temp_index.size());
         for(int j = 0; j < temp_value.size(); j++){
             auto &pvalue = temp_value[j];
+            vector<double> t_value(temp_index.size());
             std::ranges::transform(temp_index, t_value.begin(), [&pvalue](int pos){return pvalue[pos];});
-            temp_target[j] = t_value;
+            temp_target[j] = std::move(t_value);
         }
     }
 
@@ -177,22 +172,22 @@ Covar::Covar(const gcta_cli::PhenoCovarOptions& opts) {
         case 0:
             return;
         case 1:
-            sample_id = samples_qcovar;
-            this->qcovar = qcovar;
+            sample_id = std::move(samples_qcovar);
+            this->qcovar = std::move(qcovar);
             return;
         case 10:
-            sample_id = samples_covar;
-            this->covar = covar;
+            sample_id = std::move(samples_covar);
+            this->covar = std::move(covar);
             setCovarMapping(false);
             return;
         case 100:
-            sample_id = samples_rcovar;
-            this->rcovar = rcovar;
+            sample_id = std::move(samples_rcovar);
+            this->rcovar = std::move(rcovar);
             setCovarMapping(true);
             return;
-        case 1000:  
-            sample_id = samples_envir;
-            this->envir = envir;
+        case 1000:
+            sample_id = std::move(samples_envir);
+            this->envir = std::move(envir);
             return;
         case 11:
             idList[0] = &samples_qcovar;
@@ -646,134 +641,196 @@ bool Covar::getEnvirX(const vector<string> &sampleIDs, vector<double> &X, vector
   return true;
 }
 
+namespace {
+
+inline bool is_missing_covar_token(std::string_view sv) noexcept {
+    const size_t n = sv.size();
+    if (n == 1) return sv[0] == '.';
+    if (n == 2) {
+        if (sv[0] == '-' && sv[1] == '9') return true;
+        return gcta_text_io::ascii_toupper(sv[0]) == 'N' &&
+               gcta_text_io::ascii_toupper(sv[1]) == 'A';
+    }
+    if (n == 3) {
+        return gcta_text_io::ascii_toupper(sv[0]) == 'N' &&
+               gcta_text_io::ascii_toupper(sv[1]) == 'A' &&
+               gcta_text_io::ascii_toupper(sv[2]) == 'N';
+    }
+    return false;
+}
+
+inline bool is_covar_header_first_tok(std::string_view sv) noexcept {
+    if (sv.empty()) return false;
+    if (sv[0] == '#') return true;
+    return sv.size() == 3 &&
+           gcta_text_io::ascii_toupper(sv[0]) == 'F' &&
+           gcta_text_io::ascii_toupper(sv[1]) == 'I' &&
+           gcta_text_io::ascii_toupper(sv[2]) == 'D';
+}
+
+} // namespace
+
 void Covar::read_covar(string filename, vector<string>& sub_list, vector<vector<double>>* covar, vector<map<string, int>>* labels, vector<int>* keep_row_p, int max_level){
-    string err_string = "[" + filename + "].";
-    std::ifstream hcovar(filename.c_str());
-    if(!hcovar.good()){
+    const string err_string = "[" + filename + "].";
+    gcta_text_io::FastLineReader reader;
+    if (!reader.open(filename)) {
         LOGGER.e(0, "can't read " + err_string);
     }
-    string line;
-    std::getline(hcovar, line);
 
-    vector<string> line_elements;
-
-    boost::split(line_elements, line, boost::is_any_of("\t "));
-    int ncol = line_elements.size();
-    boost::replace_all(line_elements[ncol - 1], "\r", "");
     int nkeep = 0;
     int last_keep = 0;
-    if(keep_row_p){
-        nkeep = keep_row_p->size();
-        last_keep = (*keep_row_p)[nkeep - 1];
+    if (keep_row_p) {
+        nkeep = static_cast<int>(keep_row_p->size());
+        last_keep = (*keep_row_p)[static_cast<size_t>(nkeep - 1)];
     }
     int least_col = 2;
     bool has_covar = false;
-    if(covar){
+    if (covar) {
         least_col = 3;
         has_covar = true;
     }
-
     last_keep += 2;
-    if(ncol < least_col){
+
+    std::string_view line;
+    if (!reader.next_line(line)) {
         LOGGER.e(0, "less than " + to_string(least_col) + " columns in " + err_string);
     }
-    if(last_keep > ncol){
+
+    std::vector<std::string_view> toks;
+    toks.reserve(64);
+    gcta_text_io::split_ws_exact(line, toks);
+    const int ncol = static_cast<int>(toks.size());
+
+    if (ncol < least_col) {
+        LOGGER.e(0, "less than " + to_string(least_col) + " columns in " + err_string);
+    }
+    if (last_keep > ncol) {
         LOGGER.e(0, "can't read " + to_string(last_keep) + "th column from " + err_string);
     }
 
-    int line_number = 0;
-    string first_element = line_elements[0];
-    boost::to_upper(first_element);
-    if(first_element[0] != '#' && first_element != "FID"){
-        hcovar.clear();
-        hcovar.seekg(0);
-        line_number = 0;
-    }else{
-        line_number = 1;
-    }
+    const bool has_header = is_covar_header_first_tok(toks[0]);
+    int line_number = has_header ? 1 : 0;
 
     vector<int> keep_col;
-    if(nkeep == 0){
-        keep_col.resize(ncol - 2);
+    if (nkeep == 0) {
+        keep_col.resize(static_cast<size_t>(ncol - 2));
         std::iota(keep_col.begin(), keep_col.end(), 2);
-        nkeep = keep_col.size();
-    }else{
-        keep_col.resize(nkeep);
-        std::ranges::transform(*keep_row_p, keep_col.begin(), [](int value){return ++value;});
+        nkeep = static_cast<int>(keep_col.size());
+    } else {
+        keep_col.resize(static_cast<size_t>(nkeep));
+        std::ranges::transform(*keep_row_p, keep_col.begin(), [](int value) { return value + 1; });
     }
 
-    if(has_covar){
-        covar->resize(nkeep);
-    }else{
+    if (has_covar) {
+        covar->resize(static_cast<size_t>(nkeep));
+    } else {
         nkeep = 0;
     }
+
     bool is_factor = false;
-    if(labels){
+    if (labels) {
         is_factor = true;
-        labels->resize(nkeep);
-        for(int i = 0; i< nkeep; i++){
-            (*labels)[i]["LABEL_MAX_VALUE"] = -1;
+        labels->resize(static_cast<size_t>(nkeep));
+        for (int i = 0; i < nkeep; i++) {
+            (*labels)[static_cast<size_t>(i)]["LABEL_MAX_VALUE"] = -1;
         }
     }
 
-    int n_item = max_level;
+    const int n_item = max_level;
+    vector<double> covar_temp(static_cast<size_t>(nkeep));
+    std::string factor_buf;
+    factor_buf.reserve(64);
 
-    while(std::getline(hcovar, line)){
+    size_t sample_lines = 0;
+    size_t sample_bytes = 0;
+    bool reserved = false;
+
+    auto process_row = [&](std::string_view cur_line) {
         line_number++;
-        boost::split(line_elements, line, boost::is_any_of("\t "));
-        boost::replace_all(line_elements[line_elements.size() - 1], "\r", "");
-        if(line_elements.size() < last_keep){
+        const int cur_ncol = static_cast<int>(toks.size());
+        if (cur_ncol < last_keep) {
             LOGGER.e(0, "can't read " + to_string(last_keep) + "th column of line " + to_string(line_number) + " from " + err_string);
-        }else if(line_elements.size() != ncol){
+        } else if (cur_ncol != ncol) {
             LOGGER.w(0, "inconsistent column number in line " + to_string(line_number) + " from " + err_string);
         }
 
-        bool is_skip = false;
-        vector<double> covar_temp(nkeep);
-        if(has_covar){
+        if (!reserved && sample_lines < 16) {
+            sample_bytes += cur_line.size() + 1;
+            ++sample_lines;
+            if (sample_lines == 16 && reader.file_size() > 0) {
+                reserved = true;
+                const size_t avg_line = std::max<size_t>(sample_bytes / sample_lines, 6);
+                const size_t est_rows = static_cast<size_t>(reader.file_size() / avg_line) + 64;
+                sub_list.reserve(sub_list.size() + est_rows);
+                if (has_covar) {
+                    for (int i = 0; i < nkeep; ++i) {
+                        (*covar)[static_cast<size_t>(i)].reserve(
+                            (*covar)[static_cast<size_t>(i)].size() + est_rows);
+                    }
+                }
+            }
+        }
 
-           // get every column in the keep
-            for(int col_index = 0; col_index < nkeep; col_index++){
-                string temp_string = line_elements[keep_col[col_index]];
-                boost::to_upper(temp_string);
-                double temp_item;
-                if(temp_string == "NA" || temp_string == "NAN" || temp_string == "." || temp_string == "-9"){
+        bool is_skip = false;
+        if (has_covar) {
+            for (int col_index = 0; col_index < nkeep; col_index++) {
+                const std::string_view sv = toks[static_cast<size_t>(keep_col[static_cast<size_t>(col_index)])];
+                if (is_missing_covar_token(sv)) {
                     is_skip = true;
                     break;
                 }
 
-                if(is_factor){
-                    auto label_p = &(*labels)[col_index];
-                    if(label_p->find(temp_string) != label_p->end()){
-                        temp_item = (*label_p)[temp_string];
-                    }else{ // new factor
-                        (*label_p)["LABEL_MAX_VALUE"] += 1;
-                        temp_item = (*label_p)["LABEL_MAX_VALUE"];
-                        if(temp_item > n_item){
+                double temp_item = 0.0;
+                if (is_factor) {
+                    factor_buf.resize(sv.size());
+                    for (size_t k = 0; k < sv.size(); ++k) {
+                        factor_buf[k] = gcta_text_io::ascii_toupper(sv[k]);
+                    }
+                    auto& label_map = (*labels)[static_cast<size_t>(col_index)];
+                    const auto it = label_map.find(factor_buf);
+                    if (it != label_map.end()) {
+                        temp_item = static_cast<double>(it->second);
+                    } else {
+                        int& max_val = label_map["LABEL_MAX_VALUE"];
+                        max_val += 1;
+                        if (max_val > n_item) {
                             LOGGER.e(0, "too many levels in covariate #" + to_string(col_index + 1) + ". You may fit it as a quantitative covariate using --qcovar.");
                         }
-                        (*label_p)[temp_string] = temp_item;
+                        label_map.emplace(factor_buf, max_val);
+                        temp_item = static_cast<double>(max_val);
                     }
-                }else{
-                    const char* first = temp_string.data();
-                    const char* last  = first + temp_string.size();
+                } else {
+                    const char* first = sv.data();
+                    const char* last  = first + sv.size();
                     if (first < last && *first == '+') ++first;
                     auto [ptr, ec] = std::from_chars(first, last, temp_item);
                     if (ec != std::errc{} || ptr != last || !std::isfinite(temp_item)) {
                         LOGGER.error(0, "line {} contains non-numeric values in {}", line_number, err_string);
                     }
                 }
-                covar_temp[col_index] = temp_item;
+                covar_temp[static_cast<size_t>(col_index)] = temp_item;
             }
         }
 
-        // covar is complete or not
-        if(!is_skip){
-            sub_list.push_back(line_elements[0] + "\t" + line_elements[1]);
-            for(int i = 0; i < nkeep; i++){
-                (*covar)[i].push_back(covar_temp[i]);
+        if (!is_skip) {
+            std::string id;
+            id.reserve(toks[0].size() + 1 + toks[1].size());
+            id.append(toks[0]);
+            id.push_back('\t');
+            id.append(toks[1]);
+            sub_list.push_back(std::move(id));
+            for (int i = 0; i < nkeep; i++) {
+                (*covar)[static_cast<size_t>(i)].push_back(covar_temp[static_cast<size_t>(i)]);
             }
         }
+    };
+
+    if (!has_header) {
+        process_row(line);
+    }
+    while (reader.next_line(line)) {
+        gcta_text_io::split_ws_exact(line, toks);
+        process_row(line);
     }
 }
 

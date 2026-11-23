@@ -311,7 +311,8 @@ struct RemlGroups {
     CLI::Option_group* reml = nullptr;
 };
 
-RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r) {
+RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r, bool add_subcmd_level_opts = true,
+                            const bool* external_fast = nullptr) {
     const std::string g_src = "GRM / Model Source";
     const std::string g_grm = "GRM Loading";
     const std::string g_reml = "REML Solver";
@@ -320,12 +321,21 @@ RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r) {
     auto* model_source = sub->add_option_group(g_src);
     model_source->require_option(1);
 
-    auto* o_grm = model_source->add_option("--grm", r.grm, "Input GRM prefix (.grm.bin/.grm.N.bin/.grm.id)")
+    auto* o_grm = model_source->add_option("--grm", r.grm, "Input GRM prefix (.grm.f16 or .grm.bin/.grm.id)")
                       ->type_name("PREFIX")->group(g_src);
     model_source->add_option("--woodbury-reuse,--reml-woodbury-reuse,--reml-woodbury-basis-reuse",
                              r.woodbury_reuse,
                              "Reuse Woodbury basis from a prior .reml file (reads no GRM)")
         ->check(CLI::ExistingFile)->group(g_src);
+
+    if (add_subcmd_level_opts) {
+        sub->add_flag("--fast", r.fast,
+                      "Hyperscale fast preset: FP16 GRM + Woodbury MP basis")
+            ->group(g_reml);
+        sub->add_option("--woodbury-basis-file", r.woodbury_basis_file,
+                        "Override basis .reml file path referenced by a thin TREF .reml")
+            ->check(CLI::ExistingFile)->group(g_wb);
+    }
 
     auto* reml = sub->add_option_group("REML & Woodbury");
 
@@ -395,45 +405,50 @@ RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r) {
         (CLI::IsMember({"MP", "EIG", "VAR"}, CLI::ignore_case) |
          (CLI::TypeValidator<int>() & CLI::PositiveNumber))
             .description("MP|EIG|VAR|k");
-    auto* o_wb_basis = reml->add_option_function<std::string>(
-                                "--woodbury-basis,--reml-woodbury-basis",
-                                [&r](const std::string& v) {
-                                    if (v == "MP") {
-                                        r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::MP, 0};
-                                    } else if (v == "EIG") {
-                                        r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::EIG, 0};
-                                    } else if (v == "VAR") {
-                                        r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::VAR, 0};
-                                    } else {
-                                        r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::Fixed, std::stoi(v)};
-                                    }
-                                },
-                                "Woodbury low-rank basis mode: MP, EIG, VAR, or rank k [default: MP]")
-                           ->expected(0, 1)->default_str("MP")
-                           ->transform(wb_validator)
-                           ->needs(o_grm)->type_name("MODE")->group(g_wb);
+    reml->add_option_function<std::string>(
+            "--woodbury-basis,--reml-woodbury-basis",
+            [&r](const std::string& v) {
+                if (v == "MP") {
+                    r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::MP, 0};
+                } else if (v == "EIG") {
+                    r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::EIG, 0};
+                } else if (v == "VAR") {
+                    r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::VAR, 0};
+                } else {
+                    r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::Fixed, std::stoi(v)};
+                }
+            },
+            "Woodbury low-rank basis mode: MP, EIG, VAR, or rank k [default: MP]")
+        ->expected(0, 1)->default_str("MP")
+        ->transform(wb_validator)
+        ->needs(o_grm)->type_name("MODE")->group(g_wb);
 
-    reml->add_option("--woodbury-mp-margin,--reml-woodbury-basis-MP-margin",
-                     r.woodbury_mp_margin,
-                     "Marchenko-Pastur edge margin fraction (default: 0.15)")
-        ->check(CLI::NonNegativeNumber)->needs(o_wb_basis)->group(g_wb);
-    reml->add_option("--woodbury-mp-confirm,--reml-woodbury-basis-MP-confirm",
-                     r.woodbury_mp_confirm,
-                     "Confirmation eigenvalues beyond MP edge (default: 20)")
-        ->check(CLI::PositiveNumber)->needs(o_wb_basis)->group(g_wb);
-    reml->add_option("--woodbury-eig-mass,--reml-woodbury-basis-EIG-mass",
-                     r.woodbury_eig_mass,
-                     "Target eigenvalue mass fraction for EIG mode (default: 0.99)")
-        ->check(kHalfOpenUnitRange)->needs(o_wb_basis)->group(g_wb);
-    reml->add_option("--woodbury-eig-k-buffer,--reml-woodbury-basis-EIG-k-buffer",
-                     r.woodbury_eig_k_buffer,
-                     "Extra eigenvalues added in EIG mode (default: 0)")
-        ->check(CLI::NonNegativeNumber)->needs(o_wb_basis)->group(g_wb);
-    reml->add_option("--woodbury-var-tail,--reml-woodbury-basis-VAR-tail",
-                     r.woodbury_var_tail,
-                     "Max relative Frobenius tail error for VAR mode (default: 0.001)")
-        ->check(kOpenUnitRange)->needs(o_wb_basis)->group(g_wb);
-    reml->add_option_function<std::pair<int, int>>(
+    auto* o_wb_mp_margin = reml->add_option(
+            "--woodbury-mp-margin,--reml-woodbury-basis-MP-margin",
+            r.woodbury_mp_margin,
+            "Marchenko-Pastur edge margin fraction (default: 0.15)")
+        ->check(CLI::NonNegativeNumber)->group(g_wb);
+    auto* o_wb_mp_confirm = reml->add_option(
+            "--woodbury-mp-confirm,--reml-woodbury-basis-MP-confirm",
+            r.woodbury_mp_confirm,
+            "Confirmation eigenvalues beyond MP edge (default: 20)")
+        ->check(CLI::PositiveNumber)->group(g_wb);
+    auto* o_wb_eig_mass = reml->add_option(
+            "--woodbury-eig-mass,--reml-woodbury-basis-EIG-mass",
+            r.woodbury_eig_mass,
+            "Target eigenvalue mass fraction for EIG mode (default: 0.99)")
+        ->check(kHalfOpenUnitRange)->group(g_wb);
+    auto* o_wb_eig_k_buffer = reml->add_option(
+            "--woodbury-eig-k-buffer,--reml-woodbury-basis-EIG-k-buffer",
+            r.woodbury_eig_k_buffer,
+            "Extra eigenvalues added in EIG mode (default: 0)")
+        ->check(CLI::NonNegativeNumber)->group(g_wb);
+    auto* o_wb_var_tail = reml->add_option(
+            "--woodbury-var-tail,--reml-woodbury-basis-VAR-tail",
+            r.woodbury_var_tail,
+            "Max relative Frobenius tail error for VAR mode (default: 0.001)")
+        ->check(kOpenUnitRange)->group(g_wb);
+    auto* o_wb_range = reml->add_option_function<std::pair<int, int>>(
             "--woodbury-range,--reml-woodbury-basis-range",
             [&r](const std::pair<int, int>& p) {
                 if (p.first > p.second) {
@@ -442,35 +457,59 @@ RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r) {
                 r.woodbury_range = p;
             },
             "Initial and maximum rank for adaptive Woodbury basis (default: 2000 25000)")
-        ->check(CLI::PositiveNumber)->needs(o_wb_basis)
+        ->check(CLI::PositiveNumber)
         ->type_name("INIT MAX")->group(g_wb);
-    reml->add_option("--woodbury-mem-budget,--reml-woodbury-basis-mem-budget",
-                     r.woodbury_mem_budget_gb,
-                     "Hard memory budget (GB) capping rSVD sketch rank")
-        ->check(CLI::PositiveNumber)->needs(o_wb_basis)
+    auto* o_wb_mem_budget = reml->add_option(
+            "--woodbury-mem-budget,--reml-woodbury-basis-mem-budget",
+            r.woodbury_mem_budget_gb,
+            "Hard memory budget (GB) capping rSVD sketch rank")
+        ->check(CLI::PositiveNumber)
         ->type_name("GB")->group(g_wb);
-    reml->add_option("--woodbury-warm-start,--reml-woodbury-basis-warm-start",
-                     r.woodbury_warm_start,
-                     "PCA output prefix (<prefix>.eigenvec) to warm-start Woodbury rSVD")
-        ->needs(o_wb_basis)->type_name("PREFIX")->group(g_wb);
-    reml->add_flag("--woodbury-posthoc-correction,--reml-woodbury-basis-posthoc-correction",
-                   r.woodbury_posthoc_correction,
-                   "Experimental post-hoc Woodbury tail correction")
-        ->needs(o_wb_basis)->group(g_wb);
-    reml->add_option("--svd-method", r.svd_method,
-                     "Randomized SVD method for Woodbury basis: power (default) or nystrom")
+    auto* o_wb_warm_start = reml->add_option(
+            "--woodbury-warm-start,--reml-woodbury-basis-warm-start",
+            r.woodbury_warm_start,
+            "PCA output prefix (<prefix>.eigenvec) to warm-start Woodbury rSVD")
+        ->type_name("PREFIX")->group(g_wb);
+    auto* o_wb_posthoc = reml->add_flag(
+            "--woodbury-posthoc-correction,--reml-woodbury-basis-posthoc-correction",
+            r.woodbury_posthoc_correction,
+            "Experimental post-hoc Woodbury tail correction")
+        ->group(g_wb);
+    auto* o_svd_method = reml->add_option(
+            "--svd-method", r.svd_method,
+            "Randomized SVD method for Woodbury basis: power (default) or nystrom")
         ->transform(make_enum_transformer<SvdMethod>(
             {{"power", SvdMethod::Power}, {"nystrom", SvdMethod::Nystrom}},
             "{power,nystrom}"))
-        ->type_name("METHOD")
-        ->needs(o_wb_basis)->group(g_wb);
-    reml->add_option("--svd-power-iter", r.svd_power_iter,
-                     "Number of rSVD power iterations (default: 3)")
-        ->check(CLI::NonNegativeNumber)
-        ->needs(o_wb_basis)->group(g_wb);
+        ->type_name("METHOD")->group(g_wb);
+    auto* o_svd_power_iter = reml->add_option(
+            "--svd-power-iter", r.svd_power_iter,
+            "Number of rSVD power iterations (default: 3)")
+        ->check(CLI::NonNegativeNumber)->group(g_wb);
+    reml->add_flag("--reml-standalone", r.reml_standalone,
+                   "Write full standalone .reml instead of thin TREF reference on --woodbury-reuse")
+        ->group(g_wb);
 
-    reml->callback([&r]() {
-        if ((r.woodbury_basis.has_value() || !r.woodbury_reuse.empty()) && r.alg == RemlAlg::Fisher) {
+    const std::vector<CLI::Option*> wb_tuning_opts = {
+        o_wb_mp_margin, o_wb_mp_confirm, o_wb_eig_mass, o_wb_eig_k_buffer,
+        o_wb_var_tail, o_wb_range, o_wb_mem_budget, o_wb_warm_start,
+        o_wb_posthoc, o_svd_method, o_svd_power_iter
+    };
+
+    reml->callback([&r, o_grm, external_fast, wb_tuning_opts]() {
+        const bool fast_enabled = r.fast || (external_fast != nullptr && *external_fast);
+        const bool wb_from_grm = (o_grm->count() > 0) && (r.woodbury_basis.has_value() || fast_enabled);
+        for (const CLI::Option* opt : wb_tuning_opts) {
+            if (opt->count() > 0 && !wb_from_grm) {
+                if (o_grm->count() == 0) {
+                    throw CLI::ValidationError(
+                        opt->get_name(),
+                        "requires --grm with --woodbury-basis or --fast (incompatible with --woodbury-reuse).");
+                }
+                throw CLI::ValidationError(opt->get_name(), "requires --woodbury-basis or --fast.");
+            }
+        }
+        if ((wb_from_grm || !r.woodbury_reuse.empty()) && r.alg == RemlAlg::Fisher) {
             throw CLI::ValidationError("--alg",
                                        "Woodbury basis is incompatible with Fisher-scoring REML (--alg 1). "
                                        "Use AI-REML (default) or EM-REML (--alg 2).");
@@ -596,7 +635,7 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
                                       "Compute homogametic sex-chromosome GRM")->group("GRM Build");
     gm_dom->excludes(gm_hom);
 
-    grm_make->add_option_function<std::pair<int, int>>(
+    auto* gm_part = grm_make->add_option_function<std::pair<int, int>>(
                 "--part,--make-grm-part",
                 [&grm_make_opts](const std::pair<int, int>& p) {
                     if (p.second > p.first) {
@@ -606,7 +645,7 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
                 },
                 "Partitioned GRM build: <total_parts> <part_index> (1-based)")
         ->check(CLI::PositiveNumber)->type_name("TOTAL INDEX")->group("GRM Build");
-    grm_make->add_option("--alg,--make-grm-alg", grm_make_opts.alg,
+    auto* gm_alg = grm_make->add_option("--alg,--make-grm-alg", grm_make_opts.alg,
                          "GRM standardization algorithm: 0/standard (default) or 1/vanraden")
         ->transform(make_enum_transformer<GrmAlg>(
             {{"standard", GrmAlg::Standard}, {"vanraden", GrmAlg::VanRaden}},
@@ -619,11 +658,35 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
     grm_make->add_option("--n-markers,--nMarkers", grm_make_opts.n_markers,
                          "Markers per BLAS block (default: 1024)")
         ->check(CLI::PositiveNumber)->group("GRM Build");
-    grm_make->add_option("--sparse-cutoff", grm_make_opts.sparse_cutoff,
+    auto* gm_sparse = grm_make->add_option("--sparse-cutoff", grm_make_opts.sparse_cutoff,
                          "Emit sparse GRM entries above cutoff [default: 0.05]")
         ->expected(0, 1)->default_str("0.05")
         ->check(CLI::Range(0.0, 1.0, "[0, 1]"))->group("GRM Build");
-    grm_make->callback([&out, &grm_make_opts]() { out.command = std::move(grm_make_opts); });
+    auto* gm_fp16 = grm_make->add_flag("--grm-fp16", grm_make_opts.grm_fp16,
+                         "Write compact native FP16 GRM (<out>.grm.f16, exact float32 diagonal)")
+        ->group("GRM Build");
+    grm_make->add_flag("--fast", grm_make_opts.fast,
+                       "Hyperscale fast preset: VanRaden INT8 (--alg 1) + native FP16 GRM (--grm-fp16)")
+        ->group("GRM Build");
+    gm_fp16->excludes(gm_sparse, gm_part);
+    grm_make->callback([&out, &grm_make_opts, gm_alg]() {
+        grm_make_opts.alg_explicit = (gm_alg->count() > 0);
+        if (grm_make_opts.fast) {
+            if (!grm_make_opts.sparse_cutoff.has_value() && !grm_make_opts.part.has_value()) {
+                grm_make_opts.grm_fp16 = true;
+            }
+            if (!grm_make_opts.alg_explicit && !grm_make_opts.dominance && !grm_make_opts.homogametic) {
+                grm_make_opts.alg = GrmAlg::VanRaden;
+            }
+        }
+        if (grm_make_opts.grm_fp16 && grm_make_opts.sparse_cutoff.has_value()) {
+            throw CLI::ValidationError("--grm-fp16", "cannot be combined with --sparse-cutoff.");
+        }
+        if (grm_make_opts.grm_fp16 && grm_make_opts.part.has_value()) {
+            throw CLI::ValidationError("--grm-fp16", "cannot be combined with --part (use --tile-budget instead).");
+        }
+        out.command = std::move(grm_make_opts);
+    });
 
     // 1b. grm merge
     auto* grm_merge = grm_cmd->add_subcommand("merge", "Merge multiple GRMs via streaming chunks");
@@ -633,7 +696,16 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
     grm_merge->add_option("--budget", grm_merge_opts.budget_gb,
                           "Streaming memory budget in GB (0 = default ~0.5 GB)")
         ->check(CLI::NonNegativeNumber)->group("GRM Merge");
-    grm_merge->callback([&out, &grm_merge_opts]() { out.command = std::move(grm_merge_opts); });
+    grm_merge->add_flag("--grm-fp16", grm_merge_opts.grm_fp16,
+                        "Write compact native FP16 GRM (<out>.grm.f16)")->group("GRM Merge");
+    grm_merge->add_flag("--fast", grm_merge_opts.fast,
+                        "Hyperscale fast preset: native FP16 GRM output (--grm-fp16)")->group("GRM Merge");
+    grm_merge->callback([&out, &grm_merge_opts]() {
+        if (grm_merge_opts.fast) {
+            grm_merge_opts.grm_fp16 = true;
+        }
+        out.command = std::move(grm_merge_opts);
+    });
 
     // 1c. grm prune
     auto* grm_prune = grm_cmd->add_subcommand("prune", "Prune related individuals from a GRM");
@@ -650,11 +722,18 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
         ->group("Pruning Mode");
     grm_prune->add_flag("--cutoff-detail", grm_prune_opts.cutoff_detail,
                         "Write .family.txt and .singleton.txt details")->group("GRM Prune");
+    grm_prune->add_flag("--grm-fp16", grm_prune_opts.grm_fp16,
+                        "Write compact native FP16 GRM (<out>.grm.f16)")->group("GRM Prune");
+    grm_prune->add_flag("--fast", grm_prune_opts.fast,
+                        "Hyperscale fast preset: native FP16 GRM output (--grm-fp16)")->group("GRM Prune");
     grm_prune->add_option("--keep", grm_prune_opts.keep, "Keep only sample IDs listed in file")
         ->check(CLI::ExistingFile)->group("Sample Filtering");
     grm_prune->add_option("--remove", grm_prune_opts.remove, "Exclude sample IDs listed in file")
         ->check(CLI::ExistingFile)->group("Sample Filtering");
     grm_prune->callback([&out, &grm_prune_opts]() {
+        if (grm_prune_opts.fast && !grm_prune_opts.singleton.has_value()) {
+            grm_prune_opts.grm_fp16 = true;
+        }
         if (grm_prune_opts.grm == out.global.out_prefix()) {
             throw CLI::ValidationError("--out",
                                        "input --grm and output --out cannot have the same prefix ('" +
@@ -676,11 +755,20 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
     grm_sparse->add_flag("--dense", grm_sparse_opts.dense,
                          "Write dense binary GRM (--make-bK) instead of sparse .grm.sp (--make-bK-sparse)")
         ->group("GRM Sparse");
+    grm_sparse->add_flag("--grm-fp16", grm_sparse_opts.grm_fp16,
+                         "Write compact native FP16 GRM (<out>.grm.f16) when --dense is set")
+        ->group("GRM Sparse");
+    grm_sparse->add_flag("--fast", grm_sparse_opts.fast,
+                         "Hyperscale fast preset: native FP16 GRM output (--grm-fp16) when --dense is set")
+        ->group("GRM Sparse");
     grm_sparse->add_option("--keep", grm_sparse_opts.keep, "Keep only sample IDs listed in file")
         ->check(CLI::ExistingFile)->group("Sample Filtering");
     grm_sparse->add_option("--remove", grm_sparse_opts.remove, "Exclude sample IDs listed in file")
         ->check(CLI::ExistingFile)->group("Sample Filtering");
     grm_sparse->callback([&out, &grm_sparse_opts]() {
+        if (grm_sparse_opts.fast && grm_sparse_opts.dense) {
+            grm_sparse_opts.grm_fp16 = true;
+        }
         if (grm_sparse_opts.dense && grm_sparse_opts.grm == out.global.out_prefix()) {
             throw CLI::ValidationError("--out",
                                        "input --grm and output --out cannot have the same prefix when --dense is set.");
@@ -693,29 +781,47 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
     add_global_options(grm_subtract, out.global);
     grm_subtract->add_option("--mgrm", grm_sub_opts.mgrm, "File listing 2 GRM prefixes (full first, subset second)")
         ->required()->check(CLI::ExistingFile)->group("GRM Subtract");
+    grm_subtract->add_flag("--grm-fp16", grm_sub_opts.grm_fp16,
+                           "Write compact native FP16 GRM (<out>.grm.f16)")->group("GRM Subtract");
+    grm_subtract->add_flag("--fast", grm_sub_opts.fast,
+                           "Hyperscale fast preset: native FP16 GRM output (--grm-fp16)")->group("GRM Subtract");
     grm_subtract->add_option("--keep", grm_sub_opts.keep, "Keep only sample IDs listed in file")
         ->check(CLI::ExistingFile)->group("Sample Filtering");
     grm_subtract->add_option("--remove", grm_sub_opts.remove, "Exclude sample IDs listed in file")
         ->check(CLI::ExistingFile)->group("Sample Filtering");
-    grm_subtract->callback([&out, &grm_sub_opts]() { out.command = std::move(grm_sub_opts); });
+    grm_subtract->callback([&out, &grm_sub_opts]() {
+        if (grm_sub_opts.fast) {
+            grm_sub_opts.grm_fp16 = true;
+        }
+        out.command = std::move(grm_sub_opts);
+    });
 
     // 1f. grm unify
     auto* grm_unify = grm_cmd->add_subcommand("unify", "Intersect and align sample sets across multiple GRMs");
     add_global_options(grm_unify, out.global);
     grm_unify->add_option("--mgrm", grm_uni_opts.mgrm, "File listing GRM prefixes to unify")
         ->required()->check(CLI::ExistingFile)->group("GRM Unify");
+    grm_unify->add_flag("--grm-fp16", grm_uni_opts.grm_fp16,
+                        "Write compact native FP16 GRM (<out>.grm.f16)")->group("GRM Unify");
+    grm_unify->add_flag("--fast", grm_uni_opts.fast,
+                        "Hyperscale fast preset: native FP16 GRM output (--grm-fp16)")->group("GRM Unify");
     grm_unify->add_option("--keep", grm_uni_opts.keep, "Keep only sample IDs listed in file")
         ->check(CLI::ExistingFile)->group("Sample Filtering");
     grm_unify->add_option("--remove", grm_uni_opts.remove, "Exclude sample IDs listed in file")
         ->check(CLI::ExistingFile)->group("Sample Filtering");
-    grm_unify->callback([&out, &grm_uni_opts]() { out.command = std::move(grm_uni_opts); });
+    grm_unify->callback([&out, &grm_uni_opts]() {
+        if (grm_uni_opts.fast) {
+            grm_uni_opts.grm_fp16 = true;
+        }
+        out.command = std::move(grm_uni_opts);
+    });
 
     // ------------------------------------------------------------------
     // 2. pca
     // ------------------------------------------------------------------
     auto* pca_cmd = app.add_subcommand("pca", "Principal Component Analysis on a GRM");
     add_global_options(pca_cmd, out.global);
-    pca_cmd->add_option("--grm", pca_opts.grm, "Input GRM prefix (.grm.bin/.grm.id)")
+    pca_cmd->add_option("--grm", pca_opts.grm, "Input GRM prefix (.grm.f16 or .grm.bin/.grm.id)")
         ->required()->type_name("PREFIX")->group("PCA");
     pca_cmd->add_option("--pcs,--n-pcs", pca_opts.pcs, "Number of top PCs to compute (0 = all eigenvalues)")
         ->check(CLI::NonNegativeNumber)->group("PCA");
@@ -735,6 +841,18 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
     pca_cmd->add_option("--svd-power-iter", pca_opts.svd_power_iter,
                         "Number of rSVD power iterations (default: 3)")
         ->check(CLI::NonNegativeNumber)->group("PCA");
+    pca_cmd->add_option("--eigenvec-format", pca_opts.eigenvec_format,
+                        "Eigenvector output format: text (default), bin, bin16, or both")
+        ->transform(make_enum_transformer<EigenvecFormat>(
+            {{"text", EigenvecFormat::Text},
+             {"bin", EigenvecFormat::Bin32},
+             {"bin16", EigenvecFormat::Bin16},
+             {"both", EigenvecFormat::Both}},
+            "{text,bin,bin16,both}"))
+        ->type_name("FMT")->group("PCA");
+    pca_cmd->add_flag("--fast", pca_opts.fast,
+                      "Hyperscale fast preset: rSVD + packed FP16 GRM + compact binary eigenvectors")
+        ->group("PCA");
     auto* pca_chunk = pca_cmd->add_option("--grm-chunked-budget", pca_opts.grm_chunked_budget,
                                           "Stream GRM from disk within memory budget in GB")
                           ->check(CLI::PositiveNumber)->type_name("GB")->group("GRM Loading");
@@ -757,12 +875,14 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
     add_geno_input_options(reml_cmd, reml_opts.geno, GenoInputMode::SampleManifest, /*include_update_freq=*/false);
     add_sample_filter_options(reml_cmd, reml_opts.sample_filter);
     add_pheno_covar_options(reml_cmd, reml_opts.pheno_covar);
-    add_reml_options(reml_cmd, reml_opts.reml);
+    add_reml_options(reml_cmd, reml_opts.reml, /*add_subcmd_level_opts=*/true);
     reml_cmd->callback([&out, &reml_opts]() {
         if (!has_sample_manifest(reml_opts.geno)) {
             throw CLI::ValidationError("Sample Manifest",
                                        "requires one of --fam, --bfile, --pfile, --bpfile, --sample, --mbfile, --mpfile, or --mbpfile.");
         }
+        reml_opts.fast = reml_opts.reml.fast;
+        reml_opts.woodbury_basis_file = reml_opts.reml.woodbury_basis_file;
         reml_opts.save_reml = true;
         out.command = std::move(reml_opts);
     });
@@ -776,13 +896,21 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
     add_sample_filter_options(mlma_cmd, mlma_opts.sample_filter);
     add_marker_filter_options(mlma_cmd, mlma_opts.marker_filter, mlma_opts.sample_filter);
     add_pheno_covar_options(mlma_cmd, mlma_opts.pheno_covar);
-    auto [grm_src, reml_grp] = add_reml_options(mlma_cmd, mlma_opts.reml);
+    auto [grm_src, reml_grp] = add_reml_options(mlma_cmd, mlma_opts.reml, /*add_subcmd_level_opts=*/false,
+                                                &mlma_opts.fast);
 
     const std::string g_assoc = "Association Scan";
     auto* mlma_load = grm_src->add_option("--load-reml", mlma_opts.load_reml,
                                           "Load pre-fitted .reml state (skips inline REML)")
                           ->check(CLI::ExistingFile)->group("GRM / Model Source");
     reml_grp->excludes(mlma_load);
+
+    mlma_cmd->add_option("--woodbury-basis-file", mlma_opts.woodbury_basis_file,
+                         "Override basis .reml file path referenced by a thin TREF .reml")
+        ->check(CLI::ExistingFile)->group("GRM / Model Source");
+    mlma_cmd->add_flag("--fast", mlma_opts.fast,
+                       "Hyperscale fast preset: FP16 GRM + Woodbury MP + --fast-mlma 2slice")
+        ->group(g_assoc);
 
     auto* mlma_save = mlma_cmd->add_flag("--save-reml", mlma_opts.save_reml,
                                          "Fit REML only and save state to <out>.reml (same as 'GCTAg reml')")
@@ -824,6 +952,12 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
         if (mlma_opts.save_reml && !has_sample_manifest(mlma_opts.geno)) {
             throw CLI::ValidationError("Sample Manifest",
                                        "requires one of --fam, --bfile, --pfile, --bpfile, --sample, --mbfile, --mpfile, or --mbpfile.");
+        }
+        if (mlma_opts.fast) {
+            mlma_opts.reml.fast = true;
+        }
+        if (!mlma_opts.woodbury_basis_file.empty()) {
+            mlma_opts.reml.woodbury_basis_file = mlma_opts.woodbury_basis_file;
         }
         out.command = std::move(mlma_opts);
     });

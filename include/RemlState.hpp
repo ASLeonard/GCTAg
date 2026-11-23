@@ -13,9 +13,10 @@
 #include "mlma_woodbury.hpp"
 #include <Eigen/Dense>
 #include <cstdint>
+#include <optional>
 
 struct Header {
-    char    magic[4];     // 4-byte magic signature ("TUNA" or "GOBY")
+    char    magic[4];     // 4-byte magic signature ("TUN3", "TREF", or "GOBY")
     int32_t n;            // Matrix size (e.g., number of samples)
     int32_t x_c;          // Number of covariates
     int32_t num_varcmp;   // Number of variance components
@@ -53,9 +54,12 @@ struct RemlState {
     // by every downstream consumer. No consumer re-factorizes.
     bool    is_llt      = false;
     Eigen::MatrixXf Vi_L_f;  // Upper-triangular Cholesky factor per is_llt above
-    WoodburyMLMACache wb;    // TUNA: Woodbury low-rank factors (is_woodbury=true)
-    Eigen::VectorXf dk_f;    // TUNA: top-k eigenvalues of K (needed for save-reml)
-    float lambda_tail_f = 0.0f; // TUNA: tail mean eigenvalue of K
+    WoodburyMLMACache wb;    // TUN3/TREF: Woodbury low-rank factors (is_woodbury=true)
+    std::optional<QuantizedWoodburyUk> prebuilt_q_uk; // 1-pass streaming --fast-mlma cache (wb.Uk_f stays empty)
+    Eigen::VectorXf cached_Vi_y; // Precomputed exact V^{-1} y_adj from TUN3/TREF header or streaming pass
+    bool            has_cached_Vi_y = false;
+    Eigen::VectorXf dk_f;    // TUN3/TREF: top-k eigenvalues of K
+    float lambda_tail_f = 0.0f; // TUN3/TREF: tail mean eigenvalue of K
     Eigen::VectorXf b;       // fixed-effect coefficients (x_c elements)
     Eigen::VectorXf varcmp;  // variance components from REML state file
 };

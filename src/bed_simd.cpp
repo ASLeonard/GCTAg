@@ -262,7 +262,7 @@ static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw
     if (o) {
         MissSink sink;
         sink.init(o, n_out);
-        if (c.nmiss && sink.active()) miss_pass(raw, keep, n_raw, n_out, &sink);
+        if ((!want_counts || c.nmiss) && sink.active()) miss_pass(raw, keep, n_raw, n_out, &sink);
         weight_pass(out, n_out, o);
         sink.finish(o);
     }
@@ -271,11 +271,12 @@ static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw
 
 template <class T>
 static Counts decode_tab(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_out,
-                         const T* t4, T* out, uint64_t* miss_bits) {
+                         const T* t4, T* out, uint64_t* miss_bits, bool want_counts) {
     const T tb[4] = {t4[2], t4[3], t4[1], t4[0]};   // indexed by PLINK1 code
     for_each_code(raw, keep, n_raw, 0, n_out, [&](uint32_t s, uint32_t c) { out[s] = tb[c]; });
-    Counts c = count_scalar(raw, keep, n_raw, n_out);
-    if (miss_bits && c.nmiss) {
+    Counts c;
+    if (want_counts) c = count_scalar(raw, keep, n_raw, n_out);
+    if (miss_bits && (!want_counts || c.nmiss)) {
         MissSink sink;
         sink.init_bits(miss_bits, n_out);
         miss_pass(raw, keep, n_raw, n_out, &sink);
@@ -283,12 +284,12 @@ static Counts decode_tab(const uint8_t* raw, const uint64_t* keep, uint32_t n_ra
     return c;
 }
 static Counts decode_f32(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_out,
-                         const float* t4, float* out, uint64_t* miss_bits) {
-    return decode_tab<float>(raw, keep, n_raw, n_out, t4, out, miss_bits);
+                         const float* t4, float* out, uint64_t* miss_bits, bool want_counts) {
+    return decode_tab<float>(raw, keep, n_raw, n_out, t4, out, miss_bits, want_counts);
 }
 static Counts decode_f64(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_out,
-                         const double* t4, double* out, uint64_t* miss_bits) {
-    return decode_tab<double>(raw, keep, n_raw, n_out, t4, out, miss_bits);
+                         const double* t4, double* out, uint64_t* miss_bits, bool want_counts) {
+    return decode_tab<double>(raw, keep, n_raw, n_out, t4, out, miss_bits, want_counts);
 }
 
 }  // namespace scalar
@@ -614,7 +615,7 @@ static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw
     if (o) {
         MissSink sink;
         sink.init(o, n_out);
-        if (c.nmiss && sink.active()) miss_pass(raw, keep, n_raw, n_out, &sink);
+        if ((!want_counts || c.nmiss) && sink.active()) miss_pass(raw, keep, n_raw, n_out, &sink);
         weight_pass(out, n_out, o);
         sink.finish(o);
     }
@@ -622,12 +623,13 @@ static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw
 }
 
 static Counts decode_f32(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_out,
-                         const float* t4, float* out, uint64_t* miss_bits) {
+                         const float* t4, float* out, uint64_t* miss_bits, bool want_counts) {
     const float tb[4] = {t4[2], t4[3], t4[1], t4[0]};   // indexed by PLINK1 code
     run_stages(raw, keep, n_raw, 0, n_out,
                [&](const uint8_t* c, uint32_t n, uint32_t p) { map_f32(c, n, tb, out + p); });
-    Counts c = count(raw, keep, n_raw, n_out);
-    if (miss_bits && c.nmiss) {
+    Counts c;
+    if (want_counts) c = count(raw, keep, n_raw, n_out);
+    if (miss_bits && (!want_counts || c.nmiss)) {
         MissSink sink;
         sink.init_bits(miss_bits, n_out);
         miss_pass(raw, keep, n_raw, n_out, &sink);
@@ -636,12 +638,13 @@ static Counts decode_f32(const uint8_t* raw, const uint64_t* keep, uint32_t n_ra
 }
 
 static Counts decode_f64(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_out,
-                         const double* t4, double* out, uint64_t* miss_bits) {
+                         const double* t4, double* out, uint64_t* miss_bits, bool want_counts) {
     const double tb[4] = {t4[2], t4[3], t4[1], t4[0]};
     run_stages(raw, keep, n_raw, 0, n_out,
                [&](const uint8_t* c, uint32_t n, uint32_t p) { map_f64(c, n, tb, out + p); });
-    Counts c = count(raw, keep, n_raw, n_out);
-    if (miss_bits && c.nmiss) {
+    Counts c;
+    if (want_counts) c = count(raw, keep, n_raw, n_out);
+    if (miss_bits && (!want_counts || c.nmiss)) {
         MissSink sink;
         sink.init_bits(miss_bits, n_out);
         miss_pass(raw, keep, n_raw, n_out, &sink);
@@ -842,7 +845,7 @@ BED_T256 static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint3
     if (o) {
         MissSink sink;
         sink.init(o, n_out);
-        if (c.nmiss && sink.active()) scalar::miss_pass(raw, keep, n_raw, n_out, &sink);
+        if ((!want_counts || c.nmiss) && sink.active()) scalar::miss_pass(raw, keep, n_raw, n_out, &sink);
         weight_pass(out, n_out, o);
         sink.finish(o);
     }
@@ -850,12 +853,13 @@ BED_T256 static Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint3
 }
 
 BED_T256 static Counts decode_f32(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_out,
-                                  const float* t4, float* out, uint64_t* miss_bits) {
+                                  const float* t4, float* out, uint64_t* miss_bits, bool want_counts) {
     const float tb[4] = {t4[2], t4[3], t4[1], t4[0]};
     run_stages(raw, keep, n_raw, 0, n_out,
                [&](const uint8_t* c, uint32_t n, uint32_t p) { map_f32(c, n, tb, out + p); });
-    Counts c = count_popcnt(raw, keep, n_raw, n_out);
-    if (miss_bits && c.nmiss) {
+    Counts c;
+    if (want_counts) c = count_popcnt(raw, keep, n_raw, n_out);
+    if (miss_bits && (!want_counts || c.nmiss)) {
         MissSink sink;
         sink.init_bits(miss_bits, n_out);
         scalar::miss_pass(raw, keep, n_raw, n_out, &sink);
@@ -864,12 +868,13 @@ BED_T256 static Counts decode_f32(const uint8_t* raw, const uint64_t* keep, uint
 }
 
 BED_T256 static Counts decode_f64(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_out,
-                                  const double* t4, double* out, uint64_t* miss_bits) {
+                                  const double* t4, double* out, uint64_t* miss_bits, bool want_counts) {
     const double tb[4] = {t4[2], t4[3], t4[1], t4[0]};
     run_stages(raw, keep, n_raw, 0, n_out,
                [&](const uint8_t* c, uint32_t n, uint32_t p) { map_f64(c, n, tb, out + p); });
-    Counts c = count_popcnt(raw, keep, n_raw, n_out);
-    if (miss_bits && c.nmiss) {
+    Counts c;
+    if (want_counts) c = count_popcnt(raw, keep, n_raw, n_out);
+    if (miss_bits && (!want_counts || c.nmiss)) {
         MissSink sink;
         sink.init_bits(miss_bits, n_out);
         scalar::miss_pass(raw, keep, n_raw, n_out, &sink);
@@ -882,6 +887,20 @@ BED_T256 static Counts decode_f64(const uint8_t* raw, const uint64_t* keep, uint
 // AVX-512 kernels (shared with the emulator-based unit test).
 #include "bed_simd_avx512.inc"
 
+BED_T512 static Counts avx512_decode_f32_wrap(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
+                                              uint32_t n_out, const float* t4, float* out,
+                                              uint64_t* miss_bits, bool want_counts) {
+    (void)want_counts;   // AVX-512 fuses counting into the single decode pass
+    return avx512::decode_f32(raw, keep, n_raw, n_out, t4, out, miss_bits);
+}
+
+BED_T512 static Counts avx512_decode_f64_wrap(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
+                                              uint32_t n_out, const double* t4, double* out,
+                                              uint64_t* miss_bits, bool want_counts) {
+    (void)want_counts;   // AVX-512 fuses counting into the single decode pass
+    return avx512::decode_f64(raw, keep, n_raw, n_out, t4, out, miss_bits);
+}
+
 #endif  // BED_X86
 
 // ===========================================================================
@@ -891,8 +910,8 @@ struct Kernels {
     Isa isa;
     Counts (*count)(const uint8_t*, const uint64_t*, uint32_t, uint32_t);
     Counts (*i8)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, uint32_t, int8_t*, I8Opts*, bool);
-    Counts (*f32)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, const float*, float*, uint64_t*);
-    Counts (*f64)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, const double*, double*, uint64_t*);
+    Counts (*f32)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, const float*, float*, uint64_t*, bool);
+    Counts (*f64)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, const double*, double*, uint64_t*, bool);
 };
 
 static const Kernels kScalar = {Isa::Scalar, &count_scalar, &scalar::decode_i8, &scalar::decode_f32, &scalar::decode_f64};
@@ -901,7 +920,7 @@ static const Kernels kNeon = {Isa::Neon, &neon::count, &neon::decode_i8, &neon::
 #endif
 #if BED_X86
 static const Kernels kAvx2 = {Isa::Avx2, &count_popcnt, &avx2::decode_i8, &avx2::decode_f32, &avx2::decode_f64};
-static const Kernels kAvx512 = {Isa::Avx512, &avx512::count, &avx512::decode_i8, &avx512::decode_f32, &avx512::decode_f64};
+static const Kernels kAvx512 = {Isa::Avx512, &avx512::count, &avx512::decode_i8, &avx512_decode_f32_wrap, &avx512_decode_f64_wrap};
 
 static bool cpu_has_avx512() {
 #if BED_STATIC_AVX512
@@ -1034,12 +1053,27 @@ Counts decode_i8(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint3
 
 Counts decode_f32(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_keep,
                   const float table[4], float* out, uint64_t* miss_bits) {
-    return K().f32(raw, keep, n_raw, keep ? n_keep : n_raw, table, out, miss_bits);
+    return K().f32(raw, keep, n_raw, keep ? n_keep : n_raw, table, out, miss_bits, true);
 }
 
 Counts decode_f64(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_keep,
                   const double table[4], double* out, uint64_t* miss_bits) {
-    return K().f64(raw, keep, n_raw, keep ? n_keep : n_raw, table, out, miss_bits);
+    return K().f64(raw, keep, n_raw, keep ? n_keep : n_raw, table, out, miss_bits, true);
+}
+
+void decode_i8_nocount(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_keep,
+                       int8_t* out, I8Opts* opts) {
+    K().i8(raw, keep, n_raw, 0, keep ? n_keep : n_raw, out, opts, false);
+}
+
+void decode_f32_nocount(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_keep,
+                        const float table[4], float* out, uint64_t* miss_bits) {
+    K().f32(raw, keep, n_raw, keep ? n_keep : n_raw, table, out, miss_bits, false);
+}
+
+void decode_f64_nocount(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_keep,
+                        const double table[4], double* out, uint64_t* miss_bits) {
+    K().f64(raw, keep, n_raw, keep ? n_keep : n_raw, table, out, miss_bits, false);
 }
 
 void decode_i8_range(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,

@@ -2,13 +2,14 @@
    BedBackend — double-buffered native PLINK1 .bed reader.
 
    Replaces the PgenReader-based BED path:
-     * Direct POSIX pread/preadv of raw variant records into 64-byte aligned,
-       64-byte padded block slots (zero user-space copies: the kernel scatters
-       each record straight into its slot; non-contiguous extract sets merge
-       small gaps into the same syscall via discard iovecs).
+     * Direct POSIX pread/preadv of raw variant records into a 64-byte aligned
+       contiguous block buffer (stride == recBytes_, zero per-record padding,
+       zero user-space copies): contiguous ascending marker spans coalesce into
+       a single ::pread() syscall; non-contiguous extract sets bridge gaps up
+       to 2 MiB into the same preadv() via a lazily allocated discard buffer.
      * No PgrPlink1ToPlink2InplaceUnsafe pass and no fread_buf -> block.buf
        copy on the I/O thread: Geno decodes raw PLINK1 2-bit codes directly
-       via bed_simd (AVX-512 / AVX2 / NEON / scalar).
+       via bed_simd (AVX-512 / AVX2 / NEON / scalar, all using unaligned loads).
      * Validates the 3-byte magic (0x6c 0x1b 0x01) and the exact file size
        (3 + ceil(N/4) * M) of every --bfile / --mbfile member up front.
    PGEN / BGEN keep using third_party/Pgenlib via their own backends.
@@ -50,10 +51,10 @@ constexpr int kMaxIov = 1024;
 // (Linux readv/preadv transfer limit).
 constexpr uint64_t kMaxBatchBytes = 1ull << 30;
 
-// Merge gaps of at most this many records (and bytes) into one preadv call
-// by reading the gap into a discard buffer: far cheaper than a syscall.
-constexpr uint64_t kMaxGapRecords = 16;
-constexpr uint64_t kMaxGapBytes   = 1ull << 20;
+// Merge byte gaps up to 2 MiB into one preadv() call by reading the gap into
+// a lazily allocated discard buffer: keeps sequential readahead alive on
+// Lustre/GPFS even for sparse --extract subsets without per-record caps.
+constexpr uint64_t kMaxGapBytes = 2ull << 20;
 
 std::string errno_str() { return std::string(std::strerror(errno)); }
 
@@ -116,33 +117,45 @@ void pread_full(int fd, void* dst, size_t len, uint64_t off, const std::string& 
     }
 }
 
-// Scatter-read a contiguous file range into iov[0..cnt). Falls back to
-// per-iovec pread_full() for any remainder after a short preadv().
+// Scatter-read a contiguous file range into iov[0..cnt). Uses plain pread()
+// when cnt == 1, and on a short preadv() advances across completed iovecs and
+// retries preadv() on the remaining slice instead of degrading to per-iovec
+// pread() calls.
 void preadv_full(int fd, struct iovec* iov, int cnt, uint64_t off, const std::string& fname) {
-#if defined(__linux__) || defined(__APPLE__)
-    size_t total = 0;
-    for (int i = 0; i < cnt; ++i) total += iov[i].iov_len;
-    ssize_t r;
-    do {
-        r = ::preadv(fd, iov, cnt, static_cast<off_t>(off));
-    } while (r < 0 && errno == EINTR);
-    if (r < 0) {
-        LOGGER.e(0, "BedBackend: read error on [" + fname + "]: " + errno_str());
+    if (cnt <= 0) return;
+    if (cnt == 1) {
+        pread_full(fd, iov[0].iov_base, iov[0].iov_len, off, fname);
+        return;
     }
-    if (static_cast<size_t>(r) == total) return;
-    // Short read: finish the remainder iovec by iovec.
-    size_t done = static_cast<size_t>(r);
+#if defined(__linux__) || defined(__APPLE__)
+    int idx = 0;
     uint64_t pos = off;
-    for (int i = 0; i < cnt; ++i) {
-        const size_t len = iov[i].iov_len;
-        if (done >= len) {
-            done -= len;
-            pos += len;
-            continue;
+    while (idx < cnt) {
+        const int rem_cnt = cnt - idx;
+        if (rem_cnt == 1) {
+            pread_full(fd, iov[idx].iov_base, iov[idx].iov_len, pos, fname);
+            return;
         }
-        pread_full(fd, static_cast<unsigned char*>(iov[i].iov_base) + done, len - done, pos + done, fname);
-        pos += len;
-        done = 0;
+        ssize_t r;
+        do {
+            r = ::preadv(fd, iov + idx, rem_cnt, static_cast<off_t>(pos));
+        } while (r < 0 && errno == EINTR);
+        if (r < 0) {
+            LOGGER.e(0, "BedBackend: read error on [" + fname + "]: " + errno_str());
+        }
+        if (r == 0) {
+            LOGGER.e(0, "BedBackend: unexpected end of file in [" + fname + "].");
+        }
+        size_t done = static_cast<size_t>(r);
+        pos += static_cast<uint64_t>(done);
+        while (idx < cnt && done >= iov[idx].iov_len) {
+            done -= iov[idx].iov_len;
+            ++idx;
+        }
+        if (idx < cnt && done > 0) {
+            iov[idx].iov_base = static_cast<unsigned char*>(iov[idx].iov_base) + done;
+            iov[idx].iov_len -= done;
+        }
     }
 #else
     uint64_t pos = off;
@@ -195,13 +208,12 @@ public:
           extractIndex_(extractIndex),
           rawMarkerIndex_(g_.marker->get_extract_index()),
           recBytes_(recBytes),
-          strideBytes_(static_cast<uint64_t>(g_.bedRawGenoBuf1PtrSize) * sizeof(uintptr_t)),
-          markerBlock_(g_.numMarkerBlock),
-          discard_(static_cast<size_t>(std::min<uint64_t>(recBytes * kMaxGapRecords, kMaxGapBytes + recBytes))) {
+          strideBytes_(recBytes),
+          markerBlock_(g_.numMarkerBlock) {
         const std::size_t maxBlock = static_cast<std::size_t>(std::max(1, markerBlock_));
         rawRefScratch_.reserve(maxBlock);
         lagIndexScratch_.reserve(maxBlock);
-        iov_.reserve(kMaxIov);
+        iov_.reserve(64);
     }
 
     bool nextBlock(GenoBlock &block) override {
@@ -227,8 +239,10 @@ public:
         block.numMarkers   = nextSize;
         block.sexChromType = sexChromType_;
         block.fileIndex    = fileIndex_;
-        const std::size_t strideElems = static_cast<std::size_t>(g_.bedRawGenoBuf1PtrSize);
-        const std::size_t requiredElems = strideElems * nextSize;
+        const std::size_t requiredBytes =
+            static_cast<std::size_t>(nextSize) * static_cast<std::size_t>(recBytes_);
+        const std::size_t requiredElems =
+            ((requiredBytes + 63) / 64) * (64 / sizeof(uintptr_t));
         if (block.buf.size() < requiredElems) {
             block.buf.resize(requiredElems);
         }
@@ -254,48 +268,73 @@ public:
         }
 
         auto *base = reinterpret_cast<unsigned char *>(block.buf.data());
-        // Build preadv batches over runs of ascending record indices.
+        // Coalesce contiguous ascending record spans into a single iovec (issued
+        // via plain ::pread() when iov_.size() == 1); bridge small byte gaps up
+        // to kMaxGapBytes into the same preadv() via a lazily allocated discard
+        // buffer.
         iov_.clear();
         uint64_t batchStart = 0;   // record index of first iovec
         uint64_t nextRec = 0;      // record index following the last iovec
         uint64_t batchBytes = 0;   // total bytes queued in iov_
         auto flush = [&]() {
-            if (!iov_.empty()) {
-                preadv_full(fd, iov_.data(), static_cast<int>(iov_.size()), 3 + batchStart * recBytes_, fname);
-                iov_.clear();
-                batchBytes = 0;
+            if (iov_.empty()) return;
+            const uint64_t fileOff = 3ull + batchStart * recBytes_;
+            if (iov_.size() == 1) {
+                pread_full(fd, iov_[0].iov_base, iov_[0].iov_len, fileOff, fname);
+            } else {
+                preadv_full(fd, iov_.data(), static_cast<int>(iov_.size()), fileOff, fname);
             }
+            iov_.clear();
+            batchBytes = 0;
         };
         for (uint32_t i = 0; i < nextSize; ++i) {
             const uint64_t rec = lagIndexScratch_[i];
+            unsigned char *const dst = base + static_cast<size_t>(i) * strideBytes_;
             bool startNew = iov_.empty();
+            bool bridgedGap = false;
             if (!startNew) {
                 if (rec < nextRec) {
                     startNew = true;   // not ascending: new batch
                 } else if (rec > nextRec) {
                     const uint64_t gap = rec - nextRec;
                     const uint64_t gapBytes = gap * recBytes_;
-                    if (gap <= kMaxGapRecords && gapBytes <= discard_.size() &&
+                    if (gapBytes <= kMaxGapBytes &&
                         iov_.size() + 2 <= static_cast<size_t>(kMaxIov) &&
                         batchBytes + gapBytes + recBytes_ <= kMaxBatchBytes) {
+                        if (discard_.size() < kMaxGapBytes) {
+                            discard_.resize(static_cast<size_t>(kMaxGapBytes));
+                        }
                         iov_.push_back({discard_.data(), static_cast<size_t>(gapBytes)});
                         batchBytes += gapBytes;
                         nextRec = rec;
+                        bridgedGap = true;
                     } else {
                         startNew = true;
                     }
                 }
             }
-            if (!startNew && (iov_.size() + 1 > static_cast<size_t>(kMaxIov) ||
-                              batchBytes + recBytes_ > kMaxBatchBytes)) {
-                startNew = true;
+            if (!startNew && !bridgedGap) {
+                const bool canCoalesce =
+                    !iov_.empty() &&
+                    iov_.back().iov_base != discard_.data() &&
+                    static_cast<unsigned char *>(iov_.back().iov_base) + iov_.back().iov_len == dst;
+                if (batchBytes + recBytes_ > kMaxBatchBytes ||
+                    (!canCoalesce && iov_.size() + 1 > static_cast<size_t>(kMaxIov))) {
+                    startNew = true;
+                }
             }
             if (startNew) {
                 flush();
                 batchStart = rec;
                 nextRec = rec;
             }
-            iov_.push_back({base + static_cast<size_t>(i) * strideBytes_, static_cast<size_t>(recBytes_)});
+            if (!iov_.empty() &&
+                iov_.back().iov_base != discard_.data() &&
+                static_cast<unsigned char *>(iov_.back().iov_base) + iov_.back().iov_len == dst) {
+                iov_.back().iov_len += static_cast<size_t>(recBytes_);
+            } else {
+                iov_.push_back({dst, static_cast<size_t>(recBytes_)});
+            }
             batchBytes += recBytes_;
             nextRec = rec + 1;
         }
@@ -315,7 +354,7 @@ private:
 
     UniqueFd curFd_;
     int curFileIndex_ = -1;
-    std::vector<unsigned char> discard_;
+    AlignedRawBuffer<unsigned char, 64> discard_;
     std::vector<struct iovec> iov_;
     std::vector<uint32_t> rawRefScratch_;
     std::vector<uint64_t> lagIndexScratch_;
@@ -369,10 +408,9 @@ BedBackend::BedBackend(Geno &geno) : g_(geno)
         }
     }
 
-    // 64-byte aligned, 64-byte padded slot per variant so every record starts
-    // on a cache line (AVX-512 loads never split a record start).
-    g_.bedRawGenoBuf1PtrSize = static_cast<int>(((recBytes_ + 63) / 64) * 64 / sizeof(uintptr_t));
-    g_.maskPtrSize           = static_cast<int>(bed_simd::keep_mask_words(rawCT));
+    // Contiguous unpadded record stride (all bed_simd kernels use unaligned loads).
+    g_.bedRecordBytes = recBytes_;
+    g_.maskPtrSize    = static_cast<int>(bed_simd::keep_mask_words(rawCT));
 
     const std::size_t nMask = static_cast<std::size_t>(g_.maskPtrSize);
     keepMask_          = make_aligned_uninitialized<uintptr_t, 64>(nMask);
@@ -399,7 +437,8 @@ BedBackend::~BedBackend()
 std::size_t BedBackend::initialBlockCapacity() const {
     const std::size_t maxBlockMarkers =
         static_cast<std::size_t>(std::max(1, g_.numMarkerBlock));
-    return static_cast<std::size_t>(g_.bedRawGenoBuf1PtrSize) * maxBlockMarkers;
+    const std::size_t totalBytes = static_cast<std::size_t>(recBytes_) * maxBlockMarkers;
+    return ((totalBytes + 63) / 64) * (64 / sizeof(uintptr_t));
 }
 
 std::unique_ptr<GenoBackend::Producer> BedBackend::makeProducer(std::span<const uint32_t> extractIndex) {

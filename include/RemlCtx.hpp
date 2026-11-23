@@ -153,7 +153,8 @@ struct RemlCtx {
     int     woodbury_basis_rank_  = 0;     // actual rank used (<= woodbury_basis_rank or MP)
     float woodbury_basis_eigen_mass = 0.99f;    // fraction of eigenvalue mass captured by Uk
     bool woodbury_basis_eigen_adaptive = true; // true → adaptively raise k until mass target is reached rather than doubling
-    Eigen::MatrixXf Uk;              // n x k leading eigenvectors of K (float32)
+    Eigen::MatrixXf Uk;              // leading eigenvectors of K (float32): n x k by default, or k x n when Uk_is_transposed=true
+    bool    Uk_is_transposed = false; // true -> Uk is k x n (ColMajor, sample-contiguous), avoiding 40 GB transposes on --woodbury-reuse
     RemlVec dk;                      // k eigenvalues (clamped >= 0)
     double  lambda_tail     = 0.0;   // average bulk eigenvalue
     double  tail_d_var      = 0.0;   // var of tail eigenvalues (2nd-order logdet corr)

@@ -293,7 +293,7 @@ private:
     GetGenoFloatFunc getGenoFloatFunc = nullptr;
  
     //BED
-    int bedRawGenoBuf1PtrSize; // uintptr_t words per raw .bed record slot (64-byte padded)
+    uint64_t bedRecordBytes = 0; // exact bytes per raw .bed variant record (unpadded contiguous stride)
     int maskPtrSize;
     int missPtrSize;
     uint32_t rawSampleCT;
@@ -313,8 +313,8 @@ private:
 
     // Native BED helpers (bed_simd).
     const uint8_t *bedRecord(const uintptr_t *buf, int idx) const {
-        return reinterpret_cast<const uint8_t *>(buf + static_cast<std::size_t>(idx) *
-                                                           static_cast<std::size_t>(bedRawGenoBuf1PtrSize));
+        return reinterpret_cast<const uint8_t *>(buf) +
+               static_cast<std::size_t>(idx) * static_cast<std::size_t>(bedRecordBytes);
     }
     const uint64_t *bedKeepMask() const {
         return keepSampleCT == rawSampleCT ? nullptr : reinterpret_cast<const uint64_t *>(keepMaskPtr);

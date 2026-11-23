@@ -13,8 +13,10 @@
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <vector>
 #ifdef _OPENMP
@@ -706,6 +708,861 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk(
                 int64_t sl = 0;
                 const size_t r = static_cast<size_t>(r0 + rl);
                 for (int t = 0; t < p2_threads; ++t) {
+                    sh += thr_sum_hi[static_cast<size_t>(t) * k_pad64 + r];
+                    sl += thr_sum_lo[static_cast<size_t>(t) * k_hi_pad64 + r];
+                }
+                tile.u_sum_q[static_cast<size_t>(rl)] =
+                    tile.alpha_hi[static_cast<size_t>(rl)] * static_cast<double>(sh)
+                  + tile.alpha_lo[static_cast<size_t>(rl)] * static_cast<double>(sl);
+            }
+        }
+    }
+
+    const double norm_denom = (n > 1) ? (S_w2 * static_cast<double>(n - 1) / static_cast<double>(n)) : S_w2;
+    out.delta_quant = (norm_denom > 0.0) ? (total_eps_sq / norm_denom) : 0.0;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Compact TUN3 16-bit hybrid encoding helpers (Row-Scaled INT16 qmax=32385
+// when crest <= 24.0, IEEE FP16 bit-pattern when crest > 24.0)
+// ---------------------------------------------------------------------------
+inline constexpr float  kTun3Int16QMax       = 32385.0f; // 127 * 254 + 127 = 127 * 255
+inline constexpr double kTun3CrestFp16Thresh = 24.0;
+
+inline uint16_t wb_f32_to_fp16_bits(float x) noexcept {
+#if defined(__FLT16_MANT_DIG__)
+    return std::bit_cast<uint16_t>(static_cast<_Float16>(x));
+#else
+    const uint32_t u = std::bit_cast<uint32_t>(x);
+    const uint32_t sign = (u >> 16) & 0x8000u;
+    const int32_t  exp  = static_cast<int32_t>((u >> 23) & 0xFFu) - 127 + 15;
+    uint32_t       mant = u & 0x007FFFFFu;
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<uint16_t>(sign);
+        mant |= 0x00800000u;
+        const int shift = 14 - exp;
+        const uint32_t round_bit = 1u << (shift - 1);
+        const uint32_t sticky    = (mant & (round_bit - 1u)) != 0u;
+        const uint32_t lsb       = (mant >> shift) & 1u;
+        return static_cast<uint16_t>(sign | ((mant + round_bit - 1u + (sticky | lsb)) >> shift));
+    } else if (exp >= 31) {
+        return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+    const uint32_t round_bit = 0x00001000u;
+    const uint32_t sticky    = (mant & 0x00000FFFu) != 0u;
+    const uint32_t lsb       = (mant >> 13) & 1u;
+    uint32_t h = sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13);
+    h += (mant & round_bit) && (sticky || lsb);
+    return static_cast<uint16_t>(h);
+#endif
+}
+
+inline float wb_fp16_bits_to_f32(uint16_t h) noexcept {
+#if defined(__FLT16_MANT_DIG__)
+    return static_cast<float>(std::bit_cast<_Float16>(h));
+#else
+    const uint32_t sign = (static_cast<uint32_t>(h) & 0x8000u) << 16;
+    const uint32_t exp  = (static_cast<uint32_t>(h) >> 10) & 0x1Fu;
+    uint32_t       mant = static_cast<uint32_t>(h) & 0x03FFu;
+    uint32_t u = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            u = sign;
+        } else {
+            uint32_t e = 127 - 14;
+            while ((mant & 0x0400u) == 0u) { mant <<= 1; --e; }
+            mant &= 0x03FFu;
+            u = sign | (e << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        u = sign | 0x7F800000u | (mant << 13);
+    } else {
+        u = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    return std::bit_cast<float>(u);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// QuantizedWoodburyStreamBuilder
+// 1-pass streaming builder that consumes k x chunk_n uint16_t TUN3 sample
+// slabs directly from AsyncSeqReader and populates QuantizedWoodburyUk::tiles
+// WITHOUT ever allocating the 4*k*n float32 Uk_f matrix.
+//
+// Bulk INT16 rows (uk_row_scale[r] > 0) under 2slice + unit_weights decompose
+// LOSSLESSLY into (qh, ql) in [-127, 127] via q16 = 254 * qh + ql with pure
+// integer arithmetic.
+// ---------------------------------------------------------------------------
+class QuantizedWoodburyStreamBuilder {
+public:
+    QuantizedWoodburyStreamBuilder(
+        int k,
+        int n,
+        FastMlmaMode mode,
+        const float* sqrt_ck_ptr,
+        const float* uk_row_scale,
+        const Eigen::VectorXf& w_sqrt,
+        bool unit_weights,
+        double S_w2,
+        const float* exact_max_abs_override = nullptr,
+        const float* y_adj_for_uy = nullptr)
+        : k_(k),
+          n_(n),
+          unit_weights_(unit_weights),
+          has_exact_max_override_(exact_max_abs_override != nullptr),
+          S_w2_(S_w2),
+          sqrt_ck_(sqrt_ck_ptr, sqrt_ck_ptr + std::max(0, k)),
+          uk_row_scale_(uk_row_scale, uk_row_scale + std::max(0, k)),
+          w_ptr_(w_sqrt.data()),
+          y_adj_ptr_(y_adj_for_uy)
+    {
+        out_.k = k;
+        out_.n = n;
+        out_.mode = mode;
+        if (k <= 0 || n <= 0 || mode == FastMlmaMode::Off) return;
+
+        k_hi_ = k;
+        if (mode == FastMlmaMode::Slice1) {
+            k_hi_ = 0;
+        } else if (mode == FastMlmaMode::Hybrid) {
+            k_hi_ = std::min(k, std::max(std::min(k, 100), k / 10));
+        }
+
+        constexpr int kMaxQRows = 4096;
+        auto push_tiles = [&](int beg, int end, bool is_2slice) {
+            const int rc_max = is_2slice ? (kMaxQRows / 2) : kMaxQRows;
+            for (int r0 = beg; r0 < end; r0 += rc_max) {
+                QuantizedWoodburyTile t;
+                t.r_begin = r0;
+                t.r_count = std::min(rc_max, end - r0);
+                t.is_2slice = is_2slice;
+                t.q_rows = is_2slice ? 2 * t.r_count : t.r_count;
+                t.q_bytes = static_cast<size_t>(t.q_rows) * static_cast<size_t>(n);
+                t.Q = make_aligned_uninitialized<int8_t, 64>(t.q_bytes);
+                if (t.q_bytes > 0 && !t.Q) {
+                    LOGGER.e(0, "Failed to allocate quantized Woodbury Q tile.");
+                }
+                t.alpha_hi.assign(static_cast<size_t>(t.r_count), 0.0);
+                if (is_2slice) t.alpha_lo.assign(static_cast<size_t>(t.r_count), 0.0);
+                t.u_sum_q.assign(static_cast<size_t>(t.r_count), 0.0);
+                out_.tiles.push_back(std::move(t));
+            }
+        };
+        if (k_hi_ > 0) push_tiles(0, k_hi_, true);
+        if (k_hi_ < k) push_tiles(k_hi_, k, false);
+
+        const double w_max = unit_weights_
+            ? 1.0
+            : static_cast<double>(w_sqrt.cwiseAbs().maxCoeff());
+
+        alpha_hi_f_.assign(static_cast<size_t>(k), 0.0f);
+        inv_hi_f_.assign(static_cast<size_t>(k), 0.0f);
+        alpha_lo_f_.assign(static_cast<size_t>(k_hi_), 0.0f);
+        inv_lo_f_.assign(static_cast<size_t>(k_hi_), 0.0f);
+        row_unit_f_.assign(static_cast<size_t>(k), 0.0f);
+
+        const size_t num_tiles = out_.tiles.size();
+        tile_all_i16_.assign(num_tiles, true);
+        tile_fp16_rows_.resize(num_tiles);
+
+        for (size_t ti = 0; ti < num_tiles; ++ti) {
+            auto& tile = out_.tiles[ti];
+            const int r0 = tile.r_begin;
+            const int rc = tile.r_count;
+            for (int rl = 0; rl < rc; ++rl) {
+                const int r = r0 + rl;
+                const float rs = uk_row_scale_[static_cast<size_t>(r)];
+                const bool is_fp16 = (rs < 0.0f);
+                if (is_fp16) {
+                    tile_all_i16_[ti] = false;
+                    tile_fp16_rows_[ti].push_back(rl);
+                }
+
+                const double raw_max_abs = is_fp16
+                    ? static_cast<double>(-rs)
+                    : (static_cast<double>(rs) * static_cast<double>(kTun3Int16QMax));
+
+                if (!is_fp16 && unit_weights_ && !has_exact_max_override_) {
+                    // Exact lossless alignment with on-disk qmax=32385 = 127*254 + 127 = 127*255.
+                    const double unit_v = static_cast<double>(sqrt_ck_[static_cast<size_t>(r)])
+                                        * static_cast<double>(rs);
+                    row_unit_f_[static_cast<size_t>(r)] = static_cast<float>(unit_v);
+                    if (unit_v > 1.0e-35) {
+                        if (tile.is_2slice) {
+                            const double alo = unit_v;
+                            const double ahi = 254.0 * unit_v;
+                            tile.alpha_hi[static_cast<size_t>(rl)] = ahi;
+                            tile.alpha_lo[static_cast<size_t>(rl)] = alo;
+                            alpha_hi_f_[static_cast<size_t>(r)]    = static_cast<float>(ahi);
+                            inv_hi_f_[static_cast<size_t>(r)]      = static_cast<float>(1.0 / ahi);
+                            alpha_lo_f_[static_cast<size_t>(r)]    = static_cast<float>(alo);
+                            inv_lo_f_[static_cast<size_t>(r)]      = static_cast<float>(1.0 / alo);
+                        } else {
+                            const double ahi = 255.0 * unit_v;
+                            tile.alpha_hi[static_cast<size_t>(rl)] = ahi;
+                            alpha_hi_f_[static_cast<size_t>(r)]    = static_cast<float>(ahi);
+                            inv_hi_f_[static_cast<size_t>(r)]      = static_cast<float>(1.0 / ahi);
+                        }
+                    }
+                } else {
+                    const double eff_max = has_exact_max_override_
+                        ? static_cast<double>(exact_max_abs_override[r])
+                        : (raw_max_abs * w_max);
+                    const double max_v = static_cast<double>(sqrt_ck_[static_cast<size_t>(r)]) * eff_max;
+                    if (max_v > 1.0e-30) {
+                        const double ahi = max_v / 127.0;
+                        tile.alpha_hi[static_cast<size_t>(rl)] = ahi;
+                        alpha_hi_f_[static_cast<size_t>(r)]    = static_cast<float>(ahi);
+                        inv_hi_f_[static_cast<size_t>(r)]      = static_cast<float>(1.0 / ahi);
+                        if (tile.is_2slice) {
+                            const double alo = ahi / 254.0;
+                            tile.alpha_lo[static_cast<size_t>(rl)] = alo;
+                            alpha_lo_f_[static_cast<size_t>(r)]    = static_cast<float>(alo);
+                            inv_lo_f_[static_cast<size_t>(r)]      = static_cast<float>(1.0 / alo);
+                        }
+                    }
+                }
+            }
+        }
+
+        max_threads_ =
+        #ifdef _OPENMP
+            std::max(1, omp_get_max_threads());
+        #else
+            1;
+        #endif
+        k_pad64_    = (static_cast<size_t>(k) + 7) / 8 * 8;
+        k_hi_pad64_ = (static_cast<size_t>(k_hi_) + 7) / 8 * 8;
+        thr_sum_hi_.assign(static_cast<size_t>(max_threads_) * k_pad64_, 0);
+        if (k_hi_ > 0) {
+            thr_sum_lo_.assign(static_cast<size_t>(max_threads_) * k_hi_pad64_, 0);
+        }
+        if (y_adj_ptr_ != nullptr) {
+            thr_uy_.assign(static_cast<size_t>(max_threads_) * k_pad64_, 0.0);
+        }
+    }
+
+    // Optional: compute exact 15-bit Vi_y[s] = (y_adj[s] - sum_r ck_uy[r]*U[r,s]) / sigma2_eff
+    // directly from TUN3 slabs during process_sample_slab (used when prepass computed u_y).
+    void set_exact_vi_y_target(const double* ck_uy_k,
+                               const float* y_adj_n,
+                               float sigma2_eff_f,
+                               float* out_vi_y_n)
+    {
+        if (k_ <= 0 || n_ <= 0 || !ck_uy_k || !y_adj_n || !out_vi_y_n) return;
+        pre_ck_uy_.assign(ck_uy_k, ck_uy_k + k_);
+        vi_y_in_ptr_  = y_adj_n;
+        vi_y_out_ptr_ = out_vi_y_n;
+        vi_y_inv_s2e_ = 1.0 / static_cast<double>(sigma2_eff_f);
+    }
+
+    // Consume a contiguous sample slab [s_begin, s_end) where raw_u16 has
+    // layout k x (s_end - s_begin) ColMajor (each column = 1 sample).
+    void process_sample_slab(int s_begin, int s_end, const uint16_t* raw_u16)
+    {
+        if (k_ <= 0 || s_end <= s_begin) return;
+        const size_t num_tiles = out_.tiles.size();
+        const float* const rs_base   = uk_row_scale_.data();
+        const float* const sck_base  = sqrt_ck_.data();
+        const float* const ahi_base  = alpha_hi_f_.data();
+        const float* const ihi_base  = inv_hi_f_.data();
+        const float* const alo_base  = alpha_lo_f_.data();
+        const float* const ilo_base  = inv_lo_f_.data();
+        const float* const runit_base = row_unit_f_.data();
+        const bool fast_unit = unit_weights_ && !has_exact_max_override_;
+
+        double slab_eps_sq = 0.0;
+
+        #pragma omp parallel reduction(+:slab_eps_sq)
+        {
+            const int tid =
+            #ifdef _OPENMP
+                omp_get_thread_num();
+            #else
+                0;
+            #endif
+            std::vector<int32_t> local_hi32(static_cast<size_t>(k_), 0);
+            std::vector<int32_t> local_lo32(static_cast<size_t>(k_hi_), 0);
+            int64_t* const my_sum_hi = thr_sum_hi_.data() + static_cast<size_t>(tid) * k_pad64_;
+            int64_t* const my_sum_lo = (k_hi_ > 0)
+                ? (thr_sum_lo_.data() + static_cast<size_t>(tid) * k_hi_pad64_)
+                : nullptr;
+            double* const my_uy = (y_adj_ptr_ != nullptr)
+                ? (thr_uy_.data() + static_cast<size_t>(tid) * k_pad64_)
+                : nullptr;
+
+            // Process in <= 32768-sample sub-slabs so int32 accumulators never overflow.
+            constexpr int kSubSlab = 32768;
+            for (int sb = s_begin; sb < s_end; sb += kSubSlab) {
+                const int se = std::min(s_end, sb + kSubSlab);
+
+                #pragma omp for schedule(static) nowait
+                for (int s = sb; s < se; ++s) {
+                    const uint16_t* const raw_col = raw_u16 +
+                        static_cast<size_t>(s - s_begin) * static_cast<size_t>(k_);
+                    const float ws_f = unit_weights_ ? 1.0f : w_ptr_[s];
+                    float sample_eps = 0.0f;
+
+                    if (my_uy != nullptr) {
+                        const double ys = static_cast<double>(y_adj_ptr_[s]);
+                        for (int r = 0; r < k_; ++r) {
+                            const float sc = rs_base[r];
+                            const float u = (sc > 0.0f)
+                                ? (static_cast<float>(static_cast<int16_t>(raw_col[r])) * sc)
+                                : ((sc < 0.0f) ? wb_fp16_bits_to_f32(raw_col[r]) : 0.0f);
+                            my_uy[r] += static_cast<double>(u) * ys;
+                        }
+                    }
+
+                    if (vi_y_out_ptr_ != nullptr) {
+                        double proj = 0.0;
+                        const double* const cku = pre_ck_uy_.data();
+                        for (int r = 0; r < k_; ++r) {
+                            const float sc = rs_base[r];
+                            const float u = (sc > 0.0f)
+                                ? (static_cast<float>(static_cast<int16_t>(raw_col[r])) * sc)
+                                : ((sc < 0.0f) ? wb_fp16_bits_to_f32(raw_col[r]) : 0.0f);
+                            proj += cku[r] * static_cast<double>(u);
+                        }
+                        vi_y_out_ptr_[s] = static_cast<float>(
+                            (static_cast<double>(vi_y_in_ptr_[s]) - proj) * vi_y_inv_s2e_);
+                    }
+
+                    for (size_t ti = 0; ti < num_tiles; ++ti) {
+                        const auto& tile = out_.tiles[ti];
+                        const int r0 = tile.r_begin;
+                        const int rc = tile.r_count;
+                        const int qr = tile.q_rows;
+                        const uint16_t* const raw_t = raw_col + r0;
+                        const float* const rs_t  = rs_base + r0;
+                        const float* const sck   = sck_base + r0;
+                        const float* const ihi   = ihi_base + r0;
+                        const float* const ahi   = ahi_base + r0;
+                        int32_t* const     lhi   = local_hi32.data() + r0;
+                        int8_t* const      q_hi  = tile.Q.get() + static_cast<size_t>(s) * static_cast<size_t>(qr);
+
+                        if (tile.is_2slice) {
+                            int8_t* const      q_lo = q_hi + rc;
+                            int32_t* const     llo  = local_lo32.data() + r0;
+                            const float* const ilo  = ilo_base + r0;
+                            const float* const alo  = alo_base + r0;
+
+                            if (fast_unit && (tile_all_i16_[ti] || tile_fp16_rows_[ti].size() * 2 < static_cast<size_t>(rc))) {
+                                // Pure integer lossless split: q16 = 254 * qh + ql, zero extra error.
+                                #pragma omp simd
+                                for (int rl = 0; rl < rc; ++rl) {
+                                    const int32_t q = static_cast<int32_t>(static_cast<int16_t>(raw_t[rl]));
+                                    const int32_t bias = (q >= 0) ? 127 : -127;
+                                    int32_t qh = (q + bias) / 254;
+                                    if (qh > 127) qh = 127;
+                                    if (qh < -127) qh = -127;
+                                    const int32_t ql = q - 254 * qh;
+                                    q_hi[rl] = static_cast<int8_t>(qh);
+                                    q_lo[rl] = static_cast<int8_t>(ql);
+                                    lhi[rl] += qh;
+                                    llo[rl] += ql;
+                                }
+                                if (!tile_all_i16_[ti]) {
+                                    for (int rl : tile_fp16_rows_[ti]) {
+                                        lhi[rl] -= static_cast<int32_t>(q_hi[rl]);
+                                        llo[rl] -= static_cast<int32_t>(q_lo[rl]);
+                                        const float u    = wb_fp16_bits_to_f32(raw_t[rl]);
+                                        const float v    = u * sck[rl];
+                                        const float qh_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(v * ihi[rl])));
+                                        const float rem  = std::fmaf(-ahi[rl], qh_f, v);
+                                        const float ql_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(rem * ilo[rl])));
+                                        const int32_t qh = static_cast<int32_t>(qh_f);
+                                        const int32_t ql = static_cast<int32_t>(ql_f);
+                                        q_hi[rl] = static_cast<int8_t>(qh);
+                                        q_lo[rl] = static_cast<int8_t>(ql);
+                                        lhi[rl] += qh;
+                                        llo[rl] += ql;
+                                        const float eps = std::fmaf(-alo[rl], ql_f, rem);
+                                        sample_eps += eps * eps;
+                                    }
+                                }
+                            } else {
+                                for (int rl = 0; rl < rc; ++rl) {
+                                    const float sc = rs_t[rl];
+                                    const float u = (sc > 0.0f)
+                                        ? (static_cast<float>(static_cast<int16_t>(raw_t[rl])) * sc)
+                                        : ((sc < 0.0f) ? wb_fp16_bits_to_f32(raw_t[rl]) : 0.0f);
+                                    const float v    = (u * ws_f) * sck[rl];
+                                    const float qh_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(v * ihi[rl])));
+                                    const float rem  = std::fmaf(-ahi[rl], qh_f, v);
+                                    const float ql_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(rem * ilo[rl])));
+                                    const int32_t qh = static_cast<int32_t>(qh_f);
+                                    const int32_t ql = static_cast<int32_t>(ql_f);
+                                    q_hi[rl] = static_cast<int8_t>(qh);
+                                    q_lo[rl] = static_cast<int8_t>(ql);
+                                    lhi[rl] += qh;
+                                    llo[rl] += ql;
+                                    const float eps = std::fmaf(-alo[rl], ql_f, rem);
+                                    sample_eps += eps * eps;
+                                }
+                            }
+                        } else {
+                            // 1-slice tile
+                            if (fast_unit && tile_all_i16_[ti]) {
+                                const float* const runit = runit_base + r0;
+                                constexpr float kInv255 = 1.0f / 255.0f;
+                                #pragma omp simd reduction(+:sample_eps)
+                                for (int rl = 0; rl < rc; ++rl) {
+                                    const float qf   = static_cast<float>(static_cast<int16_t>(raw_t[rl]));
+                                    const float qh_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(qf * kInv255)));
+                                    const int32_t qh = static_cast<int32_t>(qh_f);
+                                    q_hi[rl] = static_cast<int8_t>(qh);
+                                    lhi[rl] += qh;
+                                    const float eps = std::fmaf(-255.0f, qh_f, qf) * runit[rl];
+                                    sample_eps += eps * eps;
+                                }
+                            } else {
+                                for (int rl = 0; rl < rc; ++rl) {
+                                    const float sc = rs_t[rl];
+                                    const float u = (sc > 0.0f)
+                                        ? (static_cast<float>(static_cast<int16_t>(raw_t[rl])) * sc)
+                                        : ((sc < 0.0f) ? wb_fp16_bits_to_f32(raw_t[rl]) : 0.0f);
+                                    const float v    = (u * ws_f) * sck[rl];
+                                    const float qh_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(v * ihi[rl])));
+                                    const int32_t qh = static_cast<int32_t>(qh_f);
+                                    q_hi[rl] = static_cast<int8_t>(qh);
+                                    lhi[rl] += qh;
+                                    const float eps = std::fmaf(-ahi[rl], qh_f, v);
+                                    sample_eps += eps * eps;
+                                }
+                            }
+                        }
+                    }
+                    slab_eps_sq += static_cast<double>(sample_eps);
+                }
+
+                // Fold int32 slab accumulators into thread-owned int64 arrays.
+                for (int r = 0; r < k_; ++r) {
+                    my_sum_hi[r] += static_cast<int64_t>(local_hi32[static_cast<size_t>(r)]);
+                    local_hi32[static_cast<size_t>(r)] = 0;
+                }
+                for (int r = 0; r < k_hi_; ++r) {
+                    my_sum_lo[r] += static_cast<int64_t>(local_lo32[static_cast<size_t>(r)]);
+                    local_lo32[static_cast<size_t>(r)] = 0;
+                }
+            }
+        }
+        extra_eps_sq_ += slab_eps_sq;
+    }
+
+    // Reduce accumulated u_y = Uk * y_adj (valid only when y_adj_for_uy was provided).
+    Eigen::VectorXd reduced_uy() const
+    {
+        Eigen::VectorXd uy = Eigen::VectorXd::Zero(k_);
+        if (thr_uy_.empty()) return uy;
+        for (int r = 0; r < k_; ++r) {
+            double acc = 0.0;
+            for (int t = 0; t < max_threads_; ++t) {
+                acc += thr_uy_[static_cast<size_t>(t) * k_pad64_ + static_cast<size_t>(r)];
+            }
+            uy[r] = acc;
+        }
+        return uy;
+    }
+
+    // Finalize u_sum_q and exact delta_quant using the TUN3 trailer row_eps_sq[k].
+    QuantizedWoodburyUk finalize(const float* row_eps_sq_trailer)
+    {
+        const size_t num_tiles = out_.tiles.size();
+        for (size_t ti = 0; ti < num_tiles; ++ti) {
+            auto& tile = out_.tiles[ti];
+            const int r0 = tile.r_begin;
+            const int rc = tile.r_count;
+            if (!tile.is_2slice) {
+                for (int rl = 0; rl < rc; ++rl) {
+                    int64_t sh = 0;
+                    const size_t r = static_cast<size_t>(r0 + rl);
+                    for (int t = 0; t < max_threads_; ++t) {
+                        sh += thr_sum_hi_[static_cast<size_t>(t) * k_pad64_ + r];
+                    }
+                    tile.u_sum_q[static_cast<size_t>(rl)] =
+                        tile.alpha_hi[static_cast<size_t>(rl)] * static_cast<double>(sh);
+                }
+            } else {
+                for (int rl = 0; rl < rc; ++rl) {
+                    int64_t sh = 0;
+                    int64_t sl = 0;
+                    const size_t r = static_cast<size_t>(r0 + rl);
+                    for (int t = 0; t < max_threads_; ++t) {
+                        sh += thr_sum_hi_[static_cast<size_t>(t) * k_pad64_ + r];
+                        sl += thr_sum_lo_[static_cast<size_t>(t) * k_hi_pad64_ + r];
+                    }
+                    tile.u_sum_q[static_cast<size_t>(rl)] =
+                        tile.alpha_hi[static_cast<size_t>(rl)] * static_cast<double>(sh)
+                      + tile.alpha_lo[static_cast<size_t>(rl)] * static_cast<double>(sl);
+                }
+            }
+        }
+
+        double disk_eps_sq = 0.0;
+        if (row_eps_sq_trailer != nullptr && n_ > 0) {
+            const double w_scale = unit_weights_ ? 1.0 : (S_w2_ / static_cast<double>(n_));
+            for (int r = 0; r < k_; ++r) {
+                const double sck = static_cast<double>(sqrt_ck_[static_cast<size_t>(r)]);
+                disk_eps_sq += (sck * sck) * static_cast<double>(row_eps_sq_trailer[r]);
+            }
+            disk_eps_sq *= w_scale;
+        }
+        const double total_eps_sq = disk_eps_sq + extra_eps_sq_;
+        const double norm_denom = (n_ > 1)
+            ? (S_w2_ * static_cast<double>(n_ - 1) / static_cast<double>(n_))
+            : S_w2_;
+        out_.delta_quant = (norm_denom > 0.0) ? (total_eps_sq / norm_denom) : 0.0;
+        return std::move(out_);
+    }
+
+private:
+    int k_ = 0;
+    int n_ = 0;
+    int k_hi_ = 0;
+    int max_threads_ = 1;
+    size_t k_pad64_ = 0;
+    size_t k_hi_pad64_ = 0;
+    bool unit_weights_ = true;
+    bool has_exact_max_override_ = false;
+    double S_w2_ = 0.0;
+    double extra_eps_sq_ = 0.0;
+
+    std::vector<float> sqrt_ck_;
+    std::vector<float> uk_row_scale_;
+    const float* w_ptr_ = nullptr;
+    const float* y_adj_ptr_ = nullptr;
+    std::vector<double> pre_ck_uy_;
+    const float* vi_y_in_ptr_ = nullptr;
+    float* vi_y_out_ptr_ = nullptr;
+    double vi_y_inv_s2e_ = 0.0;
+
+    std::vector<float> alpha_hi_f_;
+    std::vector<float> inv_hi_f_;
+    std::vector<float> alpha_lo_f_;
+    std::vector<float> inv_lo_f_;
+    std::vector<float> row_unit_f_;
+    std::vector<bool> tile_all_i16_;
+    std::vector<std::vector<int>> tile_fp16_rows_;
+    std::vector<int64_t> thr_sum_hi_;
+    std::vector<int64_t> thr_sum_lo_;
+    std::vector<double> thr_uy_;
+    QuantizedWoodburyUk out_;
+};
+
+// Reconstruct V^{-1} y_adj directly from QuantizedWoodburyUk + exact u_y = Uk * y_adj
+// (fallback used only when TUN3/TREF y_adj_hash does not match the current phenotype).
+inline Eigen::VectorXf reconstruct_vi_y_from_q_uk(
+    const QuantizedWoodburyUk& q_uk,
+    const Eigen::VectorXf& sqrt_ck_f,
+    float sigma2_eff_f,
+    const Eigen::VectorXf& y_adj,
+    const Eigen::VectorXf& w_sqrt,
+    bool unit_weights,
+    const Eigen::VectorXd& u_y)
+{
+    const int n = q_uk.n;
+    const int k = q_uk.k;
+    Eigen::VectorXf vi_y(n);
+    if (n <= 0) return vi_y;
+    const double inv_s2e = 1.0 / static_cast<double>(sigma2_eff_f);
+    std::vector<double> coeff(static_cast<size_t>(k), 0.0);
+    for (int r = 0; r < k; ++r) {
+        coeff[static_cast<size_t>(r)] = static_cast<double>(sqrt_ck_f[r]) * u_y[r];
+    }
+
+    const size_t num_tiles = q_uk.tiles.size();
+    const float* const y_ptr = y_adj.data();
+    const float* const w_ptr = w_sqrt.data();
+    #pragma omp parallel for schedule(static)
+    for (int s = 0; s < n; ++s) {
+        double proj = 0.0;
+        for (size_t ti = 0; ti < num_tiles; ++ti) {
+            const auto& tile = q_uk.tiles[ti];
+            const int r0 = tile.r_begin;
+            const int rc = tile.r_count;
+            const int qr = tile.q_rows;
+            const int8_t* const q_hi = tile.Q.get() + static_cast<size_t>(s) * static_cast<size_t>(qr);
+            const double* const ahi  = tile.alpha_hi.data();
+            const double* const cf   = coeff.data() + r0;
+            if (tile.is_2slice) {
+                const int8_t* const q_lo = q_hi + rc;
+                const double* const alo  = tile.alpha_lo.data();
+                #pragma omp simd reduction(+:proj)
+                for (int rl = 0; rl < rc; ++rl) {
+                    const double qv = ahi[rl] * static_cast<double>(q_hi[rl])
+                                    + alo[rl] * static_cast<double>(q_lo[rl]);
+                    proj += cf[rl] * qv;
+                }
+            } else {
+                #pragma omp simd reduction(+:proj)
+                for (int rl = 0; rl < rc; ++rl) {
+                    proj += cf[rl] * (ahi[rl] * static_cast<double>(q_hi[rl]));
+                }
+            }
+        }
+        if (!unit_weights) {
+            const double ws = static_cast<double>(w_ptr[s]);
+            proj = (std::fabs(ws) > 1.0e-12) ? (proj / ws) : 0.0;
+        }
+        vi_y[s] = static_cast<float>((static_cast<double>(y_ptr[s]) - proj) * inv_s2e);
+    }
+    return vi_y;
+}
+
+// Direct inline quantization from n x k ColMajor ctx.Uk (never allocates 4*k*n Uk_f).
+inline QuantizedWoodburyUk build_quantized_woodbury_uk_from_nxk(
+    const Eigen::MatrixXf& Uk_nxk,
+    const Eigen::VectorXf& sqrt_ck_f,
+    const Eigen::VectorXf& w_sqrt,
+    bool unit_weights,
+    double S_w2,
+    FastMlmaMode mode)
+{
+    QuantizedWoodburyUk out;
+    const int n = static_cast<int>(Uk_nxk.rows());
+    const int k = static_cast<int>(Uk_nxk.cols());
+    out.k = k;
+    out.n = n;
+    out.mode = mode;
+    if (k <= 0 || n <= 0 || mode == FastMlmaMode::Off) return out;
+
+    int k_hi = k;
+    if (mode == FastMlmaMode::Slice1) {
+        k_hi = 0;
+    } else if (mode == FastMlmaMode::Hybrid) {
+        k_hi = std::min(k, std::max(std::min(k, 100), k / 10));
+    }
+
+    constexpr int kMaxQRows = 4096;
+    auto push_tiles = [&](int beg, int end, bool is_2slice) {
+        const int rc_max = is_2slice ? (kMaxQRows / 2) : kMaxQRows;
+        for (int r0 = beg; r0 < end; r0 += rc_max) {
+            QuantizedWoodburyTile t;
+            t.r_begin = r0;
+            t.r_count = std::min(rc_max, end - r0);
+            t.is_2slice = is_2slice;
+            t.q_rows = is_2slice ? 2 * t.r_count : t.r_count;
+            t.q_bytes = static_cast<size_t>(t.q_rows) * static_cast<size_t>(n);
+            t.Q = make_aligned_uninitialized<int8_t, 64>(t.q_bytes);
+            if (t.q_bytes > 0 && !t.Q) {
+                LOGGER.e(0, "Failed to allocate quantized Woodbury Q tile.");
+            }
+            t.alpha_hi.assign(static_cast<size_t>(t.r_count), 0.0);
+            if (is_2slice) t.alpha_lo.assign(static_cast<size_t>(t.r_count), 0.0);
+            t.u_sum_q.assign(static_cast<size_t>(t.r_count), 0.0);
+            out.tiles.push_back(std::move(t));
+        }
+    };
+    if (k_hi > 0) push_tiles(0, k_hi, true);
+    if (k_hi < k) push_tiles(k_hi, k, false);
+
+    const float* const uk_src      = Uk_nxk.data();
+    const float* const sqrt_ck_ptr = sqrt_ck_f.data();
+    const float* const w_ptr       = w_sqrt.data();
+
+    // Phase 1: unit-stride SIMD max_abs over each contiguous n-length column of Uk_nxk.
+    std::vector<float> max_abs_raw(static_cast<size_t>(k), 0.0f);
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < k; ++r) {
+        const float* const col = uk_src + static_cast<size_t>(r) * static_cast<size_t>(n);
+        float m = 0.0f;
+        if (unit_weights) {
+            #pragma omp simd reduction(max:m)
+            for (int s = 0; s < n; ++s) {
+                const float av = std::fabs(col[s]);
+                if (av > m) m = av;
+            }
+        } else {
+            #pragma omp simd reduction(max:m)
+            for (int s = 0; s < n; ++s) {
+                const float av = std::fabs(col[s] * w_ptr[s]);
+                if (av > m) m = av;
+            }
+        }
+        max_abs_raw[static_cast<size_t>(r)] = m;
+    }
+
+    std::vector<float> alpha_hi_f(static_cast<size_t>(k), 0.0f);
+    std::vector<float> inv_hi_f(static_cast<size_t>(k), 0.0f);
+    std::vector<float> alpha_lo_f(static_cast<size_t>(k_hi), 0.0f);
+    std::vector<float> inv_lo_f(static_cast<size_t>(k_hi), 0.0f);
+
+    const size_t num_tiles = out.tiles.size();
+    for (size_t ti = 0; ti < num_tiles; ++ti) {
+        auto& tile = out.tiles[ti];
+        const int r0 = tile.r_begin;
+        const int rc = tile.r_count;
+        for (int rl = 0; rl < rc; ++rl) {
+            const int r = r0 + rl;
+            const double max_v = static_cast<double>(sqrt_ck_ptr[r])
+                               * static_cast<double>(max_abs_raw[static_cast<size_t>(r)]);
+            if (max_v > 1.0e-30) {
+                const double ahi = max_v / 127.0;
+                tile.alpha_hi[static_cast<size_t>(rl)] = ahi;
+                alpha_hi_f[static_cast<size_t>(r)]     = static_cast<float>(ahi);
+                inv_hi_f[static_cast<size_t>(r)]       = static_cast<float>(1.0 / ahi);
+                if (tile.is_2slice) {
+                    const double alo = ahi / 254.0;
+                    tile.alpha_lo[static_cast<size_t>(rl)] = alo;
+                    alpha_lo_f[static_cast<size_t>(r)]     = static_cast<float>(alo);
+                    inv_lo_f[static_cast<size_t>(r)]       = static_cast<float>(1.0 / alo);
+                }
+            }
+        }
+    }
+
+    const int max_threads =
+    #ifdef _OPENMP
+        std::max(1, omp_get_max_threads());
+    #else
+        1;
+    #endif
+    const size_t k_pad64    = (static_cast<size_t>(k) + 7) / 8 * 8;
+    const size_t k_hi_pad64 = (static_cast<size_t>(k_hi) + 7) / 8 * 8;
+    std::vector<int64_t> thr_sum_hi(static_cast<size_t>(max_threads) * k_pad64, 0);
+    std::vector<int64_t> thr_sum_lo(static_cast<size_t>(max_threads) * k_hi_pad64, 0);
+    double total_eps_sq = 0.0;
+
+    // Phase 2: cache-blocked 64x64 slab transpose into a bounded <= 256 MiB k x slab
+    // scratch buffer, immediately followed by parallel SIMD quantization into tile.Q.
+    constexpr size_t kSlabBudgetBytes = 256ULL << 20;
+    const int slab_max = std::min(n, std::clamp(static_cast<int>(kSlabBudgetBytes / (static_cast<size_t>(k) * sizeof(float))), 64, 32768));
+    AlignedRawBuffer<float, 64> slab_kn(static_cast<size_t>(k) * static_cast<size_t>(slab_max));
+
+    const float* const ahi_base = alpha_hi_f.data();
+    const float* const ihi_base = inv_hi_f.data();
+    const float* const alo_base = alpha_lo_f.data();
+    const float* const ilo_base = inv_lo_f.data();
+    const size_t n_stride = static_cast<size_t>(n);
+    const size_t k_stride = static_cast<size_t>(k);
+
+    for (int s0 = 0; s0 < n; s0 += slab_max) {
+        const int slen = std::min(slab_max, n - s0);
+        constexpr int kBlk = 64;
+        const int ni_tiles = (slen + kBlk - 1) / kBlk;
+        const int nj_tiles = (k + kBlk - 1) / kBlk;
+        const int64_t total_tiles = static_cast<int64_t>(ni_tiles) * static_cast<int64_t>(nj_tiles);
+
+        #pragma omp parallel for schedule(static)
+        for (int64_t t = 0; t < total_tiles; ++t) {
+            const int di0 = static_cast<int>(t / nj_tiles) * kBlk;
+            const int j0  = static_cast<int>(t % nj_tiles) * kBlk;
+            const int di_len = std::min(kBlk, slen - di0);
+            const int j_len  = std::min(kBlk, k - j0);
+            alignas(64) float tile[kBlk][kBlk + 4];
+            for (int dj = 0; dj < j_len; ++dj) {
+                const float* src_col = uk_src + static_cast<size_t>(j0 + dj) * n_stride + (s0 + di0);
+                for (int ddi = 0; ddi < di_len; ++ddi) {
+                    tile[ddi][dj] = src_col[ddi];
+                }
+            }
+            for (int ddi = 0; ddi < di_len; ++ddi) {
+                float* dst_col = slab_kn.data() + static_cast<size_t>(di0 + ddi) * k_stride + j0;
+                std::memcpy(dst_col, tile[ddi], static_cast<size_t>(j_len) * sizeof(float));
+            }
+        }
+
+        #pragma omp parallel reduction(+:total_eps_sq)
+        {
+            const int tid =
+            #ifdef _OPENMP
+                omp_get_thread_num();
+            #else
+                0;
+            #endif
+            std::vector<int32_t> local_hi32(static_cast<size_t>(k), 0);
+            std::vector<int32_t> local_lo32(static_cast<size_t>(k_hi), 0);
+            int64_t* const my_sum_hi = thr_sum_hi.data() + static_cast<size_t>(tid) * k_pad64;
+            int64_t* const my_sum_lo = (k_hi > 0)
+                ? (thr_sum_lo.data() + static_cast<size_t>(tid) * k_hi_pad64)
+                : nullptr;
+
+            #pragma omp for schedule(static) nowait
+            for (int ds = 0; ds < slen; ++ds) {
+                const int s = s0 + ds;
+                const float* const uk_col = slab_kn.data() + static_cast<size_t>(ds) * k_stride;
+                const float ws_f = unit_weights ? 1.0f : w_ptr[s];
+                float sample_eps = 0.0f;
+
+                for (size_t ti = 0; ti < num_tiles; ++ti) {
+                    const auto& tile = out.tiles[ti];
+                    const int r0 = tile.r_begin;
+                    const int rc = tile.r_count;
+                    const int qr = tile.q_rows;
+                    const float* const uk_t = uk_col + r0;
+                    const float* const sck  = sqrt_ck_ptr + r0;
+                    const float* const ihi  = ihi_base + r0;
+                    const float* const ahi  = ahi_base + r0;
+                    int32_t* const     lhi  = local_hi32.data() + r0;
+                    int8_t* const      q_hi = tile.Q.get() + static_cast<size_t>(s) * static_cast<size_t>(qr);
+
+                    if (!tile.is_2slice) {
+                        #pragma omp simd reduction(+:sample_eps)
+                        for (int rl = 0; rl < rc; ++rl) {
+                            const float v    = (uk_t[rl] * ws_f) * sck[rl];
+                            const float qh_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(v * ihi[rl])));
+                            const int32_t qh = static_cast<int32_t>(qh_f);
+                            q_hi[rl] = static_cast<int8_t>(qh);
+                            lhi[rl] += qh;
+                            const float eps = std::fmaf(-ahi[rl], qh_f, v);
+                            sample_eps += eps * eps;
+                        }
+                    } else {
+                        int8_t* const      q_lo = q_hi + rc;
+                        int32_t* const     llo  = local_lo32.data() + r0;
+                        const float* const ilo  = ilo_base + r0;
+                        const float* const alo  = alo_base + r0;
+                        #pragma omp simd reduction(+:sample_eps)
+                        for (int rl = 0; rl < rc; ++rl) {
+                            const float v    = (uk_t[rl] * ws_f) * sck[rl];
+                            const float qh_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(v * ihi[rl])));
+                            const float rem  = std::fmaf(-ahi[rl], qh_f, v);
+                            const float ql_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(rem * ilo[rl])));
+                            const int32_t qh = static_cast<int32_t>(qh_f);
+                            const int32_t ql = static_cast<int32_t>(ql_f);
+                            q_hi[rl] = static_cast<int8_t>(qh);
+                            q_lo[rl] = static_cast<int8_t>(ql);
+                            lhi[rl] += qh;
+                            llo[rl] += ql;
+                            const float eps = std::fmaf(-alo[rl], ql_f, rem);
+                            sample_eps += eps * eps;
+                        }
+                    }
+                }
+                total_eps_sq += static_cast<double>(sample_eps);
+            }
+
+            for (int r = 0; r < k; ++r) {
+                my_sum_hi[r] += static_cast<int64_t>(local_hi32[static_cast<size_t>(r)]);
+            }
+            for (int r = 0; r < k_hi; ++r) {
+                my_sum_lo[r] += static_cast<int64_t>(local_lo32[static_cast<size_t>(r)]);
+            }
+        }
+    }
+
+    for (size_t ti = 0; ti < num_tiles; ++ti) {
+        auto& tile = out.tiles[ti];
+        const int r0 = tile.r_begin;
+        const int rc = tile.r_count;
+        if (!tile.is_2slice) {
+            for (int rl = 0; rl < rc; ++rl) {
+                int64_t sh = 0;
+                const size_t r = static_cast<size_t>(r0 + rl);
+                for (int t = 0; t < max_threads; ++t) {
+                    sh += thr_sum_hi[static_cast<size_t>(t) * k_pad64 + r];
+                }
+                tile.u_sum_q[static_cast<size_t>(rl)] =
+                    tile.alpha_hi[static_cast<size_t>(rl)] * static_cast<double>(sh);
+            }
+        } else {
+            for (int rl = 0; rl < rc; ++rl) {
+                int64_t sh = 0;
+                int64_t sl = 0;
+                const size_t r = static_cast<size_t>(r0 + rl);
+                for (int t = 0; t < max_threads; ++t) {
                     sh += thr_sum_hi[static_cast<size_t>(t) * k_pad64 + r];
                     sl += thr_sum_lo[static_cast<size_t>(t) * k_hi_pad64 + r];
                 }

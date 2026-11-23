@@ -311,7 +311,8 @@ struct RemlGroups {
     CLI::Option_group* reml = nullptr;
 };
 
-RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r, bool add_subcmd_level_opts = true) {
+RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r, bool add_subcmd_level_opts = true,
+                            const bool* external_fast = nullptr) {
     const std::string g_src = "GRM / Model Source";
     const std::string g_grm = "GRM Loading";
     const std::string g_reml = "REML Solver";
@@ -404,45 +405,50 @@ RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r, bool add_subcmd_level
         (CLI::IsMember({"MP", "EIG", "VAR"}, CLI::ignore_case) |
          (CLI::TypeValidator<int>() & CLI::PositiveNumber))
             .description("MP|EIG|VAR|k");
-    auto* o_wb_basis = reml->add_option_function<std::string>(
-                                "--woodbury-basis,--reml-woodbury-basis",
-                                [&r](const std::string& v) {
-                                    if (v == "MP") {
-                                        r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::MP, 0};
-                                    } else if (v == "EIG") {
-                                        r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::EIG, 0};
-                                    } else if (v == "VAR") {
-                                        r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::VAR, 0};
-                                    } else {
-                                        r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::Fixed, std::stoi(v)};
-                                    }
-                                },
-                                "Woodbury low-rank basis mode: MP, EIG, VAR, or rank k [default: MP]")
-                           ->expected(0, 1)->default_str("MP")
-                           ->transform(wb_validator)
-                           ->needs(o_grm)->type_name("MODE")->group(g_wb);
+    reml->add_option_function<std::string>(
+            "--woodbury-basis,--reml-woodbury-basis",
+            [&r](const std::string& v) {
+                if (v == "MP") {
+                    r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::MP, 0};
+                } else if (v == "EIG") {
+                    r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::EIG, 0};
+                } else if (v == "VAR") {
+                    r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::VAR, 0};
+                } else {
+                    r.woodbury_basis = WoodburyBasisSpec{WoodburyBasisSpec::Kind::Fixed, std::stoi(v)};
+                }
+            },
+            "Woodbury low-rank basis mode: MP, EIG, VAR, or rank k [default: MP]")
+        ->expected(0, 1)->default_str("MP")
+        ->transform(wb_validator)
+        ->needs(o_grm)->type_name("MODE")->group(g_wb);
 
-    reml->add_option("--woodbury-mp-margin,--reml-woodbury-basis-MP-margin",
-                     r.woodbury_mp_margin,
-                     "Marchenko-Pastur edge margin fraction (default: 0.15)")
-        ->check(CLI::NonNegativeNumber)->needs(o_wb_basis)->group(g_wb);
-    reml->add_option("--woodbury-mp-confirm,--reml-woodbury-basis-MP-confirm",
-                     r.woodbury_mp_confirm,
-                     "Confirmation eigenvalues beyond MP edge (default: 20)")
-        ->check(CLI::PositiveNumber)->needs(o_wb_basis)->group(g_wb);
-    reml->add_option("--woodbury-eig-mass,--reml-woodbury-basis-EIG-mass",
-                     r.woodbury_eig_mass,
-                     "Target eigenvalue mass fraction for EIG mode (default: 0.99)")
-        ->check(kHalfOpenUnitRange)->needs(o_wb_basis)->group(g_wb);
-    reml->add_option("--woodbury-eig-k-buffer,--reml-woodbury-basis-EIG-k-buffer",
-                     r.woodbury_eig_k_buffer,
-                     "Extra eigenvalues added in EIG mode (default: 0)")
-        ->check(CLI::NonNegativeNumber)->needs(o_wb_basis)->group(g_wb);
-    reml->add_option("--woodbury-var-tail,--reml-woodbury-basis-VAR-tail",
-                     r.woodbury_var_tail,
-                     "Max relative Frobenius tail error for VAR mode (default: 0.001)")
-        ->check(kOpenUnitRange)->needs(o_wb_basis)->group(g_wb);
-    reml->add_option_function<std::pair<int, int>>(
+    auto* o_wb_mp_margin = reml->add_option(
+            "--woodbury-mp-margin,--reml-woodbury-basis-MP-margin",
+            r.woodbury_mp_margin,
+            "Marchenko-Pastur edge margin fraction (default: 0.15)")
+        ->check(CLI::NonNegativeNumber)->group(g_wb);
+    auto* o_wb_mp_confirm = reml->add_option(
+            "--woodbury-mp-confirm,--reml-woodbury-basis-MP-confirm",
+            r.woodbury_mp_confirm,
+            "Confirmation eigenvalues beyond MP edge (default: 20)")
+        ->check(CLI::PositiveNumber)->group(g_wb);
+    auto* o_wb_eig_mass = reml->add_option(
+            "--woodbury-eig-mass,--reml-woodbury-basis-EIG-mass",
+            r.woodbury_eig_mass,
+            "Target eigenvalue mass fraction for EIG mode (default: 0.99)")
+        ->check(kHalfOpenUnitRange)->group(g_wb);
+    auto* o_wb_eig_k_buffer = reml->add_option(
+            "--woodbury-eig-k-buffer,--reml-woodbury-basis-EIG-k-buffer",
+            r.woodbury_eig_k_buffer,
+            "Extra eigenvalues added in EIG mode (default: 0)")
+        ->check(CLI::NonNegativeNumber)->group(g_wb);
+    auto* o_wb_var_tail = reml->add_option(
+            "--woodbury-var-tail,--reml-woodbury-basis-VAR-tail",
+            r.woodbury_var_tail,
+            "Max relative Frobenius tail error for VAR mode (default: 0.001)")
+        ->check(kOpenUnitRange)->group(g_wb);
+    auto* o_wb_range = reml->add_option_function<std::pair<int, int>>(
             "--woodbury-range,--reml-woodbury-basis-range",
             [&r](const std::pair<int, int>& p) {
                 if (p.first > p.second) {
@@ -451,38 +457,59 @@ RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r, bool add_subcmd_level
                 r.woodbury_range = p;
             },
             "Initial and maximum rank for adaptive Woodbury basis (default: 2000 25000)")
-        ->check(CLI::PositiveNumber)->needs(o_wb_basis)
+        ->check(CLI::PositiveNumber)
         ->type_name("INIT MAX")->group(g_wb);
-    reml->add_option("--woodbury-mem-budget,--reml-woodbury-basis-mem-budget",
-                     r.woodbury_mem_budget_gb,
-                     "Hard memory budget (GB) capping rSVD sketch rank")
-        ->check(CLI::PositiveNumber)->needs(o_wb_basis)
+    auto* o_wb_mem_budget = reml->add_option(
+            "--woodbury-mem-budget,--reml-woodbury-basis-mem-budget",
+            r.woodbury_mem_budget_gb,
+            "Hard memory budget (GB) capping rSVD sketch rank")
+        ->check(CLI::PositiveNumber)
         ->type_name("GB")->group(g_wb);
-    reml->add_option("--woodbury-warm-start,--reml-woodbury-basis-warm-start",
-                     r.woodbury_warm_start,
-                     "PCA output prefix (<prefix>.eigenvec) to warm-start Woodbury rSVD")
-        ->needs(o_wb_basis)->type_name("PREFIX")->group(g_wb);
-    reml->add_flag("--woodbury-posthoc-correction,--reml-woodbury-basis-posthoc-correction",
-                   r.woodbury_posthoc_correction,
-                   "Experimental post-hoc Woodbury tail correction")
-        ->needs(o_wb_basis)->group(g_wb);
-    reml->add_option("--svd-method", r.svd_method,
-                     "Randomized SVD method for Woodbury basis: power (default) or nystrom")
+    auto* o_wb_warm_start = reml->add_option(
+            "--woodbury-warm-start,--reml-woodbury-basis-warm-start",
+            r.woodbury_warm_start,
+            "PCA output prefix (<prefix>.eigenvec) to warm-start Woodbury rSVD")
+        ->type_name("PREFIX")->group(g_wb);
+    auto* o_wb_posthoc = reml->add_flag(
+            "--woodbury-posthoc-correction,--reml-woodbury-basis-posthoc-correction",
+            r.woodbury_posthoc_correction,
+            "Experimental post-hoc Woodbury tail correction")
+        ->group(g_wb);
+    auto* o_svd_method = reml->add_option(
+            "--svd-method", r.svd_method,
+            "Randomized SVD method for Woodbury basis: power (default) or nystrom")
         ->transform(make_enum_transformer<SvdMethod>(
             {{"power", SvdMethod::Power}, {"nystrom", SvdMethod::Nystrom}},
             "{power,nystrom}"))
-        ->type_name("METHOD")
-        ->needs(o_wb_basis)->group(g_wb);
-    reml->add_option("--svd-power-iter", r.svd_power_iter,
-                     "Number of rSVD power iterations (default: 3)")
-        ->check(CLI::NonNegativeNumber)
-        ->needs(o_wb_basis)->group(g_wb);
+        ->type_name("METHOD")->group(g_wb);
+    auto* o_svd_power_iter = reml->add_option(
+            "--svd-power-iter", r.svd_power_iter,
+            "Number of rSVD power iterations (default: 3)")
+        ->check(CLI::NonNegativeNumber)->group(g_wb);
     reml->add_flag("--reml-standalone", r.reml_standalone,
                    "Write full standalone .reml instead of thin TREF reference on --woodbury-reuse")
         ->group(g_wb);
 
-    reml->callback([&r]() {
-        if ((r.woodbury_basis.has_value() || !r.woodbury_reuse.empty()) && r.alg == RemlAlg::Fisher) {
+    const std::vector<CLI::Option*> wb_tuning_opts = {
+        o_wb_mp_margin, o_wb_mp_confirm, o_wb_eig_mass, o_wb_eig_k_buffer,
+        o_wb_var_tail, o_wb_range, o_wb_mem_budget, o_wb_warm_start,
+        o_wb_posthoc, o_svd_method, o_svd_power_iter
+    };
+
+    reml->callback([&r, o_grm, external_fast, wb_tuning_opts]() {
+        const bool fast_enabled = r.fast || (external_fast != nullptr && *external_fast);
+        const bool wb_from_grm = (o_grm->count() > 0) && (r.woodbury_basis.has_value() || fast_enabled);
+        for (const CLI::Option* opt : wb_tuning_opts) {
+            if (opt->count() > 0 && !wb_from_grm) {
+                if (o_grm->count() == 0) {
+                    throw CLI::ValidationError(
+                        opt->get_name(),
+                        "requires --grm with --woodbury-basis or --fast (incompatible with --woodbury-reuse).");
+                }
+                throw CLI::ValidationError(opt->get_name(), "requires --woodbury-basis or --fast.");
+            }
+        }
+        if ((wb_from_grm || !r.woodbury_reuse.empty()) && r.alg == RemlAlg::Fisher) {
             throw CLI::ValidationError("--alg",
                                        "Woodbury basis is incompatible with Fisher-scoring REML (--alg 1). "
                                        "Use AI-REML (default) or EM-REML (--alg 2).");
@@ -869,7 +896,8 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
     add_sample_filter_options(mlma_cmd, mlma_opts.sample_filter);
     add_marker_filter_options(mlma_cmd, mlma_opts.marker_filter, mlma_opts.sample_filter);
     add_pheno_covar_options(mlma_cmd, mlma_opts.pheno_covar);
-    auto [grm_src, reml_grp] = add_reml_options(mlma_cmd, mlma_opts.reml, /*add_subcmd_level_opts=*/false);
+    auto [grm_src, reml_grp] = add_reml_options(mlma_cmd, mlma_opts.reml, /*add_subcmd_level_opts=*/false,
+                                                &mlma_opts.fast);
 
     const std::string g_assoc = "Association Scan";
     auto* mlma_load = grm_src->add_option("--load-reml", mlma_opts.load_reml,

@@ -21,6 +21,7 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <numeric>
 #include <optional>
 #include <ranges>
 #include <type_traits>
@@ -437,7 +438,8 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
         }
     };
 
-    const std::vector<uint32_t>& extractIndex = marker->get_extract_index();
+    std::vector<uint32_t> extractIndex(total_m);
+    std::iota(extractIndex.begin(), extractIndex.end(), 0u);
     geno->loopDouble(extractIndex, BLOCK,
                      /*bMakeGeno*/   true,
                      /*bGenoCenter*/ true,
@@ -740,7 +742,8 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
         }
     };
 
-    const std::vector<uint32_t>& extractIndex = marker->get_extract_index();
+    std::vector<uint32_t> extractIndex(total_m);
+    std::iota(extractIndex.begin(), extractIndex.end(), 0u);
     geno->loopDouble(extractIndex, BLOCK,
                      /*bMakeGeno*/   true,
                      /*bGenoCenter*/ true,

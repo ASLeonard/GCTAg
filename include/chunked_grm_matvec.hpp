@@ -472,7 +472,6 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
     bool use_bf16 = false)
 {
     const int cols = static_cast<int>(X.cols());
-    use_bf16 = use_bf16 && (cols >= 128);
     Eigen::MatrixXf Y(n, cols);
     if (n == 0 || cols == 0) {
         if (trace_K_out) *trace_K_out = 0.0;

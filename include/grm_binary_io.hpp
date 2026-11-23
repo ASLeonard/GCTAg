@@ -27,6 +27,8 @@
 #include "chunked_grm_matvec.hpp"
 #include "mem.hpp"
 #include "Pheno.h"
+#include "async_seq_io.hpp"
+#include "grm_format.hpp"
 
 namespace gcta_grm_io {
 
@@ -912,9 +914,13 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
     double budget_gb,
     int k_ext = 0,
     const std::string& feature_flag = "--grm-chunked-budget",
-    bool need_m_snps = true)
+    bool need_m_snps = true,
+    const std::vector<std::string>* preloaded_grm_ids = nullptr)
 {
-    const std::vector<std::string> grm_ids = Pheno::read_sublist(prefix + ".grm.id");
+    std::vector<std::string> grm_ids_storage;
+    const std::vector<std::string>& grm_ids = preloaded_grm_ids
+        ? *preloaded_grm_ids
+        : (grm_ids_storage = Pheno::read_sublist(prefix + ".grm.id"));
     const int n_grm = static_cast<int>(grm_ids.size());
     const int n = static_cast<int>(analysis_ids.size());
 
@@ -1223,12 +1229,16 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
     const std::vector<std::string>& analysis_ids,
     bool need_m_snps = false,
     const std::string& caller_flag = "--grm-fp16",
-    size_t grm_read_chunk_bytes = (1ull << 30) /* 1GiB */)
+    size_t grm_read_chunk_bytes = (1ull << 30) /* 1GiB */,
+    const std::vector<std::string>* preloaded_grm_ids = nullptr)
 {
     LOGGER.ts("grm_fp16");
     using std::to_string;
 
-    const std::vector<std::string> grm_ids = Pheno::read_sublist(grm_prefix + ".grm.id");
+    std::vector<std::string> grm_ids_storage;
+    const std::vector<std::string>& grm_ids = preloaded_grm_ids
+        ? *preloaded_grm_ids
+        : (grm_ids_storage = Pheno::read_sublist(grm_prefix + ".grm.id"));
     const int n_grm = static_cast<int>(grm_ids.size());
     if (n_grm == 0)
         LOGGER.e(0, "GRM id file [" + grm_prefix + ".grm.id] is empty.");
@@ -1459,9 +1469,12 @@ inline void load_and_subset_grm_upper(
     const std::string& caller_flag,
     size_t grm_read_chunk_bytes = (1ull << 30) /* 1GiB */,
     double* trace_K_out = nullptr,
-    double* trace_K2_out = nullptr)
+    double* trace_K2_out = nullptr,
+    const std::vector<std::string>* preloaded_grm_ids = nullptr)
 {
-    std::vector<std::string> grm_ids = Pheno::read_sublist(grm_prefix + ".grm.id");
+    std::vector<std::string> grm_ids = preloaded_grm_ids
+        ? *preloaded_grm_ids
+        : Pheno::read_sublist(grm_prefix + ".grm.id");
     const int n_grm = static_cast<int>(grm_ids.size());
     if (n_grm == 0)
         LOGGER.e(0, "GRM id file [" + grm_prefix + ".grm.id] is empty.");

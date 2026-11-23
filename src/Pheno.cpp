@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <charconv>
+#include <cstdio>
 #include "utils.hpp"
 #include <cstring>
 #include <boost/algorithm/string.hpp>
@@ -323,20 +325,47 @@ bool read_file_bytes(const std::string& path, std::vector<char>& out) {
     );
     if (fd < 0) return false;
     struct stat st{};
+    size_t hint = 0;
     if (::fstat(fd, &st) == 0 && st.st_size > 0) {
-        out.reserve(static_cast<size_t>(st.st_size));
+        hint = static_cast<size_t>(st.st_size);
+        out.resize(hint);
     }
-    char chunk[1 << 16];
-    while (true) {
-        const ssize_t r = ::read(fd, chunk, sizeof(chunk));
+    constexpr size_t kChunk = 4ULL << 20;
+    size_t total = 0;
+    while (total < hint) {
+        const size_t want = std::min(kChunk, hint - total);
+        const ssize_t r = ::read(fd, out.data() + total, want);
         if (r > 0) {
-            out.insert(out.end(), chunk, chunk + r);
+            total += static_cast<size_t>(r);
+        } else if (r == 0) {
+            out.resize(total);
+            ::close(fd);
+            return true;
+        } else if (errno == EINTR) {
+            continue;
+        } else {
+            ::close(fd);
+            out.clear();
+            return false;
+        }
+    }
+    // Probe EOF without extra heap allocation on regular files; grow cleanly if file grew or size was 0.
+    char probe[4096];
+    std::vector<char> chunk;
+    while (true) {
+        char* dst = chunk.empty() ? probe : chunk.data();
+        const size_t cap = chunk.empty() ? sizeof(probe) : chunk.size();
+        const ssize_t r = ::read(fd, dst, cap);
+        if (r > 0) {
+            out.insert(out.end(), dst, dst + r);
+            if (chunk.empty()) chunk.resize(kChunk);
         } else if (r == 0) {
             break;
         } else if (errno == EINTR) {
             continue;
         } else {
             ::close(fd);
+            out.clear();
             return false;
         }
     }
@@ -344,7 +373,8 @@ bool read_file_bytes(const std::string& path, std::vector<char>& out) {
     return true;
 }
 
-bool files_byte_equal(const std::vector<char>& ref_bytes, const std::string& other_path) {
+bool files_byte_equal(const std::vector<char>& ref_bytes, const std::string& other_path,
+                      std::vector<char>& buf) {
     const int fd = ::open(other_path.c_str(), O_RDONLY
 #ifdef O_CLOEXEC
                           | O_CLOEXEC
@@ -356,11 +386,12 @@ bool files_byte_equal(const std::vector<char>& ref_bytes, const std::string& oth
         ::close(fd);
         return false;
     }
-    constexpr size_t kChunk = 1ULL << 20;
-    std::vector<char> buf(std::min(kChunk, std::max<size_t>(ref_bytes.size(), 1)));
+    constexpr size_t kChunk = 4ULL << 20;
+    const size_t target = std::min(kChunk, std::max<size_t>(ref_bytes.size(), 1));
+    if (buf.size() < target) buf.resize(target);
     size_t offset = 0;
     while (offset < ref_bytes.size()) {
-        const size_t want = std::min(buf.size(), ref_bytes.size() - offset);
+        const size_t want = std::min(target, ref_bytes.size() - offset);
         const ssize_t r = ::read(fd, buf.data(), want);
         if (r < 0) {
             if (errno == EINTR) continue;
@@ -392,6 +423,8 @@ struct MemLineReader {
     size_t size = 0;
     size_t pos = 0;
 
+    uint64_t file_size() const noexcept { return static_cast<uint64_t>(size); }
+
     bool next_line(std::string_view& out) noexcept {
         if (pos >= size) return false;
         const char* start = data + pos;
@@ -404,6 +437,152 @@ struct MemLineReader {
         return true;
     }
 };
+
+template <typename LineReader>
+void parse_psam_reader(LineReader& reader, const std::string& psam_file,
+                       int8_t sex_code_1, int8_t sex_code_2,
+                       vector<string>& fid, vector<string>& pid, vector<string>& mark,
+                       vector<string>& fa_id, vector<string>& mo_id,
+                       vector<int8_t>& sex, vector<double>& pheno,
+                       vector<uint32_t>& index_keep, int& num_ind, int& num_keep) {
+    std::string_view line;
+    std::string preLine;
+    int curReadLine = 0;
+    bool found_data = false;
+    while (reader.next_line(line)) {
+        curReadLine++;
+        const size_t fnw = line.find_first_not_of("\r\t ");
+        if (fnw != std::string_view::npos && line[fnw] == '#') {
+            preLine.assign(line);
+            continue;
+        }
+        if (fnw == std::string_view::npos) {
+            LOGGER.e(0, "blank header line or no valid text data.");
+        }
+        found_data = true;
+        break;
+    }
+    if (!found_data) {
+        LOGGER.e(0, "blank header line or no valid text data.");
+    }
+
+    const int nHeader = curReadLine - 1;
+    std::vector<std::string_view> toks;
+    toks.reserve(16);
+    gcta_text_io::split_ws_exact(line, toks);
+    const int ncol = static_cast<int>(toks.size());
+
+    std::vector<std::string_view> head_toks;
+    if (!preLine.empty()) {
+        gcta_text_io::split_ws_exact(preLine, head_toks);
+        if (static_cast<int>(head_toks.size()) != ncol) {
+            LOGGER.e(0, "data are inconsistent with the headers.");
+        }
+    }
+    if (ncol < 2) {
+        LOGGER.e(0, "the number of fields in [" + psam_file + "] is less than 2.");
+    }
+
+    int iFID = -1, iIID = -1, iPAT = -1, iMAT = -1, iSEX = -1;
+    if (head_toks.empty()) {
+        if (ncol == 6) {
+            iFID = 0;
+            iIID = 1;
+            iPAT = 2;
+            iMAT = 3;
+            iSEX = 4;
+        } else {
+            LOGGER.e(0, "only " + to_string(ncol) + " columns for the FAM file which has at least 6 columns.");
+        }
+    } else {
+        auto find_col = [&](std::string_view key) -> int {
+            for (int c = 0; c < ncol; ++c) {
+                if (head_toks[static_cast<size_t>(c)] == key) return c;
+            }
+            return -1;
+        };
+        iFID = find_col("#FID");
+        if (iFID >= 0) {
+            iIID = find_col("IID");
+        } else {
+            // if not find FID, then use the IID instead, different from plink
+            iIID = find_col("#IID");
+            iFID = iIID;
+        }
+        if (iIID < 0) LOGGER.e(0, "can't find IID or #IID in the headers, which is invalid for a PSAM file.");
+
+        iSEX = find_col("SEX");
+        if (iSEX < 0) LOGGER.e(0, "the column for gender information is required in the PSAM file.");
+        iPAT = find_col("PAT");
+        iMAT = find_col("MAT");
+    }
+
+    if (reader.file_size() > 0) {
+        const size_t avg_line = std::max<size_t>(line.size() + 1, 8);
+        const size_t est_rows = static_cast<size_t>(reader.file_size() / avg_line) + 64;
+        fid.reserve(est_rows);
+        pid.reserve(est_rows);
+        mark.reserve(est_rows);
+        fa_id.reserve(est_rows);
+        mo_id.reserve(est_rows);
+        sex.reserve(est_rows);
+        pheno.reserve(est_rows);
+    }
+
+    constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+    int line_number = nHeader;
+    auto process_row = [&]() {
+        line_number++;
+        if (static_cast<int>(toks.size()) < ncol) {
+            LOGGER.e(0, "the file [" + psam_file + "] contains different number of elements in line " + to_string(line_number) + ".");
+        } else if (static_cast<int>(toks.size()) > ncol) {
+            LOGGER.w(0, "the file [" + psam_file + "] contains extra number of elements in line " + to_string(line_number) + ".");
+        }
+        const std::string_view sv_fid = toks[static_cast<size_t>(iFID)];
+        const std::string_view sv_iid = toks[static_cast<size_t>(iIID)];
+        const std::string_view sv_sex = toks[static_cast<size_t>(iSEX)];
+        fid.emplace_back(sv_fid);
+        pid.emplace_back(sv_iid);
+        std::string m;
+        m.reserve(sv_fid.size() + 1 + sv_iid.size());
+        m.append(sv_fid);
+        m.push_back('\t');
+        m.append(sv_iid);
+        mark.push_back(std::move(m));
+
+        int8_t sex_code = 0;
+        if (sv_sex.size() == 1) {
+            if (sv_sex[0] == '1') sex_code = sex_code_1;
+            else if (sv_sex[0] == '2') sex_code = sex_code_2;
+        }
+        sex.push_back(sex_code);
+        if (iPAT != -1) {
+            fa_id.emplace_back(toks[static_cast<size_t>(iPAT)]);
+        } else {
+            fa_id.emplace_back("0");
+        }
+        if (iMAT != -1) {
+            mo_id.emplace_back(toks[static_cast<size_t>(iMAT)]);
+        } else {
+            mo_id.emplace_back("0");
+        }
+        pheno.push_back(kNaN);
+    };
+
+    process_row();
+    while (reader.next_line(line)) {
+        gcta_text_io::split_ws_exact(line, toks);
+        process_row();
+    }
+
+    const size_t nrows = fid.size();
+    index_keep.resize(nrows);
+    std::iota(index_keep.begin(), index_keep.end(), static_cast<uint32_t>(0));
+
+    num_ind = static_cast<int>(nrows);
+    num_keep = static_cast<int>(nrows);
+    LOGGER.i(0, to_string(num_ind) + " individuals to be included from the sample file.");
+}
 
 // Token-level fallback comparison when raw bytes differ (e.g., CRLF vs LF or space vs tab).
 // Mirrors original readTxtList comparison semantics without throwing inside OpenMP.
@@ -568,39 +747,42 @@ vector<string> Pheno::read_sublist(string sublist_file, vector<vector<double>> *
 }
 
 void Pheno::read_checkMPSample(const vector<string>& mfiles){
-    if(mfiles.size() > 0){
-        read_psam(mfiles[0]);
+    if (mfiles.empty()) {
+        return;
     }
-    if(mfiles.size() > 1){
-        LOGGER << "Checking other sample files..." << std::endl;
-        std::vector<char> ref_bytes;
-        if (!gcta_pheno_detail::read_file_bytes(mfiles[0], ref_bytes)) {
-            LOGGER.e(0, "can't read [" + mfiles[0] + "].");
+    if (mfiles.size() == 1) {
+        read_psam(mfiles[0]);
+        return;
+    }
+
+    LOGGER.i(0, "Reading PLINK sample file from [" + mfiles[0] + "]...");
+    std::vector<char> ref_bytes;
+    if (!gcta_pheno_detail::read_file_bytes(mfiles[0], ref_bytes)) {
+        LOGGER.e(0, "can't read [" + mfiles[0] + "].");
+    }
+    gcta_pheno_detail::MemLineReader ref_reader{ref_bytes.data(), ref_bytes.size(), 0};
+    gcta_pheno_detail::parse_psam_reader(
+        ref_reader, mfiles[0], normalizeSexCode(1), normalizeSexCode(2),
+        fid, pid, mark, fa_id, mo_id, sex, pheno, index_keep, num_ind, num_keep);
+
+    LOGGER << "Checking other sample files..." << std::endl;
+    // Strictly sequential single-stream verification to avoid parallel open/read
+    // storms on HPC parallel filesystems (Lustre/GPFS/NFS).
+    std::vector<char> cmp_buf;
+    bool errr = false;
+    for (size_t i = 1; i < mfiles.size(); ++i) {
+        const bool ok =
+            gcta_pheno_detail::files_byte_equal(ref_bytes, mfiles[i], cmp_buf) ||
+            gcta_pheno_detail::compare_sample_files_tokens(ref_bytes, mfiles[i]);
+        if (!ok) {
+            errr = true;
+            LOGGER.w(0, "Sample file [" + mfiles[i] + "] is different from the first file.");
         }
-        const int nFiles = static_cast<int>(mfiles.size());
-        vector<uint8_t> fileValids(static_cast<size_t>(nFiles), 0);
-        #pragma omp parallel for schedule(dynamic)
-        for(int i = 1; i < nFiles; i++){
-            if (gcta_pheno_detail::files_byte_equal(ref_bytes, mfiles[static_cast<size_t>(i)])) {
-                fileValids[static_cast<size_t>(i)] = 1;
-            } else if (gcta_pheno_detail::compare_sample_files_tokens(ref_bytes, mfiles[static_cast<size_t>(i)])) {
-                fileValids[static_cast<size_t>(i)] = 1;
-            } else {
-                fileValids[static_cast<size_t>(i)] = 0;
-            }
-        }
-        bool errr = false;
-        for(int i = 1; i < nFiles; i++){
-            if(fileValids[static_cast<size_t>(i)] == 0){
-                errr = true;
-                LOGGER.w(0, "Sample file [" + mfiles[static_cast<size_t>(i)] + "] is different from the first file.");
-            }
-        }
-        if(errr){
-            LOGGER.e(0, "GCTA requires all files with same sample information.");
-        }else{
-            LOGGER.i(1, "All the files checked are OK.");
-        }
+    }
+    if (errr) {
+        LOGGER.e(0, "GCTA requires all files with same sample information.");
+    } else {
+        LOGGER.i(1, "All the files checked are OK.");
     }
 }
 
@@ -610,208 +792,102 @@ void Pheno::read_psam(string psam_file){
     if (!reader.open(psam_file)) {
         LOGGER.e(0, "can't read [" + psam_file + "].");
     }
-
-    std::string_view line;
-    std::string preLine;
-    int curReadLine = 0;
-    bool found_data = false;
-    while (reader.next_line(line)) {
-        curReadLine++;
-        const size_t fnw = line.find_first_not_of("\r\t ");
-        if (fnw != std::string_view::npos && line[fnw] == '#') {
-            preLine.assign(line);
-            continue;
-        }
-        if (fnw == std::string_view::npos) {
-            LOGGER.e(0, "blank header line or no valid text data.");
-        }
-        found_data = true;
-        break;
-    }
-    if (!found_data) {
-        LOGGER.e(0, "blank header line or no valid text data.");
-    }
-
-    const int nHeader = curReadLine - 1;
-    std::vector<std::string_view> toks;
-    toks.reserve(16);
-    gcta_text_io::split_ws_exact(line, toks);
-    const int ncol = static_cast<int>(toks.size());
-
-    std::vector<std::string_view> head_toks;
-    if (!preLine.empty()) {
-        gcta_text_io::split_ws_exact(preLine, head_toks);
-        if (static_cast<int>(head_toks.size()) != ncol) {
-            LOGGER.e(0, "data are inconsistent with the headers.");
-        }
-    }
-    if (ncol < 2) {
-        LOGGER.e(0, "the number of fields in [" + psam_file + "] is less than 2.");
-    }
-
-    int iFID = -1, iIID = -1, iPAT = -1, iMAT = -1, iSEX = -1;
-    if (head_toks.empty()) {
-        if (ncol == 6) {
-            iFID = 0;
-            iIID = 1;
-            iPAT = 2;
-            iMAT = 3;
-            iSEX = 4;
-        } else {
-            LOGGER.e(0, "only " + to_string(ncol) + " columns for the FAM file which has at least 6 columns.");
-        }
-    } else {
-        auto find_col = [&](std::string_view key) -> int {
-            for (int c = 0; c < ncol; ++c) {
-                if (head_toks[static_cast<size_t>(c)] == key) return c;
-            }
-            return -1;
-        };
-        iFID = find_col("#FID");
-        if (iFID >= 0) {
-            iIID = find_col("IID");
-        } else {
-            // if not find FID, then use the IID instead, different from plink
-            iIID = find_col("#IID");
-            iFID = iIID;
-        }
-        if (iIID < 0) LOGGER.e(0, "can't find IID or #IID in the headers, which is invalid for a PSAM file.");
-
-        iSEX = find_col("SEX");
-        if (iSEX < 0) LOGGER.e(0, "the column for gender information is required in the PSAM file.");
-        iPAT = find_col("PAT");
-        iMAT = find_col("MAT");
-    }
-
-    if (reader.file_size() > 0) {
-        const size_t avg_line = std::max<size_t>(line.size() + 1, 8);
-        const size_t est_rows = static_cast<size_t>(reader.file_size() / avg_line) + 64;
-        fid.reserve(est_rows);
-        pid.reserve(est_rows);
-        mark.reserve(est_rows);
-        fa_id.reserve(est_rows);
-        mo_id.reserve(est_rows);
-        sex.reserve(est_rows);
-        pheno.reserve(est_rows);
-    }
-
-    constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
-    int line_number = nHeader;
-    auto process_row = [&]() {
-        line_number++;
-        if (static_cast<int>(toks.size()) < ncol) {
-            LOGGER.e(0, "the file [" + psam_file + "] contains different number of elements in line " + to_string(line_number) + ".");
-        } else if (static_cast<int>(toks.size()) > ncol) {
-            LOGGER.w(0, "the file [" + psam_file + "] contains extra number of elements in line " + to_string(line_number) + ".");
-        }
-        const std::string_view sv_fid = toks[static_cast<size_t>(iFID)];
-        const std::string_view sv_iid = toks[static_cast<size_t>(iIID)];
-        const std::string_view sv_sex = toks[static_cast<size_t>(iSEX)];
-        fid.emplace_back(sv_fid);
-        pid.emplace_back(sv_iid);
-        std::string m;
-        m.reserve(sv_fid.size() + 1 + sv_iid.size());
-        m.append(sv_fid);
-        m.push_back('\t');
-        m.append(sv_iid);
-        mark.push_back(std::move(m));
-
-        int8_t sex_code = 0;
-        if (sv_sex.size() == 1) {
-            if (sv_sex[0] == '1') sex_code = normalizeSexCode(1);
-            else if (sv_sex[0] == '2') sex_code = normalizeSexCode(2);
-        }
-        sex.push_back(sex_code);
-        if (iPAT != -1) {
-            fa_id.emplace_back(toks[static_cast<size_t>(iPAT)]);
-        } else {
-            fa_id.emplace_back("0");
-        }
-        if (iMAT != -1) {
-            mo_id.emplace_back(toks[static_cast<size_t>(iMAT)]);
-        } else {
-            mo_id.emplace_back("0");
-        }
-        pheno.push_back(kNaN);
-    };
-
-    process_row();
-    while (reader.next_line(line)) {
-        gcta_text_io::split_ws_exact(line, toks);
-        process_row();
-    }
-
-    const size_t nrows = fid.size();
-    index_keep.resize(nrows);
-    std::iota(index_keep.begin(), index_keep.end(), static_cast<uint32_t>(0));
-
-    num_ind = static_cast<int>(nrows);
-    num_keep = static_cast<int>(nrows);
-    LOGGER.i(0, to_string(num_ind) + " individuals to be included from the sample file.");
+    gcta_pheno_detail::parse_psam_reader(
+        reader, psam_file, normalizeSexCode(1), normalizeSexCode(2),
+        fid, pid, mark, fa_id, mo_id, sex, pheno, index_keep, num_ind, num_keep);
 }
 
 void Pheno::read_sample(string sample_file){
     LOGGER.i(0, "Reading Oxford sample information file from [" + sample_file + "]...");
-    std::ifstream hsample(sample_file.c_str());
-    if(!hsample){
+    gcta_text_io::FastLineReader reader;
+    if (!reader.open(sample_file)) {
         LOGGER.e(0, "cannot open sample file to read.");
     }
-    string line;
-    std::getline(hsample, line);
-    vector<string> line_elements;
-    boost::split(line_elements, line, boost::is_any_of("\t "));
-    int col_num = line_elements.size();
-    boost::replace_all(line_elements[col_num - 1], "\r", "");
-    if(line_elements[0] == "ID_1" && line_elements[1] == "ID_2"
-            && line_elements[2] == "missing"
-            && line_elements[3] == "sex"){
-        std::getline(hsample, line);
-        boost::split(line_elements, line, boost::is_any_of("\t "));
-        boost::replace_all(line_elements[line_elements.size() - 1], "\r", "");
-        if(col_num != line_elements.size() 
-                || line_elements[0] != "0"
-                || line_elements[1] != "0"
-                || line_elements[2] != "0"
-                || line_elements[3] != "D"){
+    std::string_view line;
+    if (!reader.next_line(line)) {
+        LOGGER.e(0, "invalid sample file");
+    }
+    size_t header_bytes = line.size() + 1;
+    std::vector<std::string_view> toks;
+    toks.reserve(16);
+    gcta_text_io::split_ws_exact(line, toks);
+    const size_t col_num = toks.size();
+    if (col_num >= 4 && toks[0] == "ID_1" && toks[1] == "ID_2"
+            && toks[2] == "missing" && toks[3] == "sex") {
+        if (!reader.next_line(line)) {
             LOGGER.e(0, "invalid sample file");
         }
-    }else{
+        header_bytes += line.size() + 1;
+        gcta_text_io::split_ws_exact(line, toks);
+        if (toks.size() != col_num
+                || toks[0] != "0"
+                || toks[1] != "0"
+                || toks[2] != "0"
+                || toks[3] != "D") {
+            LOGGER.e(0, "invalid sample file");
+        }
+    } else {
         LOGGER.e(0, "invalid sample file");
     }
 
-    std::map<string, uint8_t> sex_map;
-    sex_map["0"] = 0;
-    sex_map["1"] = normalizeSexCode(1);
-    sex_map["2"] = normalizeSexCode(2);
-    sex_map["NA"] = 0;
-    sex_map["NAN"] = 0;
-    sex_map["na"] = 0;
-    sex_map["nan"] = 0;
+    const int8_t sex1 = normalizeSexCode(1);
+    const int8_t sex2 = normalizeSexCode(2);
+    constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+    const uint64_t fsize = reader.file_size();
+    bool reserved = false;
+    size_t sample_bytes = 0;
 
     int line_number = 0;
-    while(std::getline(hsample, line)){
-        boost::split(line_elements, line, boost::is_any_of("\t "));
-        boost::replace_all(line_elements[line_elements.size() - 1], "\r", "");
-        if(line_elements.size() == col_num){
-            fid.push_back(line_elements[0]);
-            pid.push_back(line_elements[1]);
-            fa_id.push_back("0");
-            mo_id.push_back("0");
-            mark.push_back(line_elements[0] + "\t" + line_elements[1]);
-            sex.push_back(sex_map[line_elements[3]]);
-            pheno.push_back(strtod("nan", NULL)); //5
-        }else{
+    while (reader.next_line(line)) {
+        gcta_text_io::split_ws_exact(line, toks);
+        if (toks.size() != col_num) {
             LOGGER.e(0, "line " + to_string(line_number + 3) + " has different number of columns.");
         }
+        sample_bytes += line.size() + 1;
+        if (!reserved && line_number == 15 && fsize > header_bytes) {
+            reserved = true;
+            const size_t avg_line = std::max<size_t>(sample_bytes / 16, 8);
+            const size_t est_rows = static_cast<size_t>((fsize - header_bytes) / avg_line) + 64;
+            fid.reserve(est_rows);
+            pid.reserve(est_rows);
+            fa_id.reserve(est_rows);
+            mo_id.reserve(est_rows);
+            mark.reserve(est_rows);
+            sex.reserve(est_rows);
+            pheno.reserve(est_rows);
+        }
+        const std::string_view sv_fid = toks[0];
+        const std::string_view sv_pid = toks[1];
+        const std::string_view sv_sex = toks[3];
+        fid.emplace_back(sv_fid);
+        pid.emplace_back(sv_pid);
+        fa_id.emplace_back("0");
+        mo_id.emplace_back("0");
+        std::string m;
+        m.reserve(sv_fid.size() + 1 + sv_pid.size());
+        m.append(sv_fid);
+        m.push_back('\t');
+        m.append(sv_pid);
+        mark.push_back(std::move(m));
+
+        int8_t sex_code = 0;
+        if (sv_sex.size() == 1) {
+            if (sv_sex[0] == '1') sex_code = sex1;
+            else if (sv_sex[0] == '2') sex_code = sex2;
+        }
+        sex.push_back(sex_code);
+        pheno.push_back(kNaN);
         line_number++;
+    }
+    if (reader.io_error()) {
+        LOGGER.e(0, "error reading sample file [" + sample_file + "].");
     }
 
     index_keep.resize(fid.size());
-    std::iota(index_keep.begin(), index_keep.end(), 0);
-    num_ind = index_keep.size();
-    num_keep =  index_keep.size();
+    std::iota(index_keep.begin(), index_keep.end(), static_cast<uint32_t>(0));
+    num_ind = static_cast<int>(index_keep.size());
+    num_keep = static_cast<int>(index_keep.size());
     LOGGER.i(0, to_string(num_ind) + " individuals to be included from the sample file.");
-    hsample.close();
 }
 
 
@@ -935,15 +1011,56 @@ vector<uint32_t>& Pheno::getHeterogameticExtractIndex(){
 
 void Pheno::save_pheno(string filename){
     LOGGER.i(0, "Saving individual information to [" + filename + "]...");
-    std::ofstream out(filename.c_str());
+    std::ofstream out(filename.c_str(), std::ios::binary);
     if(!out.good()){
         LOGGER.e(0, "can't write to [" + filename + "].");
     }
-    for(auto & i : index_keep){
-        out << mark[i] << "\t" << fa_id[i] << "\t" << mo_id[i] << "\t" << (int)sex[i] << "\t" << pheno[i] << std::endl;
+    constexpr size_t kFlushBytes = 4ULL << 20;
+    std::string buf;
+    buf.reserve(kFlushBytes + 4096);
+    char numbuf[64];
+    for(const uint32_t i : index_keep){
+        buf.append(mark[i]);
+        buf.push_back('\t');
+        buf.append(fa_id[i]);
+        buf.push_back('\t');
+        buf.append(mo_id[i]);
+        buf.push_back('\t');
+        {
+            auto [end, ec] = std::to_chars(numbuf, numbuf + sizeof(numbuf), static_cast<int>(sex[i]));
+            if (ec == std::errc{}) buf.append(numbuf, static_cast<size_t>(end - numbuf));
+        }
+        buf.push_back('\t');
+        const double pv = pheno[i];
+        if (std::isnan(pv)) {
+            buf.append("nan", 3);
+        } else if (std::isinf(pv)) {
+            if (pv < 0) buf.append("-inf", 4);
+            else buf.append("inf", 3);
+        } else {
+            auto [end, ec] = std::to_chars(numbuf, numbuf + sizeof(numbuf), pv,
+                                           std::chars_format::general, 6);
+            if (ec == std::errc{}) {
+                buf.append(numbuf, static_cast<size_t>(end - numbuf));
+            } else {
+                const int n = std::snprintf(numbuf, sizeof(numbuf), "%.6g", pv);
+                if (n > 0) buf.append(numbuf, static_cast<size_t>(n));
+            }
+        }
+        buf.push_back('\n');
+        if (buf.size() >= kFlushBytes) {
+            out.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+            buf.clear();
+        }
+    }
+    if (!buf.empty()) {
+        out.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+    }
+    out.flush();
+    if (!out.good()) {
+        LOGGER.e(0, "error writing to [" + filename + "].");
     }
     LOGGER.i(0, to_string(index_keep.size()) + " individuals have been saved.");
-
 }
 
 void Pheno::get_pheno(vector<string>& ids, vector<double>& pheno){

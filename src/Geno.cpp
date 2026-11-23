@@ -44,6 +44,16 @@
 #include <numeric>
 #include <array>
 #include <bit>
+#include <charconv>
+
+namespace bed_simd {
+void decode_i8_nocount(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_keep,
+                       int8_t* out, I8Opts* opts);
+void decode_f32_nocount(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_keep,
+                        const float table[4], float* out, uint64_t* miss_bits);
+void decode_f64_nocount(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw, uint32_t n_keep,
+                        const double table[4], double* out, uint64_t* miss_bits);
+}  // namespace bed_simd
 
 #ifdef _WIN64
   #include <intrin.h>
@@ -352,11 +362,13 @@ void Geno::init_AF(string alleleFileName) {
         AFA1.resize(fields.size());
         vector<uint32_t> extract_index;
         bool filterByMaf = false;
-        for(int i = 0; i < fields.size(); i++){
-            double af;
-            try{
-                af = stod(fields[i]);
-            }catch(std::out_of_range &){
+        for(size_t i = 0; i < fields.size(); i++){
+            double af = 0.0;
+            const char* first = fields[i].data();
+            const char* last = first + fields[i].size();
+            if (first < last && *first == '+') ++first;
+            auto [ptr, ec] = std::from_chars(first, last, af);
+            if(ec != std::errc{} || ptr != last || !std::isfinite(af)){
                 LOGGER.e(0, "the third column should be numeric");
             }
             if(af < 0 || af > 1.0){
@@ -364,7 +376,7 @@ void Geno::init_AF(string alleleFileName) {
             }
             double maf = std::min(af, 1.0 - af);
             if(maf > min_maf && maf < max_maf){
-                extract_index.push_back(i);
+                extract_index.push_back(static_cast<uint32_t>(i));
             }else{
                 filterByMaf = true;
             }
@@ -393,16 +405,61 @@ void Geno::init_AF(string alleleFileName) {
 void Geno::out_freq(string filename){
     string name_frq = filename + ".frq";
     LOGGER.i(0, "Saving allele frequencies...");
-    std::ofstream o_freq(name_frq.c_str());
+    std::ofstream o_freq(name_frq.c_str(), std::ios::binary);
     if (!o_freq) { LOGGER.e(0, "cannot open the file [" + name_frq + "] to write"); }
-    vector<string> out_contents;
-    out_contents.reserve(AFA1.size() + 1);
-    out_contents.push_back("CHR\tSNP\tPOS\tA1\tA2\tAF\tNCHROBS");
-    for(int i = 0; i != AFA1.size(); i++){
-        out_contents.push_back(marker->get_marker(marker->getRawIndex(i)) + "\t" + to_string(AFA1[i])
-                               + "\t" + to_string(countMarkers[i]));
+    constexpr size_t kFlushBytes = 4ULL << 20;
+    std::string out_buf;
+    out_buf.reserve(kFlushBytes + 4096);
+    out_buf.append("CHR\tSNP\tPOS\tA1\tA2\tAF\tNCHROBS\n");
+    char numbuf[64];
+    for(size_t i = 0; i != AFA1.size(); i++){
+        const uint32_t raw = marker->getRawIndex(static_cast<uint32_t>(i));
+        out_buf.append(marker->getRawChrView(raw));
+        out_buf.push_back('\t');
+        out_buf.append(marker->getRawNameView(raw));
+        out_buf.push_back('\t');
+        {
+            auto [end, ec] = std::to_chars(numbuf, numbuf + sizeof(numbuf), marker->getRawBp(raw));
+            if (ec == std::errc{}) out_buf.append(numbuf, static_cast<size_t>(end - numbuf));
+        }
+        out_buf.push_back('\t');
+        out_buf.append(marker->getRawA1View(raw));
+        out_buf.push_back('\t');
+        out_buf.append(marker->getRawA2View(raw));
+        out_buf.push_back('\t');
+        const double af = AFA1[i];
+        if (std::isnan(af)) {
+            out_buf.append("nan", 3);
+        } else if (std::isinf(af)) {
+            out_buf.append(af < 0 ? "-inf" : "inf");
+        } else {
+            auto [end, ec] = std::to_chars(numbuf, numbuf + sizeof(numbuf), af,
+                                           std::chars_format::fixed, 6);
+            if (ec == std::errc{}) {
+                out_buf.append(numbuf, static_cast<size_t>(end - numbuf));
+            } else {
+                const int n = std::snprintf(numbuf, sizeof(numbuf), "%.6f", af);
+                if (n > 0) out_buf.append(numbuf, static_cast<size_t>(n));
+            }
+        }
+        out_buf.push_back('\t');
+        {
+            auto [end, ec] = std::to_chars(numbuf, numbuf + sizeof(numbuf), countMarkers[i]);
+            if (ec == std::errc{}) out_buf.append(numbuf, static_cast<size_t>(end - numbuf));
+        }
+        out_buf.push_back('\n');
+        if (out_buf.size() >= kFlushBytes) {
+            o_freq.write(out_buf.data(), static_cast<std::streamsize>(out_buf.size()));
+            out_buf.clear();
+        }
     }
-    std::copy(out_contents.begin(), out_contents.end(), std::ostream_iterator<string>(o_freq, "\n"));
+    if (!out_buf.empty()) {
+        o_freq.write(out_buf.data(), static_cast<std::streamsize>(out_buf.size()));
+    }
+    o_freq.flush();
+    if (!o_freq.good()) {
+        LOGGER.e(0, "error writing to [" + name_frq + "]");
+    }
     o_freq.close();
     LOGGER.i(0, "Allele frequencies of " + to_string(AFA1.size()) + " SNPs have been saved in the file [" + name_frq + "]");
 }
@@ -585,7 +642,7 @@ void Geno::getGenoFloat_bed(uintptr_t *buf, int idx, float *dest,
 
     const GenoCodingSpecF32 spec = buildCodingSpecF32(mu, sd);
     const float table[4] = {spec.a0, spec.a1, spec.a2, spec.na};
-    bed_simd::decode_f32(raw, bedKeepMask(), rawSampleCT, keepSampleCT, table, dest, nullptr);
+    bed_simd::decode_f32_nocount(raw, bedKeepMask(), rawSampleCT, keepSampleCT, table, dest, nullptr);
 
     if (sexChromType == 1) {
         double weight;
@@ -994,12 +1051,12 @@ void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                 if (gbuf->geno_i8_ptr) {
                     bed_simd::I8Opts opts;
                     opts.miss_bits = pmiss64;
-                    bed_simd::decode_i8(raw, keep, rawSampleCT, keepSampleCT, gbuf->geno_i8_ptr, &opts);
+                    bed_simd::decode_i8_nocount(raw, keep, rawSampleCT, keepSampleCT, gbuf->geno_i8_ptr, &opts);
                 } else if (gbuf->geno_f32_ptr) {
                     float *out_f32 = gbuf->geno_f32_ptr;
                     const GenoCodingSpecF32 spec_f32 = buildCodingSpecF32(mu, sd);
                     const float table[4] = {spec_f32.a0, spec_f32.a1, spec_f32.a2, spec_f32.na};
-                    bed_simd::decode_f32(raw, keep, rawSampleCT, keepSampleCT, table, out_f32, pmiss64);
+                    bed_simd::decode_f32_nocount(raw, keep, rawSampleCT, keepSampleCT, table, out_f32, pmiss64);
                     if(sexChromType == 1){
                         double weight;
                         bool needWeight;
@@ -1027,7 +1084,7 @@ void Geno::getGenoDouble_bed(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                         gbuf->geno.resize(keepSampleCT);
                         out_geno = gbuf->geno.data();
                     }
-                    bed_simd::decode_f64(raw, keep, rawSampleCT, keepSampleCT, table, out_geno, pmiss64);
+                    bed_simd::decode_f64_nocount(raw, keep, rawSampleCT, keepSampleCT, table, out_geno, pmiss64);
                     if(sexChromType == 1){
                         double weight;
                         bool needWeight;
@@ -1976,6 +2033,8 @@ void Geno::processMakeBed() {
     // ── Pass 2: write .bed ────────────────────────────────────────────────
     hOut = fopen((filename + ".bed").c_str(), "wb");
     if (!hOut) LOGGER.e(0, "cannot open the file [" + filename + ".bed] to write.");
+    std::vector<char> bed_write_buf(4ULL << 20);
+    setvbuf(hOut, bed_write_buf.data(), _IOFBF, bed_write_buf.size());
     const uint8_t bedHeader[3] = {0x6c, 0x1b, 0x01};
     fwrite(bedHeader, sizeof(uint8_t), 3, hOut);
 

@@ -20,6 +20,8 @@
 #include "constants.hpp"
 #include <iterator>
 #include <algorithm>
+#include <charconv>
+#include <cstring>
 #include <numeric>
 #include <boost/algorithm/string.hpp>
 #include "utils.hpp"
@@ -28,6 +30,7 @@
 #include <utility>
 #include <cctype>
 #include <limits>
+#include <unordered_map>
 
 #ifdef BGEN_SUPPORT
 #include <sqlite3.h>
@@ -35,6 +38,146 @@
 
 using std::to_string;
 using std::unique_ptr;
+
+namespace {
+
+inline bool ascii_iequals_upper(std::string_view upper_ref, std::string_view raw) noexcept {
+    if (upper_ref.size() != raw.size()) return false;
+    for (size_t i = 0; i < upper_ref.size(); ++i) {
+        if (upper_ref[i] != gcta_text_io::ascii_toupper(raw[i])) return false;
+    }
+    return true;
+}
+
+// Equivalent to vector_commonIndex_sorted1(v1, v2, k1, k2) where v1 is a
+// CompactStringArena (zero string copies from the arena).
+void match_arena_sorted1(const CompactStringArena& v1,
+                         const std::vector<std::string>& v2,
+                         std::vector<uint32_t>& k1,
+                         std::vector<uint32_t>& k2) {
+    k1.clear();
+    k2.clear();
+    if (v1.empty() || v2.empty()) return;
+
+    constexpr uint32_t kConsumed = std::numeric_limits<uint32_t>::max();
+    const size_t n1 = v1.size();
+    const size_t n2 = v2.size();
+
+    if (n2 <= n1 * 2 && n2 < static_cast<size_t>(kConsumed)) {
+        std::unordered_map<std::string_view, uint32_t> lookup;
+        lookup.reserve(n2);
+        bool has_dup = false;
+        for (size_t j = 0; j < n2; ++j) {
+            if (!lookup.emplace(std::string_view(v2[j]), static_cast<uint32_t>(j)).second) {
+                has_dup = true;
+                break;
+            }
+        }
+        if (!has_dup) {
+            const size_t cap = std::min(n1, n2);
+            k1.reserve(cap);
+            k2.reserve(cap);
+            for (size_t i = 0; i < n1; ++i) {
+                auto it = lookup.find(v1.view(i));
+                if (it != lookup.end() && it->second != kConsumed) {
+                    k1.push_back(static_cast<uint32_t>(i));
+                    k2.push_back(it->second);
+                    it->second = kConsumed;
+                }
+            }
+            return;
+        }
+    } else if (n1 < static_cast<size_t>(kConsumed)) {
+        std::unordered_map<std::string_view, uint32_t> lookup;
+        lookup.reserve(n1);
+        bool has_dup = false;
+        for (size_t i = 0; i < n1; ++i) {
+            if (!lookup.emplace(v1.view(i), static_cast<uint32_t>(i)).second) {
+                has_dup = true;
+                break;
+            }
+        }
+        if (!has_dup) {
+            std::vector<std::pair<uint32_t, uint32_t>> pairs;
+            pairs.reserve(std::min(n1, n2));
+            for (size_t j = 0; j < n2; ++j) {
+                auto it = lookup.find(std::string_view(v2[j]));
+                if (it != lookup.end() && it->second != kConsumed) {
+                    pairs.emplace_back(it->second, static_cast<uint32_t>(j));
+                    it->second = kConsumed;
+                }
+            }
+            std::ranges::sort(pairs, [](const auto& a, const auto& b) { return a.first < b.first; });
+            k1.resize(pairs.size());
+            k2.resize(pairs.size());
+            for (size_t idx = 0; idx < pairs.size(); ++idx) {
+                k1[idx] = pairs[idx].first;
+                k2[idx] = pairs[idx].second;
+            }
+            return;
+        }
+    }
+
+    // Fallback when duplicates exist on the indexed side: sort-merge preserving k1 order.
+    std::vector<uint32_t> idx1(n1), idx2(n2);
+    std::iota(idx1.begin(), idx1.end(), 0u);
+    std::iota(idx2.begin(), idx2.end(), 0u);
+    std::ranges::sort(idx1, [&](uint32_t a, uint32_t b) { return v1.view(a) < v1.view(b); });
+    std::ranges::sort(idx2, [&](uint32_t a, uint32_t b) { return v2[a] < v2[b]; });
+
+    std::vector<std::pair<uint32_t, uint32_t>> pairs;
+    pairs.reserve(std::min(n1, n2));
+    size_t i = 0, j = 0;
+    while (i < n1 && j < n2) {
+        const std::string_view lhs = v1.view(idx1[i]);
+        const std::string_view rhs = v2[idx2[j]];
+        if (lhs < rhs) {
+            ++i;
+        } else if (rhs < lhs) {
+            ++j;
+        } else {
+            pairs.emplace_back(idx1[i], idx2[j]);
+            ++i;
+            ++j;
+        }
+    }
+    std::ranges::sort(pairs, [](const auto& a, const auto& b) { return a.first < b.first; });
+    k1.resize(pairs.size());
+    k2.resize(pairs.size());
+    for (size_t idx = 0; idx < pairs.size(); ++idx) {
+        k1[idx] = pairs[idx].first;
+        k2[idx] = pairs[idx].second;
+    }
+}
+
+} // namespace
+
+uint16_t Marker::internChr(std::string_view chr_label) {
+    if (!chr_id_.empty() && chr_dict_[chr_id_.back()] == chr_label) {
+        return chr_id_.back();
+    }
+    std::string key(chr_label);
+    const auto it = chr_to_id_.find(key);
+    if (it != chr_to_id_.end()) {
+        return it->second;
+    }
+    if (chr_dict_.size() >= static_cast<size_t>(std::numeric_limits<uint16_t>::max())) {
+        LOGGER.e(0, "too many distinct chromosome labels (>65534).");
+    }
+    const uint16_t id = static_cast<uint16_t>(chr_dict_.size());
+    uint8_t sex_type = 0;
+    if (isHomogameticChr(key)) {
+        sex_type = 1;
+    } else if (isHeterogameticChr(key)) {
+        sex_type = 2;
+    }
+    const uint8_t allowed = isAllowedChrLabelView(key) ? 1u : 0u;
+    chr_to_id_.emplace(key, id);
+    chr_dict_.push_back(std::move(key));
+    chr_dict_sex_type_.push_back(sex_type);
+    chr_dict_allowed_.push_back(allowed);
+    return id;
+}
 
 void Marker::normalizeChrLabelInto(std::string_view chr_label, std::string& out) {
     size_t b = 0;
@@ -330,70 +473,79 @@ Marker::Marker(const gcta_cli::GenoInputOptions& geno,
 }
 
 void Marker::matchSNPListFile(string filename, int num_min_fields, const std::vector<int>& field_return, std::vector<string> &fields){
-    std::vector<string> temp_fields;
-    std::ifstream allele_file(filename.c_str());
-    if(allele_file.fail()){
+    gcta_text_io::FastLineReader reader;
+    if (!reader.open(filename)) {
         LOGGER.e(0, "can't open [" + filename + "] to read]");
     }
 
     int max_fields = num_min_fields;
-    int require_fields = (field_return.size() > 0) ? (field_return[field_return.size() - 1] + 1): 0;
+    int require_fields = (field_return.size() > 0) ? (field_return[field_return.size() - 1] + 1) : 0;
     require_fields = (max_fields > require_fields) ? max_fields : require_fields;
 
-    std::vector<string> marker_name, ref_allele;
-    std::string line;
+    std::vector<string> marker_name, ref_allele, temp_fields;
     std::vector<uint32_t> bad_lines;
+    std::vector<std::string_view> toks;
+    toks.reserve(8);
+
     int num_line = 0;
-    std::vector<string> line_elements;
-    while(std::getline(allele_file, line)){
+    size_t sample_lines = 0;
+    size_t sample_bytes = 0;
+    bool reserved = false;
+    std::string_view line;
+    while (reader.next_line(line)) {
+        if (!reserved && sample_lines < 16) {
+            sample_bytes += line.size() + 1;
+            ++sample_lines;
+            if (sample_lines == 16 && reader.file_size() > 0) {
+                reserved = true;
+                const size_t avg_line = std::max<size_t>(sample_bytes / sample_lines, 6);
+                const size_t est_rows = static_cast<size_t>(reader.file_size() / avg_line) + 64;
+                marker_name.reserve(est_rows);
+                ref_allele.reserve(est_rows);
+                if (!field_return.empty()) {
+                    temp_fields.reserve(est_rows * field_return.size());
+                }
+            }
+        }
         num_line++;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        line_elements.clear();
-        size_t start = 0, pos;
-        while ((pos = line.find_first_of("\t ", start)) != std::string::npos) {
-            line_elements.emplace_back(line, start, pos - start);
-            start = pos + 1;
+        gcta_text_io::split_ws_exact(line, toks);
+        const int num_elements = static_cast<int>(toks.size());
+        if (num_elements < require_fields) {
+            bad_lines.push_back(static_cast<uint32_t>(num_line));
         }
-        line_elements.emplace_back(line, start);
-        uint16_t num_elements = line_elements.size();
-        if(num_elements < require_fields){
-            bad_lines.push_back(num_line);
+        if (num_elements >= 1) {
+            marker_name.emplace_back(toks[0]);
         }
-        if(num_elements >= 1){
-            marker_name.push_back(line_elements[0]);
+        if (num_elements >= 2) {
+            ref_allele.emplace_back(toks[1]);
         }
-
-        if(num_elements >= 2){
-            ref_allele.push_back(line_elements[1]);
+        for (auto index : field_return) {
+            temp_fields.emplace_back(toks[static_cast<size_t>(index)]);
         }
-        for(auto index : field_return){
-            temp_fields.push_back(line_elements[index]);
-        }
-
     }
-    allele_file.close();
+    reader.close();
 
     // match snp name
     std::vector<uint32_t> marker_index, ref_index;
-    vector_commonIndex_sorted1(name, marker_name, marker_index, ref_index);
+    match_arena_sorted1(name_, marker_name, marker_index, ref_index);
 
     // match alleles
     std::vector<uint32_t> index_remained;
     index_remained.reserve(marker_index.size());
     std::vector<uint32_t> ref_index_remained;
     ref_index_remained.reserve(marker_index.size());
-    if(ref_allele.size()){
-        for(int i = 0; i < marker_index.size(); i++){
-            uint32_t cur_marker_index = marker_index[i];
-            uint32_t cur_ref_index = ref_index[i];
-            std::string cur_ref = ref_allele[cur_ref_index];
-            std::transform(cur_ref.begin(), cur_ref.end(), cur_ref.begin(), toupper);
-            if(a1[cur_marker_index] == cur_ref || a2[cur_marker_index] == cur_ref){
+    if (!ref_allele.empty()) {
+        for (size_t i = 0; i < marker_index.size(); i++) {
+            const uint32_t cur_marker_index = marker_index[i];
+            const uint32_t cur_ref_index = ref_index[i];
+            const std::string_view cur_ref = ref_allele[cur_ref_index];
+            if (ascii_iequals_upper(a1_.view(cur_marker_index), cur_ref) ||
+                ascii_iequals_upper(a2_.view(cur_marker_index), cur_ref)) {
                 index_remained.push_back(cur_marker_index);
                 ref_index_remained.push_back(cur_ref_index);
             }
         }
-    }else{
+    } else {
         index_remained = marker_index;
     }
 
@@ -465,15 +617,15 @@ std::vector<uint32_t> Marker::getNextWindowIndex(uint32_t cur_marker_index, uint
     uint32_t cur_index = index_extract[cur_marker_index];
 
     uint32_t cur_pd = pd[cur_index];
-    std::string cur_chr = chr[cur_index];
+    const uint16_t cur_cid = chr_id_[cur_index];
     uint32_t final_pd = window + cur_pd;
 
     chr_ends = false;
-    isHomogameticChrom = isHomogameticChr(cur_chr);
+    isHomogameticChrom = (chr_dict_sex_type_[cur_cid] == 1);
 
     for(uint32_t marker_index = cur_marker_index; marker_index < index_extract.size(); marker_index++){
         uint32_t temp_index = index_extract[marker_index];
-        if(chr[temp_index] != cur_chr){
+        if(chr_id_[temp_index] != cur_cid){
             chr_ends = true;
             break;
         }
@@ -491,35 +643,29 @@ uint32_t Marker::getNextSize(const std::vector<uint32_t> &rawRef, uint32_t curEx
         chr_ends = true;
         return 0;
     }
-    uint32_t cur_index = rawRef[curExtractIndex];
-    std::string cur_chr = chr[cur_index];
-
+    const uint32_t cur_index = rawRef[curExtractIndex];
+    const uint16_t cur_cid = chr_id_[cur_index];
 
     chr_ends = false;
-    
-    if(isHomogameticChr(cur_chr)){
-        sexChromType = 1;
-    }else if(isHeterogameticChr(cur_chr)){
-        sexChromType = 2;
-    }else{
-        sexChromType = 0;
-    }
+    sexChromType = chr_dict_sex_type_[cur_cid];
 
     fileIndex = getMIndex(cur_index);
-    uint32_t rawIndexLimits = raw_limits[fileIndex];
+    const uint32_t rawIndexStart  = (fileIndex > 0) ? raw_limits[static_cast<size_t>(fileIndex - 1)] : 0u;
+    const uint32_t rawIndexLimits = raw_limits[static_cast<size_t>(fileIndex)];
 
-    uint32_t retSize = 0; 
+    uint32_t retSize = 0;
     for(uint32_t marker_index = curExtractIndex; marker_index < curExtractIndex + num; marker_index++){
         if(marker_index >= rawRef.size()){
             chr_ends = true;
             break;
         }
-        uint32_t temp_index = rawRef[marker_index];
-        if(chr[temp_index] != cur_chr){
-            chr_ends = true;
+        const uint32_t temp_index = rawRef[marker_index];
+        if(temp_index >= rawIndexLimits || temp_index < rawIndexStart){
             break;
         }
-        if(temp_index >= rawIndexLimits){
+        const uint16_t temp_cid = chr_id_[temp_index];
+        if(temp_cid != cur_cid && chr_dict_sex_type_[temp_cid] != sexChromType){
+            chr_ends = true;
             break;
         }
         retSize++;
@@ -537,10 +683,10 @@ std::vector<uint32_t> Marker::getNextSizeIndex(uint32_t cur_marker_index, uint32
         return indices;
     }
     uint32_t cur_index = index_extract[cur_marker_index];
-    std::string cur_chr = chr[cur_index];
+    const uint16_t cur_cid = chr_id_[cur_index];
 
     chr_ends = false;
-    isHomogameticChrom = isHomogameticChr(cur_chr);
+    isHomogameticChrom = (chr_dict_sex_type_[cur_cid] == 1);
 
     for(uint32_t marker_index = cur_marker_index; marker_index < cur_marker_index + num; marker_index++){
         if(marker_index >= index_extract.size()){
@@ -548,7 +694,7 @@ std::vector<uint32_t> Marker::getNextSizeIndex(uint32_t cur_marker_index, uint32
             break;
         }
         uint32_t temp_index = index_extract[marker_index];
-        if(chr[temp_index] != cur_chr){
+        if(chr_id_[temp_index] != cur_cid){
             chr_ends = true;
             break;
         }
@@ -566,14 +712,14 @@ uint32_t Marker::getNextWindowSize(uint32_t cur_marker_index, uint32_t window){
     uint32_t cur_index = index_extract[cur_marker_index];
 
     uint32_t cur_pd = pd[cur_index];
-    std::string cur_chr = chr[cur_index];
+    const uint16_t cur_cid = chr_id_[cur_index];
     uint32_t final_pd = window + cur_pd;
 
     uint32_t count = 0;
 
     for(uint32_t marker_index = cur_marker_index; marker_index < index_extract.size(); marker_index++){
         uint32_t temp_index = index_extract[marker_index];
-        if(chr[temp_index] != cur_chr){
+        if(chr_id_[temp_index] != cur_cid){
             break;
         }
         if(pd[temp_index] <= final_pd){
@@ -598,15 +744,62 @@ int Marker::getMIndex(uint32_t raw_index){
 
 void Marker::save_marker(string filename){
     LOGGER.i(0, "Saving SNP information to [" + filename + "]...");
-    std::ofstream out(filename.c_str());
-    for(auto & i : index_extract){
+    std::ofstream out(filename.c_str(), std::ios::binary);
+    if (!out) {
+        LOGGER.e(0, "cannot open the file [" + filename + "] to write");
+    }
+    constexpr size_t kFlushBytes = 4ULL << 20;
+    std::string out_buf;
+    out_buf.reserve(kFlushBytes + 1024);
+    char num_buf[64];
+    for (const uint32_t i : index_extract) {
+        const std::string_view sv_chr  = chr_dict_[chr_id_[i]];
+        const std::string_view sv_name = name_.view(i);
+        const std::string_view sv_a1   = a1_.view(i);
+        const std::string_view sv_a2   = a2_.view(i);
         const float gd_val = (i < gd.size()) ? gd[i] : 0.0f;
-        out << chr[i] << "\t" << name[i] << "\t" << gd_val
-            << "\t" << pd[i] << "\t" << a1[i] << "\t"
-            << a2[i] << "\n";
+
+        out_buf.append(sv_chr.data(), sv_chr.size());
+        out_buf.push_back('\t');
+        out_buf.append(sv_name.data(), sv_name.size());
+        out_buf.push_back('\t');
+        if (gd_val == 0.0f) {
+            out_buf.push_back('0');
+        } else {
+            auto [ptr, ec] = std::to_chars(num_buf, num_buf + sizeof(num_buf), gd_val, std::chars_format::general, 6);
+            if (ec == std::errc{}) {
+                out_buf.append(num_buf, static_cast<size_t>(ptr - num_buf));
+            } else {
+                const int w = std::snprintf(num_buf, sizeof(num_buf), "%.6g", static_cast<double>(gd_val));
+                if (w > 0) out_buf.append(num_buf, static_cast<size_t>(w));
+            }
+        }
+        out_buf.push_back('\t');
+        {
+            auto [ptr, ec] = std::to_chars(num_buf, num_buf + sizeof(num_buf), pd[i]);
+            if (ec == std::errc{}) {
+                out_buf.append(num_buf, static_cast<size_t>(ptr - num_buf));
+            }
+        }
+        out_buf.push_back('\t');
+        out_buf.append(sv_a1.data(), sv_a1.size());
+        out_buf.push_back('\t');
+        out_buf.append(sv_a2.data(), sv_a2.size());
+        out_buf.push_back('\n');
+
+        if (out_buf.size() >= kFlushBytes) {
+            out.write(out_buf.data(), static_cast<std::streamsize>(out_buf.size()));
+            out_buf.clear();
+        }
+    }
+    if (!out_buf.empty()) {
+        out.write(out_buf.data(), static_cast<std::streamsize>(out_buf.size()));
+    }
+    out.close();
+    if (!out) {
+        LOGGER.e(0, "failed writing SNP information to [" + filename + "]");
     }
     LOGGER.i(0, to_string(index_extract.size()) + " SNPs saved.");
-
 }
 
 void Marker::read_pvar(string pvar_file){
@@ -688,27 +881,16 @@ void Marker::read_pvar(string pvar_file){
         }
     }
 
-    const uint32_t oriSize = static_cast<uint32_t>(chr.size());
-    if (reader.file_size() > 0) {
-        const size_t avg_line = std::max<size_t>(line.size() + 1, 10);
-        const size_t est_rows = static_cast<size_t>(reader.file_size() / avg_line) + 64;
-        const size_t target = static_cast<size_t>(oriSize) + est_rows;
-        chr.reserve(target);
-        name.reserve(target);
-        pd.reserve(target);
-        a1.reserve(target);
-        a2.reserve(target);
-        index_extract.reserve(index_extract.size() + est_rows);
-    }
-
+    const uint32_t oriSize = static_cast<uint32_t>(chr_id_.size());
     uint32_t nrows = 0;
     uint32_t nValidSNP = 0;
     int line_number = nHeader;
-    std::string last_chr;
-    bool has_last_chr = false;
-    bool last_chr_allowed = false;
+    size_t sample_lines = 0;
+    size_t sample_bytes = 0;
+    size_t sample_name_bytes = 0;
+    bool reserved = false;
 
-    auto process_row = [&]() {
+    auto process_row = [&](std::string_view cur_line) {
         line_number++;
         if (static_cast<int>(toks.size()) < ncol) {
             LOGGER.e(0, "the file [" + pvar_file + "] contains different number of elements in line " + to_string(line_number) + ".");
@@ -721,6 +903,25 @@ void Marker::read_pvar(string pvar_file){
         const std::string_view sv_a1  = toks[static_cast<size_t>(iA1)];
         const std::string_view sv_a2  = toks[static_cast<size_t>(iA2)];
 
+        if (!reserved && sample_lines < 16) {
+            sample_bytes += cur_line.size() + 1;
+            sample_name_bytes += sv_id.size();
+            ++sample_lines;
+            if (sample_lines == 16 && reader.file_size() > 0) {
+                reserved = true;
+                const size_t avg_line = std::max<size_t>(sample_bytes / sample_lines, 10);
+                const size_t est_rows = static_cast<size_t>(reader.file_size() / avg_line) + 64;
+                const size_t target = static_cast<size_t>(oriSize) + est_rows;
+                const size_t avg_name = (sample_name_bytes / sample_lines) + 2;
+                chr_id_.reserve(target);
+                name_.reserve(target, name_.bytes() + est_rows * avg_name);
+                pd.reserve(target);
+                a1_.reserve(target);
+                a2_.reserve(target);
+                index_extract.reserve(index_extract.size() + est_rows);
+            }
+        }
+
         int64_t pos_val = 0;
         if (!gcta_text_io::parse_int64_sv(sv_pos, pos_val) ||
             pos_val < std::numeric_limits<int>::min() ||
@@ -729,37 +930,27 @@ void Marker::read_pvar(string pvar_file){
         }
 
         const uint32_t curRow = oriSize + nrows;
-        chr.emplace_back(sv_chr);
-        name.emplace_back(sv_id);
+        const uint16_t cid = internChr(sv_chr);
+        chr_id_.push_back(cid);
+        name_.push_back(sv_id);
         pd.push_back(static_cast<uint32_t>(pos_val));
-        a1.emplace_back(sv_a1);
-        gcta_text_io::uppercase_inplace(a1.back());
-        a2.emplace_back(sv_a2);
-        gcta_text_io::uppercase_inplace(a2.back());
+        a1_.push_back_upper(sv_a1);
+        a2_.push_back_upper(sv_a2);
 
-        bool allowed;
-        if (has_last_chr && sv_chr == last_chr) {
-            allowed = last_chr_allowed;
-        } else {
-            last_chr.assign(sv_chr);
-            has_last_chr = true;
-            last_chr_allowed = isAllowedChrLabelView(sv_chr);
-            allowed = last_chr_allowed;
-        }
-        if (allowed) {
+        if (chr_dict_allowed_[cid]) {
             index_extract.push_back(curRow);
             nValidSNP++;
         }
         nrows++;
     };
 
-    process_row();
+    process_row(line);
     while (reader.next_line(line)) {
         gcta_text_io::split_ws_exact(line, toks);
-        process_row();
+        process_row(line);
     }
 
-    num_marker = static_cast<uint32_t>(name.size());
+    num_marker = static_cast<uint32_t>(name_.size());
     num_extract = static_cast<uint32_t>(index_extract.size());
 
     LOGGER.i(0, to_string(num_marker) + " SNPs to be included from PVAR file(s).");
@@ -782,35 +973,20 @@ void Marker::read_bim(string bim_file) {
         LOGGER.e(0, "cannot open the file [" + bim_file + "] to read");
     }
 
-    const uint32_t oriSize = static_cast<uint32_t>(name.size());
+    const uint32_t oriSize = static_cast<uint32_t>(name_.size());
     uint32_t line_number = oriSize;
     const uint32_t start_line_number = oriSize + 1;
     size_t last_length = 0;
+    size_t sample_lines = 0;
+    size_t sample_bytes = 0;
+    size_t sample_name_bytes = 0;
     bool reserved = false;
 
     std::vector<std::string_view> toks;
     toks.reserve(8);
-    std::string last_chr;
-    bool has_last_chr = false;
-    bool last_chr_allowed = false;
 
     std::string_view line;
     while (reader.next_line(line)) {
-        if (!reserved) {
-            reserved = true;
-            if (reader.file_size() > 0) {
-                const size_t avg_line = std::max<size_t>(line.size() + 1, 10);
-                const size_t est_rows = static_cast<size_t>(reader.file_size() / avg_line) + 64;
-                const size_t target = static_cast<size_t>(oriSize) + est_rows;
-                chr.reserve(target);
-                name.reserve(target);
-                pd.reserve(target);
-                a1.reserve(target);
-                a2.reserve(target);
-                index_extract.reserve(index_extract.size() + est_rows);
-                if (!gd.empty()) gd.reserve(target);
-            }
-        }
         line_number++;
         gcta_text_io::split_ws_exact(line, toks);
         if (toks.size() < static_cast<size_t>(Constants::NUM_BIM_COL)) {
@@ -820,6 +996,26 @@ void Marker::read_bim(string bim_file) {
         if (line_number > start_line_number && toks.size() != last_length) {
             LOGGER.w(0, "the bim file [" + bim_file + "], line " + to_string(line_number) +
                     " have different elements, take care");
+        }
+
+        if (!reserved && sample_lines < 16) {
+            sample_bytes += line.size() + 1;
+            sample_name_bytes += toks[1].size();
+            ++sample_lines;
+            if (sample_lines == 16 && reader.file_size() > 0) {
+                reserved = true;
+                const size_t avg_line = std::max<size_t>(sample_bytes / sample_lines, 10);
+                const size_t est_rows = static_cast<size_t>(reader.file_size() / avg_line) + 64;
+                const size_t target = static_cast<size_t>(oriSize) + est_rows;
+                const size_t avg_name = (sample_name_bytes / sample_lines) + 2;
+                chr_id_.reserve(target);
+                name_.reserve(target, name_.bytes() + est_rows * avg_name);
+                pd.reserve(target);
+                a1_.reserve(target);
+                a2_.reserve(target);
+                index_extract.reserve(index_extract.size() + est_rows);
+                if (!gd.empty()) gd.reserve(target);
+            }
         }
 
         float gd_val = 0.0f;
@@ -832,9 +1028,9 @@ void Marker::read_bim(string bim_file) {
                         "] contains illegal distance value, please check");
         }
 
-        const std::string_view sv_chr = toks[0];
-        chr.emplace_back(sv_chr);
-        name.emplace_back(toks[1]);
+        const uint16_t cid = internChr(toks[0]);
+        chr_id_.push_back(cid);
+        name_.push_back(toks[1]);
         if (!gd.empty() || gd_val != 0.0f) {
             if (gd.empty()) {
                 gd.assign(static_cast<size_t>(line_number - 1), 0.0f);
@@ -842,26 +1038,15 @@ void Marker::read_bim(string bim_file) {
             gd.push_back(gd_val);
         }
         pd.push_back(static_cast<uint32_t>(pd_val));
-        a1.emplace_back(toks[4]);
-        gcta_text_io::uppercase_inplace(a1.back());
-        a2.emplace_back(toks[5]);
-        gcta_text_io::uppercase_inplace(a2.back());
+        a1_.push_back_upper(toks[4]);
+        a2_.push_back_upper(toks[5]);
 
         last_length = toks.size();
-        bool allowed;
-        if (has_last_chr && sv_chr == last_chr) {
-            allowed = last_chr_allowed;
-        } else {
-            last_chr.assign(sv_chr);
-            has_last_chr = true;
-            last_chr_allowed = isAllowedChrLabelView(sv_chr);
-            allowed = last_chr_allowed;
-        }
-        if (allowed) {
+        if (chr_dict_allowed_[cid]) {
             index_extract.push_back(line_number - 1);
         }
     }
-    num_marker = static_cast<uint32_t>(name.size());
+    num_marker = static_cast<uint32_t>(name_.size());
     num_extract = static_cast<uint32_t>(index_extract.size());
     LOGGER.i(0, to_string(num_marker) + " SNPs to be included from BIM file(s).");
     if (num_marker != num_extract) {
@@ -946,8 +1131,8 @@ std::vector<std::pair<std::string, std::vector<uint32_t>>> Marker::read_gene(str
             bool isSetEnd = false;
             for(uint32_t marker_index = 0; marker_index < index_extract.size(); marker_index++){
                 uint32_t temp_index = index_extract[marker_index];
-                //LOGGER << temp_index << "\t" << chr_item << "\t" << chr[temp_index] << std::endl;
-                if(chr[temp_index] == chr_item){
+                //LOGGER << temp_index << "\t" << chr_item << "\t" << chr_dict_[chr_id_[temp_index]] << std::endl;
+                if(chr_dict_[chr_id_[temp_index]] == chr_item){
                     if((!isSetStart)){
                         chrStartIndex = marker_index;
                         isSetStart = true;
@@ -1177,13 +1362,13 @@ void Marker::read_bgen_index(string bgen_file){
         LOGGER.w(0, "No biallelic variants.");
         return;
     }
-    int cur_total_num_variants = chr.size() + n_variants;
-    chr.reserve(cur_total_num_variants);
-    name.reserve(cur_total_num_variants);
+    int cur_total_num_variants = static_cast<int>(chr_id_.size()) + n_variants;
+    chr_id_.reserve(cur_total_num_variants);
+    name_.reserve(cur_total_num_variants, name_.bytes() + static_cast<size_t>(n_variants) * 16);
     gd.reserve(cur_total_num_variants);
     pd.reserve(cur_total_num_variants);
-    a1.reserve(cur_total_num_variants);
-    a2.reserve(cur_total_num_variants);
+    a1_.reserve(cur_total_num_variants);
+    a2_.reserve(cur_total_num_variants);
     byte_start.reserve(cur_total_num_variants);
     byte_size.reserve(cur_total_num_variants);
     LOGGER.i(0, to_string(n_variants) + " SNPs to be included from bgen index file.");
@@ -1201,16 +1386,12 @@ void Marker::read_bgen_index(string bgen_file){
         bool keep_snp = isAllowedChrLabel(snp_chr);
         if(!keep_snp) count_chr_error++;
         if(keep_snp){
-            chr.push_back(snp_chr);
-            name.push_back(RCSTR(sqlite3_column_text(stmt, 2)));
+            chr_id_.push_back(internChr(snp_chr));
+            name_.push_back(RCSTR(sqlite3_column_text(stmt, 2)));
             gd.push_back(0);
             pd.push_back(sqlite3_column_int(stmt, 1));
-            std::string snp_a1 = RCSTR(sqlite3_column_text(stmt, 3));
-            std::string snp_a2 = RCSTR(sqlite3_column_text(stmt, 4));
-            std::transform(snp_a1.begin(), snp_a1.end(), snp_a1.begin(), toupper);
-            std::transform(snp_a2.begin(), snp_a2.end(), snp_a2.begin(), toupper);
-            a1.push_back(snp_a1);
-            a2.push_back(snp_a2);
+            a1_.push_back_upper(RCSTR(sqlite3_column_text(stmt, 3)));
+            a2_.push_back_upper(RCSTR(sqlite3_column_text(stmt, 4)));
 
             byte_start.push_back(sqlite3_column_int64(stmt, 5));
             uint64_t cur_size = sqlite3_column_int64(stmt, 6);
@@ -1232,20 +1413,20 @@ void Marker::read_bgen_index(string bgen_file){
 
     // check the first and last SNPs
     if(num_var_added > 0){
-        int index1 = chr.size() - num_var_added;
+        int index1 = static_cast<int>(chr_id_.size()) - num_var_added;
         int index2 = index1 + num_var_added - 1;
         uint64_t pos1 = byte_start[index1];
         uint64_t pos2 = byte_start[index2];
         MarkerInfo m1 = extractBgenMarkerInfo(h_bgen, pos1);
         MarkerInfo m2 = extractBgenMarkerInfo(h_bgen, pos2);
-        std::vector<string> allele1 = {a1[index1], a2[index1]};
-        std::vector<string> allele2 = {a1[index2], a2[index2]};
-        if(m1.chr != chr[index1] || m1.name != name[index1] || m1.pd != pd[index1] || m1.alleles != allele1){
+        std::vector<string> allele1 = {std::string(a1_.view(index1)), std::string(a2_.view(index1))};
+        std::vector<string> allele2 = {std::string(a1_.view(index2)), std::string(a2_.view(index2))};
+        if(m1.chr != chr_dict_[chr_id_[index1]] || m1.name != name_.view(index1) || m1.pd != pd[index1] || m1.alleles != allele1){
             LOGGER.e(0, "the first variant in the bgen file is not consistent with that in the index file."
                 "\nTry to regenerate the index by " + prompt_index + ".");
         }
 
-        if(m2.chr != chr[index2] || m2.name != name[index2] || m2.pd != pd[index2] || m2.alleles != allele2){
+        if(m2.chr != chr_dict_[chr_id_[index2]] || m2.name != name_.view(index2) || m2.pd != pd[index2] || m2.alleles != allele2){
             LOGGER.e(0, "the variants in bgen file aren't consistent with those in the index file."
                 "\nTry to regenerate the index by " + prompt_index + ".");
         }
@@ -1435,19 +1616,17 @@ void Marker::read_bgen(string bgen_file){
         fseek(h_bgen, len_comp, SEEK_CUR);
         
         if(keep_snp){
-            chr.push_back(chr_str);
-            name.push_back(rsid.get());
+            chr_id_.push_back(internChr(chr_str));
+            name_.push_back(std::string_view(rsid.get(), len_rs));
             gd.push_back(0);
             pd.push_back(snp_pos);
-            std::transform(snp_a1.get(), snp_a1.get() + len_a1, snp_a1.get(), toupper);
-            std::transform(snp_a2.get(), snp_a2.get() + len_a2, snp_a2.get(), toupper);
-            a1.push_back(snp_a1.get());
-            a2.push_back(snp_a2.get());
+            a1_.push_back_upper(std::string_view(snp_a1.get(), len_a1));
+            a2_.push_back_upper(std::string_view(snp_a2.get(), len_a2));
             byte_start.push_back(snp_start);
         }
     }
-    num_marker = name.size();
-    index_extract.resize(name.size());
+    num_marker = static_cast<uint32_t>(name_.size());
+    index_extract.resize(name_.size());
     std::iota(index_extract.begin(), index_extract.end(), 0);
     num_extract = index_extract.size();
     LOGGER.i(0, to_string(num_marker) + " SNPs to be included from bgen file.");
@@ -1485,23 +1664,10 @@ std::vector<uint32_t> Marker::get_extract_index_autosome(){ // returns the index
         return auto_index;
     }
     auto_index.reserve(n);
-    std::string last_chr;
-    bool has_last = false;
-    bool last_is_auto = false;
     for (size_t i = 0; i < n; ++i) {
-        const std::string& c = chr[index_extract[i]];
-        bool is_auto;
-        if (has_last && c == last_chr) {
-            is_auto = last_is_auto;
-        } else {
-            last_chr = c;
-            has_last = true;
-            std::string norm;
-            normalizeChrLabelInto(c, norm);
-            last_is_auto = (homogametic_chrs.count(norm) == 0 && heterogametic_chrs.count(norm) == 0);
-            is_auto = last_is_auto;
+        if (chr_dict_sex_type_[chr_id_[index_extract[i]]] == 0) {
+            auto_index.push_back(static_cast<uint32_t>(i));
         }
-        if (is_auto) auto_index.push_back(static_cast<uint32_t>(i));
     }
     return auto_index;
 }
@@ -1513,21 +1679,10 @@ std::vector<uint32_t> Marker::get_extract_index_X(){
     }
     const size_t n = index_extract.size();
     x_index.reserve(n / 16 + 16);
-    std::string last_chr;
-    bool has_last = false;
-    bool last_is_x = false;
     for (size_t i = 0; i < n; ++i) {
-        const std::string& c = chr[index_extract[i]];
-        bool is_x;
-        if (has_last && c == last_chr) {
-            is_x = last_is_x;
-        } else {
-            last_chr = c;
-            has_last = true;
-            last_is_x = isHomogameticChr(c);
-            is_x = last_is_x;
+        if (chr_dict_sex_type_[chr_id_[index_extract[i]]] == 1) {
+            x_index.push_back(static_cast<uint32_t>(i));
         }
-        if (is_x) x_index.push_back(static_cast<uint32_t>(i));
     }
     return x_index;
 }
@@ -1540,7 +1695,7 @@ void Marker::extract_marker(std::vector<string> markers, bool isExtract) {
    int numDup = numOriMarker - markers.size();
    if(numDup != 0) LOGGER.w(0, to_string(numDup) + " duplicated SNPs were ignored in the list." );
 
-   vector_commonIndex_sorted1(name, markers, ori_index, marker_index);
+   match_arena_sorted1(name_, markers, ori_index, marker_index);
    std::vector<uint32_t> remain_index;
    if(isExtract){
        std::set_intersection(index_extract.begin(), index_extract.end(),
@@ -1605,9 +1760,26 @@ void Marker::keep_extracted_index(const std::vector<uint32_t>& keep_index) {
 }
 
 string Marker::get_marker(int rawindex){
-    std::string return_string = chr[rawindex] + "\t" + name[rawindex] + "\t" + 
-        std::to_string(pd[rawindex]) + "\t";
-    return return_string + a1[rawindex] + "\t" + a2[rawindex];
+    const uint32_t idx = static_cast<uint32_t>(rawindex);
+    const std::string_view sv_chr  = chr_dict_[chr_id_[idx]];
+    const std::string_view sv_name = name_.view(idx);
+    const std::string_view sv_a1   = a1_.view(idx);
+    const std::string_view sv_a2   = a2_.view(idx);
+    char bp_buf[16];
+    auto [bp_end, ec] = std::to_chars(bp_buf, bp_buf + sizeof(bp_buf), pd[idx]);
+    const size_t bp_len = (ec == std::errc{}) ? static_cast<size_t>(bp_end - bp_buf) : 0;
+    std::string out;
+    out.reserve(sv_chr.size() + sv_name.size() + bp_len + sv_a1.size() + sv_a2.size() + 4);
+    out.append(sv_chr);
+    out.push_back('\t');
+    out.append(sv_name);
+    out.push_back('\t');
+    out.append(bp_buf, bp_len);
+    out.push_back('\t');
+    out.append(sv_a1);
+    out.push_back('\t');
+    out.append(sv_a2);
+    return out;
 }
 
 string Marker::getMarkerStrExtract(int extractindex){

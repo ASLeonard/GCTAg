@@ -6,6 +6,7 @@
 #include "Marker.h"
 #include "Logger.h"
 #include "RemlEngine.hpp"
+#include "async_seq_io.hpp"
 #include "cpu.h"
 #include "mem.hpp"
 #include "mlma_woodbury.hpp"
@@ -20,10 +21,12 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <optional>
 #include <ranges>
 #include <type_traits>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 #ifdef _OPENMP
   #include <omp.h>
@@ -117,11 +120,11 @@ inline int resolve_mlma_block_size(int n, double budget_gb, bool use_int8_geno =
 
 // Fast single-line TSV formatter for .mlma output using std::to_chars (general, 6) + memcpy.
 inline void append_mlma_line(std::string& dst,
-                             const std::string& chr,
-                             const std::string& name,
+                             std::string_view chr,
+                             std::string_view name,
                              unsigned bp,
-                             const std::string& a1,
-                             const std::string& a2,
+                             std::string_view a1,
+                             std::string_view a2,
                              bool stat_ok,
                              double freq,
                              double beta,
@@ -169,17 +172,56 @@ inline void append_mlma_line(std::string& dst,
         dst.append(line, total_len);
     } else {
         dst.reserve(dst.size() + total_len);
-        dst.append(chr);               dst.push_back('\t');
-        dst.append(name);              dst.push_back('\t');
-        dst.append(bp_buf, bp_len);    dst.push_back('\t');
-        dst.append(a1);                dst.push_back('\t');
-        dst.append(a2);                dst.push_back('\t');
+        dst.append(chr.data(), chr.size());   dst.push_back('\t');
+        dst.append(name.data(), name.size()); dst.push_back('\t');
+        dst.append(bp_buf, bp_len);           dst.push_back('\t');
+        dst.append(a1.data(), a1.size());     dst.push_back('\t');
+        dst.append(a2.data(), a2.size());     dst.push_back('\t');
         dst.append(stat_buf, stat_len);
     }
 }
 
+struct MlmaAsyncOutState {
+    char*  slot_ptr  = nullptr;
+    size_t slot_cap  = 0;
+    size_t slot_used = 0;
+
+    void ensure_slot(gcta_io::AsyncSeqWriter& writer) {
+        if (!slot_ptr) {
+            slot_ptr = writer.acquire_slot(slot_cap);
+            slot_used = 0;
+        }
+    }
+
+    void append_bytes(gcta_io::AsyncSeqWriter& writer, const char* data, size_t len) {
+        size_t off = 0;
+        while (off < len) {
+            ensure_slot(writer);
+            const size_t room = slot_cap - slot_used;
+            const size_t take = std::min(room, len - off);
+            std::memcpy(slot_ptr + slot_used, data + off, take);
+            slot_used += take;
+            off += take;
+            if (slot_used == slot_cap) {
+                writer.submit_slot(slot_used);
+                slot_ptr = nullptr;
+                slot_used = 0;
+            }
+        }
+    }
+
+    void flush(gcta_io::AsyncSeqWriter& writer) {
+        if (slot_ptr) {
+            writer.submit_slot(slot_used);
+            slot_ptr = nullptr;
+            slot_used = 0;
+        }
+    }
+};
+
 // Parallel per-SNP stats + TSV formatting into per-thread pre-reserved buffers,
-// appended sequentially in exact [0..bs) SNP order into io_buf and flushed in >= 4 MiB chunks.
+// copied in parallel via prefix-sum offsets directly into the active AsyncSeqWriter
+// slot (16 MiB double-buffered, strictly 1 sequential writer thread).
 inline void format_and_buffer_mlma_block(int bs,
                                          std::span<const uint32_t> exIdx,
                                          Marker* marker,
@@ -189,8 +231,8 @@ inline void format_and_buffer_mlma_block(int bs,
                                          const Eigen::VectorXf& xvx_diag,
                                          bool log_pval,
                                          std::vector<std::string>& thr_buf,
-                                         std::string& io_buf,
-                                         std::ofstream& ofile)
+                                         MlmaAsyncOutState& out_state,
+                                         gcta_io::AsyncSeqWriter& writer)
 {
     if (bs <= 0) return;
 
@@ -218,12 +260,12 @@ inline void format_and_buffer_mlma_block(int bs,
         std::string& buf = thr_buf[static_cast<size_t>(tid)];
         buf.clear();
         for (int i = i_beg; i < i_end; ++i) {
-            const uint32_t raw      = marker->getRawIndex(exIdx[static_cast<size_t>(i)]);
-            const std::string& chr  = marker->getRawChr(raw);
-            const std::string& name = marker->getRawName(raw);
-            const unsigned     bp   = static_cast<unsigned>(marker->getRawBp(raw));
-            const std::string& a1   = marker->getRawA1(raw);
-            const std::string& a2   = marker->getRawA2(raw);
+            const uint32_t raw           = marker->getRawIndex(exIdx[static_cast<size_t>(i)]);
+            const std::string_view chr   = marker->getRawChr(raw);
+            const std::string_view name  = marker->getRawName(raw);
+            const unsigned         bp    = static_cast<unsigned>(marker->getRawBp(raw));
+            const std::string_view a1    = marker->getRawA1(raw);
+            const std::string_view a2    = marker->getRawA2(raw);
 
             float beta_val = 0.0f, se_val = 0.0f;
             double pval_val = 0.0;
@@ -239,15 +281,40 @@ inline void format_and_buffer_mlma_block(int bs,
         }
     }
 
+    std::vector<size_t> offsets(static_cast<size_t>(n_active) + 1, 0);
     for (int t = 0; t < n_active; ++t) {
-        const std::string& tb = thr_buf[static_cast<size_t>(t)];
-        if (!tb.empty()) {
-            io_buf.append(tb);
-        }
+        offsets[static_cast<size_t>(t) + 1] =
+            offsets[static_cast<size_t>(t)] + thr_buf[static_cast<size_t>(t)].size();
     }
-    if (io_buf.size() >= (4 << 20)) {
-        ofile.write(io_buf.data(), static_cast<std::streamsize>(io_buf.size()));
-        io_buf.clear();
+    const size_t total_bytes = offsets[static_cast<size_t>(n_active)];
+    if (total_bytes == 0) return;
+
+    out_state.ensure_slot(writer);
+    if (out_state.slot_used > 0 && out_state.slot_used + total_bytes > out_state.slot_cap) {
+        out_state.flush(writer);
+        out_state.ensure_slot(writer);
+    }
+
+    if (out_state.slot_used + total_bytes <= out_state.slot_cap) {
+        char* const dst_base = out_state.slot_ptr + out_state.slot_used;
+        #pragma omp parallel for schedule(static) num_threads(n_active) if (total_bytes >= 262144 && n_active > 1)
+        for (int t = 0; t < n_active; ++t) {
+            const std::string& tb = thr_buf[static_cast<size_t>(t)];
+            if (!tb.empty()) {
+                std::memcpy(dst_base + offsets[static_cast<size_t>(t)], tb.data(), tb.size());
+            }
+        }
+        out_state.slot_used += total_bytes;
+        if (out_state.slot_used >= out_state.slot_cap) {
+            out_state.flush(writer);
+        }
+    } else {
+        for (int t = 0; t < n_active; ++t) {
+            const std::string& tb = thr_buf[static_cast<size_t>(t)];
+            if (!tb.empty()) {
+                out_state.append_bytes(writer, tb.data(), tb.size());
+            }
+        }
     }
 }
 
@@ -260,7 +327,7 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
                                              int n,
                                              int block_size,
                                              bool log_pval,
-                                             std::ofstream& ofile)
+                                             gcta_io::AsyncSeqWriter& writer)
 {
     const uint32_t total_m = marker->count_extract();
     LOGGER << "\nStreaming association tests for " << total_m << " SNPs..." << std::endl;
@@ -302,15 +369,11 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
         (static_cast<size_t>(BLOCK) / static_cast<size_t>(max_threads) + 16) * 96);
     for (auto& tb : thr_buf) tb.reserve(per_thr_reserve);
 
-    std::string io_buf;
-    io_buf.reserve(8 << 20);
-
-    auto flush_io = [&]() {
-        if (!io_buf.empty()) {
-            ofile.write(io_buf.data(), static_cast<std::streamsize>(io_buf.size()));
-            io_buf.clear();
-        }
-    };
+    MlmaAsyncOutState out_state;
+    const std::string_view hdr_line = log_pval
+        ? std::string_view("Chr\tSNP\tbp\tA1\tA2\tFreq\tb\tse\tlog_p\n")
+        : std::string_view("Chr\tSNP\tbp\tA1\tA2\tFreq\tb\tse\tp\n");
+    out_state.append_bytes(writer, hdr_line.data(), hdr_line.size());
 
     auto callback = [&](uintptr_t* buf, std::span<const uint32_t> exIdx) {
         const int bs = static_cast<int>(exIdx.size());
@@ -362,7 +425,7 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
 
         format_and_buffer_mlma_block(bs, exIdx, marker, valid_v, additive_af_v,
                                      Xt_Vi_y, xvx_diag, log_pval,
-                                     thr_buf, io_buf, ofile);
+                                     thr_buf, out_state, writer);
 
         snp_done += bs;
         const int cur_pct = (total_m > 0)
@@ -382,15 +445,15 @@ inline void run_mlma_stream_association_impl(const Eigen::VectorXf& Vi_y,
                      /*bMakeMiss*/   false,
                      {callback});
 
-    flush_io();
+    out_state.flush(writer);
 }
 
 // Int8 Woodbury streaming association path: stores raw additive BED genotypes
 // in int8_t (1 byte/sample/SNP instead of 4 bytes/sample/SNP) and applies
 // mean-centering and sparse missing-genotype corrections algebraically.
-// When fast_mlma != FastMlmaMode::Off, pre-quantizes Uk into K-tiled INT8
-// slices and computes U_k^T G_block_i8 directly via u8s8s32 GEMM without
-// allocating X_panel_f32 or K x BLOCK UkX_scratch.
+// When fast_mlma != FastMlmaMode::Off, uses prebuilt_q_uk if already streamed
+// directly from TUN3, or quantizes Uk into K-tiled INT8 slices and computes
+// U_k^T G_block_i8 directly via u8s8s32 GEMM.
 inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                                                     const Eigen::VectorXf& Vi_y,
                                                     const Eigen::VectorXf& w_sqrt,
@@ -399,8 +462,9 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                                                     int n,
                                                     int block_size,
                                                     bool log_pval,
-                                                    std::ofstream& ofile,
-                                                    FastMlmaMode fast_mlma = FastMlmaMode::Off)
+                                                    gcta_io::AsyncSeqWriter& writer,
+                                                    FastMlmaMode fast_mlma = FastMlmaMode::Off,
+                                                    std::optional<QuantizedWoodburyUk>* prebuilt_q_uk = nullptr)
 {
     const uint32_t total_m = marker->count_extract();
     const bool use_fast_i8 = (fast_mlma != FastMlmaMode::Off);
@@ -440,10 +504,16 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
     Eigen::VectorXf u_sum;
     QuantizedWoodburyUk q_uk;
     if (use_fast_i8) {
-        q_uk = build_quantized_woodbury_uk(wb, w_sqrt, unit_weights, S_w2, fast_mlma);
-        // Free float32 Uk_f immediately after quantization to cut resident memory
-        // before optional AOCL pre-reordered Q buffers.
-        const_cast<WoodburyMLMACache&>(wb).Uk_f.resize(0, 0);
+        const bool from_prebuilt = (prebuilt_q_uk != nullptr && prebuilt_q_uk->has_value());
+        if (from_prebuilt) {
+            q_uk = std::move(**prebuilt_q_uk);
+            prebuilt_q_uk->reset();
+        } else {
+            q_uk = build_quantized_woodbury_uk(wb, w_sqrt, unit_weights, S_w2, fast_mlma);
+            // Free float32 Uk_f immediately after quantization to cut resident memory
+            // before optional AOCL pre-reordered Q buffers.
+            const_cast<WoodburyMLMACache&>(wb).Uk_f.resize(0, 0);
+        }
         if (std::getenv("GCTA_MLMA_REORDER_Q") != nullptr) {
             reorder_quantized_woodbury_uk(q_uk);
         }
@@ -453,6 +523,7 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                 static_cast<double>(q_uk.total_q_reordered_bytes()) / (1024.0 * 1024.0 * 1024.0)) + " GiB";
         }
         LOGGER << "Fast MLMA quantized Uk (" << fast_mlma_mode_name(fast_mlma)
+               << (from_prebuilt ? ", direct/streamed" : "")
                << "): k=" << q_uk.k
                << ", tiles=" << q_uk.tiles.size()
                << ", Q_mem=" << std::format("{:.3f}", static_cast<double>(q_uk.total_q_bytes()) / (1024.0 * 1024.0 * 1024.0))
@@ -556,15 +627,11 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
         (static_cast<size_t>(BLOCK) / static_cast<size_t>(max_threads) + 16) * 96);
     for (auto& tb : thr_buf) tb.reserve(per_thr_reserve);
 
-    std::string io_buf;
-    io_buf.reserve(8 << 20);
-
-    auto flush_io = [&]() {
-        if (!io_buf.empty()) {
-            ofile.write(io_buf.data(), static_cast<std::streamsize>(io_buf.size()));
-            io_buf.clear();
-        }
-    };
+    MlmaAsyncOutState out_state;
+    const std::string_view hdr_line = log_pval
+        ? std::string_view("Chr\tSNP\tbp\tA1\tA2\tFreq\tb\tse\tlog_p\n")
+        : std::string_view("Chr\tSNP\tbp\tA1\tA2\tFreq\tb\tse\tp\n");
+    out_state.append_bytes(writer, hdr_line.data(), hdr_line.size());
 
     // Persistent uninitialized per-thread miss_bits scratch: bed_simd::decode_i8
     // only writes/zeroes miss_bits when a SNP has missing calls (nmiss > 0), so
@@ -661,7 +728,7 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
 
         format_and_buffer_mlma_block(bs, exIdx, marker, valid_v, additive_af_v,
                                      Xt_Vi_y, xvx_diag, log_pval,
-                                     thr_buf, io_buf, ofile);
+                                     thr_buf, out_state, writer);
 
         snp_done += bs;
         const int cur_pct = (total_m > 0)
@@ -681,7 +748,7 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                      /*bMakeMiss*/   false,
                      {callback});
 
-    flush_io();
+    out_state.flush(writer);
 }
 
 // The "--save-reml and --load-reml" path
@@ -692,7 +759,7 @@ inline void run_mlma_stream_association(RemlState& state,
                                         Marker* marker,
                                         int n,
                                         bool log_pval,
-                                        std::ofstream& ofile,
+                                        gcta_io::AsyncSeqWriter& writer,
                                         double block_mem_budget_gb = 0.0,
                                         FastMlmaMode fast_mlma = FastMlmaMode::Off)
 {
@@ -702,9 +769,14 @@ inline void run_mlma_stream_association(RemlState& state,
     const bool use_llt = state.is_llt;  // selects TRSM (factor = L(V)) vs TRMM (factor = Li(Vi))
 
     if (use_wb) {
-        LOGGER << "MLMA streaming: applying V^{-1} via Woodbury low-rank update "
-            "(V^{-1} = D^{-1} - D^{-1} U_k C U_k^T D^{-1})." << std::endl;
-        Vi_y = woodbury_apply_Vi_f(state.wb, y_adj);
+        if (state.has_cached_Vi_y && state.cached_Vi_y.size() == n) {
+            LOGGER << "MLMA streaming: using precomputed exact V^{-1} y_adj from REML state." << std::endl;
+            Vi_y = state.cached_Vi_y;
+        } else {
+            LOGGER << "MLMA streaming: applying V^{-1} via Woodbury low-rank update "
+                "(V^{-1} = D^{-1} - D^{-1} U_k C U_k^T D^{-1})." << std::endl;
+            Vi_y = woodbury_apply_Vi_f(state.wb, y_adj);
+        }
     } else if (use_llt) {
         // V^{-1} y = U^{-1}(U^{-T} y) via two float triangular solves
         // against U, the (upper) Cholesky factor of V.
@@ -750,7 +822,8 @@ inline void run_mlma_stream_association(RemlState& state,
     if (use_int8_wb) {
         run_mlma_stream_association_woodbury_i8(wb, Vi_y, w_sqrt,
                                                 geno, marker, n,
-                                                BLOCK, log_pval, ofile, fast_mlma);
+                                                BLOCK, log_pval, writer, fast_mlma,
+                                                state.prebuilt_q_uk.has_value() ? &state.prebuilt_q_uk : nullptr);
         return;
     }
 
@@ -787,10 +860,10 @@ inline void run_mlma_stream_association(RemlState& state,
     run_mlma_stream_association_impl(Vi_y, compute_xvx_diag, w_sqrt,
                                      geno, marker, n,
                                      BLOCK,
-                                     log_pval, ofile);
+                                     log_pval, writer);
 }
 
-//The "inline REML" path
+// The "inline REML" path
 inline void run_mlma_stream_association(RemlCtx& ctx,
                                         const Eigen::VectorXf& y_adj,
                                         const Eigen::VectorXf& w_sqrt,
@@ -798,11 +871,51 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
                                         Marker* marker,
                                         int n,
                                         bool log_pval,
-                                        std::ofstream& ofile,
+                                        gcta_io::AsyncSeqWriter& writer,
                                         double block_mem_budget_gb = 0.0,
                                         FastMlmaMode fast_mlma = FastMlmaMode::Off)
 {
+    const bool direct_fast_wb = ctx.Vi_use_woodbury_basis &&
+                                (fast_mlma != FastMlmaMode::Off) &&
+                                geno->canUseInt8Mlma() &&
+                                (std::getenv("GCTA_DISABLE_INT8_MLMA") == nullptr);
+    if (direct_fast_wb && !ctx.Uk_is_transposed && ctx.Uk.rows() == n && ctx.Uk.cols() > 0) {
+        // Direct inline quantization from n x k ctx.Uk without ever allocating a
+        // duplicate 4*k*n Uk_f matrix (cuts peak RSS from 80 GB -> 50-60 GB at N=500k, k=20k).
+        const Eigen::VectorXf ck_f = ctx.ck.cast<float>();
+        const Eigen::VectorXf sqrt_ck_f = ck_f.cwiseSqrt();
+        const float sig2e_f = static_cast<float>(ctx.sigma2_eff);
+
+        Eigen::VectorXf u_y = ctx.Uk.transpose() * y_adj;
+        u_y.array() *= ck_f.array();
+        Eigen::VectorXf vi_y = (y_adj - ctx.Uk * u_y) / sig2e_f;
+
+        bool unit_weights = true;
+        double S_w2 = static_cast<double>(n);
+        for (int s = 0; s < n; ++s) {
+            if (std::abs(w_sqrt[s] - 1.0f) > 1.0e-7f) {
+                unit_weights = false;
+                break;
+            }
+        }
+        if (!unit_weights) {
+            S_w2 = w_sqrt.cast<double>().array().square().sum();
+        }
+
+        QuantizedWoodburyUk q_uk = build_quantized_woodbury_uk_from_nxk(
+            ctx.Uk, sqrt_ck_f, w_sqrt, unit_weights, S_w2, fast_mlma);
+        ctx.Uk.resize(0, 0); // free n x k ctx.Uk BEFORE build_reml_state
+
+        RemlState state = reml::build_reml_state(ctx);
+        state.prebuilt_q_uk = std::move(q_uk);
+        state.cached_Vi_y = std::move(vi_y);
+        state.has_cached_Vi_y = true;
+        run_mlma_stream_association(state, y_adj, w_sqrt, geno, marker, n, log_pval, writer,
+                                    block_mem_budget_gb, fast_mlma);
+        return;
+    }
+
     RemlState state = reml::build_reml_state(ctx);
-    run_mlma_stream_association(state, y_adj, w_sqrt, geno, marker, n, log_pval, ofile,
+    run_mlma_stream_association(state, y_adj, w_sqrt, geno, marker, n, log_pval, writer,
                                 block_mem_budget_gb, fast_mlma);
 }

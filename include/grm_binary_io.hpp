@@ -33,10 +33,10 @@
 
 namespace gcta_grm_io {
 
-// Default double-buffered sequential I/O slot size (64 MiB per slot = 128 MiB
-// total for 2 slots): 16-32x larger than Lustre/GPFS 1-4 MiB stripes while
-// keeping pipeline fill/drain latency negligible and bounce RAM bounded.
-inline constexpr size_t kDefaultGrmIoSlotBytes = 64ULL << 20;
+// Default double-buffered sequential I/O slot size (256 MiB per slot = 512 MiB
+// total for 2 slots): matches kMaxAsyncGrmSlotBytes so bottom rows of large
+// GRMs keep plenty of rows per chunk across high core counts while keeping RAM bounded.
+inline constexpr size_t kDefaultGrmIoSlotBytes = 256ULL << 20;
 inline constexpr size_t kMaxAsyncGrmSlotBytes  = 256ULL << 20;
 
 // ---------------------------------------------------------------------------
@@ -576,6 +576,7 @@ inline void read_grm_binary(const std::string& prefix,
     try {
         gcta_io::AsyncSeqReader reader(fd, resolved.data_path, std::move(io_chunks),
                                        /*max_slot_bytes=*/0, /*take_ownership=*/true);
+        const int unpack_nt = std::max(1, omp_get_max_threads() - 1);
         const char* raw_ptr = nullptr;
         size_t raw_len = 0;
         size_t plan_idx = 0;
@@ -584,11 +585,13 @@ inline void read_grm_binary(const std::string& prefix,
             const int row_cursor = plan.row_lo;
             const int row_end    = plan.row_hi;
             const size_t row_base_cursor = static_cast<size_t>(row_cursor) * (row_cursor + 1) / 2;
+            const int rows_in_chunk = row_end - row_cursor;
+            const int dyn_chunk = std::clamp(rows_in_chunk / std::max(1, unpack_nt * 4), 1, 16);
 
             if (is_f16) {
                 const auto* chunk_f16 = reinterpret_cast<const GrmFp16*>(raw_ptr);
                 if (accum_traces) {
-                    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                    #pragma omp parallel for num_threads(unpack_nt) reduction(+:tr_K, tr_K2) schedule(dynamic, dyn_chunk)
                     for (int i = row_cursor; i < row_end; ++i) {
                         const size_t local_off = static_cast<size_t>(i) * (i + 1) / 2 - row_base_cursor;
                         const GrmFp16* __restrict__ src_row = chunk_f16 + local_off;
@@ -608,7 +611,7 @@ inline void read_grm_binary(const std::string& prefix,
                         tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
                     }
                 } else {
-                    #pragma omp parallel for schedule(dynamic, 64)
+                    #pragma omp parallel for num_threads(unpack_nt) schedule(dynamic, dyn_chunk)
                     for (int i = row_cursor; i < row_end; ++i) {
                         const size_t local_off = static_cast<size_t>(i) * (i + 1) / 2 - row_base_cursor;
                         const GrmFp16* __restrict__ src_row = chunk_f16 + local_off;
@@ -623,7 +626,7 @@ inline void read_grm_binary(const std::string& prefix,
             } else {
                 const auto* chunk_f32 = reinterpret_cast<const float*>(raw_ptr);
                 if (accum_traces) {
-                    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                    #pragma omp parallel for num_threads(unpack_nt) reduction(+:tr_K, tr_K2) schedule(dynamic, dyn_chunk)
                     for (int i = row_cursor; i < row_end; ++i) {
                         const size_t local_off = static_cast<size_t>(i) * (i + 1) / 2 - row_base_cursor;
                         const float* __restrict__ src_row = chunk_f32 + local_off;
@@ -643,7 +646,7 @@ inline void read_grm_binary(const std::string& prefix,
                         tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
                     }
                 } else {
-                    #pragma omp parallel for schedule(dynamic, 64)
+                    #pragma omp parallel for num_threads(unpack_nt) schedule(dynamic, dyn_chunk)
                     for (int i = row_cursor; i < row_end; ++i) {
                         const size_t local_off = static_cast<size_t>(i) * (i + 1) / 2 - row_base_cursor;
                         if constexpr (std::is_same_v<Scalar, float>) {
@@ -691,13 +694,51 @@ inline void read_grm_binary(const std::string& prefix,
 inline std::vector<int> match_ids_to_grm(const std::vector<std::string>& ref_ids,
                                           const std::vector<std::string>& grm_ids)
 {
+    const size_t n_ref = ref_ids.size();
+    const size_t n_grm = grm_ids.size();
+    std::vector<int> kp(n_ref, -1);
+    if (n_ref == 0 || n_grm == 0) return kp;
+
+    // Fast path 1: exact identity (same count & identical order).
+    if (n_ref == n_grm) {
+        bool all_equal = true;
+        for (size_t i = 0; i < n_ref; ++i) {
+            if (ref_ids[i] != grm_ids[i]) {
+                all_equal = false;
+                break;
+            }
+        }
+        if (all_equal) {
+            for (size_t i = 0; i < n_ref; ++i) kp[i] = static_cast<int>(i);
+            return kp;
+        }
+    }
+
+    // Fast path 2: strictly increasing ordered subsequence (--keep / --remove).
+    if (n_ref <= n_grm) {
+        size_t g = 0;
+        bool matched_in_order = true;
+        for (size_t i = 0; i < n_ref; ++i) {
+            while (g < n_grm && grm_ids[g] != ref_ids[i]) {
+                ++g;
+            }
+            if (g >= n_grm) {
+                matched_in_order = false;
+                break;
+            }
+            kp[i] = static_cast<int>(g);
+            ++g;
+        }
+        if (matched_in_order) return kp;
+        std::fill(kp.begin(), kp.end(), -1);
+    }
+
     std::unordered_map<std::string, int> grm_map;
-    grm_map.reserve(grm_ids.size() * 2);
-    for (int i = 0; i < static_cast<int>(grm_ids.size()); ++i)
+    grm_map.reserve(n_grm * 2);
+    for (int i = 0; i < static_cast<int>(n_grm); ++i)
         grm_map.emplace(grm_ids[i], i);
 
-    std::vector<int> kp(ref_ids.size(), -1);
-    for (int i = 0; i < static_cast<int>(ref_ids.size()); ++i) {
+    for (int i = 0; i < static_cast<int>(n_ref); ++i) {
         if (const auto it = grm_map.find(ref_ids[i]); it != grm_map.end())
             kp[i] = it->second;
     }
@@ -1677,27 +1718,44 @@ public:
     Eigen::Ref<const Eigen::MatrixXf> read_tile_f32_T(int rs, int re, int cs, int ce) const {
         const int tile_rows = re - rs, tile_cols = ce - cs;
         if (tile_scratch_f32_T_.rows() < tile_cols || tile_scratch_f32_T_.cols() < tile_rows) {
+            const Eigen::Index want_rows = std::max<Eigen::Index>(tile_scratch_f32_T_.rows(), static_cast<Eigen::Index>(tile_cols));
+            const Eigen::Index padded_rows = ((want_rows & 1023) == 0) ? (want_rows + 16) : want_rows;
             tile_scratch_f32_T_.resize(
-                std::max<Eigen::Index>(tile_scratch_f32_T_.rows(), tile_cols),
-                std::max<Eigen::Index>(tile_scratch_f32_T_.cols(), tile_rows));
+                padded_rows,
+                std::max<Eigen::Index>(tile_scratch_f32_T_.cols(), static_cast<Eigen::Index>(tile_rows)));
         }
         auto tile_T = tile_scratch_f32_T_.topLeftCorner(tile_cols, tile_rows);
         const bool diagonal_tile = (rs == cs);
         const GrmFp16* base = packed_.get();
 
-        #pragma omp parallel for schedule(guided)
-        for (int lp = 0; lp < tile_rows; ++lp) {
-            const int gi = rs + lp;
-            const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
-            if (lq_end == 0) continue;
-            const GrmFp16* __restrict__ src = base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
-            float* __restrict__ dst = tile_T.col(lp).data();
-            #pragma omp simd
-            for (int lq = 0; lq < lq_end; ++lq) {
-                dst[lq] = fp16_to_f32(src[lq]);
+        if (diagonal_tile) {
+            const int half_pairs = (tile_rows + 1) / 2;
+            #pragma omp parallel for schedule(static) if (static_cast<size_t>(tile_rows) * static_cast<size_t>(tile_rows) >= 32768)
+            for (int p = 0; p < half_pairs; ++p) {
+                const int lps[2] = { p, tile_rows - 1 - p };
+                const int cnt = (lps[0] == lps[1]) ? 1 : 2;
+                for (int k = 0; k < cnt; ++k) {
+                    const int lp = lps[k];
+                    const int gi = rs + lp;
+                    const GrmFp16* __restrict__ src = base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
+                    float* __restrict__ dst = tile_T.col(lp).data();
+                    #pragma omp simd
+                    for (int lq = 0; lq < lp; ++lq) {
+                        dst[lq] = fp16_to_f32(src[lq]);
+                    }
+                    dst[lp] = diag_f32_[gi];
+                }
             }
-            if (diagonal_tile) {
-                dst[lp] = diag_f32_[gi];
+        } else {
+            #pragma omp parallel for schedule(static) if (static_cast<size_t>(tile_rows) * static_cast<size_t>(tile_cols) >= 16384)
+            for (int lp = 0; lp < tile_rows; ++lp) {
+                const int gi = rs + lp;
+                const GrmFp16* __restrict__ src = base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
+                float* __restrict__ dst = tile_T.col(lp).data();
+                #pragma omp simd
+                for (int lq = 0; lq < tile_cols; ++lq) {
+                    dst[lq] = fp16_to_f32(src[lq]);
+                }
             }
         }
         return tile_T;
@@ -1707,27 +1765,44 @@ public:
     Eigen::Ref<const Eigen::MatrixXd> read_tile_T(int rs, int re, int cs, int ce) const {
         const int tile_rows = re - rs, tile_cols = ce - cs;
         if (tile_scratch_f64_T_.rows() < tile_cols || tile_scratch_f64_T_.cols() < tile_rows) {
+            const Eigen::Index want_rows = std::max<Eigen::Index>(tile_scratch_f64_T_.rows(), static_cast<Eigen::Index>(tile_cols));
+            const Eigen::Index padded_rows = ((want_rows & 511) == 0) ? (want_rows + 8) : want_rows;
             tile_scratch_f64_T_.resize(
-                std::max<Eigen::Index>(tile_scratch_f64_T_.rows(), tile_cols),
-                std::max<Eigen::Index>(tile_scratch_f64_T_.cols(), tile_rows));
+                padded_rows,
+                std::max<Eigen::Index>(tile_scratch_f64_T_.cols(), static_cast<Eigen::Index>(tile_rows)));
         }
         auto tile_T = tile_scratch_f64_T_.topLeftCorner(tile_cols, tile_rows);
         const bool diagonal_tile = (rs == cs);
         const GrmFp16* base = packed_.get();
 
-        #pragma omp parallel for schedule(guided)
-        for (int lp = 0; lp < tile_rows; ++lp) {
-            const int gi = rs + lp;
-            const int lq_end = diagonal_tile ? (lp + 1) : tile_cols;
-            if (lq_end == 0) continue;
-            const GrmFp16* __restrict__ src = base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
-            double* __restrict__ dst = tile_T.col(lp).data();
-            #pragma omp simd
-            for (int lq = 0; lq < lq_end; ++lq) {
-                dst[lq] = static_cast<double>(fp16_to_f32(src[lq]));
+        if (diagonal_tile) {
+            const int half_pairs = (tile_rows + 1) / 2;
+            #pragma omp parallel for schedule(static) if (static_cast<size_t>(tile_rows) * static_cast<size_t>(tile_rows) >= 32768)
+            for (int p = 0; p < half_pairs; ++p) {
+                const int lps[2] = { p, tile_rows - 1 - p };
+                const int cnt = (lps[0] == lps[1]) ? 1 : 2;
+                for (int k = 0; k < cnt; ++k) {
+                    const int lp = lps[k];
+                    const int gi = rs + lp;
+                    const GrmFp16* __restrict__ src = base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
+                    double* __restrict__ dst = tile_T.col(lp).data();
+                    #pragma omp simd
+                    for (int lq = 0; lq < lp; ++lq) {
+                        dst[lq] = static_cast<double>(fp16_to_f32(src[lq]));
+                    }
+                    dst[lp] = static_cast<double>(diag_f32_[gi]);
+                }
             }
-            if (diagonal_tile) {
-                dst[lp] = static_cast<double>(diag_f32_[gi]);
+        } else {
+            #pragma omp parallel for schedule(static) if (static_cast<size_t>(tile_rows) * static_cast<size_t>(tile_cols) >= 16384)
+            for (int lp = 0; lp < tile_rows; ++lp) {
+                const int gi = rs + lp;
+                const GrmFp16* __restrict__ src = base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
+                double* __restrict__ dst = tile_T.col(lp).data();
+                #pragma omp simd
+                for (int lq = 0; lq < tile_cols; ++lq) {
+                    dst[lq] = static_cast<double>(fp16_to_f32(src[lq]));
+                }
             }
         }
         return tile_T;
@@ -1810,6 +1885,7 @@ struct PackedGrmFp16Handle {
     double m_snps = -1.0;
     double trace_K = 0.0;
     double trace_K2 = 0.0;
+    uint64_t id_hash = 0;
     int chunk_rows = 0;
 };
 
@@ -1819,7 +1895,8 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
     bool need_m_snps = false,
     const std::string& caller_flag = "--grm-fp16",
     size_t grm_read_chunk_bytes = kDefaultGrmIoSlotBytes,
-    const std::vector<std::string>* preloaded_grm_ids = nullptr)
+    const std::vector<std::string>* preloaded_grm_ids = nullptr,
+    bool direct_identity_f16 = true)
 {
     LOGGER.ts("grm_fp16");
     using std::to_string;
@@ -1874,11 +1951,17 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
         detail::validate_f32_bin_size(fd, resolved.data_path, n_grm);
     }
 
+    const bool use_header_traces = is_native_f16 && is_identity && ((hdr.flags & kGrmF16FlagHasTraces) != 0);
+    const bool use_direct_identity_f16 = direct_identity_f16 && is_native_f16 && is_identity && use_header_traces;
+
     const size_t tri_n = static_cast<size_t>(n) * (n + 1) / 2;
     const double packed_gb = static_cast<double>(tri_n * sizeof(GrmFp16)) / 1e9;
     LOGGER.i(0, caller_flag + ": loading [" + resolved.data_path + "] into packed fp16 lower triangle (" +
                 to_string(packed_gb) + " GB for n=" + to_string(n) +
-                (is_native_f16 ? ", native .grm.f16 direct stream" : ", converting float32 -> fp16") + ") ...");
+                (use_direct_identity_f16
+                    ? ", native .grm.f16 direct pread"
+                    : (is_native_f16 ? ", native .grm.f16 async stream" : ", converting float32 -> fp16")) +
+                ") ...");
 
     // Uninitialized allocation with parallel OpenMP first-touch distributes pages across NUMA nodes.
     AlignedUniquePtr<GrmFp16, 64> packed = make_aligned_uninitialized<GrmFp16, 64>(tri_n);
@@ -1900,192 +1983,252 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
         }
     }
 
-    const bool use_header_traces = is_native_f16 && is_identity && ((hdr.flags & kGrmF16FlagHasTraces) != 0);
     double tr_K  = use_header_traces ? hdr.trace_K : 0.0;
     double tr_K2 = use_header_traces ? hdr.trace_K2 : 0.0;
 
-    const size_t slot_bytes = std::clamp<size_t>(grm_read_chunk_bytes, 1ULL << 20, kMaxAsyncGrmSlotBytes);
-    const size_t max_elems_per_chunk = std::max<size_t>(1, slot_bytes / elem_bytes);
+    if (use_direct_identity_f16) {
+        struct ScopedFd {
+            int fd = -1;
+            ~ScopedFd() { if (fd >= 0) ::close(fd); }
+        } fd_guard{fd};
 
-    std::vector<detail::RowChunkPlan> plans;
-    std::vector<std::pair<off_t, size_t>> io_chunks;
-    detail::build_row_chunk_plan(n_grm, &kp, is_identity, max_elems_per_chunk,
-                                 body_off, elem_bytes, plans, io_chunks);
+        if (tri_n > 0) {
+            GrmFp16* const packed_ptr = packed.get();
+            const int use_nt = std::min(std::max(1, omp_get_max_threads()), std::max(1, n));
+            std::vector<int> touch_bounds;
+            #pragma omp parallel num_threads(use_nt)
+            {
+                const int tid = omp_get_thread_num();
+                const int nt  = omp_get_num_threads();
+                #pragma omp single
+                {
+                    touch_bounds = triangular_row_partition(n, nt);
+                }
+                const int num_parts = static_cast<int>(touch_bounds.size()) - 1;
+                const int r_lo = (tid < num_parts) ? touch_bounds[static_cast<size_t>(tid)] : n;
+                const int r_hi = (tid < num_parts) ? touch_bounds[static_cast<size_t>(tid + 1)] : n;
+                const size_t byte_lo = (static_cast<size_t>(r_lo) * (r_lo + 1) / 2) * sizeof(GrmFp16);
+                const size_t byte_hi = (static_cast<size_t>(r_hi) * (r_hi + 1) / 2) * sizeof(GrmFp16);
+                if (byte_lo < byte_hi) {
+                    volatile unsigned char* const vp = reinterpret_cast<volatile unsigned char*>(packed_ptr);
+                    if (tid == 0) vp[byte_lo] = 0;
+                    for (size_t pg = (byte_lo + 4095u) & ~size_t(4095u); pg < byte_hi; pg += 4096u) {
+                        vp[pg] = 0;
+                    }
+                }
+            }
 
-    try {
-        gcta_io::AsyncSeqReader reader(fd, resolved.data_path, std::move(io_chunks),
-                                       /*max_slot_bytes=*/0, /*take_ownership=*/true);
-        GrmFp16* packed_ptr = packed.get();
-        const char* raw_ptr = nullptr;
-        size_t raw_len = 0;
-        size_t plan_idx = 0;
-        while (reader.next_slot(raw_ptr, raw_len)) {
-            const auto& plan = plans[plan_idx++];
-            const int row_cursor = plan.row_lo;
-            const int j_cursor   = plan.j_lo;
-            const int j_end      = plan.j_hi;
-            const size_t row_base_cursor = static_cast<size_t>(row_cursor) * (row_cursor + 1) / 2;
+            const size_t total_bytes = tri_n * sizeof(GrmFp16);
+            const size_t direct_chunk = std::clamp<size_t>(grm_read_chunk_bytes, 1ULL << 20, kMaxIoChunkBytes);
+            char* const dst_bytes = reinterpret_cast<char*>(packed_ptr);
+            try {
+                for (size_t done = 0; done < total_bytes; ) {
+                    const size_t step = std::min(direct_chunk, total_bytes - done);
+                    gcta_io::read_exact_at_throwing(
+                        fd, dst_bytes + done, step, body_off + static_cast<off_t>(done), resolved.data_path);
+                    done += step;
+                }
+            } catch (const std::exception& e) {
+                LOGGER.e(0, std::string("Failed reading GRM [") + resolved.data_path + "]: " + e.what());
+            }
+        }
+    } else {
+        const size_t slot_bytes = std::clamp<size_t>(grm_read_chunk_bytes, 1ULL << 20, kMaxAsyncGrmSlotBytes);
+        const size_t max_elems_per_chunk = std::max<size_t>(1, slot_bytes / elem_bytes);
 
-            if (is_native_f16) {
-                const auto* src_f16 = reinterpret_cast<const GrmFp16*>(raw_ptr);
-                if (is_identity) {
-                    if (use_header_traces) {
-                        // Direct parallel OpenMP memcpy into packed_ (NUMA parallel first-touch,
-                        // zero f32->fp16 conversion, O(1) header traces).
-                        #pragma omp parallel for schedule(static)
+        std::vector<detail::RowChunkPlan> plans;
+        std::vector<std::pair<off_t, size_t>> io_chunks;
+        detail::build_row_chunk_plan(n_grm, &kp, is_identity, max_elems_per_chunk,
+                                     body_off, elem_bytes, plans, io_chunks);
+
+        try {
+            gcta_io::AsyncSeqReader reader(fd, resolved.data_path, std::move(io_chunks),
+                                           /*max_slot_bytes=*/0, /*take_ownership=*/true);
+            const int unpack_nt = std::max(1, omp_get_max_threads() - 1);
+            GrmFp16* packed_ptr = packed.get();
+            const char* raw_ptr = nullptr;
+            size_t raw_len = 0;
+            size_t plan_idx = 0;
+            while (reader.next_slot(raw_ptr, raw_len)) {
+                const auto& plan = plans[plan_idx++];
+                const int row_cursor = plan.row_lo;
+                const int j_cursor   = plan.j_lo;
+                const int j_end      = plan.j_hi;
+                const size_t row_base_cursor = static_cast<size_t>(row_cursor) * (row_cursor + 1) / 2;
+                const int rows_in_chunk = j_end - j_cursor;
+                const int dyn_chunk = std::clamp(rows_in_chunk / std::max(1, unpack_nt * 4), 1, 16);
+
+                if (is_native_f16) {
+                    const auto* src_f16 = reinterpret_cast<const GrmFp16*>(raw_ptr);
+                    if (is_identity) {
+                        if (use_header_traces) {
+                            // Flat byte-slice memcpy into packed_ (NUMA parallel first-touch, zero copy per row).
+                            char* const dst_base = reinterpret_cast<char*>(packed_ptr + row_base_cursor);
+                            const size_t total_bytes = raw_len;
+                            if (unpack_nt > 1 && total_bytes >= (256ULL << 10)) {
+                                #pragma omp parallel num_threads(unpack_nt)
+                                {
+                                    const int tid = omp_get_thread_num();
+                                    const int nt  = omp_get_num_threads();
+                                    const size_t lo = ((total_bytes * static_cast<size_t>(tid)) / static_cast<size_t>(nt)) & ~size_t(63);
+                                    const size_t hi = (tid + 1 == nt)
+                                        ? total_bytes
+                                        : (((total_bytes * static_cast<size_t>(tid + 1)) / static_cast<size_t>(nt)) & ~size_t(63));
+                                    if (hi > lo) {
+                                        std::memcpy(dst_base + lo, raw_ptr + lo, hi - lo);
+                                    }
+                                }
+                            } else if (total_bytes > 0) {
+                                std::memcpy(dst_base, raw_ptr, total_bytes);
+                            }
+                        } else {
+                            #pragma omp parallel for num_threads(unpack_nt) reduction(+:tr_K, tr_K2) schedule(dynamic, dyn_chunk)
+                            for (int j = j_cursor; j < j_end; ++j) {
+                                const size_t dst_off = static_cast<size_t>(j) * (j + 1) / 2;
+                                const GrmFp16* __restrict__ src_row = src_f16 + (dst_off - row_base_cursor);
+                                GrmFp16* __restrict__ dst_row = packed_ptr + dst_off;
+                                std::memcpy(dst_row, src_row, static_cast<size_t>(j + 1) * sizeof(GrmFp16));
+                                double row_off_sq = 0.0;
+                                #pragma omp simd reduction(+:row_off_sq)
+                                for (int i = 0; i < j; ++i) {
+                                    const double vd = static_cast<double>(fp16_to_f32(src_row[i]));
+                                    row_off_sq += vd * vd;
+                                }
+                                const double diag_d = static_cast<double>(diag_f32[j]);
+                                tr_K  += diag_d;
+                                tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
+                            }
+                        }
+                    } else if (!kp_runs.empty()) {
+                        #pragma omp parallel for num_threads(unpack_nt) reduction(+:tr_K, tr_K2) schedule(dynamic, dyn_chunk)
                         for (int j = j_cursor; j < j_end; ++j) {
-                            const size_t dst_off = static_cast<size_t>(j) * (j + 1) / 2;
-                            const size_t src_off = dst_off - row_base_cursor;
-                            std::memcpy(packed_ptr + dst_off, src_f16 + src_off,
-                                        static_cast<size_t>(j + 1) * sizeof(GrmFp16));
+                            const int r_grm = kp[static_cast<size_t>(j)];
+                            const GrmFp16* __restrict__ src_row = src_f16 +
+                                (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
+                            GrmFp16* __restrict__ dst_row = packed_ptr +
+                                static_cast<size_t>(j) * (j + 1) / 2;
+                            double row_off_sq = 0.0;
+                            for (const KpRun& r : kp_runs) {
+                                if (r.dst_start >= j) break;
+                                const int cnt = std::min(r.len, j - r.dst_start);
+                                const GrmFp16* __restrict__ src_seg = src_row + r.src_start;
+                                GrmFp16* __restrict__ dst_seg = dst_row + r.dst_start;
+                                std::memcpy(dst_seg, src_seg, static_cast<size_t>(cnt) * sizeof(GrmFp16));
+                                #pragma omp simd reduction(+:row_off_sq)
+                                for (int k = 0; k < cnt; ++k) {
+                                    const double vd = static_cast<double>(fp16_to_f32(src_seg[k]));
+                                    row_off_sq += vd * vd;
+                                }
+                            }
+                            dst_row[j] = src_row[r_grm];
+                            const double diag_d = static_cast<double>(diag_f32[j]);
+                            tr_K  += diag_d;
+                            tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
                         }
                     } else {
-                        #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                        #pragma omp parallel for num_threads(unpack_nt) reduction(+:tr_K, tr_K2) schedule(dynamic, dyn_chunk)
                         for (int j = j_cursor; j < j_end; ++j) {
-                            const size_t dst_off = static_cast<size_t>(j) * (j + 1) / 2;
-                            const GrmFp16* __restrict__ src_row = src_f16 + (dst_off - row_base_cursor);
-                            GrmFp16* __restrict__ dst_row = packed_ptr + dst_off;
-                            std::memcpy(dst_row, src_row, static_cast<size_t>(j + 1) * sizeof(GrmFp16));
+                            const int r_grm = kp[static_cast<size_t>(j)];
+                            const GrmFp16* __restrict__ src_row = src_f16 +
+                                (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
+                            GrmFp16* __restrict__ dst_row = packed_ptr +
+                                static_cast<size_t>(j) * (j + 1) / 2;
                             double row_off_sq = 0.0;
-                            #pragma omp simd reduction(+:row_off_sq)
                             for (int i = 0; i < j; ++i) {
-                                const double vd = static_cast<double>(fp16_to_f32(src_row[i]));
+                                const GrmFp16 h = src_row[kp[static_cast<size_t>(i)]];
+                                dst_row[i] = h;
+                                const double vd = static_cast<double>(fp16_to_f32(h));
                                 row_off_sq += vd * vd;
                             }
+                            dst_row[j] = src_row[r_grm];
                             const double diag_d = static_cast<double>(diag_f32[j]);
                             tr_K  += diag_d;
                             tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
                         }
                     }
-                } else if (!kp_runs.empty()) {
-                    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
-                    for (int j = j_cursor; j < j_end; ++j) {
-                        const int r_grm = kp[static_cast<size_t>(j)];
-                        const GrmFp16* __restrict__ src_row = src_f16 +
-                            (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
-                        GrmFp16* __restrict__ dst_row = packed_ptr +
-                            static_cast<size_t>(j) * (j + 1) / 2;
-                        double row_off_sq = 0.0;
-                        for (const KpRun& r : kp_runs) {
-                            if (r.dst_start >= j) break;
-                            const int cnt = std::min(r.len, j - r.dst_start);
-                            const GrmFp16* __restrict__ src_seg = src_row + r.src_start;
-                            GrmFp16* __restrict__ dst_seg = dst_row + r.dst_start;
-                            std::memcpy(dst_seg, src_seg, static_cast<size_t>(cnt) * sizeof(GrmFp16));
-                            #pragma omp simd reduction(+:row_off_sq)
-                            for (int k = 0; k < cnt; ++k) {
-                                const double vd = static_cast<double>(fp16_to_f32(src_seg[k]));
-                                row_off_sq += vd * vd;
-                            }
-                        }
-                        dst_row[j] = src_row[r_grm];
-                        const double diag_d = static_cast<double>(diag_f32[j]);
-                        tr_K  += diag_d;
-                        tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
-                    }
                 } else {
-                    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
-                    for (int j = j_cursor; j < j_end; ++j) {
-                        const int r_grm = kp[static_cast<size_t>(j)];
-                        const GrmFp16* __restrict__ src_row = src_f16 +
-                            (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
-                        GrmFp16* __restrict__ dst_row = packed_ptr +
-                            static_cast<size_t>(j) * (j + 1) / 2;
-                        double row_off_sq = 0.0;
-                        for (int i = 0; i < j; ++i) {
-                            const GrmFp16 h = src_row[kp[static_cast<size_t>(i)]];
-                            dst_row[i] = h;
-                            const double vd = static_cast<double>(fp16_to_f32(h));
-                            row_off_sq += vd * vd;
-                        }
-                        dst_row[j] = src_row[r_grm];
-                        const double diag_d = static_cast<double>(diag_f32[j]);
-                        tr_K  += diag_d;
-                        tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
-                    }
-                }
-            } else {
-                const auto* src_f32 = reinterpret_cast<const float*>(raw_ptr);
-                if (is_identity) {
-                    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
-                    for (int j = j_cursor; j < j_end; ++j) {
-                        const float* __restrict__ src_row = src_f32 +
-                            (static_cast<size_t>(j) * (j + 1) / 2 - row_base_cursor);
-                        GrmFp16* __restrict__ dst_row = packed_ptr +
-                            static_cast<size_t>(j) * (j + 1) / 2;
-                        double row_off_sq = 0.0;
-                        #pragma omp simd reduction(+:row_off_sq)
-                        for (int i = 0; i < j; ++i) {
-                            const float v = src_row[i];
-                            dst_row[i] = f32_to_fp16(v);
-                            const double vd = static_cast<double>(v);
-                            row_off_sq += vd * vd;
-                        }
-                        const float diag_v = src_row[j];
-                        dst_row[j] = f32_to_fp16(diag_v);
-                        diag_f32[j] = diag_v;
-                        const double diag_d = static_cast<double>(diag_v);
-                        tr_K  += diag_d;
-                        tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
-                    }
-                } else if (!kp_runs.empty()) {
-                    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
-                    for (int j = j_cursor; j < j_end; ++j) {
-                        const int r_grm = kp[static_cast<size_t>(j)];
-                        const float* __restrict__ src_row = src_f32 +
-                            (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
-                        GrmFp16* __restrict__ dst_row = packed_ptr +
-                            static_cast<size_t>(j) * (j + 1) / 2;
-                        double row_off_sq = 0.0;
-                        for (const KpRun& r : kp_runs) {
-                            if (r.dst_start >= j) break;
-                            const int cnt = std::min(r.len, j - r.dst_start);
-                            const float* __restrict__ src_seg = src_row + r.src_start;
-                            GrmFp16* __restrict__ dst_seg = dst_row + r.dst_start;
+                    const auto* src_f32 = reinterpret_cast<const float*>(raw_ptr);
+                    if (is_identity) {
+                        #pragma omp parallel for num_threads(unpack_nt) reduction(+:tr_K, tr_K2) schedule(dynamic, dyn_chunk)
+                        for (int j = j_cursor; j < j_end; ++j) {
+                            const float* __restrict__ src_row = src_f32 +
+                                (static_cast<size_t>(j) * (j + 1) / 2 - row_base_cursor);
+                            GrmFp16* __restrict__ dst_row = packed_ptr +
+                                static_cast<size_t>(j) * (j + 1) / 2;
+                            double row_off_sq = 0.0;
                             #pragma omp simd reduction(+:row_off_sq)
-                            for (int k = 0; k < cnt; ++k) {
-                                const float v = src_seg[k];
-                                dst_seg[k] = f32_to_fp16(v);
+                            for (int i = 0; i < j; ++i) {
+                                const float v = src_row[i];
+                                dst_row[i] = f32_to_fp16(v);
                                 const double vd = static_cast<double>(v);
                                 row_off_sq += vd * vd;
                             }
+                            const float diag_v = src_row[j];
+                            dst_row[j] = f32_to_fp16(diag_v);
+                            diag_f32[j] = diag_v;
+                            const double diag_d = static_cast<double>(diag_v);
+                            tr_K  += diag_d;
+                            tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
                         }
-                        const float diag_v = src_row[r_grm];
-                        dst_row[j] = f32_to_fp16(diag_v);
-                        diag_f32[j] = diag_v;
-                        const double diag_d = static_cast<double>(diag_v);
-                        tr_K  += diag_d;
-                        tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
-                    }
-                } else {
-                    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
-                    for (int j = j_cursor; j < j_end; ++j) {
-                        const int r_grm = kp[static_cast<size_t>(j)];
-                        const float* __restrict__ src_row = src_f32 +
-                            (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
-                        GrmFp16* __restrict__ dst_row = packed_ptr +
-                            static_cast<size_t>(j) * (j + 1) / 2;
-                        double row_off_sq = 0.0;
-                        for (int i = 0; i < j; ++i) {
-                            const float v = src_row[kp[static_cast<size_t>(i)]];
-                            dst_row[i] = f32_to_fp16(v);
-                            const double vd = static_cast<double>(v);
-                            row_off_sq += vd * vd;
+                    } else if (!kp_runs.empty()) {
+                        #pragma omp parallel for num_threads(unpack_nt) reduction(+:tr_K, tr_K2) schedule(dynamic, dyn_chunk)
+                        for (int j = j_cursor; j < j_end; ++j) {
+                            const int r_grm = kp[static_cast<size_t>(j)];
+                            const float* __restrict__ src_row = src_f32 +
+                                (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
+                            GrmFp16* __restrict__ dst_row = packed_ptr +
+                                static_cast<size_t>(j) * (j + 1) / 2;
+                            double row_off_sq = 0.0;
+                            for (const KpRun& r : kp_runs) {
+                                if (r.dst_start >= j) break;
+                                const int cnt = std::min(r.len, j - r.dst_start);
+                                const float* __restrict__ src_seg = src_row + r.src_start;
+                                GrmFp16* __restrict__ dst_seg = dst_row + r.dst_start;
+                                #pragma omp simd reduction(+:row_off_sq)
+                                for (int k = 0; k < cnt; ++k) {
+                                    const float v = src_seg[k];
+                                    dst_seg[k] = f32_to_fp16(v);
+                                    const double vd = static_cast<double>(v);
+                                    row_off_sq += vd * vd;
+                                }
+                            }
+                            const float diag_v = src_row[r_grm];
+                            dst_row[j] = f32_to_fp16(diag_v);
+                            diag_f32[j] = diag_v;
+                            const double diag_d = static_cast<double>(diag_v);
+                            tr_K  += diag_d;
+                            tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
                         }
-                        const float diag_v = src_row[r_grm];
-                        dst_row[j] = f32_to_fp16(diag_v);
-                        diag_f32[j] = diag_v;
-                        const double diag_d = static_cast<double>(diag_v);
-                        tr_K  += diag_d;
-                        tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
+                    } else {
+                        #pragma omp parallel for num_threads(unpack_nt) reduction(+:tr_K, tr_K2) schedule(dynamic, dyn_chunk)
+                        for (int j = j_cursor; j < j_end; ++j) {
+                            const int r_grm = kp[static_cast<size_t>(j)];
+                            const float* __restrict__ src_row = src_f32 +
+                                (static_cast<size_t>(r_grm) * (r_grm + 1) / 2 - row_base_cursor);
+                            GrmFp16* __restrict__ dst_row = packed_ptr +
+                                static_cast<size_t>(j) * (j + 1) / 2;
+                            double row_off_sq = 0.0;
+                            for (int i = 0; i < j; ++i) {
+                                const float v = src_row[kp[static_cast<size_t>(i)]];
+                                dst_row[i] = f32_to_fp16(v);
+                                const double vd = static_cast<double>(v);
+                                row_off_sq += vd * vd;
+                            }
+                            const float diag_v = src_row[r_grm];
+                            dst_row[j] = f32_to_fp16(diag_v);
+                            diag_f32[j] = diag_v;
+                            const double diag_d = static_cast<double>(diag_v);
+                            tr_K  += diag_d;
+                            tr_K2 += diag_d * diag_d + 2.0 * row_off_sq;
+                        }
                     }
                 }
+                reader.release_slot();
             }
-            reader.release_slot();
+            reader.stop();
+        } catch (const std::exception& e) {
+            LOGGER.e(0, std::string("Failed reading GRM [") + resolved.data_path + "]: " + e.what());
         }
-        reader.stop();
-    } catch (const std::exception& e) {
-        LOGGER.e(0, std::string("Failed reading GRM [") + resolved.data_path + "]: " + e.what());
     }
 
     LOGGER.i(0, std::string("The ") + (is_native_f16 ? ".grm.f16" : ".grm.bin") +
@@ -2095,6 +2238,7 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
     handle.chunk_rows = std::min(n, 4096);
     handle.trace_K = tr_K;
     handle.trace_K2 = tr_K2;
+    handle.id_hash = (is_native_f16 && is_identity) ? hdr.id_hash : 0ULL;
     if (need_m_snps) {
         handle.m_snps = is_native_f16 ? hdr.m_snps_mean : read_grm_N_mean(grm_prefix, n_grm, /*prefer_fp16=*/true);
     } else {
@@ -2230,6 +2374,7 @@ inline void load_and_subset_grm_upper(
         try {
             gcta_io::AsyncSeqReader reader(fd, resolved.data_path, std::move(io_chunks),
                                            /*max_slot_bytes=*/0, /*take_ownership=*/true);
+            const int unpack_nt = std::max(1, omp_get_max_threads() - 1);
             const char* raw_ptr = nullptr;
             size_t raw_len = 0;
             size_t plan_idx = 0;
@@ -2239,11 +2384,13 @@ inline void load_and_subset_grm_upper(
                 const int j_cursor   = plan.j_lo;
                 const int j_end      = plan.j_hi;
                 const size_t row_base_cursor = static_cast<size_t>(row_cursor) * (row_cursor + 1) / 2;
+                const int rows_in_chunk = j_end - j_cursor;
+                const int dyn_chunk = std::clamp(rows_in_chunk / std::max(1, unpack_nt * 4), 1, 16);
 
                 if (is_f16) {
                     const auto* chunk_f16 = reinterpret_cast<const GrmFp16*>(raw_ptr);
                     if (!kp_runs.empty()) {
-                        #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                        #pragma omp parallel for num_threads(unpack_nt) reduction(+:tr_K, tr_K2) schedule(dynamic, dyn_chunk)
                         for (int j = j_cursor; j < j_end; ++j) {
                             const int r_grm = kp[static_cast<size_t>(j)];
                             const GrmFp16* __restrict__ row_ptr = chunk_f16 +
@@ -2279,7 +2426,7 @@ inline void load_and_subset_grm_upper(
                             }
                         }
                     } else {
-                        #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                        #pragma omp parallel for num_threads(unpack_nt) reduction(+:tr_K, tr_K2) schedule(dynamic, dyn_chunk)
                         for (int j = j_cursor; j < j_end; ++j) {
                             const int r_grm = kp[static_cast<size_t>(j)];
                             const GrmFp16* row_ptr = chunk_f16 +
@@ -2306,7 +2453,7 @@ inline void load_and_subset_grm_upper(
                 } else {
                     const auto* chunk_f32 = reinterpret_cast<const float*>(raw_ptr);
                     if (!kp_runs.empty()) {
-                        #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                        #pragma omp parallel for num_threads(unpack_nt) reduction(+:tr_K, tr_K2) schedule(dynamic, dyn_chunk)
                         for (int j = j_cursor; j < j_end; ++j) {
                             const int r_grm = kp[static_cast<size_t>(j)];
                             const float* __restrict__ row_ptr = chunk_f32 +
@@ -2354,7 +2501,7 @@ inline void load_and_subset_grm_upper(
                             }
                         }
                     } else {
-                        #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+                        #pragma omp parallel for num_threads(unpack_nt) reduction(+:tr_K, tr_K2) schedule(dynamic, dyn_chunk)
                         for (int j = j_cursor; j < j_end; ++j) {
                             const int r_grm = kp[static_cast<size_t>(j)];
                             const float* row_ptr = chunk_f32 +
@@ -2407,7 +2554,8 @@ inline void load_and_subset_grm_upper(
     G_out.resize(n, n);
     double tr_K = 0.0;
     double tr_K2 = 0.0;
-    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, 64)
+    const int fallback_dyn_chunk = std::clamp(n / std::max(1, omp_get_max_threads() * 4), 1, 16);
+    #pragma omp parallel for reduction(+:tr_K, tr_K2) schedule(dynamic, fallback_dyn_chunk)
     for (int j = 0; j < n; ++j) {
         const int src_col = kp[static_cast<size_t>(j)];
         double row_off_sq = 0.0;

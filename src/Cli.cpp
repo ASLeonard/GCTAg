@@ -490,6 +490,42 @@ RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r, bool add_subcmd_level
                    "Write full standalone .reml instead of thin TREF reference on --woodbury-reuse")
         ->group(g_wb);
 
+    // Hidden developer tuning flags (work on both REML and Woodbury reuse paths)
+    reml->add_flag("--reml-profile", r.reml_profile,
+                   "Dev: Log detailed sub-phase timing and counter breakdown for reml")
+        ->group("");
+    reml->add_option("--reml-matvec-band-rows", r.reml_matvec_band_rows,
+                     "Dev: Row-band height H for strip-coalesced PackedGrmFp16 matvec (0 = auto)")
+        ->check(CLI::NonNegativeNumber)
+        ->group("");
+    reml->add_option("--reml-matvec-col-chunk", r.reml_matvec_col_chunk,
+                     "Dev: Off-diagonal column chunk width C for PackedGrmFp16 matvec (0 = auto)")
+        ->check(CLI::NonNegativeNumber)
+        ->group("");
+    reml->add_option("--reml-qr-power-passes", r.reml_qr_power_passes,
+                     "Dev: CholeskyQR passes on intermediate rSVD power iterations (0 = auto, 1 or 2)")
+        ->check(CLI::Range(0, 2))
+        ->group("");
+    reml->add_flag("--reml-eigh-fp32", r.reml_eigh_fp32,
+                   "Dev: Use float32 ssyevd instead of double dsyevd on Rayleigh-Ritz Gram")
+        ->group("");
+    reml->add_option("--reml-eigh-threads", r.reml_eigh_threads,
+                     "Dev: Cap worker threads during Rayleigh-Ritz symmetric eigensolve (0 = all)")
+        ->check(CLI::NonNegativeNumber)
+        ->group("");
+    reml->add_option("--reml-io-slot-mb", r.reml_io_slot_mb,
+                     "Dev: Async I/O slot size in MiB for GRM load and TUN3 save/reuse")
+        ->check(CLI::PositiveNumber)
+        ->group("");
+    reml->add_option("--reml-reuse-stream", r.reml_reuse_stream,
+                     "Dev: Zero-Uk streaming TREF reuse policy {auto,off,on}")
+        ->transform(make_enum_transformer<RemlReuseStream>(
+            {{"auto", RemlReuseStream::Auto},
+             {"off", RemlReuseStream::Off},
+             {"on", RemlReuseStream::On}},
+            "RemlReuseStream", /*allow_numeric=*/false))
+        ->group("");
+
     const std::vector<CLI::Option*> wb_tuning_opts = {
         o_wb_mp_margin, o_wb_mp_confirm, o_wb_eig_mass, o_wb_eig_k_buffer,
         o_wb_var_tail, o_wb_range, o_wb_mem_budget, o_wb_warm_start,

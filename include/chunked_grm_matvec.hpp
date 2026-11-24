@@ -571,7 +571,13 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
         return Y;
     }
     if (read_tile.fused_symm_fn && read_tile.fused_max_k > 0 && cols <= read_tile.fused_max_k) {
+        const auto t_fg0 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         read_tile.fused_symm_fn(X, Y, trace_K_out, trace_K2_out);
+        if (stats) {
+            stats->gemm_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_fg0).count();
+            stats->tiles += 1;
+            stats->gemm_calls += 1;
+        }
         return Y;
     }
     if (read_tile.large_k_symm_fn && (use_bf16 || cols >= 128 || band_rows > 0 || col_chunk > 0)) {
@@ -631,6 +637,7 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
             const int cols_j = ce - cs;
 
             if (use_T) {
+                const auto t_u0 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 auto tile_T = read_tile.read_T(rs, re, cs, ce);  // cols_j x rows_i
                 const gcta_blas_int ldT = static_cast<gcta_blas_int>(tile_T.outerStride());
                 if (want_tr2) {
@@ -644,6 +651,12 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
                     detail::convert_colmajor_f32_to_bf16(
                         tile_T.data(), ldT, T_bf16.data(),
                         static_cast<gcta_blas_int>(cols_j), static_cast<gcta_blas_int>(rows_i));
+                }
+                const auto t_g0 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                if (stats) {
+                    stats->unpack_s += std::chrono::duration<double>(t_g0 - t_u0).count();
+                }
+                if (use_bf16) {
                     gcta_gemm_bf16bf16f32_colmajor(
                         'T', 'N',
                         static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols),
@@ -672,7 +685,13 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
                                 X_ptr + rs, ldX,
                                 1.0f, Y_ptr + cs, ldY);
                 }
+                if (stats) {
+                    stats->gemm_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_g0).count();
+                    stats->tiles += 1;
+                    stats->gemm_calls += 2;
+                }
             } else {
+                const auto t_u0 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 auto tile = read_tile(rs, re, cs, ce);  // rows_i x cols_j
                 const gcta_blas_int ldT = static_cast<gcta_blas_int>(tile.outerStride());
                 if (want_tr2) {
@@ -686,6 +705,12 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
                     detail::convert_colmajor_f32_to_bf16(
                         tile.data(), ldT, T_bf16.data(),
                         static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols_j));
+                }
+                const auto t_g0 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                if (stats) {
+                    stats->unpack_s += std::chrono::duration<double>(t_g0 - t_u0).count();
+                }
+                if (use_bf16) {
                     gcta_gemm_bf16bf16f32_colmajor(
                         'N', 'N',
                         static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols),
@@ -704,11 +729,17 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
                     Y.middleRows(rs, rows_i).noalias() += tile * X.middleRows(cs, cols_j);
                     Y.middleRows(cs, cols_j).noalias() += tile.transpose() * X.middleRows(rs, rows_i);
                 }
+                if (stats) {
+                    stats->gemm_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_g0).count();
+                    stats->tiles += 1;
+                    stats->gemm_calls += 2;
+                }
             }
         }
 
         // Square diagonal tile [rs, re) x [rs, re)
         if (use_T) {
+            const auto t_u0 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             auto tile_T = read_tile.read_T(rs, re, rs, re);  // rows_i x rows_i, UPPER valid
             const gcta_blas_int ldT = static_cast<gcta_blas_int>(tile_T.outerStride());
             if (want_tr) {
@@ -731,6 +762,12 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
                         static_cast<size_t>(c + 1));
                 }
                 detail::mirror_upper_to_lower_bf16(T_bf16.data(), rows_i);
+            }
+            const auto t_g0 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (stats) {
+                stats->unpack_s += std::chrono::duration<double>(t_g0 - t_u0).count();
+            }
+            if (use_bf16) {
                 gcta_gemm_bf16bf16f32_colmajor(
                     'N', 'N',
                     static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols),
@@ -745,7 +782,13 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
                             X_ptr + rs, ldX,
                             1.0f, Y_ptr + rs, ldY);
             }
+            if (stats) {
+                stats->gemm_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_g0).count();
+                stats->tiles += 1;
+                stats->gemm_calls += 1;
+            }
         } else {
+            const auto t_u0 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             auto tile = read_tile(rs, re, rs, re);  // rows_i x rows_i, LOWER valid
             if (want_tr) {
                 tr_K += tile.diagonal().cast<double>().sum();
@@ -771,6 +814,12 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
                     }
                 }
                 detail::mirror_upper_to_lower_bf16(T_bf16.data(), rows_i);
+            }
+            const auto t_g0 = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (stats) {
+                stats->unpack_s += std::chrono::duration<double>(t_g0 - t_u0).count();
+            }
+            if (use_bf16) {
                 gcta_gemm_bf16bf16f32_colmajor(
                     'N', 'N',
                     static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols),
@@ -781,6 +830,11 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
             } else {
                 Y.middleRows(rs, rows_i).noalias() +=
                     tile.selfadjointView<Eigen::Lower>() * X.middleRows(rs, rows_i);
+            }
+            if (stats) {
+                stats->gemm_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_g0).count();
+                stats->tiles += 1;
+                stats->gemm_calls += 1;
             }
         }
 

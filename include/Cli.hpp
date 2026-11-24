@@ -93,6 +93,8 @@ struct PhenoCovarOptions {
     int covar_maxlevel = 33;
 };
 
+enum class RemlReuseStream { Auto = 0, Off = 1, On = 2 };
+
 struct RemlOptions {
     std::string grm;
     std::string woodbury_reuse;
@@ -132,6 +134,16 @@ struct RemlOptions {
     std::optional<double> ai_robust_risk;
     bool print_trajectory = false;
     std::optional<uint64_t> seed;
+
+    // Hidden developer tuning flags (group("") in CLI)
+    bool reml_profile = false;
+    int reml_matvec_band_rows = 0;
+    int reml_matvec_col_chunk = 0;
+    int reml_qr_power_passes = 0;
+    bool reml_eigh_fp32 = false;
+    int reml_eigh_threads = 0;
+    int reml_io_slot_mb = 256;
+    RemlReuseStream reml_reuse_stream = RemlReuseStream::Auto;
 };
 
 struct GrmMakeOptions {

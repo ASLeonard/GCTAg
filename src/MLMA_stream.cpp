@@ -2692,36 +2692,46 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                             "the Woodbury basis provides an exact tr(PA) and takes precedence — "
                             "--reml-trace-hutchpp is ignored.");
 
+            const size_t reml_io_slot_bytes = static_cast<size_t>(std::max(1, r.reml_io_slot_mb)) << 20;
+            double reml_grm_load_s = 0.0;
+            double reml_save_s = 0.0;
             int grm_chunk_rows = 0;
             Eigen::MatrixXf G_n;      // left empty when grm_chunked or grm_fp16
             double m_all = is_wb_mp ? 0.0 : -1.0;  // only populated when Woodbury-MP mode is selected
             gcta_grm_io::ChunkedGrmHandle chunked_grm;       // only populated when grm_chunked
             gcta_grm_io::PackedGrmFp16Handle fp16_grm;       // only populated when grm_fp16
 
-            if (grm_fp16) {
-                fp16_grm = gcta_grm_io::load_packed_grm_fp16(
-                    grm_pfx, analysis_ids, /*need_m_snps=*/is_wb_mp, "--grm-fp16");
-                grm_chunk_rows = fp16_grm.chunk_rows;
-                m_all = fp16_grm.m_snps;
-            } else if (grm_chunked) {
-                chunked_grm = gcta_grm_io::make_chunked_grm_reader(
-                    grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget",
-                    /*need_m_snps=*/is_wb_mp);
-                grm_chunk_rows = chunked_grm.chunk_rows;
-                m_all = chunked_grm.m_snps;
-                if (grm_chunk_rows >= n) {
-                    LOGGER.w(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
-                                "GB covers the full GRM (n=" + to_string(n) + ") in a single chunk. "
-                                "Falling back to dense loading instead of paying chunking overhead "
-                                "for no benefit.");
-                    chunked_grm = {};
-                    grm_chunked = false;
+            {
+                const auto t_load0 = r.reml_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                if (grm_fp16) {
+                    fp16_grm = gcta_grm_io::load_packed_grm_fp16(
+                        grm_pfx, analysis_ids, /*need_m_snps=*/is_wb_mp, "--grm-fp16",
+                        reml_io_slot_bytes);
+                    grm_chunk_rows = fp16_grm.chunk_rows;
+                    m_all = fp16_grm.m_snps;
+                } else if (grm_chunked) {
+                    chunked_grm = gcta_grm_io::make_chunked_grm_reader(
+                        grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget",
+                        /*need_m_snps=*/is_wb_mp);
+                    grm_chunk_rows = chunked_grm.chunk_rows;
+                    m_all = chunked_grm.m_snps;
+                    if (grm_chunk_rows >= n) {
+                        LOGGER.w(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
+                                    "GB covers the full GRM (n=" + to_string(n) + ") in a single chunk. "
+                                    "Falling back to dense loading instead of paying chunking overhead "
+                                    "for no benefit.");
+                        chunked_grm = {};
+                        grm_chunked = false;
+                    }
                 }
-            }
-            if (!grm_chunked && !grm_fp16 && !reuse_basis) {
-                double m_all_load = (m_all > 0.0) ? -1.0 : m_all;
-                load_and_subset_grm_upper(grm_pfx, analysis_ids, G_n, m_all_load, "--mlma");
-                if (m_all <= 0.0) m_all = m_all_load;
+                if (!grm_chunked && !grm_fp16 && !reuse_basis) {
+                    double m_all_load = (m_all > 0.0) ? -1.0 : m_all;
+                    load_and_subset_grm_upper(grm_pfx, analysis_ids, G_n, m_all_load, "--mlma");
+                    if (m_all <= 0.0) m_all = m_all_load;
+                }
+                if (r.reml_profile) {
+                    reml_grm_load_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
+                }
             }
 
 
@@ -2790,6 +2800,12 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             ctx.reml_ai_robust_tol  = reml_ai_robust_tol;
             ctx.reml_ai_robust_risk = reml_ai_robust_risk;
             ctx.reml_print_trajectory = r.print_trajectory;
+            ctx.reml_profile          = r.reml_profile;
+            ctx.reml_matvec_band_rows = r.reml_matvec_band_rows;
+            ctx.reml_matvec_col_chunk = r.reml_matvec_col_chunk;
+            ctx.reml_qr_power_passes  = r.reml_qr_power_passes;
+            ctx.reml_eigh_fp32        = r.reml_eigh_fp32;
+            ctx.reml_eigh_threads     = r.reml_eigh_threads;
 
             if (!r.woodbury_warm_start.empty()) {
                 if (!have_wb)
@@ -2806,15 +2822,21 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             LoadedBasisInfo reuse_info;
             StreamingReuseHandle streaming_reuse_info;
             if (reuse_basis) {
-                const bool use_streaming_reuse = reml_only && !r.reml_standalone;
+                const bool use_streaming_reuse =
+                    (r.reml_reuse_stream != gcta_cli::RemlReuseStream::Off) &&
+                    reml_only && !r.reml_standalone;
+                const auto t_rl0 = r.reml_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 if (use_streaming_reuse) {
                     streaming_reuse_info = preload_woodbury_subspace_streaming(
-                        r.woodbury_reuse, ctx, id_hash, basis_file_override, 256ULL << 20);
+                        r.woodbury_reuse, ctx, id_hash, basis_file_override, reml_io_slot_bytes);
                     reuse_info.tun3_path  = streaming_reuse_info.tun3_path;
                     reuse_info.basis_hash = streaming_reuse_info.basis_hash;
                 } else {
                     reuse_info = load_woodbury_basis_into_ctx(
-                        r.woodbury_reuse, ctx, id_hash, basis_file_override, 256ULL << 20);
+                        r.woodbury_reuse, ctx, id_hash, basis_file_override, reml_io_slot_bytes);
+                }
+                if (r.reml_profile) {
+                    reml_grm_load_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rl0).count();
                 }
             }
 
@@ -2828,20 +2850,46 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
 
             write_hsq_from_ctx(out_prefix, ctx);
 
+            auto log_reml_profile = [&]() {
+                if (!r.reml_profile) return;
+                const double total_s = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - mlma_t0).count();
+                const auto& p = ctx.reml_rsvd_prof;
+                LOGGER.i(0, std::format(
+                    "[reml-profile] grm_load_s={:.3f} sketch_fill_s={:.3f} sketch_matvec_s={:.3f} "
+                    "power_qr_s={:.3f} power_matvec_s={:.3f} final_qr_s={:.3f} rr_matvec_s={:.3f} "
+                    "gram_s={:.3f} eigh_s={:.3f} rotate_s={:.3f} ai_reml_s={:.3f} save_s={:.3f} "
+                    "total_s={:.3f} matvec_unpack_s={:.3f} matvec_gemm_s={:.3f} matvec_tiles={} "
+                    "matvec_gemm_calls={} qr_calls={} qr_passes={} qr_shifted={} qr_householder={} "
+                    "reuse_stream={}",
+                    reml_grm_load_s, p.sketch_fill_s, p.sketch_matvec_s,
+                    p.power_qr_s, p.power_matvec_s, p.final_qr_s, p.rr_matvec_s,
+                    p.gram_s, p.eigh_s, p.rotate_s, ctx.reml_ai_s, reml_save_s,
+                    total_s, p.matvec_unpack_s, p.matvec_gemm_s, p.matvec_tiles,
+                    p.matvec_gemm_calls, p.qr_calls, p.qr_passes, p.qr_shifted, p.qr_householder,
+                    streaming_reuse_info.active ? 1 : 0));
+            };
+
             if (reml_only) {
                 const string save_reml_file = out_prefix + ".reml";
                 LOGGER.i(0, "Saving REML state to [" + save_reml_file + "] ...");
                 LOGGER.ts("save_reml");
+                const auto t_sv0 = r.reml_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 writeRemlStateFromCtx(save_reml_file, ctx, no_adj_covar, id_hash,
                                       reuse_info.tun3_path, reuse_info.basis_hash,
                                       r.reml_standalone,
                                       streaming_reuse_info.active ? &streaming_reuse_info : nullptr,
-                                      256ULL << 20);
+                                      reml_io_slot_bytes);
+                if (r.reml_profile) {
+                    reml_save_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_sv0).count();
+                }
                 LOGGER.i(0, "REML state saved in " + to_string(LOGGER.tp("save_reml")) + " seconds.");
+                log_reml_profile();
                 LOGGER.i(0, "REML estimation completed. Use --load-reml " + save_reml_file +
                             " to perform association tests.");
                 return;
             }
+            log_reml_profile();
 
             // Deterministic y_adj = y - X*b
             y_vec = compute_y_adj_deterministic(y_vec, X_design, ctx.b.cast<float>());

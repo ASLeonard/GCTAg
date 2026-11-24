@@ -993,7 +993,7 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
         const int32_t k = static_cast<int32_t>(ctx.dk.size());
         const bool uk_ok = ctx.Uk_is_transposed
             ? (ctx.Uk.rows() == k && ctx.Uk.cols() == n)
-            : (ctx.Uk.rows() == n && ctx.Uk.cols() == k);
+            : (ctx.Uk.rows() == n && ctx.Uk.cols() >= k);
         if (!uk_ok) {
             LOGGER.e(0, "invalid Woodbury REML context dimensions before save.");
         }
@@ -1020,9 +1020,10 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
             uy.array() *= ck_f.array();
             vi_y_f = (y_adj_f - ctx.Uk.transpose() * uy) / sig2e_f;
         } else {
-            Eigen::VectorXf uy = ctx.Uk.transpose() * y_adj_f;
+            const auto Uk_view = ctx.Uk.leftCols(k);
+            Eigen::VectorXf uy = Uk_view.transpose() * y_adj_f;
             uy.array() *= ck_f.array();
-            vi_y_f = (y_adj_f - ctx.Uk * uy) / sig2e_f;
+            vi_y_f = (y_adj_f - Uk_view * uy) / sig2e_f;
         }
 
         const uint32_t flags = kTun3FlagHasViY | (no_adj_covar ? kTun3FlagNoAdjCovar : 0u);

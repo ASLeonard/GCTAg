@@ -1416,7 +1416,7 @@ inline Eigen::VectorXf reconstruct_vi_y_from_q_uk(
 
 // Direct inline quantization from n x k ColMajor ctx.Uk (never allocates 4*k*n Uk_f).
 inline QuantizedWoodburyUk build_quantized_woodbury_uk_from_nxk(
-    const Eigen::MatrixXf& Uk_nxk,
+    const Eigen::Ref<const Eigen::MatrixXf>& Uk_nxk,
     const Eigen::VectorXf& sqrt_ck_f,
     const Eigen::VectorXf& w_sqrt,
     bool unit_weights,
@@ -1435,6 +1435,7 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk_from_nxk(
     const int k_hi = populate_quantized_woodbury_tiles(out, k, n, mode, max_q_rows);
 
     const float* const uk_src      = Uk_nxk.data();
+    const size_t ld_uk             = static_cast<size_t>(Uk_nxk.outerStride());
     const float* const sqrt_ck_ptr = sqrt_ck_f.data();
     const float* const w_ptr       = w_sqrt.data();
 
@@ -1442,7 +1443,7 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk_from_nxk(
     std::vector<float> max_abs_raw(static_cast<size_t>(k), 0.0f);
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < k; ++r) {
-        const float* const col = uk_src + static_cast<size_t>(r) * static_cast<size_t>(n);
+        const float* const col = uk_src + static_cast<size_t>(r) * ld_uk;
         float m = 0.0f;
         if (unit_weights) {
             #pragma omp simd reduction(max:m)
@@ -1511,7 +1512,7 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk_from_nxk(
     const float* const ihi_base = inv_hi_f.data();
     const float* const alo_base = alpha_lo_f.data();
     const float* const ilo_base = inv_lo_f.data();
-    const size_t n_stride = static_cast<size_t>(n);
+    const size_t n_stride = ld_uk;
     const size_t k_stride = static_cast<size_t>(k);
 
     for (int s0 = 0; s0 < n; s0 += slab_max) {

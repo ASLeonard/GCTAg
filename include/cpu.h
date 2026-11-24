@@ -9,6 +9,12 @@
 #include <limits>
 #include <type_traits>
 #include <vector>
+#if defined(__unix__) || defined(__APPLE__)
+  #include <dlfcn.h>
+#endif
+#ifdef _OPENMP
+  #include <omp.h>
+#endif
 #include "Logger.h"
 
 #if defined(__x86_64__) || (defined(_M_X64) && !defined(_M_ARM64EC)) || defined(__amd64)
@@ -154,6 +160,35 @@ inline int gcta_dsyevd(gcta_blas_int n, double* a, gcta_blas_int lda, double* w)
 #endif
 }
 
+// ---- gcta_ssyevd -------------------------------------------------------
+// Single-precision symmetric eigensolver (divide-and-conquer), col-major, upper.
+inline int gcta_ssyevd(gcta_blas_int n, float* a, gcta_blas_int lda, float* w)
+{
+#if defined(GCTA_USE_ACCELERATE)
+    const char    jobz = 'V', uplo = 'U';
+    gcta_blas_int info = 0;
+    gcta_blas_int lwork_q = -1, liwork_q = -1;
+    float         work_sz = 0.0f;
+    gcta_blas_int iwork_sz = 0;
+    ssyevd_(&jobz, &uplo, &n, a, &lda, w,
+            &work_sz, &lwork_q, &iwork_sz, &liwork_q, &info);
+    if (info != 0) return static_cast<int>(info);
+    gcta_blas_int lwork  = static_cast<gcta_blas_int>(work_sz);
+    gcta_blas_int liwork = iwork_sz;
+    std::vector<float>         work(lwork);
+    std::vector<gcta_blas_int> iwork(liwork);
+    ssyevd_(&jobz, &uplo, &n, a, &lda, w,
+            work.data(), &lwork, iwork.data(), &liwork, &info);
+    return static_cast<int>(info);
+#else
+#if !defined(GCTA_USE_MKL) && !defined(GCTA_LAPACKE_IS_MKL)
+    if (n >= 32766) return -1;
+#endif
+    return static_cast<int>(
+        LAPACKE_ssyevd(LAPACK_COL_MAJOR, 'V', 'U', n, a, lda, w));
+#endif
+}
+
 // ---- gcta_dsyevr -------------------------------------------------------
 // Partial symmetric eigensolver (MRRR), index range [il, iu] (1-based, ascending).
 // a[n×n]: input matrix (upper triangle, column-major); overwritten on return.
@@ -198,6 +233,112 @@ inline int gcta_dsyevr(gcta_blas_int n, double* a, gcta_blas_int lda,
                        m_found, w, z, ldz, isuppz));
 #endif
 }
+
+inline int gcta_ssyevr(gcta_blas_int n, float* a, gcta_blas_int lda,
+                       gcta_blas_int il, gcta_blas_int iu,
+                       gcta_blas_int* m_found,
+                       float* w, float* z, gcta_blas_int ldz,
+                       gcta_blas_int* isuppz)
+{
+#if defined(GCTA_USE_ACCELERATE)
+    const char   jobz = 'V', range = 'I', uplo = 'U';
+    const float  vl = 0.0f, vu = 0.0f, abstol = 0.0f;
+    gcta_blas_int info = 0;
+    gcta_blas_int lwork_q = -1, liwork_q = -1;
+    float         work_sz = 0.0f;
+    gcta_blas_int iwork_sz = 0;
+    ssyevr_(&jobz, &range, &uplo, &n, a, &lda,
+            &vl, &vu, &il, &iu, &abstol,
+            m_found, w, z, &ldz, isuppz,
+            &work_sz, &lwork_q, &iwork_sz, &liwork_q, &info);
+    if (info != 0) return static_cast<int>(info);
+    gcta_blas_int lwork  = static_cast<gcta_blas_int>(work_sz);
+    gcta_blas_int liwork = iwork_sz;
+    std::vector<float>         work(lwork);
+    std::vector<gcta_blas_int> iwork(liwork);
+    ssyevr_(&jobz, &range, &uplo, &n, a, &lda,
+            &vl, &vu, &il, &iu, &abstol,
+            m_found, w, z, &ldz, isuppz,
+            work.data(), &lwork, iwork.data(), &liwork, &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(
+        LAPACKE_ssyevr(LAPACK_COL_MAJOR, 'V', 'I', 'U', n, a, lda,
+                       0.0f, 0.0f, il, iu, 0.0f,
+                       m_found, w, z, ldz, isuppz));
+#endif
+}
+
+// Temporarily caps OpenMP + BLAS/LAPACK worker threads for a scoped section
+// (e.g. dsyevd(20128) on 2-socket EPYC to prevent cross-socket dsymv regression)
+// and restores the exact prior settings on destruction.
+struct ScopedBlasThreadCap {
+    int prev_omp_ = 0;
+    int64_t prev_blis_ = 0;
+    int prev_mkl_ = 0;
+    int prev_ob_ = 0;
+    using GetI64Fn = int64_t(*)();
+    using SetI64Fn = void(*)(int64_t);
+    using MklLocalFn = int(*)(int);
+    using GetIntFn = int(*)();
+    using SetIntFn = void(*)(int);
+    SetI64Fn set_blis_ = nullptr;
+    MklLocalFn set_mkl_ = nullptr;
+    SetIntFn set_ob_ = nullptr;
+    bool active_ = false;
+
+    explicit ScopedBlasThreadCap(int cap) noexcept {
+#ifdef _OPENMP
+        if (cap <= 0) return;
+        prev_omp_ = omp_get_max_threads();
+        if (cap >= prev_omp_) return;
+        active_ = true;
+        omp_set_num_threads(cap);
+#if defined(__unix__) || defined(__APPLE__)
+        if (void* self = dlopen(nullptr, RTLD_LAZY)) {
+            auto get_blis = reinterpret_cast<GetI64Fn>(dlsym(self, "bli_thread_get_num_threads"));
+            set_blis_ = reinterpret_cast<SetI64Fn>(dlsym(self, "bli_thread_set_num_threads"));
+            if (set_blis_) {
+                prev_blis_ = get_blis ? get_blis() : 0;
+                set_blis_(static_cast<int64_t>(cap));
+            }
+            set_mkl_ = reinterpret_cast<MklLocalFn>(dlsym(self, "mkl_set_num_threads_local"));
+            if (set_mkl_) {
+                prev_mkl_ = set_mkl_(cap);
+            }
+            auto get_ob = reinterpret_cast<GetIntFn>(dlsym(self, "openblas_get_num_threads"));
+            set_ob_ = reinterpret_cast<SetIntFn>(dlsym(self, "openblas_set_num_threads"));
+            if (set_ob_) {
+                prev_ob_ = get_ob ? get_ob() : 0;
+                set_ob_(cap);
+            }
+            dlclose(self);
+        }
+#endif
+#else
+        (void)cap;
+#endif
+    }
+
+    ~ScopedBlasThreadCap() noexcept {
+#ifdef _OPENMP
+        if (!active_) return;
+        if (set_blis_) {
+            set_blis_(prev_blis_ > 0 ? prev_blis_ : static_cast<int64_t>(prev_omp_));
+        }
+        if (set_mkl_) {
+            set_mkl_(prev_mkl_);
+        }
+        if (set_ob_) {
+            set_ob_(prev_ob_ > 0 ? prev_ob_ : prev_omp_);
+        }
+        omp_set_num_threads(prev_omp_);
+#endif
+    }
+
+    ScopedBlasThreadCap(const ScopedBlasThreadCap&) = delete;
+    ScopedBlasThreadCap& operator=(const ScopedBlasThreadCap&) = delete;
+};
 
 // Factor A (m x k, column-major, m >= k) in place: on return, the upper
 // k x k triangle of A holds R, the rest holds Householder reflectors, and
@@ -417,17 +558,28 @@ inline int try_shifted_dpotrf(
 
 }  // namespace gcta_cpu_detail
 
-// Mixed-precision Shifted CholeskyQR3 for float32 m x k subspace matrices:
+struct CholeskyQrStats {
+    int calls = 0;
+    int passes = 0;
+    int shifted = 0;
+    int householder = 0;
+};
+
+// Mixed-precision Shifted CholeskyQR for float32 m x k subspace matrices:
 //   - Column L2 pre-normalization balances wildly scaled power-iteration columns.
 //   - O(m * k^2) SYRK and TRSM run in float32 (cblas_ssyrk / cblas_strsm), while
 //     the tiny k x k Gram Cholesky factorization runs in double (gcta_dpotrf).
-//   - If pass-0 dpotrf fails due to float32 Gram rounding on an ill-conditioned Y,
-//     attempts shifted Cholesky G + s*I recovery followed by two unshifted
-//     CholeskyQR passes (Shifted CholeskyQR3) before falling back to Householder
-//     sgeqrf/sorgqr (keeping O(m*k^2) fully Level-3 BLAS across all cores).
+//   - Callers supply `workspace` and `workspace_f` to avoid multi-GB k x k reallocation.
+//   - `min_passes=1` runs 1 unshifted CholeskyQR pass (or 1 shifted + 1 unshifted if
+//     dpotrf fails), saving >= 50% of QR compute/barriers on intermediate BF16 power
+//     iterations while keeping `min_passes=2` (Shifted CholeskyQR3) on the final Q.
 inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, gcta_blas_int ldY,
-                                    Eigen::MatrixXd* workspace = nullptr) {
+                                    Eigen::MatrixXd* workspace = nullptr,
+                                    Eigen::MatrixXf* workspace_f = nullptr,
+                                    int min_passes = 2,
+                                    CholeskyQrStats* stats = nullptr) {
     if (m <= 0 || k <= 0) return 0;
+    if (stats) ++stats->calls;
 
     // Column L2 pre-normalization (preserves col(Y), reduces artificial kappa(Y)).
     if (k <= 64 && m >= 16384) {
@@ -498,11 +650,15 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, g
     Eigen::MatrixXd local_G;
     Eigen::MatrixXd& G = workspace ? *workspace : local_G;
     G.resize(k, k);
-    Eigen::MatrixXf G_f(k, k);
+    Eigen::MatrixXf local_Gf;
+    Eigen::MatrixXf& G_f = workspace_f ? *workspace_f : local_Gf;
+    G_f.resize(k, k);
 
     bool used_shift = false;
-    int max_passes = 2;
+    const int base_passes = std::clamp(min_passes, 1, 2);
+    int max_passes = base_passes;
     for (int pass = 0; pass < max_passes; ++pass) {
+        if (stats) ++stats->passes;
         cblas_ssyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0f, Y, ldY, 0.0f, G_f.data(), k);
         gcta_cpu_detail::copy_lower_f2d(k, G_f.data(), G.data());
         const int info = gcta_dpotrf(k, G.data(), k);
@@ -510,13 +666,16 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, g
             if (pass == 0) {
                 if (gcta_cpu_detail::try_shifted_dpotrf(m, k, G_f.data(), G.data()) == 0) {
                     used_shift = true;
-                    max_passes = 3;
+                    if (stats) ++stats->shifted;
+                    max_passes = base_passes + 1;
                 } else {
+                    if (stats) ++stats->householder;
                     return gcta_qr_thin_Q(m, k, Y, ldY);
                 }
             } else if (used_shift && pass == 1) {
                 // Shifted pass-0 Y_1 is not orthonormal yet; unshifted pass-1 failure
                 // indicates genuine rank deficiency or extreme ill-conditioning.
+                if (stats) ++stats->householder;
                 return gcta_qr_thin_Q(m, k, Y, ldY);
             } else {
                 // Previous unshifted pass already produced an orthonormal Q; skip refinement.

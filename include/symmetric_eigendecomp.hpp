@@ -24,8 +24,10 @@
 #include <Eigen/Dense>
 #include <Spectra/SymEigsSolver.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <random>
 #include <stdexcept>
@@ -106,6 +108,65 @@ inline void fill_standard_normal(Eigen::Ref<Eigen::MatrixXf> matrix) {
     fill_standard_normal_impl<float>(matrix);
 }
 
+// Parallel standard-normal fill directly into column-major BF16 storage (uint16_t)
+// using a tiny L1-resident float32 chunk buffer, avoiding a full float32 omega matrix.
+inline void fill_standard_normal_bf16(uint16_t* dst, int rows, int cols) {
+    if (rows <= 0 || cols <= 0 || dst == nullptr) return;
+    const int num_threads = std::min(omp_get_max_threads(), cols);
+    std::vector<std::uint32_t> thread_seeds(num_threads);
+    for (int t = 0; t < num_threads; ++t) {
+        thread_seeds[t] = static_cast<std::uint32_t>(shared_rng()());
+    }
+    #pragma omp parallel num_threads(num_threads)
+    {
+        const int tid = omp_get_thread_num();
+        std::mt19937 local_rng(thread_seeds[tid]);
+        std::normal_distribution<double> normal(0.0, 1.0);
+        const int cols_per_thread = (cols + num_threads - 1) / num_threads;
+        const int col_begin = std::min(cols, tid * cols_per_thread);
+        const int col_end = std::min(cols, col_begin + cols_per_thread);
+        constexpr int kBuf = 256;
+        alignas(64) float fbuf[kBuf];
+        for (int col = col_begin; col < col_end; ++col) {
+            uint16_t* __restrict__ col_dst = dst + static_cast<size_t>(col) * static_cast<size_t>(rows);
+            for (int r0 = 0; r0 < rows; r0 += kBuf) {
+                const int cnt = std::min(kBuf, rows - r0);
+                for (int i = 0; i < cnt; ++i) {
+                    fbuf[i] = static_cast<float>(normal(local_rng));
+                }
+                gcta_f32_to_bf16_rne(fbuf, col_dst + r0, static_cast<size_t>(cnt));
+            }
+        }
+    }
+}
+
+struct RsvdOptions {
+    int qr_power_passes = 0;       // 0 = auto (1 when BF16 sketch active, else 2)
+    bool eigh_fp32 = false;        // true = ssyevd on float32 upper Gram instead of dsyevd
+    int eigh_threads = 0;          // 0 = all threads; >0 caps LAPACK/BLAS threads during eigh
+    bool keep_trailing_cols = false; // true = skip Q.conservativeResize(NoChange, k_target)
+};
+
+struct RsvdProfileStats {
+    double sketch_fill_s = 0.0;
+    double sketch_matvec_s = 0.0;
+    double power_qr_s = 0.0;
+    double power_matvec_s = 0.0;
+    double final_qr_s = 0.0;
+    double rr_matvec_s = 0.0;
+    double gram_s = 0.0;
+    double eigh_s = 0.0;
+    double rotate_s = 0.0;
+    double matvec_unpack_s = 0.0;
+    double matvec_gemm_s = 0.0;
+    uint64_t matvec_tiles = 0;
+    uint64_t matvec_gemm_calls = 0;
+    int qr_calls = 0;
+    int qr_passes = 0;
+    int qr_shifted = 0;
+    int qr_householder = 0;
+};
+
 inline int recommended_oversample(int k_target, int floor = 8, int cap = 128) {
     if (k_target <= 0) return 0;
     const int soft_target = std::max(8, k_target);
@@ -130,18 +191,21 @@ constexpr bool supports_precision_flag() {
 }
 
 // Compute B (k x k, double, UPPER triangle valid) = A^T * C where A and C are n x k.
-// Only converts/touches the upper triangle when Scalar == float, in parallel.
+// When Scalar == float and k >= 512, executes upper-triangular blocked cblas_sgemm
+// (~56% of full FLOPs) directly into L3-resident 25 MiB scratch, eliminating the
+// full 1.62 GB B_f allocation and lower-triangle compute.
 template <typename Scalar>
 inline void form_upper_gram_double(
     const Eigen::Ref<const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>>& A,
     const Eigen::Ref<const Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>>& C,
     Eigen::MatrixXd& B)
 {
+    const Eigen::Index n = A.rows();
     const Eigen::Index k = A.cols();
     B.resize(k, k);
     if constexpr (std::is_same_v<Scalar, double>) {
         B.noalias() = A.transpose() * C;
-    } else {
+    } else if (k < 512) {
         Eigen::MatrixXf B_f(k, k);
         B_f.noalias() = A.transpose() * C;
         #pragma omp parallel for schedule(guided) if (k >= 128)
@@ -152,6 +216,91 @@ inline void form_upper_gram_double(
             for (Eigen::Index i = 0; i <= j; ++i) {
                 dst[i] = static_cast<double>(src[i]);
             }
+        }
+    } else {
+        constexpr Eigen::Index kBlk = 2560;
+        const Eigen::Index max_b = std::min(k, kBlk);
+        AlignedRawBuffer<float, 64> tile_f(static_cast<size_t>(max_b) * static_cast<size_t>(max_b));
+        const gcta_blas_int ldA = static_cast<gcta_blas_int>(A.outerStride());
+        const gcta_blas_int ldC = static_cast<gcta_blas_int>(C.outerStride());
+        const gcta_blas_int blas_n = static_cast<gcta_blas_int>(n);
+        const float* const A_ptr = A.data();
+        const float* const C_ptr = C.data();
+        const Eigen::Index nb = (k + kBlk - 1) / kBlk;
+        for (Eigen::Index jb = 0; jb < nb; ++jb) {
+            const Eigen::Index j0 = jb * kBlk;
+            const Eigen::Index jlen = std::min(kBlk, k - j0);
+            for (Eigen::Index ib = 0; ib <= jb; ++ib) {
+                const Eigen::Index i0 = ib * kBlk;
+                const Eigen::Index ilen = std::min(kBlk, k - i0);
+                cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans,
+                            static_cast<gcta_blas_int>(ilen),
+                            static_cast<gcta_blas_int>(jlen),
+                            blas_n,
+                            1.0f, A_ptr + static_cast<size_t>(i0) * static_cast<size_t>(ldA), ldA,
+                            C_ptr + static_cast<size_t>(j0) * static_cast<size_t>(ldC), ldC,
+                            0.0f, tile_f.data(), static_cast<gcta_blas_int>(ilen));
+                if (ib < jb) {
+                    #pragma omp parallel for schedule(static) if (static_cast<size_t>(ilen) * static_cast<size_t>(jlen) >= 16384)
+                    for (Eigen::Index dc = 0; dc < jlen; ++dc) {
+                        const float* __restrict__ src = tile_f.data() + static_cast<size_t>(dc) * static_cast<size_t>(ilen);
+                        double* __restrict__ dst = B.col(j0 + dc).data() + i0;
+                        #pragma omp simd
+                        for (Eigen::Index dr = 0; dr < ilen; ++dr) {
+                            dst[dr] = static_cast<double>(src[dr]);
+                        }
+                    }
+                } else {
+                    #pragma omp parallel for schedule(guided) if (jlen >= 128)
+                    for (Eigen::Index dc = 0; dc < jlen; ++dc) {
+                        const float* __restrict__ src = tile_f.data() + static_cast<size_t>(dc) * static_cast<size_t>(ilen);
+                        double* __restrict__ dst = B.col(j0 + dc).data() + i0;
+                        #pragma omp simd
+                        for (Eigen::Index dr = 0; dr <= dc; ++dr) {
+                            dst[dr] = static_cast<double>(src[dr]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Upper-triangular blocked float32 Gram: B_f (k x k, UPPER triangle valid) = A^T * C.
+inline void form_upper_gram_float(
+    const Eigen::Ref<const Eigen::MatrixXf>& A,
+    const Eigen::Ref<const Eigen::MatrixXf>& C,
+    Eigen::MatrixXf& B_f)
+{
+    const Eigen::Index n = A.rows();
+    const Eigen::Index k = A.cols();
+    B_f.resize(k, k);
+    if (k < 512) {
+        B_f.noalias() = A.transpose() * C;
+        return;
+    }
+    constexpr Eigen::Index kBlk = 2560;
+    const gcta_blas_int ldA = static_cast<gcta_blas_int>(A.outerStride());
+    const gcta_blas_int ldC = static_cast<gcta_blas_int>(C.outerStride());
+    const gcta_blas_int ldB = static_cast<gcta_blas_int>(k);
+    const gcta_blas_int blas_n = static_cast<gcta_blas_int>(n);
+    const float* const A_ptr = A.data();
+    const float* const C_ptr = C.data();
+    float* const B_ptr = B_f.data();
+    const Eigen::Index nb = (k + kBlk - 1) / kBlk;
+    for (Eigen::Index jb = 0; jb < nb; ++jb) {
+        const Eigen::Index j0 = jb * kBlk;
+        const Eigen::Index jlen = std::min(kBlk, k - j0);
+        for (Eigen::Index ib = 0; ib <= jb; ++ib) {
+            const Eigen::Index i0 = ib * kBlk;
+            const Eigen::Index ilen = std::min(kBlk, k - i0);
+            cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans,
+                        static_cast<gcta_blas_int>(ilen),
+                        static_cast<gcta_blas_int>(jlen),
+                        blas_n,
+                        1.0f, A_ptr + static_cast<size_t>(i0) * static_cast<size_t>(ldA), ldA,
+                        C_ptr + static_cast<size_t>(j0) * static_cast<size_t>(ldC), ldC,
+                        0.0f, B_ptr + i0 + static_cast<size_t>(j0) * static_cast<size_t>(ldB), ldB);
         }
     }
 }
@@ -202,14 +351,46 @@ cast_double_block_parallel(const SrcExpr& src)
     return out;
 }
 
-// In-place basis rotation: Q <- Q * Z.leftCols(k_target) in 4096-row slabs.
-// Frees double Z immediately after casting its leading k_target columns to Scalar,
-// eliminating the 2x peak RSS spike (saves ~40 GB at N=500k, k=20k).
-template <typename Scalar>
+// Parallel cast/copy (and optional column reversal for ascending eigh output)
+// of a dense eigenvector block into Scalar storage.
+template <typename Scalar, typename ZMat>
+inline Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>
+cast_or_reverse_block_parallel(const ZMat& Z, int k_cols, bool reverse_cols)
+{
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    const int rows = static_cast<int>(Z.rows());
+    const int total_cols = static_cast<int>(Z.cols());
+    Mat out(rows, k_cols);
+    using ZScalar = typename ZMat::Scalar;
+    if constexpr (std::is_same_v<Scalar, ZScalar>) {
+        if (!reverse_cols) {
+            out.noalias() = Z.leftCols(k_cols);
+            return out;
+        }
+    }
+    #pragma omp parallel for schedule(static) if (static_cast<size_t>(rows) * static_cast<size_t>(k_cols) >= 32768)
+    for (int j = 0; j < k_cols; ++j) {
+        const int src_j = reverse_cols ? (total_cols - 1 - j) : j;
+        const ZScalar* __restrict__ s = Z.col(src_j).data();
+        Scalar* __restrict__ d = out.col(j).data();
+        #pragma omp simd
+        for (int i = 0; i < rows; ++i) {
+            d[i] = static_cast<Scalar>(s[i]);
+        }
+    }
+    return out;
+}
+
+// In-place basis rotation: Q <- Q * (selected/reversed columns of Z) in 4096-row slabs.
+// Frees Z immediately after casting its leading k_target columns to Scalar,
+// and optionally skips conservativeResize when callers slice .leftCols(k_target).
+template <typename Scalar, typename ZMat>
 inline void rotate_basis_inplace(
     Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& Q,
-    Eigen::MatrixXd& Z,
-    int k_target)
+    ZMat& Z,
+    int k_target,
+    bool reverse_Z_cols = false,
+    bool keep_trailing_cols = false)
 {
     using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
     const int n = static_cast<int>(Q.rows());
@@ -220,7 +401,7 @@ inline void rotate_basis_inplace(
         return;
     }
 
-    Mat Z_s = cast_double_block_parallel<Scalar>(Z.leftCols(k_target));
+    Mat Z_s = cast_or_reverse_block_parallel<Scalar>(Z, k_target, reverse_Z_cols);
     Z.resize(0, 0);
 
     if (static_cast<size_t>(n) * static_cast<size_t>(k_target) * sizeof(Scalar) <= (64ULL << 20)) {
@@ -283,38 +464,30 @@ inline void rotate_basis_inplace(
         }
     }
 
-    if (k_target < k_ext) {
+    if (!keep_trailing_cols && k_target < k_ext) {
         Q.conservativeResize(Eigen::NoChange, k_target);
     }
 }
 
-} // namespace detail
-
-// Full eigendecomposition of the symmetric k x k matrix whose UPPER triangle is
-// stored in B. B is destroyed. On return w (k) and Z (k x k) hold eigenpairs in
-// DESCENDING order.
-//
-// Prefers gcta_dsyevd (divide-and-conquer, Level-3 BLAS parallelized on AOCL
-// libflame where dsyevr's dstemr is single-threaded) when k < 32766, swapping
-// B into Z zero-copy on success; falls back to gcta_dsyevr when k >= 32766 or
-// if gcta_dsyevd returns its untouched -1 workspace-overflow guard.
-inline void eigh_upper_desc(Eigen::MatrixXd& B, Eigen::VectorXd& w, Eigen::MatrixXd& Z)
+inline void eigh_upper_asc_d(Eigen::MatrixXd& B, Eigen::VectorXd& w, Eigen::MatrixXd& Z,
+                             int eigh_threads = 0)
 {
     const int k = static_cast<int>(B.rows());
     if (B.cols() != k || k < 1)
-        throw std::invalid_argument("eigh_upper_desc: B must be square and non-empty.");
+        throw std::invalid_argument("eigh_upper_asc_d: B must be square and non-empty.");
     w.resize(k);
+    ScopedBlasThreadCap cap(eigh_threads);
 
     bool solved = false;
     if (k < 32766) {
-        Z.resize(0, 0);  // release any prior Z before dsyevd allocates workspace
+        Z.resize(0, 0);
         const int info_d = gcta_dsyevd(static_cast<gcta_blas_int>(k), B.data(),
                                        static_cast<gcta_blas_int>(k), w.data());
         if (info_d == 0) {
             Z.swap(B);
             solved = true;
         } else if (info_d != -1) {
-            throw std::runtime_error("eigh_upper_desc: dsyevd failed (info=" + std::to_string(info_d) + ").");
+            throw std::runtime_error("eigh_upper_asc_d: dsyevd failed (info=" + std::to_string(info_d) + ").");
         }
     }
 
@@ -326,8 +499,55 @@ inline void eigh_upper_desc(Eigen::MatrixXd& B, Eigen::VectorXd& w, Eigen::Matri
                                      static_cast<gcta_blas_int>(1), static_cast<gcta_blas_int>(k), &m_found,
                                      w.data(), Z.data(), static_cast<gcta_blas_int>(k), isuppz.data());
         if (info != 0 || m_found != k)
-            throw std::runtime_error("eigh_upper_desc: dsyevr failed (info=" + std::to_string(info) + ").");
+            throw std::runtime_error("eigh_upper_asc_d: dsyevr failed (info=" + std::to_string(info) + ").");
     }
+}
+
+inline void eigh_upper_asc_f(Eigen::MatrixXf& B_f, Eigen::VectorXd& w, Eigen::MatrixXf& Z_f,
+                             int eigh_threads = 0)
+{
+    const int k = static_cast<int>(B_f.rows());
+    if (B_f.cols() != k || k < 1)
+        throw std::invalid_argument("eigh_upper_asc_f: B_f must be square and non-empty.");
+    Eigen::VectorXf w_f(k);
+    ScopedBlasThreadCap cap(eigh_threads);
+
+    bool solved = false;
+    if (k < 32766) {
+        Z_f.resize(0, 0);
+        const int info_d = gcta_ssyevd(static_cast<gcta_blas_int>(k), B_f.data(),
+                                       static_cast<gcta_blas_int>(k), w_f.data());
+        if (info_d == 0) {
+            Z_f.swap(B_f);
+            solved = true;
+        } else if (info_d != -1) {
+            throw std::runtime_error("eigh_upper_asc_f: ssyevd failed (info=" + std::to_string(info_d) + ").");
+        }
+    }
+
+    if (!solved) {
+        Z_f.resize(k, k);
+        std::vector<gcta_blas_int> isuppz(2 * static_cast<size_t>(k));
+        gcta_blas_int m_found = 0;
+        const int info = gcta_ssyevr(static_cast<gcta_blas_int>(k), B_f.data(), static_cast<gcta_blas_int>(k),
+                                     static_cast<gcta_blas_int>(1), static_cast<gcta_blas_int>(k), &m_found,
+                                     w_f.data(), Z_f.data(), static_cast<gcta_blas_int>(k), isuppz.data());
+        if (info != 0 || m_found != k)
+            throw std::runtime_error("eigh_upper_asc_f: ssyevr failed (info=" + std::to_string(info) + ").");
+    }
+    w = w_f.cast<double>();
+}
+
+} // namespace detail
+
+// Full eigendecomposition of the symmetric k x k matrix whose UPPER triangle is
+// stored in B. B is destroyed. On return w (k) and Z (k x k) hold eigenpairs in
+// DESCENDING order.
+inline void eigh_upper_desc(Eigen::MatrixXd& B, Eigen::VectorXd& w, Eigen::MatrixXd& Z,
+                            int eigh_threads = 0)
+{
+    detail::eigh_upper_asc_d(B, w, Z, eigh_threads);
+    const int k = static_cast<int>(w.size());
 
     // Reverse ascending -> descending in place, parallelized across column pairs.
     const int half = k / 2;
@@ -408,9 +628,180 @@ build_randomized_sketch_consume(
     return {std::move(omega), std::move(Y)};
 }
 
-// Core logic: given initial sketch Y = A * omega (n x k_ext), run `power_iter`
-// power passes (low-precision BF16 allowed when supported), final CholeskyQR,
-// and an exact FP32 Rayleigh-Ritz projection with in-place Q * Z rotation.
+// Extended power iteration + Rayleigh-Ritz with persistent QR workspaces,
+// configurable power-iteration QR passes, ssyevd/thread-cap eigensolve,
+// fused eigenvector reverse, optional zero-copy Q retention, and post-RR callback.
+template <typename Scalar = double, typename MatVecApply>
+EighResultT<Scalar> power_iterate_and_project_ex(
+    MatVecApply&& apply,
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> Y,
+    int k_target,
+    int power_iter = 3,
+    const RsvdOptions& opts = {},
+    RsvdProfileStats* prof = nullptr,
+    const std::function<void()>& on_after_rr_matvec = {})
+{
+    using Clock = std::chrono::steady_clock;
+    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
+    const int n     = static_cast<int>(Y.rows());
+    const int k_ext = static_cast<int>(Y.cols());
+    if (k_target > k_ext)
+        throw std::invalid_argument("power_iterate_and_project: k_target exceeds sketch width k_ext.");
+
+    Eigen::MatrixXd qr_G;
+    Eigen::MatrixXf qr_Gf;
+    CholeskyQrStats qr_stats;
+    constexpr bool has_prec = detail::supports_precision_flag<MatVecApply, Mat>();
+    constexpr bool bf16_default =
+        std::is_same_v<Scalar, float> && has_prec && (GCTA_HAS_AOCL_BF16_GEMM != 0);
+    const int power_qr_passes = (opts.qr_power_passes > 0)
+        ? opts.qr_power_passes
+        : (bf16_default ? 1 : 2);
+
+    for (int pi = 0; pi < power_iter; ++pi) {
+        const auto t_qr0 = prof ? Clock::now() : Clock::time_point{};
+        int info = 0;
+        if constexpr (std::is_same_v<Scalar, float>) {
+            info = gcta_cholesky_qr_thin_Q(static_cast<gcta_blas_int>(n),
+                                           static_cast<gcta_blas_int>(k_ext),
+                                           Y.data(), static_cast<gcta_blas_int>(n),
+                                           &qr_G, &qr_Gf, power_qr_passes, &qr_stats);
+        } else {
+            info = gcta_cholesky_qr_thin_Q(static_cast<gcta_blas_int>(n),
+                                           static_cast<gcta_blas_int>(k_ext),
+                                           Y.data(), static_cast<gcta_blas_int>(n),
+                                           &qr_G);
+        }
+        if (prof) {
+            prof->power_qr_s += std::chrono::duration<double>(Clock::now() - t_qr0).count();
+        }
+        if (info != 0)
+            throw std::runtime_error("power_iterate_and_project: orthogonalization failed (info=" +
+                                      std::to_string(info) + ").");
+        const auto t_mv0 = prof ? Clock::now() : Clock::time_point{};
+        Y = detail::invoke_apply(apply, Y, /*exact_fp32=*/false);
+        if (prof) {
+            prof->power_matvec_s += std::chrono::duration<double>(Clock::now() - t_mv0).count();
+        }
+    }
+
+    {
+        const auto t_qr0 = prof ? Clock::now() : Clock::time_point{};
+        int info = 0;
+        if constexpr (std::is_same_v<Scalar, float>) {
+            info = gcta_cholesky_qr_thin_Q(static_cast<gcta_blas_int>(n),
+                                           static_cast<gcta_blas_int>(k_ext),
+                                           Y.data(), static_cast<gcta_blas_int>(n),
+                                           &qr_G, &qr_Gf, 2, &qr_stats);
+        } else {
+            info = gcta_cholesky_qr_thin_Q(static_cast<gcta_blas_int>(n),
+                                           static_cast<gcta_blas_int>(k_ext),
+                                           Y.data(), static_cast<gcta_blas_int>(n),
+                                           &qr_G);
+        }
+        if (prof) {
+            prof->final_qr_s += std::chrono::duration<double>(Clock::now() - t_qr0).count();
+        }
+        if (info != 0)
+            throw std::runtime_error("power_iterate_and_project: orthogonalization failed (info=" +
+                                      std::to_string(info) + ").");
+    }
+    qr_G.resize(0, 0);
+    qr_Gf.resize(0, 0);
+    Mat Q = std::move(Y);
+
+    // Final Rayleigh-Ritz pass MUST run in exact FP32/FP64.
+    const auto t_rr0 = prof ? Clock::now() : Clock::time_point{};
+    Mat AQ = detail::invoke_apply(apply, Q, /*exact_fp32=*/true);
+    if (prof) {
+        prof->rr_matvec_s += std::chrono::duration<double>(Clock::now() - t_rr0).count();
+    }
+    if (on_after_rr_matvec) {
+        on_after_rr_matvec();
+    }
+
+    Eigen::VectorXd w;
+    const auto t_g0 = prof ? Clock::now() : Clock::time_point{};
+    if constexpr (std::is_same_v<Scalar, float>) {
+        if (opts.eigh_fp32) {
+            Eigen::MatrixXf B_f;
+            detail::form_upper_gram_float(Q, AQ, B_f);
+            AQ.resize(0, 0);
+            if (prof) {
+                prof->gram_s += std::chrono::duration<double>(Clock::now() - t_g0).count();
+            }
+            const auto t_e0 = prof ? Clock::now() : Clock::time_point{};
+            Eigen::MatrixXf Z_f;
+            detail::eigh_upper_asc_f(B_f, w, Z_f, opts.eigh_threads);
+            B_f.resize(0, 0);
+            std::reverse(w.data(), w.data() + w.size());
+            if (prof) {
+                prof->eigh_s += std::chrono::duration<double>(Clock::now() - t_e0).count();
+            }
+            const auto t_rot0 = prof ? Clock::now() : Clock::time_point{};
+            detail::rotate_basis_inplace<Scalar>(
+                Q, Z_f, k_target, /*reverse_Z_cols=*/true, opts.keep_trailing_cols);
+            if (prof) {
+                prof->rotate_s += std::chrono::duration<double>(Clock::now() - t_rot0).count();
+            }
+        } else {
+            Eigen::MatrixXd B;
+            detail::form_upper_gram_double<Scalar>(Q, AQ, B);
+            AQ.resize(0, 0);
+            if (prof) {
+                prof->gram_s += std::chrono::duration<double>(Clock::now() - t_g0).count();
+            }
+            const auto t_e0 = prof ? Clock::now() : Clock::time_point{};
+            Eigen::MatrixXd Z;
+            detail::eigh_upper_asc_d(B, w, Z, opts.eigh_threads);
+            B.resize(0, 0);
+            std::reverse(w.data(), w.data() + w.size());
+            if (prof) {
+                prof->eigh_s += std::chrono::duration<double>(Clock::now() - t_e0).count();
+            }
+            const auto t_rot0 = prof ? Clock::now() : Clock::time_point{};
+            detail::rotate_basis_inplace<Scalar>(
+                Q, Z, k_target, /*reverse_Z_cols=*/true, opts.keep_trailing_cols);
+            if (prof) {
+                prof->rotate_s += std::chrono::duration<double>(Clock::now() - t_rot0).count();
+            }
+        }
+    } else {
+        Eigen::MatrixXd B;
+        detail::form_upper_gram_double<Scalar>(Q, AQ, B);
+        AQ.resize(0, 0);
+        if (prof) {
+            prof->gram_s += std::chrono::duration<double>(Clock::now() - t_g0).count();
+        }
+        const auto t_e0 = prof ? Clock::now() : Clock::time_point{};
+        Eigen::MatrixXd Z;
+        detail::eigh_upper_asc_d(B, w, Z, opts.eigh_threads);
+        B.resize(0, 0);
+        std::reverse(w.data(), w.data() + w.size());
+        if (prof) {
+            prof->eigh_s += std::chrono::duration<double>(Clock::now() - t_e0).count();
+        }
+        const auto t_rot0 = prof ? Clock::now() : Clock::time_point{};
+        detail::rotate_basis_inplace<Scalar>(
+            Q, Z, k_target, /*reverse_Z_cols=*/true, opts.keep_trailing_cols);
+        if (prof) {
+            prof->rotate_s += std::chrono::duration<double>(Clock::now() - t_rot0).count();
+        }
+    }
+
+    if (prof) {
+        prof->qr_calls += qr_stats.calls;
+        prof->qr_passes += qr_stats.passes;
+        prof->qr_shifted += qr_stats.shifted;
+        prof->qr_householder += qr_stats.householder;
+    }
+
+    EighResultT<Scalar> result;
+    result.eigenvalues  = w.head(k_target);
+    result.eigenvectors = std::move(Q);
+    return result;
+}
+
 template <typename Scalar = double, typename MatVecApply>
 EighResultT<Scalar> power_iterate_and_project(
     MatVecApply&& apply,
@@ -418,46 +809,181 @@ EighResultT<Scalar> power_iterate_and_project(
     int k_target,
     int power_iter = 3)
 {
-    using Mat = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
-    const int n     = static_cast<int>(Y.rows());
-    const int k_ext = static_cast<int>(Y.cols());
-    if (k_target > k_ext)
-        throw std::invalid_argument("power_iterate_and_project: k_target exceeds sketch width k_ext.");
+    return power_iterate_and_project_ex<Scalar>(
+        std::forward<MatVecApply>(apply), std::move(Y), k_target, power_iter);
+}
+
+// Persistent-buffer in-place BF16 rSVD for PackedGrmFp16:
+// Allocates X_bf16 (2*n*k_ext) and Y (4*n*k_ext) ONCE across sketch and all
+// power iterations (eliminating 12 GB omega + 60 GB Y/X_bf16 page-fault churn).
+template <typename ApplyBf16Inplace, typename ApplyFp32>
+EighResultF randomized_symmetric_eigh_bf16_inplace(
+    ApplyBf16Inplace&& apply_bf16_inplace,
+    ApplyFp32&& apply_fp32,
+    int n,
+    int k_target,
+    int oversample,
+    int power_iter,
+    Eigen::MatrixXf* warm_start,
+    const RsvdOptions& opts = {},
+    RsvdProfileStats* prof = nullptr,
+    const std::function<void()>& on_after_rr_matvec = {})
+{
+    using Clock = std::chrono::steady_clock;
+    const int k_ext = std::min(k_target + oversample, n - 1);
+
+    AlignedRawBuffer<uint16_t, 64> X_bf16(static_cast<size_t>(n) * static_cast<size_t>(k_ext));
+    const auto t_fill0 = prof ? Clock::now() : Clock::time_point{};
+    if (warm_start && warm_start->rows() == n && warm_start->cols() > 0) {
+        const int k_copy = std::min(static_cast<int>(warm_start->cols()), k_ext);
+        #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(k_copy) >= 32768)
+        for (int j = 0; j < k_copy; ++j) {
+            gcta_f32_to_bf16_rne(
+                warm_start->col(j).data(),
+                X_bf16.data() + static_cast<size_t>(j) * static_cast<size_t>(n),
+                static_cast<size_t>(n));
+        }
+        warm_start->resize(0, 0);
+        if (k_copy < k_ext) {
+            fill_standard_normal_bf16(
+                X_bf16.data() + static_cast<size_t>(k_copy) * static_cast<size_t>(n),
+                n, k_ext - k_copy);
+        }
+    } else {
+        if (warm_start) warm_start->resize(0, 0);
+        fill_standard_normal_bf16(X_bf16.data(), n, k_ext);
+    }
+    if (prof) {
+        prof->sketch_fill_s += std::chrono::duration<double>(Clock::now() - t_fill0).count();
+    }
+
+    Eigen::MatrixXf Y(n, k_ext);
+    const auto t_sm0 = prof ? Clock::now() : Clock::time_point{};
+    apply_bf16_inplace(X_bf16.data(), Y);
+    if (prof) {
+        prof->sketch_matvec_s += std::chrono::duration<double>(Clock::now() - t_sm0).count();
+    }
+
+    Eigen::MatrixXd qr_G;
+    Eigen::MatrixXf qr_Gf;
+    CholeskyQrStats qr_stats;
+    const int power_qr_passes = (opts.qr_power_passes > 0) ? opts.qr_power_passes : 1;
 
     for (int pi = 0; pi < power_iter; ++pi) {
-        int info = gcta_cholesky_qr_thin_Q(static_cast<gcta_blas_int>(n),
-                                           static_cast<gcta_blas_int>(k_ext),
-                                           Y.data(), static_cast<gcta_blas_int>(n));
+        const auto t_qr0 = prof ? Clock::now() : Clock::time_point{};
+        const int info = gcta_cholesky_qr_thin_Q(static_cast<gcta_blas_int>(n),
+                                                 static_cast<gcta_blas_int>(k_ext),
+                                                 Y.data(), static_cast<gcta_blas_int>(n),
+                                                 &qr_G, &qr_Gf, power_qr_passes, &qr_stats);
         if (info != 0)
-            throw std::runtime_error("power_iterate_and_project: orthogonalization failed (info=" +
+            throw std::runtime_error("randomized_symmetric_eigh_bf16_inplace: QR failed (info=" +
                                       std::to_string(info) + ").");
-        Y = detail::invoke_apply(apply, Y, /*exact_fp32=*/false);
+        // Parallel contiguous F32 -> BF16 conversion into persistent X_bf16.
+        {
+            const size_t total = static_cast<size_t>(n) * static_cast<size_t>(k_ext);
+            const float* const src = Y.data();
+            uint16_t* const dst = X_bf16.data();
+            #pragma omp parallel if (total >= 32768)
+            {
+                const int tid = omp_get_thread_num();
+                const int nt = omp_get_num_threads();
+                const size_t lo = (total * static_cast<size_t>(tid)) / static_cast<size_t>(nt);
+                const size_t hi = (total * static_cast<size_t>(tid + 1)) / static_cast<size_t>(nt);
+                if (hi > lo) gcta_f32_to_bf16_rne(src + lo, dst + lo, hi - lo);
+            }
+        }
+        if (prof) {
+            prof->power_qr_s += std::chrono::duration<double>(Clock::now() - t_qr0).count();
+        }
+        const auto t_pm0 = prof ? Clock::now() : Clock::time_point{};
+        apply_bf16_inplace(X_bf16.data(), Y);
+        if (prof) {
+            prof->power_matvec_s += std::chrono::duration<double>(Clock::now() - t_pm0).count();
+        }
     }
+
+    X_bf16.clear();
 
     {
-        int info = gcta_cholesky_qr_thin_Q(static_cast<gcta_blas_int>(n),
-                                           static_cast<gcta_blas_int>(k_ext),
-                                           Y.data(), static_cast<gcta_blas_int>(n));
+        const auto t_fqr0 = prof ? Clock::now() : Clock::time_point{};
+        const int info = gcta_cholesky_qr_thin_Q(static_cast<gcta_blas_int>(n),
+                                                 static_cast<gcta_blas_int>(k_ext),
+                                                 Y.data(), static_cast<gcta_blas_int>(n),
+                                                 &qr_G, &qr_Gf, 2, &qr_stats);
+        if (prof) {
+            prof->final_qr_s += std::chrono::duration<double>(Clock::now() - t_fqr0).count();
+        }
         if (info != 0)
-            throw std::runtime_error("power_iterate_and_project: orthogonalization failed (info=" +
+            throw std::runtime_error("randomized_symmetric_eigh_bf16_inplace: final QR failed (info=" +
                                       std::to_string(info) + ").");
     }
-    Mat Q = std::move(Y);
+    qr_G.resize(0, 0);
+    qr_Gf.resize(0, 0);
+    Eigen::MatrixXf Q = std::move(Y);
 
-    // Final Rayleigh-Ritz pass MUST run in exact FP32/FP64.
-    Mat AQ = detail::invoke_apply(apply, Q, /*exact_fp32=*/true);
-    Eigen::MatrixXd B;
-    detail::form_upper_gram_double<Scalar>(Q, AQ, B);
-    AQ.resize(0, 0);
+    const auto t_rr0 = prof ? Clock::now() : Clock::time_point{};
+    Eigen::MatrixXf AQ = apply_fp32(Q);
+    if (prof) {
+        prof->rr_matvec_s += std::chrono::duration<double>(Clock::now() - t_rr0).count();
+    }
+    if (on_after_rr_matvec) {
+        on_after_rr_matvec();
+    }
 
     Eigen::VectorXd w;
-    Eigen::MatrixXd Z;
-    eigh_upper_desc(B, w, Z);
-    B.resize(0, 0);
+    const auto t_g0 = prof ? Clock::now() : Clock::time_point{};
+    if (opts.eigh_fp32) {
+        Eigen::MatrixXf B_f;
+        detail::form_upper_gram_float(Q, AQ, B_f);
+        AQ.resize(0, 0);
+        if (prof) {
+            prof->gram_s += std::chrono::duration<double>(Clock::now() - t_g0).count();
+        }
+        const auto t_e0 = prof ? Clock::now() : Clock::time_point{};
+        Eigen::MatrixXf Z_f;
+        detail::eigh_upper_asc_f(B_f, w, Z_f, opts.eigh_threads);
+        B_f.resize(0, 0);
+        std::reverse(w.data(), w.data() + w.size());
+        if (prof) {
+            prof->eigh_s += std::chrono::duration<double>(Clock::now() - t_e0).count();
+        }
+        const auto t_rot0 = prof ? Clock::now() : Clock::time_point{};
+        detail::rotate_basis_inplace<float>(
+            Q, Z_f, k_target, /*reverse_Z_cols=*/true, opts.keep_trailing_cols);
+        if (prof) {
+            prof->rotate_s += std::chrono::duration<double>(Clock::now() - t_rot0).count();
+        }
+    } else {
+        Eigen::MatrixXd B;
+        detail::form_upper_gram_double<float>(Q, AQ, B);
+        AQ.resize(0, 0);
+        if (prof) {
+            prof->gram_s += std::chrono::duration<double>(Clock::now() - t_g0).count();
+        }
+        const auto t_e0 = prof ? Clock::now() : Clock::time_point{};
+        Eigen::MatrixXd Z;
+        detail::eigh_upper_asc_d(B, w, Z, opts.eigh_threads);
+        B.resize(0, 0);
+        std::reverse(w.data(), w.data() + w.size());
+        if (prof) {
+            prof->eigh_s += std::chrono::duration<double>(Clock::now() - t_e0).count();
+        }
+        const auto t_rot0 = prof ? Clock::now() : Clock::time_point{};
+        detail::rotate_basis_inplace<float>(
+            Q, Z, k_target, /*reverse_Z_cols=*/true, opts.keep_trailing_cols);
+        if (prof) {
+            prof->rotate_s += std::chrono::duration<double>(Clock::now() - t_rot0).count();
+        }
+    }
 
-    detail::rotate_basis_inplace<Scalar>(Q, Z, k_target);
+    if (prof) {
+        prof->qr_calls += qr_stats.calls;
+        prof->qr_passes += qr_stats.passes;
+        prof->qr_shifted += qr_stats.shifted;
+        prof->qr_householder += qr_stats.householder;
+    }
 
-    EighResultT<Scalar> result;
+    EighResultF result;
     result.eigenvalues  = w.head(k_target);
     result.eigenvectors = std::move(Q);
     return result;
@@ -551,8 +1077,19 @@ EighResultT<Scalar> expand_symmetric_eigh(
         const double ortho_tol = std::is_same_v<Scalar, float>
             ? 5e-3 * std::sqrt(static_cast<double>(std::max(1, m)))
             : 1e-8;
-        if (static_cast<double>((V0.transpose() * Q1).norm()) > ortho_tol)
+        if (static_cast<size_t>(k0) * static_cast<size_t>(m) > 262144) {
+            constexpr int kOrthoProbes = 16;
+            Mat G_probe(m, kOrthoProbes);
+            fill_standard_normal(G_probe);
+            const Mat Zp = Q1 * G_probe;
+            const Mat R = V0.transpose() * Zp;
+            const double est_frob =
+                static_cast<double>(R.norm()) / std::sqrt(static_cast<double>(kOrthoProbes));
+            if (est_frob > ortho_tol * 2.0)
+                throw std::runtime_error("expand_symmetric_eigh: fresh block is not orthogonal to the locked basis.");
+        } else if (static_cast<double>((V0.transpose() * Q1).norm()) > ortho_tol) {
             throw std::runtime_error("expand_symmetric_eigh: fresh block is not orthogonal to the locked basis.");
+        }
     }
 
     // Final Rayleigh-Ritz pass in exact FP32/FP64.

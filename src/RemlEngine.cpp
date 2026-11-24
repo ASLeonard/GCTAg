@@ -25,6 +25,7 @@
 
 #include <Eigen/Dense>
 #include <boost/math/distributions/chi_squared.hpp>
+#include <chrono>
 #include <random>
 #include <algorithm>
 #include <cmath>
@@ -188,7 +189,7 @@ void ensure_woodbury_subspace_cache(RemlCtx& ctx) {
 
     const Eigen::MatrixXf UkTXY_f = ctx.Uk_is_transposed
         ? (ctx.Uk * XY_f).eval()
-        : (ctx.Uk.transpose() * XY_f).eval();  // k x (c + 1)
+        : (ctx.Uk.leftCols(k).transpose() * XY_f).eval();  // k x (c + 1)
     ctx.UkTX = UkTXY_f.leftCols(c).cast<double>();
     ctx.UkTy = UkTXY_f.col(c).cast<double>();
 
@@ -196,7 +197,7 @@ void ensure_woodbury_subspace_cache(RemlCtx& ctx) {
     // covariates (e.g. PCs) lie inside span(Uk).
     const Eigen::MatrixXf proj_f = ctx.Uk_is_transposed
         ? (ctx.Uk.transpose() * UkTXY_f).eval()
-        : (ctx.Uk * UkTXY_f).eval();            // n x (c + 1)
+        : (ctx.Uk.leftCols(k) * UkTXY_f).eval();            // n x (c + 1)
     RemlMat X_perp(n, c);
     #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(c) >= 65536)
     for (int j = 0; j < c; ++j) {
@@ -272,29 +273,32 @@ WoodburySubspaceVec wb_y_vec(const RemlCtx& ctx) {
 
 // Woodbury n-vector helpers (retained for any direct non-subspace path)
 RemlMat woodbury_basis_KZ(const RemlCtx& ctx, const RemlMat& Z) {
+    const int k = ctx.woodbury_basis_rank_;
     const Eigen::MatrixXf Zf = Z.cast<float>();
-    RemlMat UkZ = (ctx.Uk_is_transposed ? (ctx.Uk * Zf).eval() : (ctx.Uk.transpose() * Zf).eval()).cast<double>();
+    RemlMat UkZ = (ctx.Uk_is_transposed ? (ctx.Uk * Zf).eval() : (ctx.Uk.leftCols(k).transpose() * Zf).eval()).cast<double>();
     UkZ.array().colwise() *= (ctx.dk.array() - ctx.lambda_tail);
     const Eigen::MatrixXf UkZf = UkZ.cast<float>();
-    const Eigen::MatrixXf back = ctx.Uk_is_transposed ? (ctx.Uk.transpose() * UkZf).eval() : (ctx.Uk * UkZf).eval();
+    const Eigen::MatrixXf back = ctx.Uk_is_transposed ? (ctx.Uk.transpose() * UkZf).eval() : (ctx.Uk.leftCols(k) * UkZf).eval();
     return ctx.lambda_tail * Z + back.cast<double>();
 }
 
 RemlVec woodbury_basis_Viv(const RemlCtx& ctx, const RemlVec& v) {
+    const int k = ctx.woodbury_basis_rank_;
     const Eigen::VectorXf vf = v.cast<float>();
-    RemlVec Ukv = (ctx.Uk_is_transposed ? (ctx.Uk * vf).eval() : (ctx.Uk.transpose() * vf).eval()).cast<double>();
+    RemlVec Ukv = (ctx.Uk_is_transposed ? (ctx.Uk * vf).eval() : (ctx.Uk.leftCols(k).transpose() * vf).eval()).cast<double>();
     Ukv.array() *= ctx.ck.array();
     const Eigen::VectorXf Ukvf = Ukv.cast<float>();
-    const Eigen::VectorXf back = ctx.Uk_is_transposed ? (ctx.Uk.transpose() * Ukvf).eval() : (ctx.Uk * Ukvf).eval();
+    const Eigen::VectorXf back = ctx.Uk_is_transposed ? (ctx.Uk.transpose() * Ukvf).eval() : (ctx.Uk.leftCols(k) * Ukvf).eval();
     return (v - back.cast<double>()) / ctx.sigma2_eff;
 }
 
 RemlMat woodbury_basis_ViZ(const RemlCtx& ctx, const RemlMat& Z) {
+    const int k = ctx.woodbury_basis_rank_;
     const Eigen::MatrixXf Zf = Z.cast<float>();
-    RemlMat UkZ = (ctx.Uk_is_transposed ? (ctx.Uk * Zf).eval() : (ctx.Uk.transpose() * Zf).eval()).cast<double>();
+    RemlMat UkZ = (ctx.Uk_is_transposed ? (ctx.Uk * Zf).eval() : (ctx.Uk.leftCols(k).transpose() * Zf).eval()).cast<double>();
     UkZ.array().colwise() *= ctx.ck.array();
     const Eigen::MatrixXf UkZf = UkZ.cast<float>();
-    const Eigen::MatrixXf back = ctx.Uk_is_transposed ? (ctx.Uk.transpose() * UkZf).eval() : (ctx.Uk * UkZf).eval();
+    const Eigen::MatrixXf back = ctx.Uk_is_transposed ? (ctx.Uk.transpose() * UkZf).eval() : (ctx.Uk.leftCols(k) * UkZf).eval();
     return (Z - back.cast<double>()) / ctx.sigma2_eff;
 }
 
@@ -813,7 +817,7 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
             const Eigen::MatrixXf ck_UkTX_f = ck_UkTX.cast<float>();
             const Eigen::MatrixXf back = ctx.Uk_is_transposed
                 ? (ctx.Uk.transpose() * ck_UkTX_f).eval()
-                : (ctx.Uk * ck_UkTX_f).eval();
+                : (ctx.Uk.leftCols(ctx.woodbury_basis_rank_) * ck_UkTX_f).eval();
             ctx.Vi_X = (ctx.X - back.cast<double>()) * inv_s2;
         }
     } else if (ctx.Vi_use_llt) {
@@ -843,7 +847,7 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
         if (ctx.Uk_is_transposed)
             Uk_scaled = ctx.Uk.transpose().cast<double>();
         else
-            Uk_scaled = ctx.Uk.cast<double>();
+            Uk_scaled = ctx.Uk.leftCols(ctx.woodbury_basis_rank_).cast<double>();
         for (int j = 0; j < ctx.woodbury_basis_rank_; ++j)
             Uk_scaled.col(j) *= std::sqrt(ctx.ck[j] / ctx.sigma2_eff);
         ctx.Vi.selfadjointView<Eigen::Upper>().rankUpdate(Uk_scaled, -1.0);
@@ -1253,7 +1257,7 @@ void calcu_Hi(RemlCtx& ctx, RemlMat& P, RemlMat& Hi) {
             if (ctx.Uk_is_transposed)
                 Uk_d = ctx.Uk.transpose().cast<double>();
             else
-                Uk_d = ctx.Uk.cast<double>();
+                Uk_d = ctx.Uk.leftCols(ctx.woodbury_basis_rank_).cast<double>();
             RemlMat PUk(n, ctx.woodbury_basis_rank_);
             PUk.noalias() = P * Uk_d;
             RemlVec delta_v = ctx.dk.array() - ctx.lambda_tail;
@@ -2188,6 +2192,9 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     double target_mass = (mode == WoodburyBasisSpec::Kind::EIG && have_chunked_traces)
         ? (ctx.woodbury_basis_eigen_mass * trace_K_full) : 0.0;
 
+    ctx.reml_rsvd_prof = {};
+    gcta_chunked::MatvecStats mv_stats{};
+    gcta_chunked::MatvecStats* const mv_stats_ptr = ctx.reml_profile ? &mv_stats : nullptr;
     auto apply = [&](const Eigen::Ref<const Eigen::MatrixXf>& X, bool exact_fp32) -> Eigen::MatrixXf {
         const bool use_bf16 = !exact_fp32 && gcta_chunked::default_bf16_sketch();
         if (grm_chunked) {
@@ -2195,7 +2202,8 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                 double* tr_ptr  = have_chunked_traces ? nullptr : &trace_K_full;
                 double* tr2_ptr = have_chunked_traces ? nullptr : &trace_K2;
                 Eigen::MatrixXf Y = gcta_chunked::chunked_symmetric_matvec_f32(
-                    ctx.grm_tile_reader_f32, n, grm_chunk_rows, X, tr_ptr, tr2_ptr, use_bf16);
+                    ctx.grm_tile_reader_f32, n, grm_chunk_rows, X, tr_ptr, tr2_ptr, use_bf16,
+                    ctx.reml_matvec_band_rows, ctx.reml_matvec_col_chunk, mv_stats_ptr);
                 if (!have_chunked_traces) {
                     have_chunked_traces = true;
                     if (mode == WoodburyBasisSpec::Kind::EIG)
@@ -2240,6 +2248,24 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     if (ctx.svd_nystrom && ctx.Uk.size() > 0) {
         ctx.Uk.resize(0, 0);  // Nystrom does not consume warm-start vectors; release immediately
     }
+
+    auto release_grm_storage = [&]() {
+        ctx.A[ctx.r_indx[0]].resize(0, 0);
+        if (ctx.grm_fp16_release) {
+            ctx.grm_fp16_release();
+            ctx.grm_fp16_release = nullptr;
+        }
+        ctx.grm_tile_reader.release();
+        ctx.grm_tile_reader = nullptr;
+        ctx.grm_tile_reader_f32 = nullptr;
+    };
+
+    gcta_eigh::RsvdOptions rsvd_opts;
+    rsvd_opts.qr_power_passes    = ctx.reml_qr_power_passes;
+    rsvd_opts.eigh_fp32          = ctx.reml_eigh_fp32;
+    rsvd_opts.eigh_threads       = ctx.reml_eigh_threads;
+    rsvd_opts.keep_trailing_cols = true;
+    gcta_eigh::RsvdProfileStats* const prof_ptr = ctx.reml_profile ? &ctx.reml_rsvd_prof : nullptr;
 
     for (;;) {
         const int oversample = gcta_eigh::recommended_oversample(k_svd);
@@ -2293,16 +2319,52 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                     LOGGER << "Woodbury: seeding initial rSVD sketch with " << k_warm
                            << " warm-start vector(s) (--reml-woodbury-basis-warm-start)." << std::endl;
                 }
-                // Copies ctx.Uk into omega and frees ctx.Uk BEFORE apply(omega) allocates Y.
-                auto [omega, Y] = gcta_eigh::build_randomized_sketch_consume<float>(
-                    apply, n, k_ext, has_warm ? &ctx.Uk : nullptr, /*exact_fp32=*/false);
-                omega.resize(0, 0);
                 const int k_proj = (mode == WoodburyBasisSpec::Kind::Fixed) ? k_svd : k_ext;
+                const std::function<void()> on_after_rr = (mode == WoodburyBasisSpec::Kind::Fixed)
+                    ? std::function<void()>(release_grm_storage)
+                    : std::function<void()>{};
+                const bool can_bf16_inplace =
+                    ctx.grm_fp16 &&
+                    static_cast<bool>(ctx.grm_tile_reader_f32.large_k_symm_fn) &&
+                    gcta_chunked::default_bf16_sketch();
                 try {
-                    gcta_eigh::EighResultF res =
-                        gcta_eigh::power_iterate_and_project<float>(apply, std::move(Y), k_proj, q_pow);
-                    eval_all  = std::move(res.eigenvalues);
-                    evec_full = std::move(res.eigenvectors);
+                    if (can_bf16_inplace) {
+                        auto apply_bf16_inplace = [&](const uint16_t* X_bf16_ptr, Eigen::MatrixXf& Y_mat) {
+                            double* tr_ptr  = have_chunked_traces ? nullptr : &trace_K_full;
+                            double* tr2_ptr = have_chunked_traces ? nullptr : &trace_K2;
+                            ctx.grm_tile_reader_f32.large_k_symm_fn(
+                                nullptr, static_cast<gcta_blas_int>(n), X_bf16_ptr, k_ext,
+                                Y_mat.data(), static_cast<gcta_blas_int>(n), /*use_bf16=*/true,
+                                ctx.reml_matvec_band_rows, ctx.reml_matvec_col_chunk,
+                                tr_ptr, tr2_ptr, mv_stats_ptr);
+                            if (!have_chunked_traces) {
+                                have_chunked_traces = true;
+                                if (mode == WoodburyBasisSpec::Kind::EIG)
+                                    target_mass = ctx.woodbury_basis_eigen_mass * trace_K_full;
+                            }
+                        };
+                        auto apply_fp32 = [&](const Eigen::Ref<const Eigen::MatrixXf>& Q_ref) -> Eigen::MatrixXf {
+                            return apply(Q_ref, /*exact_fp32=*/true);
+                        };
+                        gcta_eigh::EighResultF res = gcta_eigh::randomized_symmetric_eigh_bf16_inplace(
+                            apply_bf16_inplace, apply_fp32, n, k_proj, k_ext - k_proj, q_pow,
+                            has_warm ? &ctx.Uk : nullptr, rsvd_opts, prof_ptr, on_after_rr);
+                        eval_all  = std::move(res.eigenvalues);
+                        evec_full = std::move(res.eigenvectors);
+                    } else {
+                        using Clock = std::chrono::steady_clock;
+                        const auto t_sk0 = prof_ptr ? Clock::now() : Clock::time_point{};
+                        auto [omega, Y] = gcta_eigh::build_randomized_sketch_consume<float>(
+                            apply, n, k_ext, has_warm ? &ctx.Uk : nullptr, /*exact_fp32=*/false);
+                        omega.resize(0, 0);
+                        if (prof_ptr) {
+                            prof_ptr->sketch_matvec_s += std::chrono::duration<double>(Clock::now() - t_sk0).count();
+                        }
+                        gcta_eigh::EighResultF res = gcta_eigh::power_iterate_and_project_ex<float>(
+                            apply, std::move(Y), k_proj, q_pow, rsvd_opts, prof_ptr, on_after_rr);
+                        eval_all  = std::move(res.eigenvalues);
+                        evec_full = std::move(res.eigenvectors);
+                    }
                 } catch (const std::exception& e) {
                     LOGGER.e(0, std::string("Woodbury: ") + e.what());
                 }
@@ -2403,12 +2465,12 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     eval_all.resize(0);
 
     // Release dense/packed/chunked GRM storage and tile readers immediately post-basis.
-    if (!ctx.woodbury_basis_posthoc_correction) {
-        ctx.A[ctx.r_indx[0]].resize(0, 0);
-        if (ctx.grm_fp16_release) ctx.grm_fp16_release();
-        ctx.grm_tile_reader.release();
-        ctx.grm_tile_reader = nullptr;
-        ctx.grm_tile_reader_f32 = nullptr;
+    release_grm_storage();
+    if (prof_ptr) {
+        prof_ptr->matvec_unpack_s += mv_stats.unpack_s;
+        prof_ptr->matvec_gemm_s += mv_stats.gemm_s;
+        prof_ptr->matvec_tiles += mv_stats.tiles;
+        prof_ptr->matvec_gemm_calls += mv_stats.gemm_calls;
     }
 
     int k = finalize_and_log_woodbury_rank(mode, ctx, eval_full, k_svd, k_svd_budget_ceiling, lambda_plus, trace_K_full, trace_K2, eval_res);
@@ -2431,9 +2493,6 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                                     - ctx.lambda_tail * ctx.lambda_tail) : 0.0;
 
     ctx.dk = std::move(eval);
-    if (evec_full.cols() != k) {
-        evec_full.conservativeResize(Eigen::NoChange, k);
-    }
     ctx.Uk = std::move(evec_full);
     ctx.Uk_is_transposed = false;
     ctx.woodbury_basis_rank_ = k;
@@ -2489,7 +2548,7 @@ void compute(RemlCtx& ctx,
             LOGGER.e(0, "--reml-woodbury-reuse supports only single-GRM models.");
         const bool uk_dims_ok = ctx.Uk_is_transposed
             ? (ctx.Uk.rows() == ctx.woodbury_basis_rank_ && ctx.Uk.cols() == ctx.n)
-            : (ctx.Uk.rows() == ctx.n && ctx.Uk.cols() == ctx.woodbury_basis_rank_);
+            : (ctx.Uk.rows() == ctx.n && ctx.Uk.cols() >= ctx.woodbury_basis_rank_);
         if (!uk_dims_ok || ctx.dk.size() != ctx.woodbury_basis_rank_)
             LOGGER.e(0, "--reml-woodbury-reuse: preloaded basis has inconsistent dimensions.");
         ctx.wb_subspace_ready = false;
@@ -2511,6 +2570,9 @@ void compute(RemlCtx& ctx,
         ctx.grm_chunk_rows = setup_chunked_grm_stream(
             ctx, ctx.grm_fp16 ? "--grm-fp16" : "--grm-chunked-budget");
     }
+
+    ctx.reml_ai_s = 0.0;
+    const auto t_ai0 = ctx.reml_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     // Precompute spectral-subspace cache once before HE warm-start and iter 0.
     if (ctx.Vi_use_woodbury_basis) {
@@ -2579,6 +2641,9 @@ void compute(RemlCtx& ctx,
         int iter_dummy = 0;
         calcu_Vi(ctx, varcmp, logdet_dummy, iter_dummy, /*factorize_only=*/true);
     }
+    if (ctx.reml_profile) {
+        ctx.reml_ai_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ai0).count();
+    }
 }
 
 RemlState build_reml_state(RemlCtx& ctx) {
@@ -2612,7 +2677,7 @@ RemlState build_reml_state(RemlCtx& ctx) {
             // WoodburyMLMACache stores Uk_f as k×n ColMajor for GEMM efficiency.
             // Cache-block (64x64) the n×k -> k×n float32 transpose to eliminate
             // 2 MB-stride cache/STLB misses (40-60 s -> ~0.2 s at N=500k, k=20k).
-            const Eigen::Index k = ctx.Uk.cols();
+            const Eigen::Index k = ctx.woodbury_basis_rank_;
             const Eigen::Index n = ctx.Uk.rows();
             rs.wb.Uk_f.resize(k, n);
             constexpr Eigen::Index kBlock = 64;

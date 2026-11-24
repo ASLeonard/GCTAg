@@ -17,6 +17,7 @@
 #include "ModeTypes.hpp"
 #include "mlma_woodbury.hpp"
 #include "chunked_grm_matvec.hpp"
+#include "symmetric_eigendecomp.hpp"
 #include <Eigen/Dense>
 #include <optional>
 #include <string>
@@ -219,4 +220,14 @@ struct RemlCtx {
     double logL = 0.0;             // converged REML log-likelihood
     bool has_logL = false;
     int reml_iterations = 0;       // total REML loop rounds executed
+
+    // ── Developer tuning options & phase profiling (Stage 3 REML) ──────────
+    bool reml_profile = false;
+    int  reml_matvec_band_rows = 0;   // 0 = auto (8192 for PackedGrmFp16)
+    int  reml_matvec_col_chunk = 0;   // 0 = auto (<= 1 GiB strip)
+    int  reml_qr_power_passes  = 0;   // 0 = auto (1 when BF16 sketch, else 2)
+    bool reml_eigh_fp32        = false;
+    int  reml_eigh_threads     = 0;   // 0 = all threads
+    gcta_eigh::RsvdProfileStats reml_rsvd_prof{};
+    double reml_ai_s = 0.0;
 };

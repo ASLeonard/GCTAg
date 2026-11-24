@@ -976,16 +976,18 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
                                 (fast_mlma != FastMlmaMode::Off) &&
                                 geno->canUseInt8Mlma() &&
                                 (std::getenv("GCTA_DISABLE_INT8_MLMA") == nullptr);
-    if (direct_fast_wb && !ctx.Uk_is_transposed && ctx.Uk.rows() == n && ctx.Uk.cols() > 0) {
+    const int wb_k = ctx.woodbury_basis_rank_;
+    if (direct_fast_wb && !ctx.Uk_is_transposed && wb_k > 0 && ctx.Uk.rows() == n && ctx.Uk.cols() >= wb_k) {
         // Direct inline quantization from n x k ctx.Uk without ever allocating a
         // duplicate 4*k*n Uk_f matrix (cuts peak RSS from 80 GB -> 50-60 GB at N=500k, k=20k).
+        const auto Uk_view = ctx.Uk.leftCols(wb_k);
         const Eigen::VectorXf ck_f = ctx.ck.cast<float>();
         const Eigen::VectorXf sqrt_ck_f = ck_f.cwiseSqrt();
         const float sig2e_f = static_cast<float>(ctx.sigma2_eff);
 
-        Eigen::VectorXf u_y = ctx.Uk.transpose() * y_adj;
+        Eigen::VectorXf u_y = Uk_view.transpose() * y_adj;
         u_y.array() *= ck_f.array();
-        Eigen::VectorXf vi_y = (y_adj - ctx.Uk * u_y) / sig2e_f;
+        Eigen::VectorXf vi_y = (y_adj - Uk_view * u_y) / sig2e_f;
 
         bool unit_weights = true;
         double S_w2 = static_cast<double>(n);
@@ -1001,7 +1003,7 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
 
         const auto t_qb0 = prof ? Clock::now() : Clock::time_point{};
         QuantizedWoodburyUk q_uk = build_quantized_woodbury_uk_from_nxk(
-            ctx.Uk, sqrt_ck_f, w_sqrt, unit_weights, S_w2, fast_mlma, tuning.q_rows);
+            Uk_view, sqrt_ck_f, w_sqrt, unit_weights, S_w2, fast_mlma, tuning.q_rows);
         if (prof) {
             prof->q_build_s += std::chrono::duration<double>(Clock::now() - t_qb0).count();
         }

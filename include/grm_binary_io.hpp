@@ -9,6 +9,7 @@
 #include <array>
 #include <bit>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
@@ -1709,6 +1710,8 @@ public:
         tile_scratch_f64_.resize(0, 0);
         tile_scratch_f32_T_.resize(0, 0);
         tile_scratch_f64_T_.resize(0, 0);
+        strip_scratch_bf16_.clear();
+        strip_scratch_f32_.clear();
     }
 
     // Fast-path transposed float32 tile: shape (ce-cs) x (re-rs) ColMajor so
@@ -1821,6 +1824,22 @@ public:
     }
     int fused_j_block() const noexcept { return fused_j_block_; }
 
+    // Strip-coalesced large-k symmetric matvec: Y = K * X.
+    // Unpacks horizontal row bands [rs, re) across wide column chunks [cs, ce) directly
+    // into L3/RAM strip scratch (with fused FP16 -> BF16 RNE conversion when use_bf16=true),
+    // eliminating double-hop FP16->FP32->BF16 traffic and 15x-37x GEMM/OMP barriers,
+    // plus balanced 64x64 diagonal unpack+mirror into cblas_sgemm / BF16 GEMM.
+    void symm_large_k(const float* X_ptr, gcta_blas_int ldX,
+                      const uint16_t* X_bf16_pre,
+                      int cols,
+                      float* Y_ptr, gcta_blas_int ldY,
+                      bool use_bf16,
+                      int band_rows = 0,
+                      int col_chunk = 0,
+                      double* trace_K_out = nullptr,
+                      double* trace_K2_out = nullptr,
+                      gcta_chunked::MatvecStats* stats = nullptr) const;
+
     // Legacy non-transposed float32 tile (shape (re-rs) x (ce-cs)).
     Eigen::Ref<const Eigen::MatrixXf> read_tile_f32(int rs, int re, int cs, int ce) const {
         const auto tile_T = read_tile_f32_T(rs, re, cs, ce);
@@ -1890,6 +1909,8 @@ private:
     mutable Eigen::MatrixXd tile_scratch_f64_;
     mutable Eigen::MatrixXf tile_scratch_f32_T_;
     mutable Eigen::MatrixXd tile_scratch_f64_T_;
+    mutable AlignedRawBuffer<uint16_t, 64> strip_scratch_bf16_;
+    mutable AlignedRawBuffer<float, 64> strip_scratch_f32_;
 };
 
 namespace detail {
@@ -1910,6 +1931,70 @@ inline bool packed_f16_has_avx512() noexcept {
 #else
     return false;
 #endif
+}
+
+inline bool packed_f16_has_avx512bf16() noexcept {
+#if GCTA_CPU_x86 && (defined(__GNUC__) || defined(__clang__))
+  #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__F16C__) && defined(__AVX512BF16__)
+    return true;
+  #else
+    static const bool has =
+        __builtin_cpu_supports("avx512f") &&
+        __builtin_cpu_supports("avx512bw") &&
+        __builtin_cpu_supports("avx512vl") &&
+        __builtin_cpu_supports("f16c") &&
+        __builtin_cpu_supports("avx512bf16");
+    return has;
+  #endif
+#else
+    return false;
+#endif
+}
+
+#if GCTA_CPU_x86 && (defined(__GNUC__) || defined(__clang__))
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__F16C__) && defined(__AVX512BF16__)
+inline void fp16_to_bf16_rne_avx512(const GrmFp16* src, uint16_t* dst, size_t n) noexcept {
+#else
+__attribute__((target("avx512f,avx512bw,avx512vl,f16c,avx512bf16"), noinline))
+inline void fp16_to_bf16_rne_avx512(const GrmFp16* src, uint16_t* dst, size_t n) noexcept {
+#endif
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        const __m512 lo = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i)));
+        const __m512 hi = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i + 16)));
+        const __m512bh bh = _mm512_cvtne2ps_pbh(hi, lo);
+        std::memcpy(dst + i, &bh, 64);
+    }
+    if (i + 16 <= n) {
+        const __m512 v = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i)));
+        const __m256bh bh = _mm512_cvtneps_pbh(v);
+        std::memcpy(dst + i, &bh, 32);
+        i += 16;
+    }
+    for (; i < n; ++i) {
+        const float f = fp16_to_f32(src[i]);
+        gcta_f32_to_bf16_rne(&f, dst + i, 1);
+    }
+}
+#endif
+
+inline void fp16_to_bf16_rne_vec(const GrmFp16* src, uint16_t* dst, size_t n) noexcept {
+    if (n == 0) return;
+#if GCTA_CPU_x86 && (defined(__GNUC__) || defined(__clang__))
+    if (packed_f16_has_avx512bf16()) {
+        fp16_to_bf16_rne_avx512(src, dst, n);
+        return;
+    }
+#endif
+    constexpr size_t kBlk = 64;
+    float tmp[kBlk];
+    for (size_t i = 0; i < n; i += kBlk) {
+        const size_t cnt = std::min(kBlk, n - i);
+        for (size_t k = 0; k < cnt; ++k) {
+            tmp[k] = fp16_to_f32(src[i + k]);
+        }
+        gcta_f32_to_bf16_rne(tmp, dst + i, cnt);
+    }
 }
 
 template <int P>
@@ -2500,6 +2585,277 @@ inline void PackedGrmFp16::symm_f32_fused(
     }
 }
 
+namespace detail {
+
+template <typename Elem>
+inline Elem symm_large_k_diag_elem(float v) noexcept {
+    if constexpr (std::is_same_v<Elem, uint16_t>) {
+        uint16_t b = 0;
+        gcta_f32_to_bf16_rne(&v, &b, 1);
+        return b;
+    } else {
+        return v;
+    }
+}
+
+template <typename Elem>
+inline void unpack_fp16_row_strip(const GrmFp16* src, Elem* dst, size_t n) noexcept {
+    if constexpr (std::is_same_v<Elem, uint16_t>) {
+        fp16_to_bf16_rne_vec(src, dst, n);
+    } else {
+        #pragma omp simd
+        for (size_t lq = 0; lq < n; ++lq) {
+            dst[lq] = fp16_to_f32(src[lq]);
+        }
+    }
+}
+
+template <typename Elem>
+inline void unpack_diag_tile_symmetric(
+    const GrmFp16* packed_base,
+    const float* diag_ptr,
+    int rs,
+    int rows_i,
+    Elem* T,
+    gcta_blas_int ldD) noexcept
+{
+    constexpr int kB = 64;
+    const int nblk = (rows_i + kB - 1) / kB;
+    const int total_upper = nblk * (nblk + 1) / 2;
+    #pragma omp parallel for schedule(static) if (rows_i >= 128)
+    for (int idx = 0; idx < total_upper; ++idx) {
+        int bj = static_cast<int>((std::sqrt(8.0 * static_cast<double>(idx) + 1.0) - 1.0) * 0.5);
+        while ((bj + 1) * (bj + 2) / 2 <= idx) ++bj;
+        while (bj * (bj + 1) / 2 > idx) --bj;
+        const int bi = idx - bj * (bj + 1) / 2;
+
+        const int r0 = bi * kB;
+        const int r1 = std::min(rows_i, r0 + kB);
+        const int rlen = r1 - r0;
+        const int c0 = bj * kB;
+        const int c1 = std::min(rows_i, c0 + kB);
+        const int clen = c1 - c0;
+
+        if (bi < bj) {
+            alignas(64) Elem blk[kB][kB + 4];
+            for (int dc = 0; dc < clen; ++dc) {
+                const int c = c0 + dc;
+                const int gi = rs + c;
+                const GrmFp16* __restrict__ src =
+                    packed_base + static_cast<size_t>(gi) * (gi + 1) / 2 + (rs + r0);
+                Elem* __restrict__ dst_col = T + r0 + static_cast<size_t>(c) * static_cast<size_t>(ldD);
+                unpack_fp16_row_strip(src, dst_col, static_cast<size_t>(rlen));
+                for (int dr = 0; dr < rlen; ++dr) {
+                    blk[dr][dc] = dst_col[dr];
+                }
+            }
+            for (int dr = 0; dr < rlen; ++dr) {
+                std::memcpy(T + c0 + static_cast<size_t>(r0 + dr) * static_cast<size_t>(ldD),
+                            blk[dr], static_cast<size_t>(clen) * sizeof(Elem));
+            }
+        } else {
+            for (int dc = 0; dc < clen; ++dc) {
+                const int c = c0 + dc;
+                const int gi = rs + c;
+                const GrmFp16* __restrict__ src =
+                    packed_base + static_cast<size_t>(gi) * (gi + 1) / 2 + (rs + c0);
+                Elem* __restrict__ dst_col = T + c0 + static_cast<size_t>(c) * static_cast<size_t>(ldD);
+                if (dc > 0) {
+                    unpack_fp16_row_strip(src, dst_col, static_cast<size_t>(dc));
+                }
+                dst_col[dc] = symm_large_k_diag_elem<Elem>(diag_ptr[gi]);
+                for (int dr = 0; dr < dc; ++dr) {
+                    T[c + static_cast<size_t>(c0 + dr) * static_cast<size_t>(ldD)] = dst_col[dr];
+                }
+            }
+        }
+    }
+}
+
+} // namespace detail
+
+inline void PackedGrmFp16::symm_large_k(
+    const float* X_ptr, gcta_blas_int ldX,
+    const uint16_t* X_bf16_pre,
+    int cols,
+    float* Y_ptr, gcta_blas_int ldY,
+    bool use_bf16,
+    int band_rows,
+    int col_chunk,
+    double* trace_K_out,
+    double* trace_K2_out,
+    gcta_chunked::MatvecStats* stats) const
+{
+    using Clock = std::chrono::steady_clock;
+    if (trace_K_out) *trace_K_out = trace_K_;
+    if (trace_K2_out) *trace_K2_out = trace_K2_;
+    if (n_ <= 0 || cols <= 0) return;
+
+    gcta_chunked::detail::parallel_zero_colmajor(Y_ptr, ldY, n_, cols);
+
+    AlignedRawBuffer<uint16_t, 64> X_bf16_local;
+    const uint16_t* X_bf16_ptr = X_bf16_pre;
+    if (use_bf16) {
+        strip_scratch_f32_.clear();
+        if (X_bf16_ptr == nullptr) {
+            X_bf16_local.resize(static_cast<size_t>(n_) * static_cast<size_t>(cols));
+            gcta_chunked::detail::convert_colmajor_f32_to_bf16(
+                X_ptr, ldX, X_bf16_local.data(),
+                static_cast<gcta_blas_int>(n_), static_cast<gcta_blas_int>(cols));
+            X_bf16_ptr = X_bf16_local.data();
+        }
+    } else {
+        strip_scratch_bf16_.clear();
+    }
+
+    const int H = std::clamp(band_rows > 0 ? band_rows : 8192, 64, n_);
+    const size_t elem_b = use_bf16 ? sizeof(uint16_t) : sizeof(float);
+    const size_t max_elems = (1ULL << 30) / elem_b;
+    int C = (col_chunk > 0)
+        ? col_chunk
+        : static_cast<int>(std::clamp<size_t>(
+              (max_elems / static_cast<size_t>(H)) & ~size_t(63), 4096, 65536));
+    C = std::max(64, std::min(n_, C));
+
+    auto pad_ld = [&](int dim) noexcept -> int {
+        if (use_bf16) {
+            return ((dim & 2047) == 0) ? (dim + 32) : dim;
+        }
+        return ((dim & 1023) == 0) ? (dim + 16) : dim;
+    };
+
+    const int max_cols_j = std::min(n_, C);
+    const int max_rows_i = std::min(n_, H);
+    const size_t need_elems = std::max(
+        static_cast<size_t>(pad_ld(max_cols_j)) * static_cast<size_t>(max_rows_i),
+        static_cast<size_t>(pad_ld(max_rows_i)) * static_cast<size_t>(max_rows_i));
+
+    if (use_bf16) {
+        if (strip_scratch_bf16_.size() < need_elems) strip_scratch_bf16_.resize(need_elems);
+    } else {
+        if (strip_scratch_f32_.size() < need_elems) strip_scratch_f32_.resize(need_elems);
+    }
+
+    const GrmFp16* const packed_base = packed_.get();
+    const float* const diag_ptr = diag_f32_.data();
+    const gcta_blas_int ldX_bf16 = static_cast<gcta_blas_int>(n_);
+
+    for (int rs = 0; rs < n_; rs += H) {
+        const int re = std::min(n_, rs + H);
+        const int rows_i = re - rs;
+
+        // Strictly off-diagonal column chunks [cs, ce) with ce <= rs
+        for (int cs = 0; cs < rs; cs += C) {
+            const int ce = std::min(rs, cs + C);
+            const int cols_j = ce - cs;
+            const gcta_blas_int ldT = static_cast<gcta_blas_int>(pad_ld(cols_j));
+
+            const auto t_u0 = stats ? Clock::now() : Clock::time_point{};
+            if (use_bf16) {
+                uint16_t* const T_bf16 = strip_scratch_bf16_.data();
+                #pragma omp parallel for schedule(static) if (static_cast<size_t>(rows_i) * static_cast<size_t>(cols_j) >= 16384)
+                for (int lp = 0; lp < rows_i; ++lp) {
+                    const int gi = rs + lp;
+                    const GrmFp16* __restrict__ src =
+                        packed_base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
+                    uint16_t* __restrict__ dst = T_bf16 + static_cast<size_t>(lp) * static_cast<size_t>(ldT);
+                    detail::fp16_to_bf16_rne_vec(src, dst, static_cast<size_t>(cols_j));
+                }
+            } else {
+                float* const T_f32 = strip_scratch_f32_.data();
+                #pragma omp parallel for schedule(static) if (static_cast<size_t>(rows_i) * static_cast<size_t>(cols_j) >= 16384)
+                for (int lp = 0; lp < rows_i; ++lp) {
+                    const int gi = rs + lp;
+                    const GrmFp16* __restrict__ src =
+                        packed_base + static_cast<size_t>(gi) * (gi + 1) / 2 + cs;
+                    float* __restrict__ dst = T_f32 + static_cast<size_t>(lp) * static_cast<size_t>(ldT);
+                    #pragma omp simd
+                    for (int lq = 0; lq < cols_j; ++lq) {
+                        dst[lq] = fp16_to_f32(src[lq]);
+                    }
+                }
+            }
+            const auto t_g0 = stats ? Clock::now() : Clock::time_point{};
+            if (stats) {
+                stats->unpack_s += std::chrono::duration<double>(t_g0 - t_u0).count();
+            }
+
+            if (use_bf16) {
+                const uint16_t* const T_bf16 = strip_scratch_bf16_.data();
+                gcta_gemm_bf16bf16f32_colmajor(
+                    'T', 'N',
+                    static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols),
+                    static_cast<gcta_blas_int>(cols_j),
+                    1.0f, T_bf16, ldT,
+                    X_bf16_ptr + cs, ldX_bf16,
+                    1.0f, Y_ptr + rs, ldY);
+                gcta_gemm_bf16bf16f32_colmajor(
+                    'N', 'N',
+                    static_cast<gcta_blas_int>(cols_j), static_cast<gcta_blas_int>(cols),
+                    static_cast<gcta_blas_int>(rows_i),
+                    1.0f, T_bf16, ldT,
+                    X_bf16_ptr + rs, ldX_bf16,
+                    1.0f, Y_ptr + cs, ldY);
+            } else {
+                const float* const T_f32 = strip_scratch_f32_.data();
+                cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans,
+                            static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols),
+                            static_cast<gcta_blas_int>(cols_j),
+                            1.0f, T_f32, ldT,
+                            X_ptr + cs, ldX,
+                            1.0f, Y_ptr + rs, ldY);
+                cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                            static_cast<gcta_blas_int>(cols_j), static_cast<gcta_blas_int>(cols),
+                            static_cast<gcta_blas_int>(rows_i),
+                            1.0f, T_f32, ldT,
+                            X_ptr + rs, ldX,
+                            1.0f, Y_ptr + cs, ldY);
+            }
+            if (stats) {
+                stats->gemm_s += std::chrono::duration<double>(Clock::now() - t_g0).count();
+                stats->tiles += 1;
+                stats->gemm_calls += 2;
+            }
+        }
+
+        // Diagonal square tile [rs, re) x [rs, re)
+        const gcta_blas_int ldD = static_cast<gcta_blas_int>(pad_ld(rows_i));
+        const auto t_u0 = stats ? Clock::now() : Clock::time_point{};
+        if (use_bf16) {
+            detail::unpack_diag_tile_symmetric(
+                packed_base, diag_ptr, rs, rows_i, strip_scratch_bf16_.data(), ldD);
+        } else {
+            detail::unpack_diag_tile_symmetric(
+                packed_base, diag_ptr, rs, rows_i, strip_scratch_f32_.data(), ldD);
+        }
+        const auto t_g0 = stats ? Clock::now() : Clock::time_point{};
+        if (stats) {
+            stats->unpack_s += std::chrono::duration<double>(t_g0 - t_u0).count();
+        }
+        if (use_bf16) {
+            gcta_gemm_bf16bf16f32_colmajor(
+                'N', 'N',
+                static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols),
+                static_cast<gcta_blas_int>(rows_i),
+                1.0f, strip_scratch_bf16_.data(), ldD,
+                X_bf16_ptr + rs, ldX_bf16,
+                1.0f, Y_ptr + rs, ldY);
+        } else {
+            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols),
+                        static_cast<gcta_blas_int>(rows_i),
+                        1.0f, strip_scratch_f32_.data(), ldD,
+                        X_ptr + rs, ldX,
+                        1.0f, Y_ptr + rs, ldY);
+        }
+        if (stats) {
+            stats->gemm_s += std::chrono::duration<double>(Clock::now() - t_g0).count();
+            stats->tiles += 1;
+            stats->gemm_calls += 1;
+        }
+    }
+}
+
 struct PackedGrmFp16Handle {
     gcta_chunked::TileReader reader;
     gcta_chunked::TileReaderF32 reader_f32;
@@ -2903,6 +3259,17 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
                                              double* tr_K_out,
                                              double* tr_K2_out) {
         file->symm_f32_fused(X, Y, tr_K_out, tr_K2_out);
+    };
+    handle.reader_f32.large_k_symm_fn = [file](const float* X_ptr, gcta_blas_int ldX,
+                                               const uint16_t* X_bf16_pre,
+                                               int cols,
+                                               float* Y_ptr, gcta_blas_int ldY,
+                                               bool use_bf16,
+                                               int band_rows, int col_chunk,
+                                               double* tr_K_out, double* tr_K2_out,
+                                               gcta_chunked::MatvecStats* stats) {
+        file->symm_large_k(X_ptr, ldX, X_bf16_pre, cols, Y_ptr, ldY, use_bf16,
+                           band_rows, col_chunk, tr_K_out, tr_K2_out, stats);
     };
     // Avoid small-k tile starvation in PCA rSVD (k_ext < 256): use 8192-row tiles.
     handle.reader_f32.small_k_block_size = std::min(n, 8192);

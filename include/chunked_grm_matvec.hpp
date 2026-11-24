@@ -28,6 +28,7 @@
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -55,6 +56,13 @@ inline constexpr bool default_bf16_sketch() noexcept {
     return false;
 #endif
 }
+
+struct MatvecStats {
+    double unpack_s = 0.0;
+    double gemm_s = 0.0;
+    uint64_t tiles = 0;
+    uint64_t gemm_calls = 0;
+};
 
 // Optional RAII band-prefetch handle for double-buffered streaming sweeps.
 class TileSweep {
@@ -85,6 +93,14 @@ struct TileReaderBase {
                        MatrixT& Y,
                        double* trace_K_out,
                        double* trace_K2_out)> fused_symm_fn;
+    std::function<void(const float* X_ptr, gcta_blas_int ldX,
+                       const uint16_t* X_bf16_pre,
+                       int cols,
+                       float* Y_ptr, gcta_blas_int ldY,
+                       bool use_bf16,
+                       int band_rows, int col_chunk,
+                       double* trace_K_out, double* trace_K2_out,
+                       MatvecStats* stats)> large_k_symm_fn;
     int small_k_block_size = 0;
     int fused_max_k = 128;
 
@@ -103,6 +119,7 @@ struct TileReaderBase {
         begin_sweep_fn = nullptr;
         release_fn = nullptr;
         fused_symm_fn = nullptr;
+        large_k_symm_fn = nullptr;
         small_k_block_size = 0;
         fused_max_k = 128;
         return *this;
@@ -201,44 +218,83 @@ inline int solve_chunk_rows(int n, double budget_gb, int k_ext, double reserved_
 namespace detail {
 
 template <typename Scalar>
-inline void parallel_zero_matrix(Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& M) noexcept {
-    const Eigen::Index rows = M.rows();
-    const Eigen::Index cols = M.cols();
-    if (rows <= 0 || cols <= 0) return;
-    const size_t total_bytes = static_cast<size_t>(rows) * static_cast<size_t>(cols) * sizeof(Scalar);
-    char* const ptr = reinterpret_cast<char*>(M.data());
-    if (total_bytes < (256ULL << 10)) {
-        std::memset(ptr, 0, total_bytes);
+inline void parallel_zero_colmajor(Scalar* ptr, gcta_blas_int ld, int rows, int cols) noexcept {
+    if (rows <= 0 || cols <= 0 || ptr == nullptr) return;
+    if (ld == rows) {
+        const size_t total_bytes = static_cast<size_t>(rows) * static_cast<size_t>(cols) * sizeof(Scalar);
+        char* const cptr = reinterpret_cast<char*>(ptr);
+        if (total_bytes < (256ULL << 10)) {
+            std::memset(cptr, 0, total_bytes);
+            return;
+        }
+        #pragma omp parallel
+        {
+            const int tid = omp_get_thread_num();
+            const int nt  = omp_get_num_threads();
+            const size_t lo = ((total_bytes * static_cast<size_t>(tid)) / static_cast<size_t>(nt)) & ~size_t(63);
+            const size_t hi = (tid + 1 == nt)
+                ? total_bytes
+                : (((total_bytes * static_cast<size_t>(tid + 1)) / static_cast<size_t>(nt)) & ~size_t(63));
+            if (hi > lo) {
+                std::memset(cptr + lo, 0, hi - lo);
+            }
+        }
         return;
     }
-    #pragma omp parallel
-    {
-        const int tid = omp_get_thread_num();
-        const int nt  = omp_get_num_threads();
-        const size_t lo = ((total_bytes * static_cast<size_t>(tid)) / static_cast<size_t>(nt)) & ~size_t(63);
-        const size_t hi = (tid + 1 == nt)
-            ? total_bytes
-            : (((total_bytes * static_cast<size_t>(tid + 1)) / static_cast<size_t>(nt)) & ~size_t(63));
-        if (hi > lo) {
-            std::memset(ptr + lo, 0, hi - lo);
-        }
+    const size_t col_bytes = static_cast<size_t>(rows) * sizeof(Scalar);
+    #pragma omp parallel for schedule(static) if (static_cast<size_t>(cols) * col_bytes >= (256ULL << 10))
+    for (int j = 0; j < cols; ++j) {
+        std::memset(ptr + static_cast<size_t>(j) * static_cast<size_t>(ld), 0, col_bytes);
     }
 }
 
+template <typename Scalar>
+inline void parallel_zero_matrix(Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>& M) noexcept {
+    parallel_zero_colmajor(M.data(), static_cast<gcta_blas_int>(M.outerStride()),
+                           static_cast<int>(M.rows()), static_cast<int>(M.cols()));
+}
+
 // Cache-blocked 64x64 mirror of upper triangle (r <= c) into strict lower triangle (r > c)
-// of a column-major dim x dim BF16 tile (L3-resident, <= 32-128 MB).
+// of a column-major dim x dim BF16 tile (parallelized over all nblk*(nblk+1)/2 upper blocks
+// so high core counts >= 192 stay saturated without triangular load skew).
 inline void mirror_upper_to_lower_bf16(uint16_t* T_bf16, int dim) noexcept {
     constexpr int kMir = 64;
-    #pragma omp parallel for schedule(guided) if (dim >= 256)
-    for (int c0 = 0; c0 < dim; c0 += kMir) {
+    if (dim <= 1) return;
+    const int nblk = (dim + kMir - 1) / kMir;
+    const int total_upper = nblk * (nblk + 1) / 2;
+    #pragma omp parallel for schedule(static) if (dim >= 256)
+    for (int idx = 0; idx < total_upper; ++idx) {
+        int bj = static_cast<int>((std::sqrt(8.0 * static_cast<double>(idx) + 1.0) - 1.0) * 0.5);
+        while ((bj + 1) * (bj + 2) / 2 <= idx) ++bj;
+        while (bj * (bj + 1) / 2 > idx) --bj;
+        const int bi = idx - bj * (bj + 1) / 2;
+
+        const int r0 = bi * kMir;
+        const int r1 = std::min(dim, r0 + kMir);
+        const int rlen = r1 - r0;
+        const int c0 = bj * kMir;
         const int c1 = std::min(dim, c0 + kMir);
-        for (int r0 = c0; r0 < dim; r0 += kMir) {
-            const int r1 = std::min(dim, r0 + kMir);
+        const int clen = c1 - c0;
+
+        if (bi < bj) {
+            alignas(64) uint16_t blk[kMir][kMir + 4];
+            for (int dc = 0; dc < clen; ++dc) {
+                const uint16_t* __restrict__ src =
+                    T_bf16 + r0 + static_cast<size_t>(c0 + dc) * static_cast<size_t>(dim);
+                for (int dr = 0; dr < rlen; ++dr) {
+                    blk[dr][dc] = src[dr];
+                }
+            }
+            for (int dr = 0; dr < rlen; ++dr) {
+                std::memcpy(T_bf16 + c0 + static_cast<size_t>(r0 + dr) * static_cast<size_t>(dim),
+                            blk[dr], static_cast<size_t>(clen) * sizeof(uint16_t));
+            }
+        } else {
             for (int c = c0; c < c1; ++c) {
-                const int r_start = std::max(r0, c + 1);
-                uint16_t* dst_col = T_bf16 + static_cast<size_t>(c) * static_cast<size_t>(dim);
-                for (int r = r_start; r < r1; ++r) {
-                    dst_col[r] = T_bf16[c + static_cast<size_t>(r) * static_cast<size_t>(dim)];
+                const uint16_t* __restrict__ src_col =
+                    T_bf16 + static_cast<size_t>(c) * static_cast<size_t>(dim);
+                for (int r = c0; r < c; ++r) {
+                    T_bf16[c + static_cast<size_t>(r) * static_cast<size_t>(dim)] = src_col[r];
                 }
             }
         }
@@ -502,7 +558,10 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
     const Eigen::Ref<const Eigen::MatrixXf>& X,
     double* trace_K_out = nullptr,
     double* trace_K2_out = nullptr,
-    bool use_bf16 = false)
+    bool use_bf16 = false,
+    int band_rows = 0,
+    int col_chunk = 0,
+    MatvecStats* stats = nullptr)
 {
     const int cols = static_cast<int>(X.cols());
     Eigen::MatrixXf Y(n, cols);
@@ -513,6 +572,15 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
     }
     if (read_tile.fused_symm_fn && read_tile.fused_max_k > 0 && cols <= read_tile.fused_max_k) {
         read_tile.fused_symm_fn(X, Y, trace_K_out, trace_K2_out);
+        return Y;
+    }
+    if (read_tile.large_k_symm_fn && (use_bf16 || cols >= 128 || band_rows > 0 || col_chunk > 0)) {
+        read_tile.large_k_symm_fn(
+            X.data(), static_cast<gcta_blas_int>(X.outerStride()),
+            nullptr, cols,
+            Y.data(), static_cast<gcta_blas_int>(n),
+            use_bf16, band_rows, col_chunk,
+            trace_K_out, trace_K2_out, stats);
         return Y;
     }
     detail::parallel_zero_matrix(Y);

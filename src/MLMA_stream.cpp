@@ -965,6 +965,73 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
     return st;
 }
 
+struct StreamingReuseHandle {
+    string           tun3_path;
+    uint64_t         basis_hash = 0;
+    Tun3Metadata     meta;
+    std::vector<int> fp16_rows;
+    size_t           io_slot_bytes = 256ULL << 20;
+    bool             active = false;
+};
+
+// Pass 3 of zero-Uk streaming TREF reuse: stream 16-bit TUN3 slabs once through a
+// reusable <= 256 MiB float32 slab to compute proj_y = Uk^T * uy_scaled_f and return
+// vi_y_f = (y_adj_f - proj_y) / sig2e_f without ever allocating 4*k*n ctx.Uk.
+Eigen::VectorXf compute_vi_y_streaming_tun3(const StreamingReuseHandle& h,
+                                            int n,
+                                            const Eigen::VectorXf& y_adj_f,
+                                            const Eigen::VectorXf& uy_scaled_f,
+                                            float sig2e_f)
+{
+    ScopedFd fd(::open(h.tun3_path.c_str(), O_RDONLY));
+    if (!fd) {
+        LOGGER.e(0, "Cannot re-open TUN3 basis [" + h.tun3_path + "] for TREF Vi_y pass.");
+    }
+    const int32_t k = h.meta.k;
+    const size_t col_bytes = static_cast<size_t>(k) * sizeof(uint16_t);
+    const size_t u16_slot_bytes = std::clamp<size_t>(h.io_slot_bytes, 1ULL << 20, 128ULL << 20);
+    const std::vector<SampleChunk> plan =
+        plan_sample_chunks(h.meta.body_offset, n, col_bytes, u16_slot_bytes);
+    std::vector<std::pair<off_t, size_t>> io_chunks;
+    io_chunks.reserve(plan.size());
+    size_t max_b = 0;
+    int max_cols = 1;
+    for (const auto& c : plan) {
+        io_chunks.emplace_back(c.offset, c.bytes);
+        max_b = std::max(max_b, c.bytes);
+        max_cols = std::max(max_cols, c.s_end - c.s_beg);
+    }
+
+    AlignedRawBuffer<float, 64> slab_f32(static_cast<size_t>(k) * static_cast<size_t>(max_cols));
+    Eigen::VectorXf proj_y = Eigen::VectorXf::Zero(n);
+    const int unpack_nt = std::max(1, omp_get_max_threads() - 1);
+
+    try {
+        gcta_io::AsyncSeqReader reader(fd.get(), h.tun3_path, std::move(io_chunks), max_b, false);
+        const char* data = nullptr;
+        size_t len = 0;
+        size_t ci = 0;
+        while (reader.next_slot(data, len)) {
+            const int s_beg = plan[ci].s_beg;
+            const int cols  = plan[ci].s_end - s_beg;
+            dequant_tun3_slab_to_f32(
+                reinterpret_cast<const uint16_t*>(data), k, cols,
+                h.meta.uk_row_scale, h.fp16_rows, slab_f32.data(), unpack_nt);
+            reader.release_slot();
+            cblas_sgemv(CblasColMajor, CblasTrans,
+                        static_cast<gcta_blas_int>(k), static_cast<gcta_blas_int>(cols),
+                        1.0f, slab_f32.data(), static_cast<gcta_blas_int>(k),
+                        uy_scaled_f.data(), 1,
+                        0.0f, proj_y.data() + s_beg, 1);
+            ++ci;
+        }
+        reader.stop();
+    } catch (const std::exception& e) {
+        LOGGER.e(0, e.what());
+    }
+    return (y_adj_f - proj_y) / sig2e_f;
+}
+
 // Writes TUN3 (compact 16-bit Woodbury), TREF (thin reference on --woodbury-reuse
 // unless reml_standalone=true), or GOBY (exact dense float32 Cholesky).
 // Note: invoked only on --save-reml (which exits immediately), so it may release ctx.Uk
@@ -973,7 +1040,9 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
                            uint64_t id_hash,
                            const string& reuse_basis_tun3_path = {},
                            uint64_t reuse_basis_hash = 0,
-                           bool reml_standalone = false)
+                           bool reml_standalone = false,
+                           const StreamingReuseHandle* streaming_reuse = nullptr,
+                           size_t io_slot_bytes = (256ULL << 20))
 {
     ScopedFd fd(::open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
     if (!fd) {
@@ -991,9 +1060,12 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
     if (ctx.Vi_use_woodbury_basis) {
         const int32_t n = static_cast<int32_t>(ctx.n);
         const int32_t k = static_cast<int32_t>(ctx.dk.size());
-        const bool uk_ok = ctx.Uk_is_transposed
-            ? (ctx.Uk.rows() == k && ctx.Uk.cols() == n)
-            : (ctx.Uk.rows() == n && ctx.Uk.cols() >= k);
+        const bool is_streaming_reuse = (streaming_reuse != nullptr && streaming_reuse->active);
+        const bool uk_ok = is_streaming_reuse
+            ? (ctx.wb_subspace_ready && ctx.UkTX.rows() == k && static_cast<int32_t>(ctx.UkTy.size()) == k)
+            : (ctx.Uk_is_transposed
+                ? (ctx.Uk.rows() == k && ctx.Uk.cols() == n)
+                : (ctx.Uk.rows() == n && ctx.Uk.cols() >= k));
         if (!uk_ok) {
             LOGGER.e(0, "invalid Woodbury REML context dimensions before save.");
         }
@@ -1014,16 +1086,44 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
         float sig2e_f = 0.0f;
         compute_woodbury_ck_from_saved(dk_f, ctx.lambda_tail, varcmp_f, ck_f, sqrt_ck_f, sig2e_f);
 
+        std::vector<float> max_abs;
+        bool have_max_abs = false;
         Eigen::VectorXf vi_y_f;
-        if (ctx.Uk_is_transposed) {
+        if (is_streaming_reuse) {
+            RemlVec uy_d = ctx.UkTy;
+            if (!no_adj_covar && ctx.X_c > 0) {
+                uy_d.noalias() -= ctx.UkTX * ctx.b;
+            }
+            const Eigen::VectorXf uy_scaled = uy_d.cast<float>().cwiseProduct(ck_f);
+            vi_y_f = compute_vi_y_streaming_tun3(*streaming_reuse, n, y_adj_f, uy_scaled, sig2e_f);
+        } else if (ctx.Uk_is_transposed) {
             Eigen::VectorXf uy = ctx.Uk * y_adj_f;
             uy.array() *= ck_f.array();
             vi_y_f = (y_adj_f - ctx.Uk.transpose() * uy) / sig2e_f;
         } else {
-            const auto Uk_view = ctx.Uk.leftCols(k);
-            Eigen::VectorXf uy = Uk_view.transpose() * y_adj_f;
+            // Fuse max_abs[r] and uy[r] = dot(Uk[:,r], y_adj_f) in a single pass over Uk.
+            max_abs.assign(static_cast<size_t>(k), 0.0f);
+            Eigen::VectorXf uy(k);
+            const float* const uk_src = ctx.Uk.data();
+            const float* const y_adj_ptr = y_adj_f.data();
+            #pragma omp parallel for schedule(static)
+            for (int32_t r = 0; r < k; ++r) {
+                const float* const col = uk_src + static_cast<size_t>(r) * static_cast<size_t>(n);
+                float m = 0.0f;
+                double dot = 0.0;
+                #pragma omp simd reduction(max:m) reduction(+:dot)
+                for (int32_t s = 0; s < n; ++s) {
+                    const float v = col[s];
+                    const float av = std::fabs(v);
+                    if (av > m) m = av;
+                    dot += static_cast<double>(v) * static_cast<double>(y_adj_ptr[s]);
+                }
+                max_abs[static_cast<size_t>(r)] = m;
+                uy[r] = static_cast<float>(dot);
+            }
+            have_max_abs = true;
             uy.array() *= ck_f.array();
-            vi_y_f = (y_adj_f - Uk_view * uy) / sig2e_f;
+            vi_y_f = (y_adj_f - ctx.Uk.leftCols(k) * uy) / sig2e_f;
         }
 
         const uint32_t flags = kTun3FlagHasViY | (no_adj_covar ? kTun3FlagNoAdjCovar : 0u);
@@ -1070,44 +1170,46 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
         }
 
         // --- Compact 16-bit TUN3 Branch ---
-        std::vector<float> max_abs(static_cast<size_t>(k), 0.0f);
         const float* const uk_src = ctx.Uk.data();
-        if (!ctx.Uk_is_transposed) {
-            #pragma omp parallel for schedule(static)
-            for (int32_t r = 0; r < k; ++r) {
-                const float* const col = uk_src + static_cast<size_t>(r) * static_cast<size_t>(n);
-                float m = 0.0f;
-                #pragma omp simd reduction(max:m)
-                for (int32_t s = 0; s < n; ++s) {
-                    const float av = std::fabs(col[s]);
-                    if (av > m) m = av;
+        if (!have_max_abs) {
+            max_abs.assign(static_cast<size_t>(k), 0.0f);
+            if (!ctx.Uk_is_transposed) {
+                #pragma omp parallel for schedule(static)
+                for (int32_t r = 0; r < k; ++r) {
+                    const float* const col = uk_src + static_cast<size_t>(r) * static_cast<size_t>(n);
+                    float m = 0.0f;
+                    #pragma omp simd reduction(max:m)
+                    for (int32_t s = 0; s < n; ++s) {
+                        const float av = std::fabs(col[s]);
+                        if (av > m) m = av;
+                    }
+                    max_abs[static_cast<size_t>(r)] = m;
                 }
-                max_abs[static_cast<size_t>(r)] = m;
-            }
-        } else {
-            const int max_t = std::max(1, omp_get_max_threads());
-            const size_t k_pad = (static_cast<size_t>(k) + 15) / 16 * 16;
-            std::vector<float> thr_max(static_cast<size_t>(max_t) * k_pad, 0.0f);
-            #pragma omp parallel
-            {
-                const int tid = omp_get_thread_num();
-                float* const lmax = thr_max.data() + static_cast<size_t>(tid) * k_pad;
-                #pragma omp for schedule(static)
-                for (int32_t s = 0; s < n; ++s) {
-                    const float* const col = uk_src + static_cast<size_t>(s) * static_cast<size_t>(k);
-                    #pragma omp simd
-                    for (int32_t r = 0; r < k; ++r) {
-                        const float av = std::fabs(col[r]);
-                        if (av > lmax[r]) lmax[r] = av;
+            } else {
+                const int max_t = std::max(1, omp_get_max_threads());
+                const size_t k_pad = (static_cast<size_t>(k) + 15) / 16 * 16;
+                std::vector<float> thr_max(static_cast<size_t>(max_t) * k_pad, 0.0f);
+                #pragma omp parallel
+                {
+                    const int tid = omp_get_thread_num();
+                    float* const lmax = thr_max.data() + static_cast<size_t>(tid) * k_pad;
+                    #pragma omp for schedule(static)
+                    for (int32_t s = 0; s < n; ++s) {
+                        const float* const col = uk_src + static_cast<size_t>(s) * static_cast<size_t>(k);
+                        #pragma omp simd
+                        for (int32_t r = 0; r < k; ++r) {
+                            const float av = std::fabs(col[r]);
+                            if (av > lmax[r]) lmax[r] = av;
+                        }
                     }
                 }
-            }
-            for (int32_t r = 0; r < k; ++r) {
-                float m = 0.0f;
-                for (int t = 0; t < max_t; ++t) {
-                    m = std::max(m, thr_max[static_cast<size_t>(t) * k_pad + static_cast<size_t>(r)]);
+                for (int32_t r = 0; r < k; ++r) {
+                    float m = 0.0f;
+                    for (int t = 0; t < max_t; ++t) {
+                        m = std::max(m, thr_max[static_cast<size_t>(t) * k_pad + static_cast<size_t>(r)]);
+                    }
+                    max_abs[static_cast<size_t>(r)] = m;
                 }
-                max_abs[static_cast<size_t>(r)] = m;
             }
         }
 
@@ -1151,16 +1253,16 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
         wr(&y_adj_hash, sizeof(uint64_t));
         wr(vi_y_f.data(), static_cast<size_t>(n) * sizeof(float));
 
-        // Stream k x n 16-bit Uk body via double-buffered 64 MiB AsyncSeqWriter.
-        constexpr size_t kTun3WriteSlotBytes = 64ULL << 20;
+        // Stream k x n 16-bit Uk body via double-buffered AsyncSeqWriter (256 MiB default, T-1 workers).
+        const size_t kTun3WriteSlotBytes = std::clamp<size_t>(io_slot_bytes, 1ULL << 20, 256ULL << 20);
         const size_t col_bytes = static_cast<size_t>(k) * sizeof(uint16_t);
         const int32_t cols_per_chunk = static_cast<int32_t>(
             std::max<size_t>(1, kTun3WriteSlotBytes / std::max<size_t>(1, col_bytes)));
         const size_t init_slot_bytes = std::max(kTun3WriteSlotBytes, col_bytes);
 
-        const int max_t = std::max(1, omp_get_max_threads());
+        const int io_nt = std::max(1, omp_get_max_threads() - 1);
         const size_t k_pad64 = (static_cast<size_t>(k) + 7) / 8 * 8;
-        std::vector<double> thr_eps(static_cast<size_t>(max_t) * k_pad64, 0.0);
+        std::vector<double> thr_eps(static_cast<size_t>(io_nt) * k_pad64, 0.0);
 
         const float* const sc_ptr  = uk_row_scale.data();
         const float* const isc_ptr = inv_row_scale.data();
@@ -1179,7 +1281,7 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
 
                 if (ctx.Uk_is_transposed) {
                     // Already k x n: quantize columns directly with zero transpose!
-                    #pragma omp parallel
+                    #pragma omp parallel num_threads(io_nt)
                     {
                         const int tid = omp_get_thread_num();
                         double* const my_eps = thr_eps.data() + static_cast<size_t>(tid) * k_pad64;
@@ -1214,7 +1316,7 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
                     const int32_t nj_tiles = (k + kBlk - 1) / kBlk;
                     const int64_t total_tiles = static_cast<int64_t>(ni_tiles) * static_cast<int64_t>(nj_tiles);
 
-                    #pragma omp parallel
+                    #pragma omp parallel num_threads(io_nt)
                     {
                         const int tid = omp_get_thread_num();
                         double* const my_eps = thr_eps.data() + static_cast<size_t>(tid) * k_pad64;
@@ -1266,17 +1368,22 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
                 writer.submit_slot(chunk_bytes);
             }
 
-            // Write 4*k trailer row_eps_sq[k] sequentially after Uk body.
+            // Write 4*k trailer row_eps_sq[k] sequentially after Uk body (contiguous SIMD sum).
             const size_t trailer_bytes = static_cast<size_t>(k) * sizeof(float);
             AlignedRawBuffer<char, 64>& tslot = writer.acquire_slot();
             if (tslot.size() < trailer_bytes) tslot.resize(trailer_bytes);
             float* const eps_dst = reinterpret_cast<float*>(tslot.data());
-            for (int32_t r = 0; r < k; ++r) {
-                double acc = 0.0;
-                for (int t = 0; t < max_t; ++t) {
-                    acc += thr_eps[static_cast<size_t>(t) * k_pad64 + static_cast<size_t>(r)];
+            std::vector<double> eps_sum(static_cast<size_t>(k), 0.0);
+            for (int t = 0; t < io_nt; ++t) {
+                const double* __restrict__ row_t = thr_eps.data() + static_cast<size_t>(t) * k_pad64;
+                #pragma omp simd
+                for (int32_t r = 0; r < k; ++r) {
+                    eps_sum[static_cast<size_t>(r)] += row_t[r];
                 }
-                eps_dst[r] = static_cast<float>(acc);
+            }
+            #pragma omp simd
+            for (int32_t r = 0; r < k; ++r) {
+                eps_dst[r] = static_cast<float>(eps_sum[static_cast<size_t>(r)]);
             }
             writer.submit_slot(trailer_bytes);
             writer.finish();
@@ -1316,8 +1423,9 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
     }
 
     const Eigen::MatrixXd& mat = *mat_ptr;
-    constexpr size_t kGobyWriteSlotBytes = 64ULL << 20; // 64 MiB double-buffered
+    const size_t kGobyWriteSlotBytes = std::clamp<size_t>(io_slot_bytes, 1ULL << 20, 256ULL << 20);
     const size_t max_window_elems = kGobyWriteSlotBytes / sizeof(float);
+    const int goby_io_nt = std::max(1, omp_get_max_threads() - 1);
 
     try {
         gcta_io::AsyncSeqWriter writer(fd.get(), filename, kGobyWriteSlotBytes, /*take_ownership=*/false);
@@ -1337,7 +1445,7 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
             float* const dst_base = reinterpret_cast<float*>(slot.data());
             const size_t chunk_start_elem = static_cast<size_t>(j) * (j + 1) / 2;
 
-            #pragma omp parallel for schedule(guided)
+            #pragma omp parallel for schedule(guided) num_threads(goby_io_nt)
             for (int32_t jj = j; jj < j_end; ++jj) {
                 const int32_t len = jj + 1;
                 const double* col_src = mat.col(jj).head(len).data();
@@ -1374,7 +1482,8 @@ struct LoadedBasisInfo {
 // ctx.Uk in k x n layout (ctx.Uk_is_transposed = true), eliminating both 40 GB transposes!
 LoadedBasisInfo load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ctx,
                                              uint64_t expected_id_hash,
-                                             const string& basis_file_override)
+                                             const string& basis_file_override,
+                                             size_t io_slot_bytes = (256ULL << 20))
 {
     ScopedFd fd(::open(filename.c_str(), O_RDONLY));
     if (!fd) LOGGER.e(0, "Cannot open file [" + filename + "].");
@@ -1425,7 +1534,7 @@ LoadedBasisInfo load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ct
     ctx.Uk.resize(k, ctx.n);
     ctx.Uk_is_transposed = true;
 
-    constexpr size_t kReadSlotBytes = 64ULL << 20;
+    const size_t kReadSlotBytes = std::clamp<size_t>(io_slot_bytes, 1ULL << 20, 256ULL << 20);
     const size_t col_bytes = static_cast<size_t>(k) * sizeof(uint16_t);
     const std::vector<SampleChunk> plan = plan_sample_chunks(meta.body_offset, ctx.n, col_bytes, kReadSlotBytes);
     std::vector<std::pair<off_t, size_t>> io_chunks;
@@ -1435,6 +1544,7 @@ LoadedBasisInfo load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ct
         io_chunks.emplace_back(c.offset, c.bytes);
         max_b = std::max(max_b, c.bytes);
     }
+    const int unpack_nt = std::max(1, omp_get_max_threads() - 1);
 
     try {
         gcta_io::AsyncSeqReader reader(tun3_fd, tun3_path, std::move(io_chunks), max_b, false);
@@ -1447,7 +1557,8 @@ LoadedBasisInfo load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ct
             dequant_tun3_slab_to_f32(
                 reinterpret_cast<const uint16_t*>(data), k, cols,
                 meta.uk_row_scale, fp16_rows,
-                ctx.Uk.data() + static_cast<size_t>(s_beg) * static_cast<size_t>(k));
+                ctx.Uk.data() + static_cast<size_t>(s_beg) * static_cast<size_t>(k),
+                unpack_nt);
             reader.release_slot();
             ++ci;
         }
@@ -1469,6 +1580,198 @@ LoadedBasisInfo load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ct
                 ", lambda_tail=" + to_text(meta.lambda_tail) +
                 ", tail_d_var=" + to_text(meta.tail_d_var) + ".");
     return LoadedBasisInfo{tun3_path, meta.basis_hash};
+}
+
+// Zero-Uk streaming --reml-woodbury-reuse for REML-only thin TREF output:
+// Never allocates 4*k*n ctx.Uk (12 GB at N=150k, k=20k); instead streams 16-bit TUN3
+// slabs through a single reusable <= 256 MiB float32 slab across two passes to fill
+// UkTX, UkTy, wb_XtX_perp, wb_Xty_perp, wb_yty_perp, cutting reuse RSS ~30x.
+StreamingReuseHandle preload_woodbury_subspace_streaming(const string& filename,
+                                                         RemlCtx& ctx,
+                                                         uint64_t expected_id_hash,
+                                                         const string& basis_file_override,
+                                                         size_t io_slot_bytes = (256ULL << 20))
+{
+    ScopedFd fd(::open(filename.c_str(), O_RDONLY));
+    if (!fd) LOGGER.e(0, "Cannot open file [" + filename + "].");
+
+    struct stat sb{};
+    if (::fstat(fd.get(), &sb) != 0) {
+        LOGGER.e(0, "Failed to stat file [" + filename + "].");
+    }
+    const size_t file_size = static_cast<size_t>(sb.st_size);
+    if (file_size < kRemlPrefixBytes) {
+        LOGGER.e(0, "[" + filename + "] is empty or too short to be a REML state.");
+    }
+
+    const RemlPrefix prefix = read_reml_prefix(fd.get(), filename);
+    if (prefix.kind == RemlKind::Goby) {
+        LOGGER.e(0, "[" + filename + "] is a dense (GOBY) REML state; --reml-woodbury-reuse needs a "
+                    "Woodbury (TUN3/TREF) state saved from a --reml-woodbury-basis fit.");
+    }
+    check_reml_samples(prefix, ctx.n, expected_id_hash, filename);
+
+    ScopedFd tun3_fd_owner;
+    int tun3_fd = -1;
+    StreamingReuseHandle out;
+    out.io_slot_bytes = io_slot_bytes;
+
+    if (prefix.kind == RemlKind::Tref) {
+        TrefMetadata tref = read_tref_metadata(fd.get(), prefix, filename, /*load_vi_y=*/false);
+        open_and_verify_tref_basis(filename, tref, basis_file_override,
+                                   tun3_fd_owner, out.tun3_path, out.meta);
+        tun3_fd = tun3_fd_owner.get();
+    } else {
+        out.meta      = read_tun3_metadata(fd.get(), prefix, file_size, filename, /*load_vi_y=*/false);
+        tun3_fd       = fd.get();
+        out.tun3_path = filename;
+    }
+
+    const int32_t k = out.meta.k;
+    const int n = ctx.n;
+    const int c = ctx.X_c;
+    if (k <= 0 || k >= n) {
+        LOGGER.e(0, "[" + out.tun3_path + "] has invalid Woodbury rank k=" + to_string(k) + ".");
+    }
+    for (int32_t r = 0; r < k; ++r) {
+        if (out.meta.uk_row_scale[static_cast<size_t>(r)] < 0.0f) {
+            out.fp16_rows.push_back(r);
+        }
+    }
+
+    ctx.Uk.resize(0, 0);
+    ctx.Uk_is_transposed         = false;
+    ctx.dk                       = out.meta.dk_f.cast<double>();
+    ctx.lambda_tail              = out.meta.lambda_tail;
+    ctx.tail_d_var               = out.meta.tail_d_var;
+    ctx.woodbury_basis           = WoodburyBasisSpec{WoodburyBasisSpec::Kind::Fixed, k};
+    ctx.woodbury_basis_rank_     = k;
+    ctx.Vi_use_woodbury_basis    = true;
+    ctx.woodbury_basis_preloaded = true;
+    out.basis_hash               = out.meta.basis_hash;
+    out.active                   = true;
+
+    Eigen::MatrixXf XY_f(n, c + 1);
+    #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(c) >= 65536)
+    for (int j = 0; j < c; ++j) {
+        const double* __restrict__ src = ctx.X.col(j).data();
+        float* __restrict__ dst = XY_f.col(j).data();
+        #pragma omp simd
+        for (int i = 0; i < n; ++i) dst[i] = static_cast<float>(src[i]);
+    }
+    {
+        const double* __restrict__ src = ctx.y.data();
+        float* __restrict__ dst = XY_f.col(c).data();
+        #pragma omp parallel for schedule(static) if (n >= 65536)
+        for (int i = 0; i < n; ++i) dst[i] = static_cast<float>(src[i]);
+    }
+
+    const size_t col_bytes = static_cast<size_t>(k) * sizeof(uint16_t);
+    const size_t u16_slot_bytes = std::clamp<size_t>(io_slot_bytes, 1ULL << 20, 128ULL << 20);
+    const std::vector<SampleChunk> plan = plan_sample_chunks(out.meta.body_offset, n, col_bytes, u16_slot_bytes);
+    std::vector<std::pair<off_t, size_t>> io_chunks;
+    io_chunks.reserve(plan.size());
+    size_t max_b = 0;
+    int max_cols = 1;
+    for (const auto& ch : plan) {
+        io_chunks.emplace_back(ch.offset, ch.bytes);
+        max_b = std::max(max_b, ch.bytes);
+        max_cols = std::max(max_cols, ch.s_end - ch.s_beg);
+    }
+
+    AlignedRawBuffer<float, 64> slab_f32(static_cast<size_t>(k) * static_cast<size_t>(max_cols));
+    Eigen::MatrixXf UkTXY_f = Eigen::MatrixXf::Zero(k, c + 1);
+    const int unpack_nt = std::max(1, omp_get_max_threads() - 1);
+
+    try {
+        // Pass 1: UkTXY_f = sum_slab slab_f32 * XY_f[s_beg:s_end]
+        {
+            gcta_io::AsyncSeqReader reader(tun3_fd, out.tun3_path, io_chunks, max_b, false);
+            const char* data = nullptr;
+            size_t len = 0;
+            size_t ci = 0;
+            while (reader.next_slot(data, len)) {
+                const int s_beg = plan[ci].s_beg;
+                const int cols  = plan[ci].s_end - s_beg;
+                dequant_tun3_slab_to_f32(
+                    reinterpret_cast<const uint16_t*>(data), k, cols,
+                    out.meta.uk_row_scale, out.fp16_rows, slab_f32.data(), unpack_nt);
+                reader.release_slot();
+                cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                            static_cast<gcta_blas_int>(k), static_cast<gcta_blas_int>(c + 1),
+                            static_cast<gcta_blas_int>(cols),
+                            1.0f, slab_f32.data(), static_cast<gcta_blas_int>(k),
+                            XY_f.data() + s_beg, static_cast<gcta_blas_int>(n),
+                            1.0f, UkTXY_f.data(), static_cast<gcta_blas_int>(k));
+                ++ci;
+            }
+            reader.stop();
+        }
+        XY_f.resize(0, 0);
+
+        ctx.UkTX = UkTXY_f.leftCols(c).cast<double>();
+        ctx.UkTy = UkTXY_f.col(c).cast<double>();
+
+        // Pass 2: proj_f = Uk^T * UkTXY_f (computes exact orthogonalized residual subspace)
+        Eigen::MatrixXf proj_f(n, c + 1);
+        {
+            gcta_io::AsyncSeqReader reader(tun3_fd, out.tun3_path, io_chunks, max_b, false);
+            const char* data = nullptr;
+            size_t len = 0;
+            size_t ci = 0;
+            while (reader.next_slot(data, len)) {
+                const int s_beg = plan[ci].s_beg;
+                const int cols  = plan[ci].s_end - s_beg;
+                dequant_tun3_slab_to_f32(
+                    reinterpret_cast<const uint16_t*>(data), k, cols,
+                    out.meta.uk_row_scale, out.fp16_rows, slab_f32.data(), unpack_nt);
+                reader.release_slot();
+                cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans,
+                            static_cast<gcta_blas_int>(cols), static_cast<gcta_blas_int>(c + 1),
+                            static_cast<gcta_blas_int>(k),
+                            1.0f, slab_f32.data(), static_cast<gcta_blas_int>(k),
+                            UkTXY_f.data(), static_cast<gcta_blas_int>(k),
+                            0.0f, proj_f.data() + s_beg, static_cast<gcta_blas_int>(n));
+                ++ci;
+            }
+            reader.stop();
+        }
+        slab_f32.clear();
+
+        RemlMat X_perp(n, c);
+        #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(c) >= 65536)
+        for (int j = 0; j < c; ++j) {
+            const double* __restrict__ xcol = ctx.X.col(j).data();
+            const float*  __restrict__ pcol = proj_f.col(j).data();
+            double*       __restrict__ dcol = X_perp.col(j).data();
+            #pragma omp simd
+            for (int i = 0; i < n; ++i) dcol[i] = xcol[i] - static_cast<double>(pcol[i]);
+        }
+        RemlVec y_perp(n);
+        {
+            const double* __restrict__ ycol = ctx.y.data();
+            const float*  __restrict__ pcol = proj_f.col(c).data();
+            double*       __restrict__ dcol = y_perp.data();
+            #pragma omp parallel for schedule(static) if (n >= 65536)
+            for (int i = 0; i < n; ++i) dcol[i] = ycol[i] - static_cast<double>(pcol[i]);
+        }
+        proj_f.resize(0, 0);
+
+        ctx.wb_XtX_perp.resize(c, c);
+        ctx.wb_XtX_perp.noalias() = X_perp.transpose() * X_perp;
+        ctx.wb_Xty_perp.resize(c);
+        ctx.wb_Xty_perp.noalias() = X_perp.transpose() * y_perp;
+        ctx.wb_yty_perp = y_perp.squaredNorm();
+        ctx.wb_subspace_ready = true;
+    } catch (const std::exception& e) {
+        LOGGER.e(0, e.what());
+    }
+
+    LOGGER.i(0, "Woodbury subspace streamed (zero-Uk) from [" + out.tun3_path + "]: n=" +
+                to_string(n) + ", k=" + to_string(k) +
+                ", lambda_tail=" + to_text(out.meta.lambda_tail) +
+                ", tail_d_var=" + to_text(out.meta.tail_d_var) + ".");
+    return out;
 }
 
 void write_hsq_from_ctx(const string& out_prefix, const RemlCtx& ctx)
@@ -2234,13 +2537,14 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
         const int n = static_cast<int>(pheno.count_keep());
         LOGGER.i(0, "After matching all files, " + to_string(n) +
                     " individuals to be included in --MLMA.");
+        const vector<string> analysis_ids = pheno.get_id(0, n - 1, "\t");
+        const uint64_t id_hash = hash_sample_ids(analysis_ids);
 
         // Build design matrix X  (n × x_c, column-major)
         if (has_covar) {
-            vector<string> final_ids = pheno.get_id(0, n - 1, "\t");
             vector<double> covar_X;
             vector<uint32_t> ck_dummy;
-            covar.getCovarX(final_ids, covar_X, ck_dummy);
+            covar.getCovarX(analysis_ids, covar_X, ck_dummy);
             const int covar_cols = (n > 0) ? static_cast<int>(covar_X.size()) / n : 0;
             x_c = 1 + covar_cols;
             X_design.resize(n, x_c);
@@ -2281,7 +2585,7 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             LOGGER.ts("load_reml");
             const auto t_reml0 = std::chrono::steady_clock::now();
             state = readRemlState(load_reml_file, no_adj_covar, n, x_c,
-                                  hash_sample_ids(pheno.get_id(0, n - 1, "\t")),
+                                  id_hash,
                                   basis_file_override,
                                   can_stream_fast ? fast_mlma_mode : FastMlmaMode::Off,
                                   y_vec, X_design, w_sqrt,
@@ -2311,8 +2615,6 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             else
                 LOGGER.i(0, "Running inline REML using GRM [" + grm_pfx + "] ...");
 
-            const vector<string> analysis_ids = pheno.get_id(0, n - 1, "\t");
-            const uint64_t id_hash = hash_sample_ids(analysis_ids);
             const double grm_chunked_budget = reuse_basis ? 0.0 : r.grm_chunked_budget.value_or(0.0);
             bool grm_chunked = grm_chunked_budget > 0.0;
             bool grm_fp16 = !reuse_basis && r.grm_fp16;
@@ -2502,8 +2804,18 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             }
 
             LoadedBasisInfo reuse_info;
+            StreamingReuseHandle streaming_reuse_info;
             if (reuse_basis) {
-                reuse_info = load_woodbury_basis_into_ctx(r.woodbury_reuse, ctx, id_hash, basis_file_override);
+                const bool use_streaming_reuse = reml_only && !r.reml_standalone;
+                if (use_streaming_reuse) {
+                    streaming_reuse_info = preload_woodbury_subspace_streaming(
+                        r.woodbury_reuse, ctx, id_hash, basis_file_override, 256ULL << 20);
+                    reuse_info.tun3_path  = streaming_reuse_info.tun3_path;
+                    reuse_info.basis_hash = streaming_reuse_info.basis_hash;
+                } else {
+                    reuse_info = load_woodbury_basis_into_ctx(
+                        r.woodbury_reuse, ctx, id_hash, basis_file_override, 256ULL << 20);
+                }
             }
 
             reml::compute(ctx, r.priors, r.priors_var, no_constrain);
@@ -2522,7 +2834,9 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                 LOGGER.ts("save_reml");
                 writeRemlStateFromCtx(save_reml_file, ctx, no_adj_covar, id_hash,
                                       reuse_info.tun3_path, reuse_info.basis_hash,
-                                      r.reml_standalone);
+                                      r.reml_standalone,
+                                      streaming_reuse_info.active ? &streaming_reuse_info : nullptr,
+                                      256ULL << 20);
                 LOGGER.i(0, "REML state saved in " + to_string(LOGGER.tp("save_reml")) + " seconds.");
                 LOGGER.i(0, "REML estimation completed. Use --load-reml " + save_reml_file +
                             " to perform association tests.");

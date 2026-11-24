@@ -2540,18 +2540,29 @@ void compute(RemlCtx& ctx,
     // Woodbury basis (must be done before init_varcomp for HE warm-start)
     if (ctx.woodbury_basis_preloaded) {
         // Basis supplied by the caller (--reml-woodbury-reuse): Uk/dk/lambda_tail/
-        // woodbury_basis_rank_ are already set and ctx.A[GRM] is empty, i.e. the
-        // same state compute_woodbury_basis() leaves behind.
+        // woodbury_basis_rank_ (or precomputed streaming subspace cache) are already set.
         if (ctx.reml_mtd == RemlAlg::Fisher)
             LOGGER.e(0, "--reml-woodbury-reuse is incompatible with Fisher-scoring REML.");
         if ((int)ctx.r_indx.size() != 2)
             LOGGER.e(0, "--reml-woodbury-reuse supports only single-GRM models.");
-        const bool uk_dims_ok = ctx.Uk_is_transposed
-            ? (ctx.Uk.rows() == ctx.woodbury_basis_rank_ && ctx.Uk.cols() == ctx.n)
-            : (ctx.Uk.rows() == ctx.n && ctx.Uk.cols() >= ctx.woodbury_basis_rank_);
+        const bool subspace_preloaded =
+            ctx.wb_subspace_ready &&
+            ctx.UkTX.rows() == ctx.woodbury_basis_rank_ &&
+            ctx.UkTX.cols() == ctx.X_c &&
+            static_cast<int>(ctx.UkTy.size()) == ctx.woodbury_basis_rank_ &&
+            ctx.wb_XtX_perp.rows() == ctx.X_c &&
+            ctx.wb_XtX_perp.cols() == ctx.X_c &&
+            static_cast<int>(ctx.wb_Xty_perp.size()) == ctx.X_c;
+        const bool uk_dims_ok = subspace_preloaded
+            ? true
+            : (ctx.Uk_is_transposed
+                ? (ctx.Uk.rows() == ctx.woodbury_basis_rank_ && ctx.Uk.cols() == ctx.n)
+                : (ctx.Uk.rows() == ctx.n && ctx.Uk.cols() >= ctx.woodbury_basis_rank_));
         if (!uk_dims_ok || ctx.dk.size() != ctx.woodbury_basis_rank_)
             LOGGER.e(0, "--reml-woodbury-reuse: preloaded basis has inconsistent dimensions.");
-        ctx.wb_subspace_ready = false;
+        if (!subspace_preloaded) {
+            ctx.wb_subspace_ready = false;
+        }
         LOGGER << "Woodbury basis reused: k=" << ctx.woodbury_basis_rank_
                << ", lambda_tail=" << ctx.lambda_tail << std::endl;
     } else if (ctx.woodbury_basis.has_value()) {

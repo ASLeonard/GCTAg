@@ -913,6 +913,40 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
     pca_cmd->add_option("--remove", pca_opts.remove, "Exclude sample IDs listed in file")
         ->check(CLI::ExistingFile)->group("Sample Filtering");
     pca_cmd->add_option("--seed", pca_opts.seed, "Random seed for rSVD")->group("PCA");
+    // Hidden developer tuning flags
+    pca_cmd->add_flag("--pca-profile", pca_opts.pca_profile,
+                      "Dev: Log detailed phase timing breakdown for pca")
+        ->group("");
+    pca_cmd->add_option("--pca-matvec-mode", pca_opts.pca_matvec_mode,
+                        "Dev: Packed FP16 matvec mode {auto,fused,tiled}")
+        ->transform(make_enum_transformer<PcaMatvecMode>(
+            {{"auto", PcaMatvecMode::Auto},
+             {"fused", PcaMatvecMode::Fused},
+             {"tiled", PcaMatvecMode::Tiled}},
+            "{auto,fused,tiled}",
+            /*allow_numeric=*/false))
+        ->group("");
+    pca_cmd->add_option("--pca-fused-max-k", pca_opts.pca_fused_max_k,
+                        "Dev: Max X width for auto fused FP16 matvec")
+        ->check(CLI::NonNegativeNumber)->group("");
+    pca_cmd->add_option("--pca-j-block", pca_opts.pca_j_block,
+                        "Dev: Column slab size JB inside fused FP16 matvec")
+        ->check(CLI::PositiveNumber)->group("");
+    pca_cmd->add_option("--pca-load-mode", pca_opts.pca_load_mode,
+                        "Dev: Packed FP16 GRM loader mode {auto,direct,async}")
+        ->transform(make_enum_transformer<PcaLoadMode>(
+            {{"auto", PcaLoadMode::Auto},
+             {"direct", PcaLoadMode::Direct},
+             {"async", PcaLoadMode::Async}},
+            "{auto,direct,async}",
+            /*allow_numeric=*/false))
+        ->group("");
+    pca_cmd->add_option("--pca-io-slot-mb", pca_opts.pca_io_slot_mb,
+                        "Dev: GRM reader slot/read chunk size in MiB (0 = default)")
+        ->check(CLI::NonNegativeNumber)->group("");
+    pca_cmd->add_option("--pca-tile-size", pca_opts.pca_tile_size,
+                        "Dev: Override tiled symmetric matvec block size (0 = default)")
+        ->check(CLI::NonNegativeNumber)->group("");
     pca_cmd->callback([&out, &pca_opts]() { out.command = std::move(pca_opts); });
 
     // ------------------------------------------------------------------

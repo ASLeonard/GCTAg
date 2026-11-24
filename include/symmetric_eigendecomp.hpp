@@ -223,6 +223,31 @@ inline void rotate_basis_inplace(
     Mat Z_s = cast_double_block_parallel<Scalar>(Z.leftCols(k_target));
     Z.resize(0, 0);
 
+    if (static_cast<size_t>(n) * static_cast<size_t>(k_target) * sizeof(Scalar) <= (64ULL << 20)) {
+        Mat Q_new(n, k_target);
+        const gcta_blas_int ldQ = static_cast<gcta_blas_int>(n);
+        const gcta_blas_int ldZ = static_cast<gcta_blas_int>(k_ext);
+        if constexpr (std::is_same_v<Scalar, float>) {
+            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<gcta_blas_int>(n),
+                        static_cast<gcta_blas_int>(k_target),
+                        static_cast<gcta_blas_int>(k_ext),
+                        1.0f, Q.data(), ldQ,
+                        Z_s.data(), ldZ,
+                        0.0f, Q_new.data(), ldQ);
+        } else {
+            cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<gcta_blas_int>(n),
+                        static_cast<gcta_blas_int>(k_target),
+                        static_cast<gcta_blas_int>(k_ext),
+                        1.0, Q.data(), ldQ,
+                        Z_s.data(), ldZ,
+                        0.0, Q_new.data(), ldQ);
+        }
+        Q.swap(Q_new);
+        return;
+    }
+
     constexpr int kSlabRows = 4096;
     const int max_rb = std::min(n, kSlabRows);
     AlignedRawBuffer<Scalar, 64> slab(static_cast<size_t>(max_rb) * static_cast<size_t>(k_target));

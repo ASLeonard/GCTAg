@@ -205,11 +205,23 @@ inline void parallel_zero_matrix(Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dy
     const Eigen::Index rows = M.rows();
     const Eigen::Index cols = M.cols();
     if (rows <= 0 || cols <= 0) return;
-    const size_t total_elems = static_cast<size_t>(rows) * static_cast<size_t>(cols);
-    const size_t col_bytes = static_cast<size_t>(rows) * sizeof(Scalar);
-    #pragma omp parallel for schedule(static) if (total_elems >= 65536)
-    for (Eigen::Index c = 0; c < cols; ++c) {
-        std::memset(M.col(c).data(), 0, col_bytes);
+    const size_t total_bytes = static_cast<size_t>(rows) * static_cast<size_t>(cols) * sizeof(Scalar);
+    char* const ptr = reinterpret_cast<char*>(M.data());
+    if (total_bytes < (256ULL << 10)) {
+        std::memset(ptr, 0, total_bytes);
+        return;
+    }
+    #pragma omp parallel
+    {
+        const int tid = omp_get_thread_num();
+        const int nt  = omp_get_num_threads();
+        const size_t lo = ((total_bytes * static_cast<size_t>(tid)) / static_cast<size_t>(nt)) & ~size_t(63);
+        const size_t hi = (tid + 1 == nt)
+            ? total_bytes
+            : (((total_bytes * static_cast<size_t>(tid + 1)) / static_cast<size_t>(nt)) & ~size_t(63));
+        if (hi > lo) {
+            std::memset(ptr + lo, 0, hi - lo);
+        }
     }
 }
 
@@ -238,6 +250,20 @@ inline void convert_colmajor_f32_to_bf16(
     uint16_t* dst, gcta_blas_int rows, gcta_blas_int cols) noexcept
 {
     const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+    if (rows <= 0 || cols <= 0) return;
+    if (ld_src == rows && total >= 32768) {
+        #pragma omp parallel
+        {
+            const int tid = omp_get_thread_num();
+            const int nt  = omp_get_num_threads();
+            const size_t lo = (total * static_cast<size_t>(tid)) / static_cast<size_t>(nt);
+            const size_t hi = (total * static_cast<size_t>(tid + 1)) / static_cast<size_t>(nt);
+            if (hi > lo) {
+                gcta_f32_to_bf16_rne(src + lo, dst + lo, hi - lo);
+            }
+        }
+        return;
+    }
     #pragma omp parallel for schedule(static) if (total >= 32768)
     for (gcta_blas_int c = 0; c < cols; ++c) {
         gcta_f32_to_bf16_rne(

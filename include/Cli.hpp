@@ -21,6 +21,8 @@ enum class GrmAlg : int { Standard = 0, VanRaden = 1 };
 enum class GrmStripLayout : uint8_t { ColMajor = 0, RowMajor = 1 };
 enum class GrmDiagMode : uint8_t { Syrk = 0, Fused = 1 };
 enum class PcaApprox : uint8_t { Lanczos = 1, rSVD = 2 };
+enum class PcaMatvecMode : uint8_t { Auto = 0, Fused = 1, Tiled = 2 };
+enum class PcaLoadMode : uint8_t { Auto = 0, Direct = 1, Async = 2 };
 enum class SvdMethod : uint8_t { Power = 0, Nystrom = 1 };
 enum class GenoModel : uint8_t { Additive = 0, Dominance = 1, NonAdditive = 2 };
 enum class EigenvecFormat : uint8_t { Text = 0, Bin32 = 1, Bin16 = 2, Both = 3 };
@@ -209,6 +211,15 @@ struct PcaOptions {
     std::string keep;
     std::string remove;
     std::optional<uint64_t> seed;
+
+    // Hidden developer tuning options (group("") in CLI)
+    bool pca_profile = false;
+    PcaMatvecMode pca_matvec_mode = PcaMatvecMode::Auto;
+    int pca_fused_max_k = 128;
+    int pca_j_block = 1024;
+    PcaLoadMode pca_load_mode = PcaLoadMode::Auto;
+    int pca_io_slot_mb = 0;   // 0 = default (256 MiB)
+    int pca_tile_size = 0;    // 0 = default (8192 small-k / 4096 large-k)
 };
 
 struct MlmaOptions {

@@ -430,18 +430,67 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, g
     if (m <= 0 || k <= 0) return 0;
 
     // Column L2 pre-normalization (preserves col(Y), reduces artificial kappa(Y)).
-    #pragma omp parallel for schedule(static)
-    for (gcta_blas_int j = 0; j < k; ++j) {
-        float* col = Y + static_cast<size_t>(j) * ldY;
-        double norm2 = 0.0;
-        for (gcta_blas_int i = 0; i < m; ++i) {
-            const double v = static_cast<double>(col[i]);
-            norm2 += v * v;
+    if (k <= 64 && m >= 16384) {
+        double norm2_sum[64]{};
+        float inv_norm[64]{};
+        #pragma omp parallel
+        {
+            const int tid = omp_get_thread_num();
+            const int nt  = omp_get_num_threads();
+            const gcta_blas_int r0 = static_cast<gcta_blas_int>((static_cast<int64_t>(m) * tid) / nt);
+            const gcta_blas_int r1 = static_cast<gcta_blas_int>((static_cast<int64_t>(m) * (tid + 1)) / nt);
+            double loc[64]{};
+            for (gcta_blas_int j = 0; j < k; ++j) {
+                const float* __restrict__ col = Y + static_cast<size_t>(j) * ldY;
+                double s = 0.0;
+                #pragma omp simd reduction(+:s)
+                for (gcta_blas_int i = r0; i < r1; ++i) {
+                    const double v = static_cast<double>(col[i]);
+                    s += v * v;
+                }
+                loc[j] = s;
+            }
+            #pragma omp critical
+            {
+                for (gcta_blas_int j = 0; j < k; ++j) {
+                    norm2_sum[j] += loc[j];
+                }
+            }
+            #pragma omp barrier
+            #pragma omp single
+            {
+                for (gcta_blas_int j = 0; j < k; ++j) {
+                    const double n2 = norm2_sum[j];
+                    inv_norm[j] = (n2 > 0.0 && std::isfinite(n2)) ? static_cast<float>(1.0 / std::sqrt(n2)) : 0.0f;
+                }
+            }
+            for (gcta_blas_int j = 0; j < k; ++j) {
+                const float inv = inv_norm[j];
+                if (inv > 0.0f) {
+                    float* __restrict__ col = Y + static_cast<size_t>(j) * ldY;
+                    #pragma omp simd
+                    for (gcta_blas_int i = r0; i < r1; ++i) {
+                        col[i] *= inv;
+                    }
+                }
+            }
         }
-        if (norm2 > 0.0 && std::isfinite(norm2)) {
-            const float inv_norm = static_cast<float>(1.0 / std::sqrt(norm2));
+    } else {
+        #pragma omp parallel for schedule(static) if (static_cast<size_t>(m) * static_cast<size_t>(k) >= 65536)
+        for (gcta_blas_int j = 0; j < k; ++j) {
+            float* __restrict__ col = Y + static_cast<size_t>(j) * ldY;
+            double norm2 = 0.0;
+            #pragma omp simd reduction(+:norm2)
             for (gcta_blas_int i = 0; i < m; ++i) {
-                col[i] *= inv_norm;
+                const double v = static_cast<double>(col[i]);
+                norm2 += v * v;
+            }
+            if (norm2 > 0.0 && std::isfinite(norm2)) {
+                const float inv_norm = static_cast<float>(1.0 / std::sqrt(norm2));
+                #pragma omp simd
+                for (gcta_blas_int i = 0; i < m; ++i) {
+                    col[i] *= inv_norm;
+                }
             }
         }
     }

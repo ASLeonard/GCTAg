@@ -974,7 +974,15 @@ private:
         allow_i32_mode_ = (all_locs_.size() <= kMaxInt32Markers);
 
         // Engine config defaults (RowMajor strips, fused diagonal, unchunked GEMM, 256 MiB I/O slots)
-        cfg_.strip_rows = opts_.strip_rows.value_or(4096);
+        const double dense_i32_bytes = static_cast<double>(num_grm_) * 4.0;
+        const bool tight_mem_budget = is_tight_mem_budget();
+        if (opts_.strip_rows.has_value()) {
+            cfg_.strip_rows = *opts_.strip_rows;
+        } else if (!tight_mem_budget && grm_n_ >= 98304 && omp_get_max_threads() >= 64) {
+            cfg_.strip_rows = 8192;
+        } else {
+            cfg_.strip_rows = 4096;
+        }
         cfg_.layout = opts_.strip_layout.value_or(gcta_cli::GrmStripLayout::RowMajor);
         cfg_.diag_mode = opts_.diag_mode.value_or(gcta_cli::GrmDiagMode::Fused);
         cfg_.diag_block = opts_.diag_block.value_or(1024);
@@ -985,10 +993,21 @@ private:
         if (opts_.n_markers.has_value()) {
             cfg_.n_marker_block = *opts_.n_markers;
         } else {
-            constexpr uint64_t kTargetKMajorBytes = 2ULL << 30;
-            constexpr uint64_t kTargetBedSlotBytes = 512ULL << 20;
-            const uint64_t k_by_kmajor = kTargetKMajorBytes / std::max<uint64_t>(1ULL, static_cast<uint64_t>(grm_n_));
-            const uint64_t k_by_bed = kTargetBedSlotBytes / std::max<uint64_t>(1ULL, static_cast<uint64_t>(rec_bytes_));
+            const double eff_grm_bytes = (tile_budget_bytes_ > 0.0)
+                ? std::min(dense_i32_bytes, tile_budget_bytes_)
+                : dense_i32_bytes;
+            const uint64_t kmajor_floor = tight_mem_budget
+                ? std::max<uint64_t>(
+                      256ULL << 20,
+                      std::min<uint64_t>(2ULL << 30, static_cast<uint64_t>(tile_budget_bytes_ * 0.10)))
+                : (2ULL << 30);
+            const uint64_t kmajor_target = std::clamp<uint64_t>(
+                static_cast<uint64_t>(eff_grm_bytes * 0.05),
+                kmajor_floor,
+                12ULL << 30);
+            const uint64_t bed_slot_target = kmajor_target / 4ULL;
+            const uint64_t k_by_kmajor = kmajor_target / std::max<uint64_t>(1ULL, static_cast<uint64_t>(grm_n_));
+            const uint64_t k_by_bed = bed_slot_target / std::max<uint64_t>(1ULL, static_cast<uint64_t>(rec_bytes_));
             const uint64_t raw_k = std::min(k_by_kmajor, k_by_bed);
             cfg_.n_marker_block = static_cast<int>(std::clamp<uint64_t>((raw_k / 64ULL) * 64ULL, 1024ULL, 12288ULL));
         }
@@ -1055,6 +1074,11 @@ private:
         reader_ = std::make_unique<BedBlockReader>(
             std::move(bed_files_), std::move(file_snp_counts),
             rec_bytes_, mb, all_locs_.size());
+    }
+
+    bool is_tight_mem_budget() const noexcept {
+        return tile_budget_bytes_ > 0.0 &&
+               tile_budget_bytes_ < (48.0 * static_cast<double>(1ULL << 30));
     }
 
     void reset_strips() noexcept {
@@ -1672,7 +1696,10 @@ private:
         const bool is_rowmajor = (cfg_.layout == gcta_cli::GrmStripLayout::RowMajor);
 
         if (is_rowmajor) {
-            const int max_c_blk = std::max(64, std::min(4096, static_cast<int>((16ULL << 20) / static_cast<size_t>(std::max(1, std::min(H, tile_rows_))))));
+            const bool tight_mem_budget = is_tight_mem_budget();
+            const size_t max_tile_elems = tight_mem_budget ? (16ULL << 20) : (64ULL << 20);
+            const int max_c_cap = tight_mem_budget ? 4096 : 16384;
+            const int max_c_blk = std::max(64, std::min(max_c_cap, static_cast<int>(max_tile_elems / static_cast<size_t>(std::max(1, std::min(H, tile_rows_))))));
             const size_t need_tile = static_cast<size_t>(std::min(H, tile_rows_)) * static_cast<size_t>(max_c_blk);
             if (i32_tile_.size() < need_tile) i32_tile_.resize(need_tile);
 

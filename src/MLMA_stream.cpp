@@ -510,11 +510,13 @@ void open_and_verify_tref_basis(const string& tref_file, const TrefMetadata& tre
 void dequant_tun3_slab_to_f32(const uint16_t* raw_u16, int k, int cols,
                               const std::vector<float>& uk_row_scale,
                               const std::vector<int>& fp16_rows,
-                              float* dst_f32)
+                              float* dst_f32,
+                              int num_threads_override = 0)
 {
     const float* const sc = uk_row_scale.data();
     const bool mostly_i16 = (fp16_rows.size() * 2 < static_cast<size_t>(k));
-    #pragma omp parallel for schedule(static)
+    const int use_nt = (num_threads_override > 0) ? num_threads_override : std::max(1, omp_get_max_threads());
+    #pragma omp parallel for schedule(static) num_threads(use_nt)
     for (int c = 0; c < cols; ++c) {
         const uint16_t* const src = raw_u16 + static_cast<size_t>(c) * static_cast<size_t>(k);
         float* const dst          = dst_f32 + static_cast<size_t>(c) * static_cast<size_t>(k);
@@ -573,7 +575,9 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
                         FastMlmaMode stream_fast_mode,
                         const Eigen::VectorXf& y_raw_f,
                         const Eigen::MatrixXd& X_design,
-                        const Eigen::VectorXf& w_sqrt)
+                        const Eigen::VectorXf& w_sqrt,
+                        size_t tun3_slot_bytes = (256ULL << 20),
+                        int max_q_rows = 4096)
 {
     ScopedFd fd(::open(filename.c_str(), O_RDONLY));
     if (!fd) LOGGER.e(0, "Cannot open file [" + filename + "].");
@@ -737,9 +741,10 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
         st.has_cached_Vi_y = true;
     }
 
-    constexpr size_t kTun3SlotBytes = 64ULL << 20; // 64 MiB double-buffered
+    const size_t kTun3SlotBytes = std::clamp<size_t>(tun3_slot_bytes, 1ULL << 20, 512ULL << 20);
     const size_t col_bytes = static_cast<size_t>(k) * sizeof(uint16_t);
     const std::vector<SampleChunk> plan = plan_sample_chunks(basis_meta.body_offset, n, col_bytes, kTun3SlotBytes);
+    const int unpack_nt = std::max(1, omp_get_max_threads() - 1);
 
     // Path 1: 1-pass streaming quantization directly into QuantizedWoodburyUk (0 Uk_f RAM!).
     if (stream_fast_mode != FastMlmaMode::Off) {
@@ -789,7 +794,7 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
                 p1_chunks.emplace_back(c.offset, c.bytes);
                 max_b = std::max(max_b, c.bytes);
             }
-            const int max_t = std::max(1, omp_get_max_threads());
+            const int max_t = unpack_nt;
             const size_t k_pad_f = (static_cast<size_t>(k) + 15) / 16 * 16;
             const size_t k_pad_d = (static_cast<size_t>(k) + 7) / 8 * 8;
             std::vector<float> thr_max;
@@ -808,7 +813,7 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
                     const float* rs = basis_meta.uk_row_scale.data();
                     const float* wp = w_sqrt.data();
                     const float* yp = y_adj_f.data();
-                    #pragma omp parallel
+                    #pragma omp parallel num_threads(max_t)
                     {
                         const int tid = omp_get_thread_num();
                         float* lmax = thr_max.empty() ? nullptr : (thr_max.data() + static_cast<size_t>(tid) * k_pad_f);
@@ -868,7 +873,8 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
             basis_meta.uk_row_scale.data(),
             w_sqrt, unit_weights, S_w2,
             exact_max_w.empty() ? nullptr : exact_max_w.data(),
-            defer_uy_reconstruct ? y_adj_f.data() : nullptr);
+            defer_uy_reconstruct ? y_adj_f.data() : nullptr,
+            max_q_rows);
         if (need_exact_vi_y_pass) {
             st.cached_Vi_y.resize(n);
             builder.set_exact_vi_y_target(pre_ck_uy.data(), y_adj_f.data(),
@@ -891,7 +897,8 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
             size_t ci = 0;
             while (reader.next_slot(data, len)) {
                 builder.process_sample_slab(plan[ci].s_beg, plan[ci].s_end,
-                                            reinterpret_cast<const uint16_t*>(data));
+                                            reinterpret_cast<const uint16_t*>(data),
+                                            unpack_nt);
                 reader.release_slot();
                 ++ci;
             }
@@ -944,7 +951,8 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
             dequant_tun3_slab_to_f32(
                 reinterpret_cast<const uint16_t*>(data), k, cols,
                 basis_meta.uk_row_scale, fp16_rows,
-                Uk.data() + static_cast<size_t>(s_beg) * static_cast<size_t>(k));
+                Uk.data() + static_cast<size_t>(s_beg) * static_cast<size_t>(k),
+                unpack_nt);
             reader.release_slot();
             ++ci;
         }

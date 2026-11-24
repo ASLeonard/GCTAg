@@ -305,9 +305,10 @@ inline void woodbury_xvx_diag_block_i8(
 struct QuantizedWoodburyTile {
     int r_begin = 0;
     int r_count = 0;
-    int q_rows = 0;       // is_2slice ? 2 * r_count : r_count (always <= 4096)
+    int q_rows = 0;       // is_2slice ? 2 * r_count : r_count
+    int q_ld = 0;         // 64B-padded, 4K-alias-free column stride of Q
     bool is_2slice = true;
-    AlignedUniquePtr<int8_t, 64> Q;                       // q_rows x n, col-major
+    AlignedUniquePtr<int8_t, 64> Q;                       // q_ld x n, col-major (first q_rows active)
     size_t q_bytes = 0;
     AlignedUniquePtr<int8_t, 64> Q_reordered;             // AOCL pre-reordered B buffer (null if unused)
     size_t q_reordered_bytes = 0;
@@ -359,9 +360,88 @@ inline void reorder_quantized_woodbury_uk(QuantizedWoodburyUk& q_uk)
             static_cast<gcta_blas_int>(tile.q_rows),
             static_cast<gcta_blas_int>(q_uk.n),
             tile.Q.get(),
-            static_cast<gcta_blas_int>(tile.q_rows),
+            static_cast<gcta_blas_int>(tile.q_ld > 0 ? tile.q_ld : tile.q_rows),
             tile.Q_reordered.get());
     }
+}
+
+// Allocate evenly-balanced, 4K-alias-free Q tiles covering [0, k) for the chosen
+// FastMlmaMode. Returns k_hi (the split boundary between 2-slice and 1-slice rows).
+inline int populate_quantized_woodbury_tiles(
+    QuantizedWoodburyUk& out,
+    int k,
+    int n,
+    FastMlmaMode mode,
+    int max_q_rows = 4096)
+{
+    int k_hi = k;
+    if (mode == FastMlmaMode::Slice1) {
+        k_hi = 0;
+    } else if (mode == FastMlmaMode::Hybrid) {
+        k_hi = std::min(k, std::max(std::min(k, 100), k / 10));
+    }
+
+    const int raw_q = (max_q_rows <= 0) ? 4096 : max_q_rows;
+    const int capped_q_rows = std::clamp(((raw_q + 63) / 64) * 64, 256, 16384);
+
+    auto push_tiles = [&](int beg, int end, bool is_2slice) {
+        const int total = end - beg;
+        if (total <= 0) return;
+        const int rc_max = is_2slice ? std::max(1, capped_q_rows / 2) : capped_q_rows;
+        const int num_t = (total + rc_max - 1) / rc_max;
+        const int total_q16 = (total + 15) / 16;
+        int r_cur = beg;
+        for (int ti = 0; ti < num_t && r_cur < end; ++ti) {
+            const int q16_this = (total_q16 / num_t) + (ti < (total_q16 % num_t) ? 1 : 0);
+            const int rem_rows = end - r_cur;
+            const int rc_want = (ti + 1 == num_t)
+                ? rem_rows
+                : std::min(rem_rows, std::max(16, q16_this * 16));
+            const int rc = std::clamp(rc_want, 1, rc_max);
+            QuantizedWoodburyTile t;
+            t.r_begin = r_cur;
+            t.r_count = rc;
+            t.is_2slice = is_2slice;
+            t.q_rows = is_2slice ? (2 * rc) : rc;
+            int q_ld = ((t.q_rows + 63) / 64) * 64;
+            if (q_ld % 4096 == 0) q_ld += 64;
+            t.q_ld = q_ld;
+            t.q_bytes = static_cast<size_t>(t.q_ld) * static_cast<size_t>(n);
+            t.Q = make_aligned_uninitialized<int8_t, 64>(t.q_bytes);
+            if (t.q_bytes > 0 && !t.Q) {
+                LOGGER.e(0, "Failed to allocate quantized Woodbury Q tile.");
+            }
+            t.alpha_hi.assign(static_cast<size_t>(rc), 0.0);
+            if (is_2slice) t.alpha_lo.assign(static_cast<size_t>(rc), 0.0);
+            t.u_sum_q.assign(static_cast<size_t>(rc), 0.0);
+            out.tiles.push_back(std::move(t));
+            r_cur += rc;
+        }
+        while (r_cur < end) {
+            const int rc = std::min(rc_max, end - r_cur);
+            QuantizedWoodburyTile t;
+            t.r_begin = r_cur;
+            t.r_count = rc;
+            t.is_2slice = is_2slice;
+            t.q_rows = is_2slice ? (2 * rc) : rc;
+            int q_ld = ((t.q_rows + 63) / 64) * 64;
+            if (q_ld % 4096 == 0) q_ld += 64;
+            t.q_ld = q_ld;
+            t.q_bytes = static_cast<size_t>(t.q_ld) * static_cast<size_t>(n);
+            t.Q = make_aligned_uninitialized<int8_t, 64>(t.q_bytes);
+            if (t.q_bytes > 0 && !t.Q) {
+                LOGGER.e(0, "Failed to allocate quantized Woodbury Q tile.");
+            }
+            t.alpha_hi.assign(static_cast<size_t>(rc), 0.0);
+            if (is_2slice) t.alpha_lo.assign(static_cast<size_t>(rc), 0.0);
+            t.u_sum_q.assign(static_cast<size_t>(rc), 0.0);
+            out.tiles.push_back(std::move(t));
+            r_cur += rc;
+        }
+    };
+    if (k_hi > 0) push_tiles(0, k_hi, true);
+    if (k_hi < k) push_tiles(k_hi, k, false);
+    return k_hi;
 }
 
 inline QuantizedWoodburyUk build_quantized_woodbury_uk(
@@ -369,7 +449,8 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk(
     const Eigen::VectorXf& w_sqrt,
     bool unit_weights,
     double S_w2,
-    FastMlmaMode mode)
+    FastMlmaMode mode,
+    int max_q_rows = 4096)
 {
     QuantizedWoodburyUk out;
     const int k = static_cast<int>(wb.Uk_f.rows());
@@ -379,36 +460,7 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk(
     out.mode = mode;
     if (k <= 0 || n <= 0 || mode == FastMlmaMode::Off) return out;
 
-    int k_hi = k;
-    if (mode == FastMlmaMode::Slice1) {
-        k_hi = 0;
-    } else if (mode == FastMlmaMode::Hybrid) {
-        k_hi = std::min(k, std::max(std::min(k, 100), k / 10));
-    }
-
-    // Cap every tile at q_rows <= 4096 (r_count <= 2048 for 2-slice, <= 4096 for 1-slice).
-    constexpr int kMaxQRows = 4096;
-    auto push_tiles = [&](int beg, int end, bool is_2slice) {
-        const int rc_max = is_2slice ? (kMaxQRows / 2) : kMaxQRows;
-        for (int r0 = beg; r0 < end; r0 += rc_max) {
-            QuantizedWoodburyTile t;
-            t.r_begin = r0;
-            t.r_count = std::min(rc_max, end - r0);
-            t.is_2slice = is_2slice;
-            t.q_rows = is_2slice ? 2 * t.r_count : t.r_count;
-            t.q_bytes = static_cast<size_t>(t.q_rows) * static_cast<size_t>(n);
-            t.Q = make_aligned_uninitialized<int8_t, 64>(t.q_bytes);
-            if (t.q_bytes > 0 && !t.Q) {
-                LOGGER.e(0, "Failed to allocate quantized Woodbury Q tile.");
-            }
-            t.alpha_hi.assign(static_cast<size_t>(t.r_count), 0.0);
-            if (is_2slice) t.alpha_lo.assign(static_cast<size_t>(t.r_count), 0.0);
-            t.u_sum_q.assign(static_cast<size_t>(t.r_count), 0.0);
-            out.tiles.push_back(std::move(t));
-        }
-    };
-    if (k_hi > 0) push_tiles(0, k_hi, true);
-    if (k_hi < k) push_tiles(k_hi, k, false);
+    const int k_hi = populate_quantized_woodbury_tiles(out, k, n, mode, max_q_rows);
 
     const float* const uk_base     = wb.Uk_f.data();
     const float* const sqrt_ck_ptr = wb.sqrt_ck_f.data();
@@ -578,13 +630,13 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk(
                     const auto& tile = out.tiles[ti];
                     const int r0 = tile.r_begin;
                     const int rc = tile.r_count;
-                    const int qr = tile.q_rows;
+                    const int q_ld = tile.q_ld;
                     const float* const uk_t = uk_col + r0;
                     const float* const sck  = sqrt_ck_ptr + r0;
                     const float* const ihi  = ihi_base + r0;
                     const float* const ahi  = ahi_base + r0;
                     int32_t* const     lhi  = local_hi32.data() + r0;
-                    int8_t* const      q_hi = tile.Q.get() + static_cast<size_t>(s) * static_cast<size_t>(qr);
+                    int8_t* const      q_hi = tile.Q.get() + static_cast<size_t>(s) * static_cast<size_t>(q_ld);
 
                     if (!tile.is_2slice) {
                         if (unit_weights) {
@@ -693,6 +745,7 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk(
         const int r0 = tile.r_begin;
         const int rc = tile.r_count;
         if (!tile.is_2slice) {
+            #pragma omp parallel for schedule(static) if (rc >= 512)
             for (int rl = 0; rl < rc; ++rl) {
                 int64_t sh = 0;
                 const size_t r = static_cast<size_t>(r0 + rl);
@@ -703,6 +756,7 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk(
                     tile.alpha_hi[static_cast<size_t>(rl)] * static_cast<double>(sh);
             }
         } else {
+            #pragma omp parallel for schedule(static) if (rc >= 512)
             for (int rl = 0; rl < rc; ++rl) {
                 int64_t sh = 0;
                 int64_t sl = 0;
@@ -806,7 +860,8 @@ public:
         bool unit_weights,
         double S_w2,
         const float* exact_max_abs_override = nullptr,
-        const float* y_adj_for_uy = nullptr)
+        const float* y_adj_for_uy = nullptr,
+        int max_q_rows = 4096)
         : k_(k),
           n_(n),
           unit_weights_(unit_weights),
@@ -822,35 +877,7 @@ public:
         out_.mode = mode;
         if (k <= 0 || n <= 0 || mode == FastMlmaMode::Off) return;
 
-        k_hi_ = k;
-        if (mode == FastMlmaMode::Slice1) {
-            k_hi_ = 0;
-        } else if (mode == FastMlmaMode::Hybrid) {
-            k_hi_ = std::min(k, std::max(std::min(k, 100), k / 10));
-        }
-
-        constexpr int kMaxQRows = 4096;
-        auto push_tiles = [&](int beg, int end, bool is_2slice) {
-            const int rc_max = is_2slice ? (kMaxQRows / 2) : kMaxQRows;
-            for (int r0 = beg; r0 < end; r0 += rc_max) {
-                QuantizedWoodburyTile t;
-                t.r_begin = r0;
-                t.r_count = std::min(rc_max, end - r0);
-                t.is_2slice = is_2slice;
-                t.q_rows = is_2slice ? 2 * t.r_count : t.r_count;
-                t.q_bytes = static_cast<size_t>(t.q_rows) * static_cast<size_t>(n);
-                t.Q = make_aligned_uninitialized<int8_t, 64>(t.q_bytes);
-                if (t.q_bytes > 0 && !t.Q) {
-                    LOGGER.e(0, "Failed to allocate quantized Woodbury Q tile.");
-                }
-                t.alpha_hi.assign(static_cast<size_t>(t.r_count), 0.0);
-                if (is_2slice) t.alpha_lo.assign(static_cast<size_t>(t.r_count), 0.0);
-                t.u_sum_q.assign(static_cast<size_t>(t.r_count), 0.0);
-                out_.tiles.push_back(std::move(t));
-            }
-        };
-        if (k_hi_ > 0) push_tiles(0, k_hi_, true);
-        if (k_hi_ < k) push_tiles(k_hi_, k, false);
+        k_hi_ = populate_quantized_woodbury_tiles(out_, k, n, mode, max_q_rows);
 
         const double w_max = unit_weights_
             ? 1.0
@@ -865,11 +892,13 @@ public:
         const size_t num_tiles = out_.tiles.size();
         tile_all_i16_.assign(num_tiles, true);
         tile_fp16_rows_.resize(num_tiles);
+        int max_rc = 0;
 
         for (size_t ti = 0; ti < num_tiles; ++ti) {
             auto& tile = out_.tiles[ti];
             const int r0 = tile.r_begin;
             const int rc = tile.r_count;
+            max_rc = std::max(max_rc, rc);
             for (int rl = 0; rl < rc; ++rl) {
                 const int r = r0 + rl;
                 const float rs = uk_row_scale_[static_cast<size_t>(r)];
@@ -934,10 +963,13 @@ public:
         #endif
         k_pad64_    = (static_cast<size_t>(k) + 7) / 8 * 8;
         k_hi_pad64_ = (static_cast<size_t>(k_hi_) + 7) / 8 * 8;
+        max_tile_rc_pad_ = (static_cast<size_t>(max_rc) + 15) / 16 * 16;
         thr_sum_hi_.assign(static_cast<size_t>(max_threads_) * k_pad64_, 0);
         if (k_hi_ > 0) {
             thr_sum_lo_.assign(static_cast<size_t>(max_threads_) * k_hi_pad64_, 0);
+            thr_local_lo32_.resize(static_cast<size_t>(max_threads_) * max_tile_rc_pad_);
         }
+        thr_local_hi32_.resize(static_cast<size_t>(max_threads_) * max_tile_rc_pad_);
         if (y_adj_ptr_ != nullptr) {
             thr_uy_.assign(static_cast<size_t>(max_threads_) * k_pad64_, 0.0);
         }
@@ -959,22 +991,25 @@ public:
 
     // Consume a contiguous sample slab [s_begin, s_end) where raw_u16 has
     // layout k x (s_end - s_begin) ColMajor (each column = 1 sample).
-    void process_sample_slab(int s_begin, int s_end, const uint16_t* raw_u16)
+    // Loops tile-outer so thread-local INT32 accumulators stay L1D-resident with zero
+    // per-slab heap allocations.
+    void process_sample_slab(int s_begin, int s_end, const uint16_t* raw_u16, int num_threads_override = 0)
     {
         if (k_ <= 0 || s_end <= s_begin) return;
         const size_t num_tiles = out_.tiles.size();
-        const float* const rs_base   = uk_row_scale_.data();
-        const float* const sck_base  = sqrt_ck_.data();
-        const float* const ahi_base  = alpha_hi_f_.data();
-        const float* const ihi_base  = inv_hi_f_.data();
-        const float* const alo_base  = alpha_lo_f_.data();
-        const float* const ilo_base  = inv_lo_f_.data();
+        const float* const rs_base    = uk_row_scale_.data();
+        const float* const sck_base   = sqrt_ck_.data();
+        const float* const ahi_base   = alpha_hi_f_.data();
+        const float* const ihi_base   = inv_hi_f_.data();
+        const float* const alo_base   = alpha_lo_f_.data();
+        const float* const ilo_base   = inv_lo_f_.data();
         const float* const runit_base = row_unit_f_.data();
         const bool fast_unit = unit_weights_ && !has_exact_max_override_;
+        const int use_nt = (num_threads_override > 0) ? std::min(num_threads_override, max_threads_) : max_threads_;
 
         double slab_eps_sq = 0.0;
 
-        #pragma omp parallel reduction(+:slab_eps_sq)
+        #pragma omp parallel num_threads(use_nt) reduction(+:slab_eps_sq)
         {
             const int tid =
             #ifdef _OPENMP
@@ -982,8 +1017,20 @@ public:
             #else
                 0;
             #endif
-            std::vector<int32_t> local_hi32(static_cast<size_t>(k_), 0);
-            std::vector<int32_t> local_lo32(static_cast<size_t>(k_hi_), 0);
+            const int nt =
+            #ifdef _OPENMP
+                omp_get_num_threads();
+            #else
+                1;
+            #endif
+            const int slab_n = s_end - s_begin;
+            const int s_lo = s_begin + static_cast<int>((static_cast<int64_t>(slab_n) * tid) / nt);
+            const int s_hi = s_begin + static_cast<int>((static_cast<int64_t>(slab_n) * (tid + 1)) / nt);
+
+            int32_t* const lhi = thr_local_hi32_.data() + static_cast<size_t>(tid) * max_tile_rc_pad_;
+            int32_t* const llo = (k_hi_ > 0)
+                ? (thr_local_lo32_.data() + static_cast<size_t>(tid) * max_tile_rc_pad_)
+                : nullptr;
             int64_t* const my_sum_hi = thr_sum_hi_.data() + static_cast<size_t>(tid) * k_pad64_;
             int64_t* const my_sum_lo = (k_hi_ > 0)
                 ? (thr_sum_lo_.data() + static_cast<size_t>(tid) * k_hi_pad64_)
@@ -992,18 +1039,11 @@ public:
                 ? (thr_uy_.data() + static_cast<size_t>(tid) * k_pad64_)
                 : nullptr;
 
-            // Process in <= 32768-sample sub-slabs so int32 accumulators never overflow.
-            constexpr int kSubSlab = 32768;
-            for (int sb = s_begin; sb < s_end; sb += kSubSlab) {
-                const int se = std::min(s_end, sb + kSubSlab);
-
-                #pragma omp for schedule(static) nowait
-                for (int s = sb; s < se; ++s) {
+            if (my_uy != nullptr || vi_y_out_ptr_ != nullptr) {
+                const double* const cku = pre_ck_uy_.data();
+                for (int s = s_lo; s < s_hi; ++s) {
                     const uint16_t* const raw_col = raw_u16 +
                         static_cast<size_t>(s - s_begin) * static_cast<size_t>(k_);
-                    const float ws_f = unit_weights_ ? 1.0f : w_ptr_[s];
-                    float sample_eps = 0.0f;
-
                     if (my_uy != nullptr) {
                         const double ys = static_cast<double>(y_adj_ptr_[s]);
                         for (int r = 0; r < k_; ++r) {
@@ -1014,10 +1054,8 @@ public:
                             my_uy[r] += static_cast<double>(u) * ys;
                         }
                     }
-
                     if (vi_y_out_ptr_ != nullptr) {
                         double proj = 0.0;
-                        const double* const cku = pre_ck_uy_.data();
                         for (int r = 0; r < k_; ++r) {
                             const float sc = rs_base[r];
                             const float u = (sc > 0.0f)
@@ -1028,28 +1066,44 @@ public:
                         vi_y_out_ptr_[s] = static_cast<float>(
                             (static_cast<double>(vi_y_in_ptr_[s]) - proj) * vi_y_inv_s2e_);
                     }
+                }
+            }
 
-                    for (size_t ti = 0; ti < num_tiles; ++ti) {
-                        const auto& tile = out_.tiles[ti];
-                        const int r0 = tile.r_begin;
-                        const int rc = tile.r_count;
-                        const int qr = tile.q_rows;
-                        const uint16_t* const raw_t = raw_col + r0;
-                        const float* const rs_t  = rs_base + r0;
-                        const float* const sck   = sck_base + r0;
-                        const float* const ihi   = ihi_base + r0;
-                        const float* const ahi   = ahi_base + r0;
-                        int32_t* const     lhi   = local_hi32.data() + r0;
-                        int8_t* const      q_hi  = tile.Q.get() + static_cast<size_t>(s) * static_cast<size_t>(qr);
+            constexpr int kSubSlab = 32768;
+            for (size_t ti = 0; ti < num_tiles; ++ti) {
+                const auto& tile = out_.tiles[ti];
+                const int r0 = tile.r_begin;
+                const int rc = tile.r_count;
+                const int q_ld = tile.q_ld;
+                int8_t* const      tile_q_base = tile.Q.get();
+                const float* const rs_t  = rs_base + r0;
+                const float* const sck   = sck_base + r0;
+                const float* const ihi   = ihi_base + r0;
+                const float* const ahi   = ahi_base + r0;
+                const float* const ilo   = tile.is_2slice ? (ilo_base + r0) : nullptr;
+                const float* const alo   = tile.is_2slice ? (alo_base + r0) : nullptr;
+                const float* const runit = runit_base + r0;
+                const bool use_fast_i16_tile = fast_unit &&
+                    (tile_all_i16_[ti] || tile_fp16_rows_[ti].size() * 2 < static_cast<size_t>(rc));
+                const bool all_i16 = tile_all_i16_[ti];
+
+                for (int sb = s_lo; sb < s_hi; sb += kSubSlab) {
+                    const int se = std::min(s_hi, sb + kSubSlab);
+                    std::memset(lhi, 0, static_cast<size_t>(rc) * sizeof(int32_t));
+                    if (tile.is_2slice) {
+                        std::memset(llo, 0, static_cast<size_t>(rc) * sizeof(int32_t));
+                    }
+
+                    for (int s = sb; s < se; ++s) {
+                        const uint16_t* const raw_t = raw_u16 +
+                            static_cast<size_t>(s - s_begin) * static_cast<size_t>(k_) + r0;
+                        const float ws_f = unit_weights_ ? 1.0f : w_ptr_[s];
+                        int8_t* const q_hi = tile_q_base + static_cast<size_t>(s) * static_cast<size_t>(q_ld);
+                        float tile_eps = 0.0f;
 
                         if (tile.is_2slice) {
-                            int8_t* const      q_lo = q_hi + rc;
-                            int32_t* const     llo  = local_lo32.data() + r0;
-                            const float* const ilo  = ilo_base + r0;
-                            const float* const alo  = alo_base + r0;
-
-                            if (fast_unit && (tile_all_i16_[ti] || tile_fp16_rows_[ti].size() * 2 < static_cast<size_t>(rc))) {
-                                // Pure integer lossless split: q16 = 254 * qh + ql, zero extra error.
+                            int8_t* const q_lo = q_hi + rc;
+                            if (use_fast_i16_tile) {
                                 #pragma omp simd
                                 for (int rl = 0; rl < rc; ++rl) {
                                     const int32_t q = static_cast<int32_t>(static_cast<int16_t>(raw_t[rl]));
@@ -1063,7 +1117,7 @@ public:
                                     lhi[rl] += qh;
                                     llo[rl] += ql;
                                 }
-                                if (!tile_all_i16_[ti]) {
+                                if (!all_i16) {
                                     for (int rl : tile_fp16_rows_[ti]) {
                                         lhi[rl] -= static_cast<int32_t>(q_hi[rl]);
                                         llo[rl] -= static_cast<int32_t>(q_lo[rl]);
@@ -1079,7 +1133,7 @@ public:
                                         lhi[rl] += qh;
                                         llo[rl] += ql;
                                         const float eps = std::fmaf(-alo[rl], ql_f, rem);
-                                        sample_eps += eps * eps;
+                                        tile_eps += eps * eps;
                                     }
                                 }
                             } else {
@@ -1099,15 +1153,13 @@ public:
                                     lhi[rl] += qh;
                                     llo[rl] += ql;
                                     const float eps = std::fmaf(-alo[rl], ql_f, rem);
-                                    sample_eps += eps * eps;
+                                    tile_eps += eps * eps;
                                 }
                             }
                         } else {
-                            // 1-slice tile
-                            if (fast_unit && tile_all_i16_[ti]) {
-                                const float* const runit = runit_base + r0;
+                            if (fast_unit && all_i16) {
                                 constexpr float kInv255 = 1.0f / 255.0f;
-                                #pragma omp simd reduction(+:sample_eps)
+                                #pragma omp simd reduction(+:tile_eps)
                                 for (int rl = 0; rl < rc; ++rl) {
                                     const float qf   = static_cast<float>(static_cast<int16_t>(raw_t[rl]));
                                     const float qh_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(qf * kInv255)));
@@ -1115,7 +1167,7 @@ public:
                                     q_hi[rl] = static_cast<int8_t>(qh);
                                     lhi[rl] += qh;
                                     const float eps = std::fmaf(-255.0f, qh_f, qf) * runit[rl];
-                                    sample_eps += eps * eps;
+                                    tile_eps += eps * eps;
                                 }
                             } else {
                                 for (int rl = 0; rl < rc; ++rl) {
@@ -1129,22 +1181,21 @@ public:
                                     q_hi[rl] = static_cast<int8_t>(qh);
                                     lhi[rl] += qh;
                                     const float eps = std::fmaf(-ahi[rl], qh_f, v);
-                                    sample_eps += eps * eps;
+                                    tile_eps += eps * eps;
                                 }
                             }
                         }
+                        slab_eps_sq += static_cast<double>(tile_eps);
                     }
-                    slab_eps_sq += static_cast<double>(sample_eps);
-                }
 
-                // Fold int32 slab accumulators into thread-owned int64 arrays.
-                for (int r = 0; r < k_; ++r) {
-                    my_sum_hi[r] += static_cast<int64_t>(local_hi32[static_cast<size_t>(r)]);
-                    local_hi32[static_cast<size_t>(r)] = 0;
-                }
-                for (int r = 0; r < k_hi_; ++r) {
-                    my_sum_lo[r] += static_cast<int64_t>(local_lo32[static_cast<size_t>(r)]);
-                    local_lo32[static_cast<size_t>(r)] = 0;
+                    for (int rl = 0; rl < rc; ++rl) {
+                        my_sum_hi[r0 + rl] += static_cast<int64_t>(lhi[rl]);
+                    }
+                    if (tile.is_2slice) {
+                        for (int rl = 0; rl < rc; ++rl) {
+                            my_sum_lo[r0 + rl] += static_cast<int64_t>(llo[rl]);
+                        }
+                    }
                 }
             }
         }
@@ -1156,6 +1207,7 @@ public:
     {
         Eigen::VectorXd uy = Eigen::VectorXd::Zero(k_);
         if (thr_uy_.empty()) return uy;
+        #pragma omp parallel for schedule(static) if (k_ >= 1024)
         for (int r = 0; r < k_; ++r) {
             double acc = 0.0;
             for (int t = 0; t < max_threads_; ++t) {
@@ -1175,6 +1227,7 @@ public:
             const int r0 = tile.r_begin;
             const int rc = tile.r_count;
             if (!tile.is_2slice) {
+                #pragma omp parallel for schedule(static) if (rc >= 512)
                 for (int rl = 0; rl < rc; ++rl) {
                     int64_t sh = 0;
                     const size_t r = static_cast<size_t>(r0 + rl);
@@ -1185,6 +1238,7 @@ public:
                         tile.alpha_hi[static_cast<size_t>(rl)] * static_cast<double>(sh);
                 }
             } else {
+                #pragma omp parallel for schedule(static) if (rc >= 512)
                 for (int rl = 0; rl < rc; ++rl) {
                     int64_t sh = 0;
                     int64_t sl = 0;
@@ -1224,6 +1278,7 @@ private:
     int max_threads_ = 1;
     size_t k_pad64_ = 0;
     size_t k_hi_pad64_ = 0;
+    size_t max_tile_rc_pad_ = 0;
     bool unit_weights_ = true;
     bool has_exact_max_override_ = false;
     double S_w2_ = 0.0;
@@ -1247,6 +1302,8 @@ private:
     std::vector<std::vector<int>> tile_fp16_rows_;
     std::vector<int64_t> thr_sum_hi_;
     std::vector<int64_t> thr_sum_lo_;
+    AlignedRawBuffer<int32_t, 64> thr_local_hi32_;
+    AlignedRawBuffer<int32_t, 64> thr_local_lo32_;
     std::vector<double> thr_uy_;
     QuantizedWoodburyUk out_;
 };
@@ -1282,8 +1339,8 @@ inline Eigen::VectorXf reconstruct_vi_y_from_q_uk(
             const auto& tile = q_uk.tiles[ti];
             const int r0 = tile.r_begin;
             const int rc = tile.r_count;
-            const int qr = tile.q_rows;
-            const int8_t* const q_hi = tile.Q.get() + static_cast<size_t>(s) * static_cast<size_t>(qr);
+            const int q_ld = tile.q_ld;
+            const int8_t* const q_hi = tile.Q.get() + static_cast<size_t>(s) * static_cast<size_t>(q_ld);
             const double* const ahi  = tile.alpha_hi.data();
             const double* const cf   = coeff.data() + r0;
             if (tile.is_2slice) {
@@ -1318,7 +1375,8 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk_from_nxk(
     const Eigen::VectorXf& w_sqrt,
     bool unit_weights,
     double S_w2,
-    FastMlmaMode mode)
+    FastMlmaMode mode,
+    int max_q_rows = 4096)
 {
     QuantizedWoodburyUk out;
     const int n = static_cast<int>(Uk_nxk.rows());
@@ -1328,35 +1386,7 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk_from_nxk(
     out.mode = mode;
     if (k <= 0 || n <= 0 || mode == FastMlmaMode::Off) return out;
 
-    int k_hi = k;
-    if (mode == FastMlmaMode::Slice1) {
-        k_hi = 0;
-    } else if (mode == FastMlmaMode::Hybrid) {
-        k_hi = std::min(k, std::max(std::min(k, 100), k / 10));
-    }
-
-    constexpr int kMaxQRows = 4096;
-    auto push_tiles = [&](int beg, int end, bool is_2slice) {
-        const int rc_max = is_2slice ? (kMaxQRows / 2) : kMaxQRows;
-        for (int r0 = beg; r0 < end; r0 += rc_max) {
-            QuantizedWoodburyTile t;
-            t.r_begin = r0;
-            t.r_count = std::min(rc_max, end - r0);
-            t.is_2slice = is_2slice;
-            t.q_rows = is_2slice ? 2 * t.r_count : t.r_count;
-            t.q_bytes = static_cast<size_t>(t.q_rows) * static_cast<size_t>(n);
-            t.Q = make_aligned_uninitialized<int8_t, 64>(t.q_bytes);
-            if (t.q_bytes > 0 && !t.Q) {
-                LOGGER.e(0, "Failed to allocate quantized Woodbury Q tile.");
-            }
-            t.alpha_hi.assign(static_cast<size_t>(t.r_count), 0.0);
-            if (is_2slice) t.alpha_lo.assign(static_cast<size_t>(t.r_count), 0.0);
-            t.u_sum_q.assign(static_cast<size_t>(t.r_count), 0.0);
-            out.tiles.push_back(std::move(t));
-        }
-    };
-    if (k_hi > 0) push_tiles(0, k_hi, true);
-    if (k_hi < k) push_tiles(k_hi, k, false);
+    const int k_hi = populate_quantized_woodbury_tiles(out, k, n, mode, max_q_rows);
 
     const float* const uk_src      = Uk_nxk.data();
     const float* const sqrt_ck_ptr = sqrt_ck_f.data();
@@ -1490,13 +1520,13 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk_from_nxk(
                     const auto& tile = out.tiles[ti];
                     const int r0 = tile.r_begin;
                     const int rc = tile.r_count;
-                    const int qr = tile.q_rows;
+                    const int q_ld = tile.q_ld;
                     const float* const uk_t = uk_col + r0;
                     const float* const sck  = sqrt_ck_ptr + r0;
                     const float* const ihi  = ihi_base + r0;
                     const float* const ahi  = ahi_base + r0;
                     int32_t* const     lhi  = local_hi32.data() + r0;
-                    int8_t* const      q_hi = tile.Q.get() + static_cast<size_t>(s) * static_cast<size_t>(qr);
+                    int8_t* const      q_hi = tile.Q.get() + static_cast<size_t>(s) * static_cast<size_t>(q_ld);
 
                     if (!tile.is_2slice) {
                         #pragma omp simd reduction(+:sample_eps)
@@ -1548,6 +1578,7 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk_from_nxk(
         const int r0 = tile.r_begin;
         const int rc = tile.r_count;
         if (!tile.is_2slice) {
+            #pragma omp parallel for schedule(static) if (rc >= 512)
             for (int rl = 0; rl < rc; ++rl) {
                 int64_t sh = 0;
                 const size_t r = static_cast<size_t>(r0 + rl);
@@ -1558,6 +1589,7 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk_from_nxk(
                     tile.alpha_hi[static_cast<size_t>(rl)] * static_cast<double>(sh);
             }
         } else {
+            #pragma omp parallel for schedule(static) if (rc >= 512)
             for (int rl = 0; rl < rc; ++rl) {
                 int64_t sh = 0;
                 int64_t sl = 0;
@@ -1614,6 +1646,7 @@ inline void woodbury_xvx_diag_block_fast_i8(
     for (const auto& tile : q_uk.tiles) {
         const int qr = tile.q_rows;
         const int rc = tile.r_count;
+        const int q_ld = (tile.q_ld > 0) ? tile.q_ld : qr;
         const int8_t* const q_base = tile.Q.get();
 #if GCTA_HAS_AOCL_S8_GEMM
         const size_t budget_cols = (64ULL << 20) / (static_cast<size_t>(qr) * sizeof(int32_t));
@@ -1641,8 +1674,8 @@ inline void woodbury_xvx_diag_block_fast_i8(
                     static_cast<gcta_blas_int>(cols),
                     static_cast<gcta_blas_int>(rows),
                     q_reordered,
-                    q_base + static_cast<size_t>(s0) * static_cast<size_t>(qr),
-                    static_cast<gcta_blas_int>(qr),
+                    q_base + static_cast<size_t>(s0) * static_cast<size_t>(q_ld),
+                    static_cast<gcta_blas_int>(q_ld),
                     G_block_i8 + static_cast<size_t>(j0) * static_cast<size_t>(ldG) + s0,
                     static_cast<gcta_blas_int>(ldG),
                     P_i32.data(),
@@ -1731,7 +1764,7 @@ inline void woodbury_xvx_diag_block_fast_i8(
                             std::fill_n(miss_acc.data(), qr, int64_t{0});
                             int64_t* const ma = miss_acc.data();
                             for (int s : miss_list) {
-                                const int8_t* const q_col = q_base + static_cast<size_t>(s) * static_cast<size_t>(qr);
+                                const int8_t* const q_col = q_base + static_cast<size_t>(s) * static_cast<size_t>(q_ld);
                                 #pragma omp simd
                                 for (int q = 0; q < qr; ++q) {
                                     ma[q] += static_cast<int64_t>(q_col[q]);

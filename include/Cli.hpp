@@ -222,6 +222,8 @@ struct PcaOptions {
     int pca_tile_size = 0;    // 0 = default (8192 small-k / 4096 large-k)
 };
 
+enum class MlmaReorderQ { Auto = 0, Off = 1, On = 2 };
+
 struct MlmaOptions {
     GenoInputOptions geno;
     SampleFilterOptions sample_filter;
@@ -238,6 +240,17 @@ struct MlmaOptions {
     GenoModel model = GenoModel::Additive;
     bool log_pval = false;
     bool no_preadj_covar = false;
+
+    // Hidden developer tuning flags
+    bool mlma_profile = false;
+    int mlma_p_budget_mb = 64;
+    int mlma_q_rows = 4096;
+    int mlma_snp_tile = 0;
+    MlmaReorderQ mlma_reorder_q = MlmaReorderQ::Auto;
+    int mlma_block_size = 0;
+    int mlma_sample_tile = 8192;
+    int mlma_ukx_budget_mb = 160;
+    int mlma_tun3_slot_mb = 256;
 };
 
 struct LegacyOptions {

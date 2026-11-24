@@ -1023,6 +1023,47 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
                        "Disable covariate pre-adjustment (currently unsupported in V2 MLMA)")
         ->group(g_assoc);
 
+    // Hidden developer tuning flags
+    mlma_cmd->add_flag("--mlma-profile", mlma_opts.mlma_profile,
+                       "Dev: Log detailed phase timing breakdown for mlma")
+        ->group("");
+    mlma_cmd->add_option("--mlma-p-budget-mb", mlma_opts.mlma_p_budget_mb,
+                         "Dev: Persistent P_i32 tile buffer budget in MiB for quantized fast-mlma")
+        ->check(CLI::PositiveNumber)
+        ->group("");
+    mlma_cmd->add_option("--mlma-q-rows", mlma_opts.mlma_q_rows,
+                         "Dev: Max sample rows per quantized Q tile for 2slice/1slice/hybrid")
+        ->check(CLI::Range(16, 1048576))
+        ->group("");
+    mlma_cmd->add_option("--mlma-snp-tile", mlma_opts.mlma_snp_tile,
+                         "Dev: Override SNP sub-tile width in fast_i8 (0 = auto from P budget)")
+        ->check(CLI::NonNegativeNumber)
+        ->group("");
+    mlma_cmd->add_option("--mlma-reorder-q", mlma_opts.mlma_reorder_q,
+                         "Dev: AOCL Q reorder policy {auto,off,on}")
+        ->transform(make_enum_transformer<MlmaReorderQ>(
+            {{"auto", MlmaReorderQ::Auto},
+             {"off", MlmaReorderQ::Off},
+             {"on", MlmaReorderQ::On}},
+            "MlmaReorderQ", /*allow_numeric=*/false))
+        ->group("");
+    mlma_cmd->add_option("--mlma-block-size", mlma_opts.mlma_block_size,
+                         "Dev: Override SNP streaming block size (0 = auto)")
+        ->check(CLI::NonNegativeNumber)
+        ->group("");
+    mlma_cmd->add_option("--mlma-sample-tile", mlma_opts.mlma_sample_tile,
+                         "Dev: Sample tile size for std_i8 GEMM/UKX path")
+        ->check(CLI::PositiveNumber)
+        ->group("");
+    mlma_cmd->add_option("--mlma-ukx-budget-mb", mlma_opts.mlma_ukx_budget_mb,
+                         "Dev: Scratch budget in MiB for std_i8 UKX output panel")
+        ->check(CLI::PositiveNumber)
+        ->group("");
+    mlma_cmd->add_option("--mlma-tun3-slot-mb", mlma_opts.mlma_tun3_slot_mb,
+                         "Dev: Pre-allocated double-buffer slot size in MiB for TUN3 loading")
+        ->check(CLI::PositiveNumber)
+        ->group("");
+
     mlma_load->excludes(mlma_save);
     mlma_save->excludes(mlma_fast, mlma_budget, mlma_model, mlma_logp);
 

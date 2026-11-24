@@ -63,6 +63,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cerrno>
+#include <chrono>
 #include <format>
 #ifdef _OPENMP
   #include <omp.h>
@@ -2110,6 +2111,42 @@ Eigen::MatrixXf load_pca_warm_start(const string& eigenvec_prefix,
 // ---------------------------------------------------------------------------
 void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
 {
+    const auto mlma_t0 = std::chrono::steady_clock::now();
+    MlmaTuningOptions mlma_tuning;
+    mlma_tuning.p_budget_mb   = opts.mlma_p_budget_mb;
+    mlma_tuning.q_rows        = opts.mlma_q_rows;
+    mlma_tuning.snp_tile      = opts.mlma_snp_tile;
+    if (opts.mlma_reorder_q == gcta_cli::MlmaReorderQ::On) {
+        mlma_tuning.reorder_q = true;
+    } else if (opts.mlma_reorder_q == gcta_cli::MlmaReorderQ::Off) {
+        mlma_tuning.reorder_q = false;
+    } else if (const char* env_rq = std::getenv("GCTA_MLMA_REORDER_Q")) {
+        mlma_tuning.reorder_q = (std::strcmp(env_rq, "1") == 0);
+    } else {
+        mlma_tuning.reorder_q = false;
+    }
+    mlma_tuning.block_size    = opts.mlma_block_size;
+    mlma_tuning.sample_tile   = opts.mlma_sample_tile;
+    mlma_tuning.ukx_budget_mb = opts.mlma_ukx_budget_mb;
+    mlma_tuning.tun3_slot_mb  = opts.mlma_tun3_slot_mb;
+    mlma_tuning.profile       = opts.mlma_profile;
+    MlmaProfileStats mlma_prof;
+    MlmaProfileStats* mlma_prof_ptr = mlma_tuning.profile ? &mlma_prof : nullptr;
+    auto log_mlma_profile = [&]() {
+        if (!mlma_tuning.profile) return;
+        const double total_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - mlma_t0).count();
+        LOGGER.i(0, std::format(
+            "[mlma-profile] reml_load_s={:.3f} q_build_s={:.3f} q_reorder_s={:.3f} "
+            "decode_s={:.3f} xvx_gemm_s={:.3f} xvx_reduce_s={:.3f} format_write_s={:.3f} "
+            "total_s={:.3f} blocks={} valid_snps={} total_snps={} q_tiles={} block_size={}",
+            mlma_prof.reml_load_s, mlma_prof.q_build_s, mlma_prof.q_reorder_s,
+            mlma_prof.decode_s, mlma_prof.xvx_gemm_s, mlma_prof.xvx_reduce_s,
+            mlma_prof.format_write_s, total_s, mlma_prof.blocks,
+            mlma_prof.valid_snps, mlma_prof.total_snps, mlma_prof.q_tiles,
+            mlma_prof.block_size));
+    };
+
     const auto& r = opts.reml;
     const bool   no_adj_covar   = opts.no_preadj_covar;
     const bool   log_pval       = opts.log_pval;
@@ -2241,11 +2278,16 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                                          (std::getenv("GCTA_DISABLE_INT8_MLMA") == nullptr);
             LOGGER.i(0, "Loading REML state from [" + load_reml_file + "]...");
             LOGGER.ts("load_reml");
+            const auto t_reml0 = std::chrono::steady_clock::now();
             state = readRemlState(load_reml_file, no_adj_covar, n, x_c,
                                   hash_sample_ids(pheno.get_id(0, n - 1, "\t")),
                                   basis_file_override,
                                   can_stream_fast ? fast_mlma_mode : FastMlmaMode::Off,
-                                  y_vec, X_design, w_sqrt);
+                                  y_vec, X_design, w_sqrt,
+                                  static_cast<size_t>(std::max(1, mlma_tuning.tun3_slot_mb)) << 20,
+                                  mlma_tuning.q_rows);
+            mlma_prof.reml_load_s += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_reml0).count();
             LOGGER.i(0, "REML state loaded in " + to_string(LOGGER.tp("load_reml")) + " seconds.");
 
             if (state.n != n)
@@ -2494,11 +2536,13 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             try {
                 gcta_io::AsyncSeqWriter mlma_writer(out_file, 16ULL << 20); // 2 x 16 MiB
                 run_mlma_stream_association(ctx, y_vec, w_sqrt, geno.get(), marker.get(), n, log_pval,
-                                            mlma_writer, mlma_tile_budget_gb, fast_mlma_mode);
+                                            mlma_writer, mlma_tile_budget_gb, fast_mlma_mode,
+                                            mlma_tuning, mlma_prof_ptr);
                 mlma_writer.finish();
             } catch (const std::exception& e) {
                 LOGGER.e(0, e.what());
             }
+            log_mlma_profile();
             LOGGER << "\nAssociation results saved to [" << out_file << "]." << std::endl;
         }
 
@@ -2510,10 +2554,12 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
         try {
             gcta_io::AsyncSeqWriter mlma_writer(out_file, 16ULL << 20); // 2 x 16 MiB
             run_mlma_stream_association(state, y_vec, w_sqrt, geno.get(), marker.get(), n, log_pval,
-                                        mlma_writer, mlma_tile_budget_gb, fast_mlma_mode);
+                                        mlma_writer, mlma_tile_budget_gb, fast_mlma_mode,
+                                        mlma_tuning, mlma_prof_ptr);
             mlma_writer.finish();
         } catch (const std::exception& e) {
             LOGGER.e(0, e.what());
         }
+        log_mlma_profile();
         LOGGER << "\nAssociation results saved to [" << out_file << "]." << std::endl;
 }

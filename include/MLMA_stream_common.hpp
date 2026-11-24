@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <bit>
 #include <charconv>
+#include <chrono>
 #include <concepts>
 #include <cstdint>
 #include <cstdio>
@@ -298,7 +299,7 @@ inline void format_and_buffer_mlma_block(int bs,
 
     if (out_state.slot_used + total_bytes <= out_state.slot_cap) {
         char* const dst_base = out_state.slot_ptr + out_state.slot_used;
-        #pragma omp parallel for schedule(static) num_threads(n_active) if (total_bytes >= 262144 && n_active > 1)
+        #pragma omp parallel for schedule(static) num_threads(n_active) if (total_bytes >= 4194304 && n_active > 1)
         for (int t = 0; t < n_active; ++t) {
             const std::string& tb = thr_buf[static_cast<size_t>(t)];
             if (!tb.empty()) {
@@ -466,8 +467,11 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                                                     bool log_pval,
                                                     gcta_io::AsyncSeqWriter& writer,
                                                     FastMlmaMode fast_mlma = FastMlmaMode::Off,
-                                                    std::optional<QuantizedWoodburyUk>* prebuilt_q_uk = nullptr)
+                                                    std::optional<QuantizedWoodburyUk>* prebuilt_q_uk = nullptr,
+                                                    const MlmaTuningOptions& tuning = {},
+                                                    MlmaProfileStats* prof = nullptr)
 {
+    using Clock = std::chrono::steady_clock;
     const uint32_t total_m = marker->count_extract();
     const bool use_fast_i8 = (fast_mlma != FastMlmaMode::Off);
     LOGGER << "\nStreaming association tests for " << total_m << " SNPs ("
@@ -511,13 +515,24 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
             q_uk = std::move(**prebuilt_q_uk);
             prebuilt_q_uk->reset();
         } else {
-            q_uk = build_quantized_woodbury_uk(wb, w_sqrt, unit_weights, S_w2, fast_mlma);
+            const auto t_qb0 = prof ? Clock::now() : Clock::time_point{};
+            q_uk = build_quantized_woodbury_uk(wb, w_sqrt, unit_weights, S_w2, fast_mlma, tuning.q_rows);
+            if (prof) {
+                prof->q_build_s += std::chrono::duration<double>(Clock::now() - t_qb0).count();
+            }
             // Free float32 Uk_f immediately after quantization to cut resident memory
             // before optional AOCL pre-reordered Q buffers.
             const_cast<WoodburyMLMACache&>(wb).Uk_f.resize(0, 0);
         }
-        if (std::getenv("GCTA_MLMA_REORDER_Q") != nullptr) {
+        if (tuning.reorder_q) {
+            const auto t_qr0 = prof ? Clock::now() : Clock::time_point{};
             reorder_quantized_woodbury_uk(q_uk);
+            if (prof) {
+                prof->q_reorder_s += std::chrono::duration<double>(Clock::now() - t_qr0).count();
+            }
+        }
+        if (prof) {
+            prof->q_tiles = static_cast<int>(q_uk.tiles.size());
         }
         std::string reord_msg;
         if (q_uk.total_q_reordered_bytes() > 0) {
@@ -608,13 +623,23 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
     Eigen::VectorXf Xt_Vi_y(BLOCK);
     Eigen::VectorXf xvx_diag(BLOCK);
     Eigen::MatrixXf UkX_scratch;
-    std::vector<float> X_panel_f32;
-    std::vector<int32_t> P_i32;
+    AlignedRawBuffer<float, 64> X_panel_f32;
+    AlignedRawBuffer<int32_t, 64> P_i32;
+    AlignedRawBuffer<int32_t, 64> thr_miss_acc;
     std::vector<float> scratch_A_f32, scratch_B_f32, scratch_C_f32;
     std::vector<double> ukx_norm_sq(static_cast<size_t>(BLOCK), 0.0);
 
+    std::vector<int>     compact_idx(static_cast<size_t>(BLOCK));
+    std::vector<uint8_t> compact_valid(static_cast<size_t>(BLOCK), 1);
+    std::vector<float>   compact_mu(static_cast<size_t>(BLOCK));
+    std::vector<float>   compact_x_norm(static_cast<size_t>(BLOCK));
+    Eigen::VectorXf      compact_xvx(BLOCK);
+
     int snp_done = 0;
     int last_pct = -1;
+    if (prof) {
+        prof->block_size = BLOCK;
+    }
 
     std::vector<uint8_t> valid_v(BLOCK, 0);
     std::vector<float>   af_v(BLOCK, 0.0f);
@@ -647,6 +672,7 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
         const int bs = static_cast<int>(exIdx.size());
         int block_has_miss = 0;
 
+        const auto t_dec0 = prof ? Clock::now() : Clock::time_point{};
         #pragma omp parallel reduction(|:block_has_miss)
         {
             const int tid =
@@ -682,7 +708,6 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
 
                 if (!valid) {
                     snp_miss_samples[i].clear();
-                    std::memset(col_i8, 0, static_cast<size_t>(n));
                     Xt_Vi_y[i]  = 0.0f;
                     x_norm_v[i] = 0.0f;
                     continue;
@@ -713,24 +738,82 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                 }
             }
         }
-
-        if (use_fast_i8) {
-            woodbury_xvx_diag_block_fast_i8(wb, q_uk, G_block_i8.get(), ldG, bs,
-                                            valid_v, mu_v, x_norm_v, snp_miss_samples,
-                                            xvx_diag, P_i32,
-                                            scratch_A_f32, scratch_B_f32, scratch_C_f32,
-                                            block_has_miss != 0, &ukx_norm_sq);
-        } else {
-            woodbury_xvx_diag_block_i8(wb, u_sum, w_sqrt, unit_weights,
-                                       G_block_i8.get(), ldG, bs,
-                                       valid_v, mu_v, x_norm_v, snp_miss_samples,
-                                       xvx_diag, UkX_scratch, X_panel_f32,
-                                       block_has_miss != 0, &ukx_norm_sq);
+        if (prof) {
+            prof->decode_s += std::chrono::duration<double>(Clock::now() - t_dec0).count();
         }
 
+        // Compact valid SNPs before Woodbury GEMM so filtered SNPs are skipped cleanly.
+        int n_valid = 0;
+        for (int i = 0; i < bs; ++i) {
+            if (valid_v[i]) {
+                compact_idx[static_cast<size_t>(n_valid)] = i;
+                ++n_valid;
+            }
+        }
+
+        if (n_valid == 0) {
+            xvx_diag.head(bs).setZero();
+        } else if (n_valid == bs) {
+            if (use_fast_i8) {
+                woodbury_xvx_diag_block_fast_i8(wb, q_uk, G_block_i8.get(), ldG, bs,
+                                                valid_v, mu_v, x_norm_v, snp_miss_samples,
+                                                xvx_diag, P_i32,
+                                                scratch_A_f32, scratch_B_f32, scratch_C_f32,
+                                                block_has_miss != 0, &ukx_norm_sq, &thr_miss_acc,
+                                                tuning.p_budget_mb, tuning.snp_tile, prof);
+            } else {
+                woodbury_xvx_diag_block_i8(wb, u_sum, w_sqrt, unit_weights,
+                                           G_block_i8.get(), ldG, bs,
+                                           valid_v, mu_v, x_norm_v, snp_miss_samples,
+                                           xvx_diag, UkX_scratch, X_panel_f32,
+                                           block_has_miss != 0, &ukx_norm_sq,
+                                           tuning.sample_tile, tuning.ukx_budget_mb, prof);
+            }
+        } else {
+            for (int c = 0; c < n_valid; ++c) {
+                const int src = compact_idx[static_cast<size_t>(c)];
+                compact_mu[static_cast<size_t>(c)]     = mu_v[src];
+                compact_x_norm[static_cast<size_t>(c)] = x_norm_v[src];
+                if (src != c) {
+                    std::memcpy(G_block_i8.get() + static_cast<size_t>(c) * static_cast<size_t>(ldG),
+                                G_block_i8.get() + static_cast<size_t>(src) * static_cast<size_t>(ldG),
+                                static_cast<size_t>(n));
+                    if (block_has_miss != 0) {
+                        snp_miss_samples[static_cast<size_t>(c)].swap(snp_miss_samples[static_cast<size_t>(src)]);
+                    }
+                }
+            }
+            if (use_fast_i8) {
+                woodbury_xvx_diag_block_fast_i8(wb, q_uk, G_block_i8.get(), ldG, n_valid,
+                                                compact_valid, compact_mu, compact_x_norm, snp_miss_samples,
+                                                compact_xvx, P_i32,
+                                                scratch_A_f32, scratch_B_f32, scratch_C_f32,
+                                                block_has_miss != 0, &ukx_norm_sq, &thr_miss_acc,
+                                                tuning.p_budget_mb, tuning.snp_tile, prof);
+            } else {
+                woodbury_xvx_diag_block_i8(wb, u_sum, w_sqrt, unit_weights,
+                                           G_block_i8.get(), ldG, n_valid,
+                                           compact_valid, compact_mu, compact_x_norm, snp_miss_samples,
+                                           compact_xvx, UkX_scratch, X_panel_f32,
+                                           block_has_miss != 0, &ukx_norm_sq,
+                                           tuning.sample_tile, tuning.ukx_budget_mb, prof);
+            }
+            xvx_diag.head(bs).setZero();
+            for (int c = 0; c < n_valid; ++c) {
+                xvx_diag[compact_idx[static_cast<size_t>(c)]] = compact_xvx[c];
+            }
+        }
+
+        const auto t_fmt0 = prof ? Clock::now() : Clock::time_point{};
         format_and_buffer_mlma_block(bs, exIdx, marker, valid_v, additive_af_v,
                                      Xt_Vi_y, xvx_diag, log_pval,
                                      thr_buf, out_state, writer);
+        if (prof) {
+            prof->format_write_s += std::chrono::duration<double>(Clock::now() - t_fmt0).count();
+            ++prof->blocks;
+            prof->valid_snps += static_cast<uint64_t>(n_valid);
+            prof->total_snps += static_cast<uint64_t>(bs);
+        }
 
         snp_done += bs;
         const int cur_pct = (total_m > 0)
@@ -764,7 +847,9 @@ inline void run_mlma_stream_association(RemlState& state,
                                         bool log_pval,
                                         gcta_io::AsyncSeqWriter& writer,
                                         double block_mem_budget_gb = 0.0,
-                                        FastMlmaMode fast_mlma = FastMlmaMode::Off)
+                                        FastMlmaMode fast_mlma = FastMlmaMode::Off,
+                                        const MlmaTuningOptions& tuning = {},
+                                        MlmaProfileStats* prof = nullptr)
 {
     Eigen::VectorXf Vi_y(n);
 
@@ -819,14 +904,20 @@ inline void run_mlma_stream_association(RemlState& state,
         ? static_cast<int>(wb.Uk_f.rows())
         : 0;
     const int align_tile = use_int8_wb ? 2048 : 0;
-    const int BLOCK = resolve_mlma_block_size(n, block_mem_budget_gb, use_int8_wb, raw_n, wb_k,
-                                              geno->getGenoFormat(), align_tile);
+    const int BLOCK = (tuning.block_size > 0)
+        ? tuning.block_size
+        : resolve_mlma_block_size(n, block_mem_budget_gb, use_int8_wb, raw_n, wb_k,
+                                  geno->getGenoFormat(), align_tile);
+    if (tuning.block_size > 0) {
+        LOGGER << "MLMA streaming block size (override): " << BLOCK << " SNPs per tile" << std::endl;
+    }
 
     if (use_int8_wb) {
         run_mlma_stream_association_woodbury_i8(wb, Vi_y, w_sqrt,
                                                 geno, marker, n,
                                                 BLOCK, log_pval, writer, fast_mlma,
-                                                state.prebuilt_q_uk.has_value() ? &state.prebuilt_q_uk : nullptr);
+                                                state.prebuilt_q_uk.has_value() ? &state.prebuilt_q_uk : nullptr,
+                                                tuning, prof);
         return;
     }
 
@@ -876,8 +967,11 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
                                         bool log_pval,
                                         gcta_io::AsyncSeqWriter& writer,
                                         double block_mem_budget_gb = 0.0,
-                                        FastMlmaMode fast_mlma = FastMlmaMode::Off)
+                                        FastMlmaMode fast_mlma = FastMlmaMode::Off,
+                                        const MlmaTuningOptions& tuning = {},
+                                        MlmaProfileStats* prof = nullptr)
 {
+    using Clock = std::chrono::steady_clock;
     const bool direct_fast_wb = ctx.Vi_use_woodbury_basis &&
                                 (fast_mlma != FastMlmaMode::Off) &&
                                 geno->canUseInt8Mlma() &&
@@ -905,8 +999,12 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
             S_w2 = w_sqrt.cast<double>().array().square().sum();
         }
 
+        const auto t_qb0 = prof ? Clock::now() : Clock::time_point{};
         QuantizedWoodburyUk q_uk = build_quantized_woodbury_uk_from_nxk(
-            ctx.Uk, sqrt_ck_f, w_sqrt, unit_weights, S_w2, fast_mlma);
+            ctx.Uk, sqrt_ck_f, w_sqrt, unit_weights, S_w2, fast_mlma, tuning.q_rows);
+        if (prof) {
+            prof->q_build_s += std::chrono::duration<double>(Clock::now() - t_qb0).count();
+        }
         ctx.Uk.resize(0, 0); // free n x k ctx.Uk BEFORE build_reml_state
 
         RemlState state = reml::build_reml_state(ctx);
@@ -914,11 +1012,11 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
         state.cached_Vi_y = std::move(vi_y);
         state.has_cached_Vi_y = true;
         run_mlma_stream_association(state, y_adj, w_sqrt, geno, marker, n, log_pval, writer,
-                                    block_mem_budget_gb, fast_mlma);
+                                    block_mem_budget_gb, fast_mlma, tuning, prof);
         return;
     }
 
     RemlState state = reml::build_reml_state(ctx);
     run_mlma_stream_association(state, y_adj, w_sqrt, geno, marker, n, log_pval, writer,
-                                block_mem_budget_gb, fast_mlma);
+                                block_mem_budget_gb, fast_mlma, tuning, prof);
 }

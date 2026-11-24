@@ -14,6 +14,7 @@
 #include <Eigen/Dense>
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -42,6 +43,33 @@ struct WoodburyMLMACache {
     Eigen::VectorXf ck_f;          // k    (Woodbury coefficients)
     Eigen::VectorXf sqrt_ck_f;     // k    cwiseSqrt(ck_f); safe because ck >= 0
     float           sigma2_eff_f = 0.0f;
+};
+
+struct MlmaTuningOptions {
+    int p_budget_mb = 64;        // safe default per dc3dd31
+    int q_rows = 4096;           // max q_rows per Q tile
+    int snp_tile = 0;            // 0 = auto from p_budget_mb
+    bool reorder_q = false;      // default off per dc3dd31
+    int block_size = 0;          // 0 = auto from --stream-budget / resolve_mlma_block_size
+    int sample_tile = 8192;      // std_i8 X_panel_f32 sample tile
+    int ukx_budget_mb = 160;     // std_i8 UkX_scratch budget
+    int tun3_slot_mb = 256;      // TUN3 AsyncSeqReader slot size
+    bool profile = false;
+};
+
+struct MlmaProfileStats {
+    double reml_load_s = 0.0;
+    double q_build_s = 0.0;
+    double q_reorder_s = 0.0;
+    double decode_s = 0.0;
+    double xvx_gemm_s = 0.0;
+    double xvx_reduce_s = 0.0;
+    double format_write_s = 0.0;
+    uint64_t blocks = 0;
+    uint64_t valid_snps = 0;
+    uint64_t total_snps = 0;
+    int q_tiles = 0;
+    int block_size = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -153,11 +181,15 @@ inline void woodbury_xvx_diag_block_i8(
     const std::vector<std::vector<int>>& snp_miss_samples,
     Eigen::VectorXf& xvx_diag,
     Eigen::MatrixXf& UkX_scratch,
-    std::vector<float>& X_panel_f32,
+    AlignedRawBuffer<float, 64>& X_panel_f32,
     bool block_has_miss = true,
-    std::vector<double>* ukx_norm_sq_scratch = nullptr)
+    std::vector<double>* ukx_norm_sq_scratch = nullptr,
+    int sample_tile_opt = 8192,
+    int ukx_budget_mb_opt = 160,
+    MlmaProfileStats* prof = nullptr)
 {
     (void)ukx_norm_sq_scratch;
+    using Clock = std::chrono::steady_clock;
     const int k = static_cast<int>(wb.Uk_f.rows());
     const int n = static_cast<int>(wb.Uk_f.cols());
     if (bs <= 0) return;
@@ -172,8 +204,8 @@ inline void woodbury_xvx_diag_block_i8(
         return;
     }
 
-    constexpr int kSampleTile = 8192;
-    constexpr size_t kUkXTileBudgetBytes = 160ULL << 20;
+    const int kSampleTile = std::max(256, sample_tile_opt);
+    const size_t kUkXTileBudgetBytes = static_cast<size_t>(std::max(16, ukx_budget_mb_opt)) << 20;
     const size_t raw_cols = kUkXTileBudgetBytes / (static_cast<size_t>(k) * sizeof(float));
     const int rounded_cols = static_cast<int>((raw_cols / 64ULL) * 64ULL);
     const int kSnpTile = std::min(bs, std::clamp(rounded_cols, 1024, 4096));
@@ -183,8 +215,13 @@ inline void woodbury_xvx_diag_block_i8(
     }
     const gcta_blas_int ldUkX = static_cast<gcta_blas_int>(UkX_scratch.rows());
 
+    auto calc_ld_panel = [](int r) -> int {
+        int ld = ((r + 15) / 16) * 16;
+        if ((static_cast<size_t>(ld) * sizeof(float)) % 4096 == 0) ld += 16;
+        return std::max(r, ld);
+    };
     const size_t panel_need =
-        static_cast<size_t>(std::min(n, kSampleTile)) *
+        static_cast<size_t>(calc_ld_panel(std::min(n, kSampleTile))) *
         static_cast<size_t>(kSnpTile);
     if (X_panel_f32.size() < panel_need) {
         X_panel_f32.resize(panel_need);
@@ -199,8 +236,10 @@ inline void woodbury_xvx_diag_block_i8(
     for (int j0 = 0; j0 < bs; j0 += kSnpTile) {
         const int cols = std::min(kSnpTile, bs - j0);
 
+        const auto t_gemm0 = prof ? Clock::now() : Clock::time_point{};
         for (int s0 = 0; s0 < n; s0 += kSampleTile) {
             const int rows = std::min(kSampleTile, n - s0);
+            const int ldPanel = calc_ld_panel(rows);
             const float beta = (s0 == 0) ? 0.0f : 1.0f;
             const float* const uk_slab = uk_base + static_cast<size_t>(s0) * static_cast<size_t>(k);
 
@@ -210,7 +249,7 @@ inline void woodbury_xvx_diag_block_i8(
                     const int8_t* src = G_block_i8 +
                         static_cast<size_t>(j0 + c) * static_cast<size_t>(ldG) + s0;
                     float* dst = X_panel_f32.data() +
-                        static_cast<size_t>(c) * static_cast<size_t>(rows);
+                        static_cast<size_t>(c) * static_cast<size_t>(ldPanel);
                     #pragma omp simd
                     for (int r = 0; r < rows; ++r) {
                         dst[r] = static_cast<float>(src[r]);
@@ -223,7 +262,7 @@ inline void woodbury_xvx_diag_block_i8(
                     const int8_t* src = G_block_i8 +
                         static_cast<size_t>(j0 + c) * static_cast<size_t>(ldG) + s0;
                     float* dst = X_panel_f32.data() +
-                        static_cast<size_t>(c) * static_cast<size_t>(rows);
+                        static_cast<size_t>(c) * static_cast<size_t>(ldPanel);
                     #pragma omp simd
                     for (int r = 0; r < rows; ++r) {
                         dst[r] = static_cast<float>(src[r]) * w_slice[r];
@@ -237,11 +276,15 @@ inline void woodbury_xvx_diag_block_i8(
                         static_cast<gcta_blas_int>(rows),
                         1.0f,
                         uk_slab, static_cast<gcta_blas_int>(k),
-                        X_panel_f32.data(), static_cast<gcta_blas_int>(rows),
+                        X_panel_f32.data(), static_cast<gcta_blas_int>(ldPanel),
                         beta,
                         ukx_buf, ldUkX);
         }
+        if (prof) {
+            prof->xvx_gemm_s += std::chrono::duration<double>(Clock::now() - t_gemm0).count();
+        }
 
+        const auto t_red0 = prof ? Clock::now() : Clock::time_point{};
         #pragma omp parallel for schedule(static)
         for (int c = 0; c < cols; ++c) {
             const int j = j0 + c;
@@ -287,6 +330,9 @@ inline void woodbury_xvx_diag_block_i8(
             const float ukx_norm = static_cast<float>(ukx_norm_d);
             const float val      = (x_norm_v[j] - ukx_norm) / wb.sigma2_eff_f;
             xvx_diag[j] = std::max(0.0f, val);
+        }
+        if (prof) {
+            prof->xvx_reduce_s += std::chrono::duration<double>(Clock::now() - t_red0).count();
         }
     }
 }
@@ -1621,15 +1667,37 @@ inline void woodbury_xvx_diag_block_fast_i8(
     const std::vector<float>& x_norm_v,
     const std::vector<std::vector<int>>& snp_miss_samples,
     Eigen::VectorXf& xvx_diag,
-    std::vector<int32_t>& P_i32,
+    AlignedRawBuffer<int32_t, 64>& P_i32,
     std::vector<float>& scratch_A_f32,
     std::vector<float>& scratch_B_f32,
     std::vector<float>& scratch_C_f32,
     bool block_has_miss = true,
-    std::vector<double>* ukx_norm_sq_scratch = nullptr)
+    std::vector<double>* ukx_norm_sq_scratch = nullptr,
+    AlignedRawBuffer<int32_t, 64>* thr_miss_acc_buf = nullptr,
+    int p_budget_mb = 64,
+    int snp_tile_override = 0,
+    MlmaProfileStats* prof = nullptr)
 {
+    using Clock = std::chrono::steady_clock;
     if (bs <= 0) return;
     const int n = q_uk.n;
+    const double debias_scale = 1.0 + q_uk.delta_quant;
+    const double sig2e = static_cast<double>(wb.sigma2_eff_f);
+
+    const size_t num_tiles = q_uk.tiles.size();
+    if (num_tiles == 0) {
+        #pragma omp parallel for schedule(static)
+        for (int j = 0; j < bs; ++j) {
+            if (!valid_v[j]) {
+                xvx_diag[j] = 0.0f;
+            } else {
+                const double val = (debias_scale * static_cast<double>(x_norm_v[j])) / sig2e;
+                xvx_diag[j] = std::max(0.0f, static_cast<float>(val));
+            }
+        }
+        return;
+    }
+
 #if GCTA_HAS_AOCL_S8_GEMM
     const int kSampleTile = std::min(n, 8388608);
 #else
@@ -1643,21 +1711,52 @@ inline void woodbury_xvx_diag_block_fast_i8(
     }
     std::fill_n(ukx_norm_sq.data(), bs, 0.0);
 
-    for (const auto& tile : q_uk.tiles) {
+    AlignedRawBuffer<int32_t, 64> local_miss_buf;
+    AlignedRawBuffer<int32_t, 64>& miss_buf = thr_miss_acc_buf ? *thr_miss_acc_buf : local_miss_buf;
+    const int max_threads =
+    #ifdef _OPENMP
+        std::max(1, omp_get_max_threads());
+    #else
+        1;
+    #endif
+
+    for (size_t ti = 0; ti < num_tiles; ++ti) {
+        const auto& tile = q_uk.tiles[ti];
+        const bool is_last_tile = (ti + 1 == num_tiles);
         const int qr = tile.q_rows;
         const int rc = tile.r_count;
         const int q_ld = (tile.q_ld > 0) ? tile.q_ld : qr;
         const int8_t* const q_base = tile.Q.get();
+
+        // Pad ldP to multiple of 16 int32s (64B), skipping 4096-byte (1024-elem) aliasing strides.
+        int ldP = ((qr + 15) / 16) * 16;
+        if ((static_cast<size_t>(ldP) * sizeof(int32_t)) % 4096 == 0) ldP += 16;
+        ldP = std::max(qr, ldP);
+
+        int kSnpTile = 0;
+        if (snp_tile_override > 0) {
+            kSnpTile = std::min(bs, snp_tile_override);
+        } else {
 #if GCTA_HAS_AOCL_S8_GEMM
-        const size_t budget_cols = (64ULL << 20) / (static_cast<size_t>(qr) * sizeof(int32_t));
-        const int kSnpTile = std::min(
-            bs,
-            std::clamp(static_cast<int>(budget_cols), 2048, 8192));
+            const size_t p_budget_bytes = static_cast<size_t>(std::max(16, p_budget_mb)) << 20;
+            const size_t budget_cols = p_budget_bytes / (static_cast<size_t>(ldP) * sizeof(int32_t));
+            kSnpTile = std::min(
+                bs,
+                std::clamp(static_cast<int>(budget_cols), 2048, 8192));
 #else
-        const int kSnpTile = std::min(bs, 1024);
+            kSnpTile = std::min(bs, 1024);
 #endif
-        const size_t need_p = static_cast<size_t>(qr) * static_cast<size_t>(kSnpTile);
+        }
+        const size_t need_p = static_cast<size_t>(ldP) * static_cast<size_t>(kSnpTile);
         if (P_i32.size() < need_p) P_i32.resize(need_p);
+
+        const size_t miss_stride = ((static_cast<size_t>(qr) + 15) / 16) * 16;
+        if (block_has_miss) {
+            const size_t need_miss = static_cast<size_t>(max_threads) * miss_stride;
+            if (miss_buf.size() < need_miss) {
+                miss_buf.resize(need_miss);
+            }
+        }
 
         const double* const ahi = tile.alpha_hi.data();
         const double* const alo = tile.is_2slice ? tile.alpha_lo.data() : nullptr;
@@ -1665,6 +1764,7 @@ inline void woodbury_xvx_diag_block_fast_i8(
 
         for (int j0 = 0; j0 < bs; j0 += kSnpTile) {
             const int cols = std::min(kSnpTile, bs - j0);
+            const auto t_gemm0 = prof ? Clock::now() : Clock::time_point{};
             for (int s0 = 0; s0 < n; s0 += kSampleTile) {
                 const int rows = std::min(kSampleTile, n - s0);
                 const int32_t beta = (s0 == 0) ? 0 : 1;
@@ -1679,22 +1779,29 @@ inline void woodbury_xvx_diag_block_fast_i8(
                     G_block_i8 + static_cast<size_t>(j0) * static_cast<size_t>(ldG) + s0,
                     static_cast<gcta_blas_int>(ldG),
                     P_i32.data(),
-                    static_cast<gcta_blas_int>(qr),
+                    static_cast<gcta_blas_int>(ldP),
                     beta,
                     scratch_A_f32,
                     scratch_B_f32,
                     scratch_C_f32);
             }
+            if (prof) {
+                prof->xvx_gemm_s += std::chrono::duration<double>(Clock::now() - t_gemm0).count();
+            }
 
+            const auto t_red0 = prof ? Clock::now() : Clock::time_point{};
             if (!block_has_miss) {
-                // Zero-missing fast path (post-Beagle): no miss_acc alloc/zero,
-                // unswitched unit-stride SIMD reduction over split [qh | ql].
+                // Zero-missing fast path (post-Beagle): unswitched unit-stride SIMD reduction,
+                // fusing final xvx_diag normalization on the last tile.
                 if (tile.is_2slice) {
                     #pragma omp parallel for schedule(static)
                     for (int c = 0; c < cols; ++c) {
                         const int j = j0 + c;
-                        if (!valid_v[j]) continue;
-                        const int32_t* const p_hi = P_i32.data() + static_cast<size_t>(c) * static_cast<size_t>(qr);
+                        if (!valid_v[j]) {
+                            if (is_last_tile) xvx_diag[j] = 0.0f;
+                            continue;
+                        }
+                        const int32_t* const p_hi = P_i32.data() + static_cast<size_t>(c) * static_cast<size_t>(ldP);
                         const int32_t* const p_lo = p_hi + rc;
                         const double mu_j = static_cast<double>(mu_v[j]);
                         double tile_norm_sq = 0.0;
@@ -1705,14 +1812,22 @@ inline void woodbury_xvx_diag_block_fast_i8(
                                              - mu_j * usq[rl];
                             tile_norm_sq += val * val;
                         }
-                        ukx_norm_sq[j] += tile_norm_sq;
+                        const double acc_sq = ukx_norm_sq[j] + tile_norm_sq;
+                        ukx_norm_sq[j] = acc_sq;
+                        if (is_last_tile) {
+                            const double val = (debias_scale * static_cast<double>(x_norm_v[j]) - acc_sq) / sig2e;
+                            xvx_diag[j] = std::max(0.0f, static_cast<float>(val));
+                        }
                     }
                 } else {
                     #pragma omp parallel for schedule(static)
                     for (int c = 0; c < cols; ++c) {
                         const int j = j0 + c;
-                        if (!valid_v[j]) continue;
-                        const int32_t* const p_hi = P_i32.data() + static_cast<size_t>(c) * static_cast<size_t>(qr);
+                        if (!valid_v[j]) {
+                            if (is_last_tile) xvx_diag[j] = 0.0f;
+                            continue;
+                        }
+                        const int32_t* const p_hi = P_i32.data() + static_cast<size_t>(c) * static_cast<size_t>(ldP);
                         const double mu_j = static_cast<double>(mu_v[j]);
                         double tile_norm_sq = 0.0;
                         #pragma omp simd reduction(+:tile_norm_sq)
@@ -1721,19 +1836,33 @@ inline void woodbury_xvx_diag_block_fast_i8(
                                              - mu_j * usq[rl];
                             tile_norm_sq += val * val;
                         }
-                        ukx_norm_sq[j] += tile_norm_sq;
+                        const double acc_sq = ukx_norm_sq[j] + tile_norm_sq;
+                        ukx_norm_sq[j] = acc_sq;
+                        if (is_last_tile) {
+                            const double val = (debias_scale * static_cast<double>(x_norm_v[j]) - acc_sq) / sig2e;
+                            xvx_diag[j] = std::max(0.0f, static_cast<float>(val));
+                        }
                     }
                 }
             } else {
                 #pragma omp parallel
                 {
-                    std::vector<int64_t> miss_acc;
-                    #pragma omp for schedule(static)
+                    const int tid =
+                    #ifdef _OPENMP
+                        omp_get_thread_num();
+                    #else
+                        0;
+                    #endif
+                    int32_t* const ma = miss_buf.data() + static_cast<size_t>(tid) * miss_stride;
+                    #pragma omp for schedule(dynamic, 16)
                     for (int c = 0; c < cols; ++c) {
                         const int j = j0 + c;
-                        if (!valid_v[j]) continue;
+                        if (!valid_v[j]) {
+                            if (is_last_tile) xvx_diag[j] = 0.0f;
+                            continue;
+                        }
 
-                        const int32_t* const p_hi = P_i32.data() + static_cast<size_t>(c) * static_cast<size_t>(qr);
+                        const int32_t* const p_hi = P_i32.data() + static_cast<size_t>(c) * static_cast<size_t>(ldP);
                         const double mu_j = static_cast<double>(mu_v[j]);
                         const auto& miss_list = snp_miss_samples[j];
                         const bool has_miss = !miss_list.empty();
@@ -1758,21 +1887,17 @@ inline void woodbury_xvx_diag_block_fast_i8(
                                 }
                             }
                         } else {
-                            if (static_cast<int>(miss_acc.size()) < qr) {
-                                miss_acc.resize(static_cast<size_t>(qr));
-                            }
-                            std::fill_n(miss_acc.data(), qr, int64_t{0});
-                            int64_t* const ma = miss_acc.data();
+                            std::memset(ma, 0, static_cast<size_t>(qr) * sizeof(int32_t));
                             for (int s : miss_list) {
                                 const int8_t* const q_col = q_base + static_cast<size_t>(s) * static_cast<size_t>(q_ld);
                                 #pragma omp simd
                                 for (int q = 0; q < qr; ++q) {
-                                    ma[q] += static_cast<int64_t>(q_col[q]);
+                                    ma[q] += static_cast<int32_t>(q_col[q]);
                                 }
                             }
                             if (tile.is_2slice) {
                                 const int32_t* const p_lo = p_hi + rc;
-                                const int64_t* const m_lo = ma + rc;
+                                const int32_t* const m_lo = ma + rc;
                                 #pragma omp simd reduction(+:tile_norm_sq)
                                 for (int rl = 0; rl < rc; ++rl) {
                                     const double val = ahi[rl] * (static_cast<double>(p_hi[rl]) + mu_j * static_cast<double>(ma[rl]))
@@ -1789,23 +1914,19 @@ inline void woodbury_xvx_diag_block_fast_i8(
                                 }
                             }
                         }
-                        ukx_norm_sq[j] += tile_norm_sq;
+                        const double acc_sq = ukx_norm_sq[j] + tile_norm_sq;
+                        ukx_norm_sq[j] = acc_sq;
+                        if (is_last_tile) {
+                            const double val = (debias_scale * static_cast<double>(x_norm_v[j]) - acc_sq) / sig2e;
+                            xvx_diag[j] = std::max(0.0f, static_cast<float>(val));
+                        }
                     }
                 }
             }
+            if (prof) {
+                prof->xvx_reduce_s += std::chrono::duration<double>(Clock::now() - t_red0).count();
+            }
         }
-    }
-
-    const double debias_scale = 1.0 + q_uk.delta_quant;
-    const double sig2e = static_cast<double>(wb.sigma2_eff_f);
-    #pragma omp parallel for schedule(static)
-    for (int j = 0; j < bs; ++j) {
-        if (!valid_v[j]) {
-            xvx_diag[j] = 0.0f;
-            continue;
-        }
-        const double val = (debias_scale * static_cast<double>(x_norm_v[j]) - ukx_norm_sq[j]) / sig2e;
-        xvx_diag[j] = std::max(0.0f, static_cast<float>(val));
     }
 }
 

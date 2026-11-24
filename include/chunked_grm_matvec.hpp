@@ -81,7 +81,12 @@ struct TileReaderBase {
     std::function<std::vector<int>(int max_rows_per_band)> row_bands_fn;
     std::function<std::unique_ptr<TileSweep>(const std::vector<int>& bands)> begin_sweep_fn;
     std::function<void()> release_fn;
+    std::function<void(const Eigen::Ref<const MatrixT>& X,
+                       MatrixT& Y,
+                       double* trace_K_out,
+                       double* trace_K2_out)> fused_symm_fn;
     int small_k_block_size = 0;
+    int fused_max_k = 128;
 
     TileReaderBase() = default;
     TileReaderBase(std::nullptr_t) noexcept {}
@@ -97,7 +102,9 @@ struct TileReaderBase {
         row_bands_fn = nullptr;
         begin_sweep_fn = nullptr;
         release_fn = nullptr;
+        fused_symm_fn = nullptr;
         small_k_block_size = 0;
+        fused_max_k = 128;
         return *this;
     }
 
@@ -476,6 +483,10 @@ inline Eigen::MatrixXf chunked_symmetric_matvec_f32(
     if (n == 0 || cols == 0) {
         if (trace_K_out) *trace_K_out = 0.0;
         if (trace_K2_out) *trace_K2_out = 0.0;
+        return Y;
+    }
+    if (read_tile.fused_symm_fn && read_tile.fused_max_k > 0 && cols <= read_tile.fused_max_k) {
+        read_tile.fused_symm_fn(X, Y, trace_K_out, trace_K2_out);
         return Y;
     }
     detail::parallel_zero_matrix(Y);

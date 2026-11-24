@@ -1808,6 +1808,19 @@ public:
         return tile_T;
     }
 
+    // Fast-path: direct fused symmetric matvec on packed FP16 storage for narrow X.
+    // Avoids all intermediate FP32/BF16 tiles and GEMM packing barriers by streaming
+    // strictly-lower FP16 rows once per panel in L2-blocked j-slabs.
+    void symm_f32_fused(const Eigen::Ref<const Eigen::MatrixXf>& X,
+                        Eigen::MatrixXf& Y,
+                        double* trace_K_out = nullptr,
+                        double* trace_K2_out = nullptr) const;
+
+    void set_fused_j_block(int jb) noexcept {
+        fused_j_block_ = std::max(64, (jb + 15) & ~15);
+    }
+    int fused_j_block() const noexcept { return fused_j_block_; }
+
     // Legacy non-transposed float32 tile (shape (re-rs) x (ce-cs)).
     Eigen::Ref<const Eigen::MatrixXf> read_tile_f32(int rs, int re, int cs, int ce) const {
         const auto tile_T = read_tile_f32_T(rs, re, cs, ce);
@@ -1872,11 +1885,620 @@ private:
     Eigen::VectorXf diag_f32_;
     double trace_K_ = 0.0;
     double trace_K2_ = 0.0;
+    mutable int fused_j_block_ = 1024;
     mutable Eigen::MatrixXf tile_scratch_f32_;
     mutable Eigen::MatrixXd tile_scratch_f64_;
     mutable Eigen::MatrixXf tile_scratch_f32_T_;
     mutable Eigen::MatrixXd tile_scratch_f64_T_;
 };
+
+namespace detail {
+
+inline bool packed_f16_has_avx512() noexcept {
+#if GCTA_CPU_x86 && (defined(__GNUC__) || defined(__clang__))
+  #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__F16C__) && defined(__FMA__)
+    return true;
+  #else
+    static const bool has =
+        __builtin_cpu_supports("avx512f") &&
+        __builtin_cpu_supports("avx512bw") &&
+        __builtin_cpu_supports("avx512vl") &&
+        __builtin_cpu_supports("f16c") &&
+        __builtin_cpu_supports("fma");
+    return has;
+  #endif
+#else
+    return false;
+#endif
+}
+
+template <int P>
+inline void packed_f16_kernel_1row_portable(
+    const GrmFp16* __restrict__ src,
+    int j_len,
+    const float* __restrict__ X_j,
+    const float* __restrict__ X_i,
+    float* __restrict__ y_row,
+    float* __restrict__ y_col) noexcept
+{
+    alignas(64) float yr[P];
+    alignas(64) float xi[P];
+    for (int d = 0; d < P; ++d) {
+        yr[d] = y_row[d];
+        xi[d] = X_i[d];
+    }
+    for (int jj = 0; jj < j_len; ++jj) {
+        const float kv = fp16_to_f32(src[jj]);
+        const float* __restrict__ xj = X_j + static_cast<size_t>(jj) * P;
+        float* __restrict__ yc = y_col + static_cast<size_t>(jj) * P;
+        #pragma omp simd
+        for (int d = 0; d < P; ++d) {
+            yr[d] += kv * xj[d];
+            yc[d] += kv * xi[d];
+        }
+    }
+    for (int d = 0; d < P; ++d) {
+        y_row[d] = yr[d];
+    }
+}
+
+template <int P>
+inline void packed_f16_kernel_4row_portable(
+    const GrmFp16* __restrict__ s0,
+    const GrmFp16* __restrict__ s1,
+    const GrmFp16* __restrict__ s2,
+    const GrmFp16* __restrict__ s3,
+    int j_len,
+    const float* __restrict__ X_j,
+    const float* __restrict__ X_i_base,
+    float* __restrict__ y_row_base,
+    float* __restrict__ y_col) noexcept
+{
+    alignas(64) float yr0[P], yr1[P], yr2[P], yr3[P];
+    alignas(64) float xi0[P], xi1[P], xi2[P], xi3[P];
+    for (int d = 0; d < P; ++d) {
+        yr0[d] = y_row_base[0 * P + d];
+        yr1[d] = y_row_base[1 * P + d];
+        yr2[d] = y_row_base[2 * P + d];
+        yr3[d] = y_row_base[3 * P + d];
+        xi0[d] = X_i_base[0 * P + d];
+        xi1[d] = X_i_base[1 * P + d];
+        xi2[d] = X_i_base[2 * P + d];
+        xi3[d] = X_i_base[3 * P + d];
+    }
+    for (int jj = 0; jj < j_len; ++jj) {
+        const float k0 = fp16_to_f32(s0[jj]);
+        const float k1 = fp16_to_f32(s1[jj]);
+        const float k2 = fp16_to_f32(s2[jj]);
+        const float k3 = fp16_to_f32(s3[jj]);
+        const float* __restrict__ xj = X_j + static_cast<size_t>(jj) * P;
+        float* __restrict__ yc = y_col + static_cast<size_t>(jj) * P;
+        #pragma omp simd
+        for (int d = 0; d < P; ++d) {
+            const float xjd = xj[d];
+            yr0[d] += k0 * xjd;
+            yr1[d] += k1 * xjd;
+            yr2[d] += k2 * xjd;
+            yr3[d] += k3 * xjd;
+            yc[d]  += k0 * xi0[d] + k1 * xi1[d] + k2 * xi2[d] + k3 * xi3[d];
+        }
+    }
+    for (int d = 0; d < P; ++d) {
+        y_row_base[0 * P + d] = yr0[d];
+        y_row_base[1 * P + d] = yr1[d];
+        y_row_base[2 * P + d] = yr2[d];
+        y_row_base[3 * P + d] = yr3[d];
+    }
+}
+
+#if GCTA_CPU_x86 && (defined(__GNUC__) || defined(__clang__))
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__F16C__) && defined(__FMA__)
+#define GCTA_PCA_AVX512_ATTR
+#else
+#define GCTA_PCA_AVX512_ATTR __attribute__((target("avx512f,avx512bw,avx512vl,f16c,fma"), noinline))
+#endif
+
+GCTA_PCA_AVX512_ATTR
+inline void packed_f16_kernel_1row_avx512_16(
+    const GrmFp16* __restrict__ src,
+    int j_len,
+    const float* __restrict__ X_j,
+    const float* __restrict__ X_i,
+    float* __restrict__ y_row,
+    float* __restrict__ y_col) noexcept
+{
+    __m512 yr = _mm512_load_ps(y_row);
+    const __m512 xi = _mm512_load_ps(X_i);
+    int jj = 0;
+    alignas(64) float kv[16];
+    for (; jj + 16 <= j_len; jj += 16) {
+        const __m512 kvec = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + jj)));
+        _mm512_store_ps(kv, kvec);
+        for (int t = 0; t < 16; ++t) {
+            const size_t off = static_cast<size_t>(jj + t) * 16;
+            const __m512 kb = _mm512_set1_ps(kv[t]);
+            const __m512 xj = _mm512_load_ps(X_j + off);
+            __m512 yc = _mm512_load_ps(y_col + off);
+            yr = _mm512_fmadd_ps(kb, xj, yr);
+            yc = _mm512_fmadd_ps(kb, xi, yc);
+            _mm512_store_ps(y_col + off, yc);
+        }
+    }
+    for (; jj < j_len; ++jj) {
+        const __m512 kb = _mm512_set1_ps(fp16_to_f32(src[jj]));
+        const size_t off = static_cast<size_t>(jj) * 16;
+        const __m512 xj = _mm512_load_ps(X_j + off);
+        __m512 yc = _mm512_load_ps(y_col + off);
+        yr = _mm512_fmadd_ps(kb, xj, yr);
+        yc = _mm512_fmadd_ps(kb, xi, yc);
+        _mm512_store_ps(y_col + off, yc);
+    }
+    _mm512_store_ps(y_row, yr);
+}
+
+GCTA_PCA_AVX512_ATTR
+inline void packed_f16_kernel_1row_avx512_32(
+    const GrmFp16* __restrict__ src,
+    int j_len,
+    const float* __restrict__ X_j,
+    const float* __restrict__ X_i,
+    float* __restrict__ y_row,
+    float* __restrict__ y_col) noexcept
+{
+    __m512 yr_lo = _mm512_load_ps(y_row);
+    __m512 yr_hi = _mm512_load_ps(y_row + 16);
+    const __m512 xi_lo = _mm512_load_ps(X_i);
+    const __m512 xi_hi = _mm512_load_ps(X_i + 16);
+    int jj = 0;
+    alignas(64) float kv[16];
+    for (; jj + 16 <= j_len; jj += 16) {
+        const __m512 kvec = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + jj)));
+        _mm512_store_ps(kv, kvec);
+        for (int t = 0; t < 16; ++t) {
+            const size_t off = static_cast<size_t>(jj + t) * 32;
+            const __m512 kb = _mm512_set1_ps(kv[t]);
+            const __m512 xj_lo = _mm512_load_ps(X_j + off);
+            const __m512 xj_hi = _mm512_load_ps(X_j + off + 16);
+            __m512 yc_lo = _mm512_load_ps(y_col + off);
+            __m512 yc_hi = _mm512_load_ps(y_col + off + 16);
+            yr_lo = _mm512_fmadd_ps(kb, xj_lo, yr_lo);
+            yr_hi = _mm512_fmadd_ps(kb, xj_hi, yr_hi);
+            yc_lo = _mm512_fmadd_ps(kb, xi_lo, yc_lo);
+            yc_hi = _mm512_fmadd_ps(kb, xi_hi, yc_hi);
+            _mm512_store_ps(y_col + off, yc_lo);
+            _mm512_store_ps(y_col + off + 16, yc_hi);
+        }
+    }
+    for (; jj < j_len; ++jj) {
+        const __m512 kb = _mm512_set1_ps(fp16_to_f32(src[jj]));
+        const size_t off = static_cast<size_t>(jj) * 32;
+        const __m512 xj_lo = _mm512_load_ps(X_j + off);
+        const __m512 xj_hi = _mm512_load_ps(X_j + off + 16);
+        __m512 yc_lo = _mm512_load_ps(y_col + off);
+        __m512 yc_hi = _mm512_load_ps(y_col + off + 16);
+        yr_lo = _mm512_fmadd_ps(kb, xj_lo, yr_lo);
+        yr_hi = _mm512_fmadd_ps(kb, xj_hi, yr_hi);
+        yc_lo = _mm512_fmadd_ps(kb, xi_lo, yc_lo);
+        yc_hi = _mm512_fmadd_ps(kb, xi_hi, yc_hi);
+        _mm512_store_ps(y_col + off, yc_lo);
+        _mm512_store_ps(y_col + off + 16, yc_hi);
+    }
+    _mm512_store_ps(y_row, yr_lo);
+    _mm512_store_ps(y_row + 16, yr_hi);
+}
+
+GCTA_PCA_AVX512_ATTR
+inline void packed_f16_kernel_4row_avx512_16(
+    const GrmFp16* __restrict__ s0,
+    const GrmFp16* __restrict__ s1,
+    const GrmFp16* __restrict__ s2,
+    const GrmFp16* __restrict__ s3,
+    int j_len,
+    const float* __restrict__ X_j,
+    const float* __restrict__ X_i_base,
+    float* __restrict__ y_row_base,
+    float* __restrict__ y_col) noexcept
+{
+    __m512 yr0 = _mm512_load_ps(y_row_base + 0 * 16);
+    __m512 yr1 = _mm512_load_ps(y_row_base + 1 * 16);
+    __m512 yr2 = _mm512_load_ps(y_row_base + 2 * 16);
+    __m512 yr3 = _mm512_load_ps(y_row_base + 3 * 16);
+    const __m512 xi0 = _mm512_load_ps(X_i_base + 0 * 16);
+    const __m512 xi1 = _mm512_load_ps(X_i_base + 1 * 16);
+    const __m512 xi2 = _mm512_load_ps(X_i_base + 2 * 16);
+    const __m512 xi3 = _mm512_load_ps(X_i_base + 3 * 16);
+
+    int jj = 0;
+    alignas(64) float kv0[16], kv1[16], kv2[16], kv3[16];
+    for (; jj + 16 <= j_len; jj += 16) {
+        _mm512_store_ps(kv0, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s0 + jj))));
+        _mm512_store_ps(kv1, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s1 + jj))));
+        _mm512_store_ps(kv2, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s2 + jj))));
+        _mm512_store_ps(kv3, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s3 + jj))));
+        for (int t = 0; t < 16; ++t) {
+            const size_t off = static_cast<size_t>(jj + t) * 16;
+            const __m512 xj = _mm512_load_ps(X_j + off);
+            __m512 yc = _mm512_load_ps(y_col + off);
+            const __m512 k0 = _mm512_set1_ps(kv0[t]);
+            yr0 = _mm512_fmadd_ps(k0, xj, yr0);
+            yc  = _mm512_fmadd_ps(k0, xi0, yc);
+            const __m512 k1 = _mm512_set1_ps(kv1[t]);
+            yr1 = _mm512_fmadd_ps(k1, xj, yr1);
+            yc  = _mm512_fmadd_ps(k1, xi1, yc);
+            const __m512 k2 = _mm512_set1_ps(kv2[t]);
+            yr2 = _mm512_fmadd_ps(k2, xj, yr2);
+            yc  = _mm512_fmadd_ps(k2, xi2, yc);
+            const __m512 k3 = _mm512_set1_ps(kv3[t]);
+            yr3 = _mm512_fmadd_ps(k3, xj, yr3);
+            yc  = _mm512_fmadd_ps(k3, xi3, yc);
+            _mm512_store_ps(y_col + off, yc);
+        }
+    }
+    for (; jj < j_len; ++jj) {
+        const size_t off = static_cast<size_t>(jj) * 16;
+        const __m512 xj = _mm512_load_ps(X_j + off);
+        __m512 yc = _mm512_load_ps(y_col + off);
+        const __m512 k0 = _mm512_set1_ps(fp16_to_f32(s0[jj]));
+        yr0 = _mm512_fmadd_ps(k0, xj, yr0);
+        yc  = _mm512_fmadd_ps(k0, xi0, yc);
+        const __m512 k1 = _mm512_set1_ps(fp16_to_f32(s1[jj]));
+        yr1 = _mm512_fmadd_ps(k1, xj, yr1);
+        yc  = _mm512_fmadd_ps(k1, xi1, yc);
+        const __m512 k2 = _mm512_set1_ps(fp16_to_f32(s2[jj]));
+        yr2 = _mm512_fmadd_ps(k2, xj, yr2);
+        yc  = _mm512_fmadd_ps(k2, xi2, yc);
+        const __m512 k3 = _mm512_set1_ps(fp16_to_f32(s3[jj]));
+        yr3 = _mm512_fmadd_ps(k3, xj, yr3);
+        yc  = _mm512_fmadd_ps(k3, xi3, yc);
+        _mm512_store_ps(y_col + off, yc);
+    }
+    _mm512_store_ps(y_row_base + 0 * 16, yr0);
+    _mm512_store_ps(y_row_base + 1 * 16, yr1);
+    _mm512_store_ps(y_row_base + 2 * 16, yr2);
+    _mm512_store_ps(y_row_base + 3 * 16, yr3);
+}
+
+GCTA_PCA_AVX512_ATTR
+inline void packed_f16_kernel_4row_avx512_32(
+    const GrmFp16* __restrict__ s0,
+    const GrmFp16* __restrict__ s1,
+    const GrmFp16* __restrict__ s2,
+    const GrmFp16* __restrict__ s3,
+    int j_len,
+    const float* __restrict__ X_j,
+    const float* __restrict__ X_i_base,
+    float* __restrict__ y_row_base,
+    float* __restrict__ y_col) noexcept
+{
+    __m512 yr0_lo = _mm512_load_ps(y_row_base + 0 * 32);
+    __m512 yr0_hi = _mm512_load_ps(y_row_base + 0 * 32 + 16);
+    __m512 yr1_lo = _mm512_load_ps(y_row_base + 1 * 32);
+    __m512 yr1_hi = _mm512_load_ps(y_row_base + 1 * 32 + 16);
+    __m512 yr2_lo = _mm512_load_ps(y_row_base + 2 * 32);
+    __m512 yr2_hi = _mm512_load_ps(y_row_base + 2 * 32 + 16);
+    __m512 yr3_lo = _mm512_load_ps(y_row_base + 3 * 32);
+    __m512 yr3_hi = _mm512_load_ps(y_row_base + 3 * 32 + 16);
+    const __m512 xi0_lo = _mm512_load_ps(X_i_base + 0 * 32);
+    const __m512 xi0_hi = _mm512_load_ps(X_i_base + 0 * 32 + 16);
+    const __m512 xi1_lo = _mm512_load_ps(X_i_base + 1 * 32);
+    const __m512 xi1_hi = _mm512_load_ps(X_i_base + 1 * 32 + 16);
+    const __m512 xi2_lo = _mm512_load_ps(X_i_base + 2 * 32);
+    const __m512 xi2_hi = _mm512_load_ps(X_i_base + 2 * 32 + 16);
+    const __m512 xi3_lo = _mm512_load_ps(X_i_base + 3 * 32);
+    const __m512 xi3_hi = _mm512_load_ps(X_i_base + 3 * 32 + 16);
+
+    int jj = 0;
+    alignas(64) float kv0[16], kv1[16], kv2[16], kv3[16];
+    for (; jj + 16 <= j_len; jj += 16) {
+        _mm512_store_ps(kv0, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s0 + jj))));
+        _mm512_store_ps(kv1, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s1 + jj))));
+        _mm512_store_ps(kv2, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s2 + jj))));
+        _mm512_store_ps(kv3, _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s3 + jj))));
+        for (int t = 0; t < 16; ++t) {
+            const size_t off = static_cast<size_t>(jj + t) * 32;
+            const __m512 xj_lo = _mm512_load_ps(X_j + off);
+            const __m512 xj_hi = _mm512_load_ps(X_j + off + 16);
+            __m512 yc_lo = _mm512_load_ps(y_col + off);
+            __m512 yc_hi = _mm512_load_ps(y_col + off + 16);
+            const __m512 k0 = _mm512_set1_ps(kv0[t]);
+            yr0_lo = _mm512_fmadd_ps(k0, xj_lo, yr0_lo);
+            yr0_hi = _mm512_fmadd_ps(k0, xj_hi, yr0_hi);
+            yc_lo  = _mm512_fmadd_ps(k0, xi0_lo, yc_lo);
+            yc_hi  = _mm512_fmadd_ps(k0, xi0_hi, yc_hi);
+            const __m512 k1 = _mm512_set1_ps(kv1[t]);
+            yr1_lo = _mm512_fmadd_ps(k1, xj_lo, yr1_lo);
+            yr1_hi = _mm512_fmadd_ps(k1, xj_hi, yr1_hi);
+            yc_lo  = _mm512_fmadd_ps(k1, xi1_lo, yc_lo);
+            yc_hi  = _mm512_fmadd_ps(k1, xi1_hi, yc_hi);
+            const __m512 k2 = _mm512_set1_ps(kv2[t]);
+            yr2_lo = _mm512_fmadd_ps(k2, xj_lo, yr2_lo);
+            yr2_hi = _mm512_fmadd_ps(k2, xj_hi, yr2_hi);
+            yc_lo  = _mm512_fmadd_ps(k2, xi2_lo, yc_lo);
+            yc_hi  = _mm512_fmadd_ps(k2, xi2_hi, yc_hi);
+            const __m512 k3 = _mm512_set1_ps(kv3[t]);
+            yr3_lo = _mm512_fmadd_ps(k3, xj_lo, yr3_lo);
+            yr3_hi = _mm512_fmadd_ps(k3, xj_hi, yr3_hi);
+            yc_lo  = _mm512_fmadd_ps(k3, xi3_lo, yc_lo);
+            yc_hi  = _mm512_fmadd_ps(k3, xi3_hi, yc_hi);
+            _mm512_store_ps(y_col + off, yc_lo);
+            _mm512_store_ps(y_col + off + 16, yc_hi);
+        }
+    }
+    for (; jj < j_len; ++jj) {
+        const size_t off = static_cast<size_t>(jj) * 32;
+        const __m512 xj_lo = _mm512_load_ps(X_j + off);
+        const __m512 xj_hi = _mm512_load_ps(X_j + off + 16);
+        __m512 yc_lo = _mm512_load_ps(y_col + off);
+        __m512 yc_hi = _mm512_load_ps(y_col + off + 16);
+        const __m512 k0 = _mm512_set1_ps(fp16_to_f32(s0[jj]));
+        yr0_lo = _mm512_fmadd_ps(k0, xj_lo, yr0_lo);
+        yr0_hi = _mm512_fmadd_ps(k0, xj_hi, yr0_hi);
+        yc_lo  = _mm512_fmadd_ps(k0, xi0_lo, yc_lo);
+        yc_hi  = _mm512_fmadd_ps(k0, xi0_hi, yc_hi);
+        const __m512 k1 = _mm512_set1_ps(fp16_to_f32(s1[jj]));
+        yr1_lo = _mm512_fmadd_ps(k1, xj_lo, yr1_lo);
+        yr1_hi = _mm512_fmadd_ps(k1, xj_hi, yr1_hi);
+        yc_lo  = _mm512_fmadd_ps(k1, xi1_lo, yc_lo);
+        yc_hi  = _mm512_fmadd_ps(k1, xi1_hi, yc_hi);
+        const __m512 k2 = _mm512_set1_ps(fp16_to_f32(s2[jj]));
+        yr2_lo = _mm512_fmadd_ps(k2, xj_lo, yr2_lo);
+        yr2_hi = _mm512_fmadd_ps(k2, xj_hi, yr2_hi);
+        yc_lo  = _mm512_fmadd_ps(k2, xi2_lo, yc_lo);
+        yc_hi  = _mm512_fmadd_ps(k2, xi2_hi, yc_hi);
+        const __m512 k3 = _mm512_set1_ps(fp16_to_f32(s3[jj]));
+        yr3_lo = _mm512_fmadd_ps(k3, xj_lo, yr3_lo);
+        yr3_hi = _mm512_fmadd_ps(k3, xj_hi, yr3_hi);
+        yc_lo  = _mm512_fmadd_ps(k3, xi3_lo, yc_lo);
+        yc_hi  = _mm512_fmadd_ps(k3, xi3_hi, yc_hi);
+        _mm512_store_ps(y_col + off, yc_lo);
+        _mm512_store_ps(y_col + off + 16, yc_hi);
+    }
+    _mm512_store_ps(y_row_base + 0 * 32, yr0_lo);
+    _mm512_store_ps(y_row_base + 0 * 32 + 16, yr0_hi);
+    _mm512_store_ps(y_row_base + 1 * 32, yr1_lo);
+    _mm512_store_ps(y_row_base + 1 * 32 + 16, yr1_hi);
+    _mm512_store_ps(y_row_base + 2 * 32, yr2_lo);
+    _mm512_store_ps(y_row_base + 2 * 32 + 16, yr2_hi);
+    _mm512_store_ps(y_row_base + 3 * 32, yr3_lo);
+    _mm512_store_ps(y_row_base + 3 * 32 + 16, yr3_hi);
+}
+#undef GCTA_PCA_AVX512_ATTR
+#endif
+
+template <int P>
+inline void packed_f16_kernel_1row(
+    const GrmFp16* __restrict__ src,
+    int j_len,
+    const float* __restrict__ X_j,
+    const float* __restrict__ X_i,
+    float* __restrict__ y_row,
+    float* __restrict__ y_col,
+    bool use_avx512) noexcept
+{
+#if GCTA_CPU_x86 && (defined(__GNUC__) || defined(__clang__))
+    if (use_avx512) {
+        if constexpr (P == 16) {
+            packed_f16_kernel_1row_avx512_16(src, j_len, X_j, X_i, y_row, y_col);
+            return;
+        } else if constexpr (P == 32) {
+            packed_f16_kernel_1row_avx512_32(src, j_len, X_j, X_i, y_row, y_col);
+            return;
+        }
+    }
+#else
+    (void)use_avx512;
+#endif
+    packed_f16_kernel_1row_portable<P>(src, j_len, X_j, X_i, y_row, y_col);
+}
+
+template <int P>
+inline void packed_f16_kernel_4row(
+    const GrmFp16* __restrict__ s0,
+    const GrmFp16* __restrict__ s1,
+    const GrmFp16* __restrict__ s2,
+    const GrmFp16* __restrict__ s3,
+    int j_len,
+    const float* __restrict__ X_j,
+    const float* __restrict__ X_i_base,
+    float* __restrict__ y_row_base,
+    float* __restrict__ y_col,
+    bool use_avx512) noexcept
+{
+#if GCTA_CPU_x86 && (defined(__GNUC__) || defined(__clang__))
+    if (use_avx512) {
+        if constexpr (P == 16) {
+            packed_f16_kernel_4row_avx512_16(s0, s1, s2, s3, j_len, X_j, X_i_base, y_row_base, y_col);
+            return;
+        } else if constexpr (P == 32) {
+            packed_f16_kernel_4row_avx512_32(s0, s1, s2, s3, j_len, X_j, X_i_base, y_row_base, y_col);
+            return;
+        }
+    }
+#else
+    (void)use_avx512;
+#endif
+    packed_f16_kernel_4row_portable<P>(s0, s1, s2, s3, j_len, X_j, X_i_base, y_row_base, y_col);
+}
+
+template <int P>
+inline void packed_f16_symm_panel_loop(
+    int n,
+    int cols,
+    int j_block,
+    const GrmFp16* base,
+    const float* diag_ptr,
+    const float* X_ptr,
+    Eigen::Index ldX,
+    float* Y_ptr,
+    Eigen::Index ldY)
+{
+    AlignedRawBuffer<float, 64> X_rm(static_cast<size_t>(n) * P);
+    AlignedRawBuffer<float, 64> Y_row(static_cast<size_t>(n) * P);
+    AlignedRawBuffer<float, 64> Y_col(static_cast<size_t>(n) * P);
+
+    const int JB = j_block;
+    const int n_slabs = (n + JB - 1) / JB;
+    std::vector<std::mutex> slab_locks(static_cast<size_t>(std::max(1, n_slabs)));
+    const bool use_avx512 = packed_f16_has_avx512();
+    const int use_nt = std::min(std::max(1, omp_get_max_threads()), n);
+
+    for (int p0 = 0; p0 < cols; p0 += P) {
+        const int p_len = std::min(P, cols - p0);
+        std::vector<int> bounds;
+
+        #pragma omp parallel num_threads(use_nt)
+        {
+            const int tid = omp_get_thread_num();
+            const int nt  = omp_get_num_threads();
+
+            #pragma omp single nowait
+            {
+                bounds = triangular_row_partition(n, nt);
+            }
+
+            // Phase 1: transpose ColMajor X[:, p0..p0+p_len) -> RowMajor X_rm (n x P, padded with 0)
+            // and zero Y_col in disjoint row slices.
+            const int row_lo = static_cast<int>((static_cast<int64_t>(n) * tid) / nt);
+            const int row_hi = static_cast<int>((static_cast<int64_t>(n) * (tid + 1)) / nt);
+            float* const x_rm_ptr = X_rm.data();
+            float* const y_col_ptr = Y_col.data();
+            float* const y_row_ptr = Y_row.data();
+
+            for (int i = row_lo; i < row_hi; ++i) {
+                float* __restrict__ xrow = x_rm_ptr + static_cast<size_t>(i) * P;
+                for (int d = 0; d < p_len; ++d) {
+                    xrow[d] = X_ptr[i + static_cast<Eigen::Index>(p0 + d) * ldX];
+                }
+                for (int d = p_len; d < P; ++d) {
+                    xrow[d] = 0.0f;
+                }
+            }
+            if (row_hi > row_lo) {
+                std::memset(y_col_ptr + static_cast<size_t>(row_lo) * P, 0,
+                            static_cast<size_t>(row_hi - row_lo) * P * sizeof(float));
+            }
+
+            #pragma omp barrier
+
+            // Phase 2: triangular-partitioned single pass over strict-lower packed FP16 rows.
+            const int num_parts = static_cast<int>(bounds.size()) - 1;
+            const int r_lo = (tid < num_parts) ? bounds[static_cast<size_t>(tid)] : n;
+            const int r_hi = (tid < num_parts) ? bounds[static_cast<size_t>(tid + 1)] : n;
+
+            for (int i = r_lo; i < r_hi; ++i) {
+                const float dv = diag_ptr[i];
+                const float* __restrict__ xi = x_rm_ptr + static_cast<size_t>(i) * P;
+                float* __restrict__ yr = y_row_ptr + static_cast<size_t>(i) * P;
+                #pragma omp simd
+                for (int d = 0; d < P; ++d) {
+                    yr[d] = dv * xi[d];
+                }
+            }
+
+            const int n_slabs_t = (r_hi > 1) ? ((r_hi - 2) / JB + 1) : 0;
+            if (n_slabs_t > 0 && r_lo < r_hi) {
+                AlignedRawBuffer<float, 64> y_col_loc(static_cast<size_t>(JB) * P);
+                const int offset = (tid * 7) % n_slabs_t;
+                for (int step = 0; step < n_slabs_t; ++step) {
+                    const int s = (step + offset) % n_slabs_t;
+                    const int j0 = s * JB;
+                    const int j1 = std::min(n, j0 + JB);
+                    const int i_start = std::max(r_lo, j0 + 1);
+                    if (i_start >= r_hi) continue;
+                    const int j_len = j1 - j0;
+                    std::memset(y_col_loc.data(), 0, static_cast<size_t>(j_len) * P * sizeof(float));
+
+                    const float* const x_j_ptr = x_rm_ptr + static_cast<size_t>(j0) * P;
+
+                    // (a) Diagonal-straddling rows: j0 < i < min(r_hi, j1)
+                    const int i_diag_end = std::min(r_hi, j1);
+                    for (int i = i_start; i < i_diag_end; ++i) {
+                        const GrmFp16* src_i = base + static_cast<size_t>(i) * (i + 1) / 2 + j0;
+                        const int len = i - j0;
+                        packed_f16_kernel_1row<P>(
+                            src_i, len, x_j_ptr,
+                            x_rm_ptr + static_cast<size_t>(i) * P,
+                            y_row_ptr + static_cast<size_t>(i) * P,
+                            y_col_loc.data(), use_avx512);
+                    }
+
+                    // (b) Rectangular rows: i in [max(i_start, j1), r_hi), 4 rows at a time
+                    int i = std::max(i_start, j1);
+                    for (; i + 3 < r_hi; i += 4) {
+                        const GrmFp16* s0 = base + static_cast<size_t>(i) * (i + 1) / 2 + j0;
+                        const GrmFp16* s1 = base + static_cast<size_t>(i + 1) * (i + 2) / 2 + j0;
+                        const GrmFp16* s2 = base + static_cast<size_t>(i + 2) * (i + 3) / 2 + j0;
+                        const GrmFp16* s3 = base + static_cast<size_t>(i + 3) * (i + 4) / 2 + j0;
+                        packed_f16_kernel_4row<P>(
+                            s0, s1, s2, s3, j_len, x_j_ptr,
+                            x_rm_ptr + static_cast<size_t>(i) * P,
+                            y_row_ptr + static_cast<size_t>(i) * P,
+                            y_col_loc.data(), use_avx512);
+                    }
+                    for (; i < r_hi; ++i) {
+                        const GrmFp16* src_i = base + static_cast<size_t>(i) * (i + 1) / 2 + j0;
+                        packed_f16_kernel_1row<P>(
+                            src_i, j_len, x_j_ptr,
+                            x_rm_ptr + static_cast<size_t>(i) * P,
+                            y_row_ptr + static_cast<size_t>(i) * P,
+                            y_col_loc.data(), use_avx512);
+                    }
+
+                    // Flush thread-local y_col_loc into shared Y_col[j0..j1) under per-slab mutex.
+                    {
+                        std::lock_guard<std::mutex> lk(slab_locks[static_cast<size_t>(s)]);
+                        float* __restrict__ dst = y_col_ptr + static_cast<size_t>(j0) * P;
+                        const float* __restrict__ src = y_col_loc.data();
+                        const size_t cnt = static_cast<size_t>(j_len) * P;
+                        #pragma omp simd
+                        for (size_t idx = 0; idx < cnt; ++idx) {
+                            dst[idx] += src[idx];
+                        }
+                    }
+                }
+            }
+
+            #pragma omp barrier
+
+            // Phase 3: combine Y_row + Y_col and write back ColMajor Y[:, p0..p0+p_len).
+            for (int i = row_lo; i < row_hi; ++i) {
+                const float* __restrict__ yr = y_row_ptr + static_cast<size_t>(i) * P;
+                const float* __restrict__ yc = y_col_ptr + static_cast<size_t>(i) * P;
+                for (int d = 0; d < p_len; ++d) {
+                    Y_ptr[i + static_cast<Eigen::Index>(p0 + d) * ldY] = yr[d] + yc[d];
+                }
+            }
+        }
+    }
+}
+
+} // namespace detail
+
+inline void PackedGrmFp16::symm_f32_fused(
+    const Eigen::Ref<const Eigen::MatrixXf>& X,
+    Eigen::MatrixXf& Y,
+    double* trace_K_out,
+    double* trace_K2_out) const
+{
+    if (trace_K_out)  *trace_K_out  = trace_K_;
+    if (trace_K2_out) *trace_K2_out = trace_K2_;
+    const int n = n_;
+    const int cols = static_cast<int>(X.cols());
+    if (n == 0 || cols == 0) return;
+
+    const float* X_ptr = X.data();
+    const Eigen::Index ldX = X.outerStride();
+    float* Y_ptr = Y.data();
+    const Eigen::Index ldY = Y.outerStride();
+    const GrmFp16* base = packed_.get();
+    const float* diag_ptr = diag_f32_.data();
+
+    if (cols <= 16) {
+        detail::packed_f16_symm_panel_loop<16>(n, cols, fused_j_block_, base, diag_ptr, X_ptr, ldX, Y_ptr, ldY);
+    } else {
+        detail::packed_f16_symm_panel_loop<32>(n, cols, fused_j_block_, base, diag_ptr, X_ptr, ldX, Y_ptr, ldY);
+    }
+}
 
 struct PackedGrmFp16Handle {
     gcta_chunked::TileReader reader;
@@ -2276,8 +2898,15 @@ inline PackedGrmFp16Handle load_packed_grm_fp16(
     handle.reader_f32.release_fn = [file]() {
         file->release_scratch();
     };
+    handle.reader_f32.fused_symm_fn = [file](const Eigen::Ref<const Eigen::MatrixXf>& X,
+                                             Eigen::MatrixXf& Y,
+                                             double* tr_K_out,
+                                             double* tr_K2_out) {
+        file->symm_f32_fused(X, Y, tr_K_out, tr_K2_out);
+    };
     // Avoid small-k tile starvation in PCA rSVD (k_ext < 256): use 8192-row tiles.
     handle.reader_f32.small_k_block_size = std::min(n, 8192);
+    handle.reader_f32.fused_max_k = 128;
 
     return handle;
 }

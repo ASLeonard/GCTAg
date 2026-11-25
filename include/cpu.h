@@ -302,7 +302,10 @@ struct ScopedBlasThreadCap {
                 prev_blis_ = get_blis ? get_blis() : 0;
                 set_blis_(static_cast<int64_t>(cap));
             }
-            set_mkl_ = reinterpret_cast<MklLocalFn>(dlsym(self, "mkl_set_num_threads_local"));
+            // In libmkl_rt.so, PascalCase MKL_Set_Num_Threads_Local(int) is the C
+            // pass-by-value ABI, whereas lowercase mkl_set_num_threads_local is the
+            // Fortran pass-by-reference wrapper (passing an int by value segfaults).
+            set_mkl_ = reinterpret_cast<MklLocalFn>(dlsym(self, "MKL_Set_Num_Threads_Local"));
             if (set_mkl_) {
                 prev_mkl_ = set_mkl_(cap);
             }

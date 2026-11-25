@@ -7,6 +7,7 @@ Usage:
 """
 
 import array
+import math
 import os
 import random
 import re
@@ -77,6 +78,13 @@ def generate_datasets(data_dir):
         val = 0 if (j % 3 == 0) else (2 if (j % 3 == 1) else None)
         mono_snps.append(("1", f"mono_{j}", 1000 + j * 50, "A", "G", [val] * n))
     write_plink(os.path.join(data_dir, "mono_all"), n, mono_snps, fam_lines)
+
+    # Edge case: samples 0 and 65 have 100% missing genotypes
+    all_miss_snps = make_snps(0, 180)
+    for _, _, _, _, _, g in all_miss_snps:
+        g[0] = None
+        g[65] = None
+    write_plink(os.path.join(data_dir, "all_miss_sample"), n, all_miss_snps, fam_lines)
 
     keep_idx = sorted(rng.sample(range(n), 417))
     with open(os.path.join(data_dir, "keep_sub.txt"), "w") as kf:
@@ -199,6 +207,177 @@ def run_pair(name, base_args, dev_args, work_dir, is_fast=False, threads=4, chec
         compare_byte_identical(new_pfx, ref_pfx, name)
     print(f"  PASS {name}")
     return log_new
+
+
+def decode_fp16_array(raw_bytes):
+    arr = array.array("H")
+    arr.frombytes(raw_bytes)
+    out = []
+    for h in arr:
+        s = (h >> 15) & 1
+        e = (h >> 10) & 0x1F
+        m = h & 0x3FF
+        if e == 0:
+            v = (m / 1024.0) * (2.0 ** -14)
+        elif e == 31:
+            v = float("nan") if m else float("inf")
+        else:
+            v = (1.0 + m / 1024.0) * (2.0 ** (e - 15))
+        out.append(-v if s else v)
+    return out
+
+
+def compute_exact_impute_mean_grm(bfile_pfx, keep_file=None):
+    fam = [line.split() for line in open(bfile_pfx + ".fam") if line.strip()]
+    n_raw = len(fam)
+    if keep_file:
+        keep_set = {tuple(line.split()[:2]) for line in open(keep_file) if line.strip()}
+        keep_idx = [i for i, r in enumerate(fam) if (r[0], r[1]) in keep_set]
+    else:
+        keep_idx = list(range(n_raw))
+    n = len(keep_idx)
+    nb = (n_raw + 3) // 4
+    m_raw = sum(1 for _ in open(bfile_pfx + ".bim"))
+    code_map = {0b00: 2.0, 0b10: 1.0, 0b11: 0.0, 0b01: None}
+
+    q = 1 if m_raw == 0 else max(1, min(63, int(math.floor(math.sqrt(2000000000.0 / m_raw) * 0.5))))
+    centered_cols = []
+    quant_cols = []
+    diag_err_sum = [0.0] * n
+    sd_sum = 0.0
+    valid_m = 0
+    with open(bfile_pfx + ".bed", "rb") as bf:
+        magic = bf.read(3)
+        assert magic == b"\x6c\x1b\x01"
+        for _ in range(m_raw):
+            rec = bf.read(nb)
+            vals = []
+            obs_sum = 0.0
+            n_obs = 0
+            for raw_i in keep_idx:
+                code = (rec[raw_i >> 2] >> (2 * (raw_i & 3))) & 3
+                v = code_map[code]
+                vals.append(v)
+                if v is not None:
+                    obs_sum += v
+                    n_obs += 1
+            if n_obs == 0:
+                continue
+            af = obs_sum / (2.0 * n_obs)
+            mu = 2.0 * af
+            sd = mu * (1.0 - af)
+            if sd < 1e-50:
+                continue
+            sd_sum += sd
+            valid_m += 1
+            mu_q = q * mu
+            mq = max(0, min(2 * q, int(math.floor(mu_q + 0.5))))
+            err_q2 = (mq - mu_q) ** 2
+            centered_cols.append([(0.0 if v is None else (v - mu)) for v in vals])
+            qcol = []
+            for s_idx, v in enumerate(vals):
+                if v is None:
+                    qcol.append((mq - mu_q) / q)
+                    diag_err_sum[s_idx] += err_q2 / (q * q)
+                else:
+                    qcol.append(v - mu)
+            quant_cols.append(qcol)
+
+    tri = []
+    q_tri = []
+    if valid_m == 0:
+        tri = [0.0] * (n * (n + 1) // 2)
+        return tri, tri, 0, 1.0
+    for i in range(n):
+        for j in range(i + 1):
+            dot = 0.0
+            qdot = 0.0
+            for col, qcol in zip(centered_cols, quant_cols):
+                dot += col[i] * col[j]
+                qdot += qcol[i] * qcol[j]
+            if i == j:
+                qdot = max(0.0, qdot - diag_err_sum[i])
+            tri.append(dot / sd_sum)
+            q_tri.append(qdot / sd_sum)
+    return tri, q_tri, valid_m, valid_m / sd_sum
+
+
+def verify_impute_mean_case(name, base_args, dev_args, bfile_pfx, runs_dir, keep_file=None, is_fast=False, check_profile=False):
+    out_pfx = os.path.join(runs_dir, f"{name}.imp")
+    rc, log = run_cmd([GCTAG_BIN, "grm", "make"] + base_args + dev_args + ["--threads", "4", "--out", out_pfx])
+    if rc != 0:
+        raise AssertionError(f"{name}: impute-mean failed rc={rc}\n{log}")
+    if check_profile:
+        m = re.search(
+            r"GRM profile \(s\): init=\d+\.\d+ io_wait=\d+\.\d+ count\+decode=\d+\.\d+ miss=([0-9.]+) gemm=\d+\.\d+ flush=\d+\.\d+",
+            log,
+        )
+        if not m:
+            raise AssertionError(f"{name}: --grm-profile missing:\n{log}")
+        if float(m.group(1)) != 0.0:
+            raise AssertionError(f"{name}: expected miss=0.000 under --impute-mean, got miss={m.group(1)}")
+
+    ref_tri, qref_tri, valid_m, _ = compute_exact_impute_mean_grm(bfile_pfx, keep_file=keep_file)
+    if is_fast:
+        assert not os.path.exists(out_pfx + ".grm.N.bin"), f"{name}: .grm.N.bin should be omitted for --fast --impute-mean"
+        f16 = read_f16(out_pfx + ".grm.f16")
+        assert (f16["flags"] & (1 << 3)) != 0, f"{name}: kGrmF16FlagZeroMissing should be set"
+        assert f16["valid_m"] == valid_m, f"{name}: valid_m {f16['valid_m']} != {valid_m}"
+        assert abs(f16["m_mean"] - valid_m) <= 1e-12, f"{name}: m_mean {f16['m_mean']} != {valid_m}"
+        diag = array.array("f"); diag.frombytes(f16["diag"])
+        body = decode_fp16_array(f16["body"])
+        n = f16["n"]
+        idx = 0
+        max_diag_diff = 0.0
+        max_off_diff = 0.0
+        max_q_diag_diff = 0.0
+        for i in range(n):
+            for j in range(i + 1):
+                if i == j:
+                    d_err = abs(diag[i] - ref_tri[idx])
+                    qd_err = abs(diag[i] - qref_tri[idx])
+                    if d_err > max_diag_diff:
+                        max_diag_diff = d_err
+                    if qd_err > max_q_diag_diff:
+                        max_q_diag_diff = qd_err
+                else:
+                    o_err = abs(body[idx] - ref_tri[idx])
+                    if o_err > max_off_diff:
+                        max_off_diff = o_err
+                idx += 1
+        assert max_q_diag_diff <= 2e-6, f"{name}: diag vs quant-ref max diff {max_q_diag_diff:.3e} > 2e-6"
+        assert max_diag_diff <= 2e-6, f"{name}: diag max diff {max_diag_diff:.3e} > 2e-6"
+        assert max_off_diff <= 2.5e-3, f"{name}: fp16 off-diag max diff {max_off_diff:.3e} > 2.5e-3"
+    else:
+        nb = open(out_pfx + ".grm.bin", "rb").read()
+        nn = open(out_pfx + ".grm.N.bin", "rb").read()
+        got_g = array.array("f"); got_g.frombytes(nb)
+        got_n = array.array("f"); got_n.frombytes(nn)
+        assert len(got_g) == len(ref_tri), f"{name}: len {len(got_g)} != {len(ref_tri)}"
+        for nv in got_n:
+            assert nv == float(valid_m), f"{name}: expected constant N={valid_m}, got {nv}"
+        n = int((math.isqrt(1 + 8 * len(ref_tri)) - 1) // 2)
+        idx = 0
+        max_diag_diff = 0.0
+        max_off_diff = 0.0
+        max_q_diff = 0.0
+        for i in range(n):
+            for j in range(i + 1):
+                err = abs(got_g[idx] - ref_tri[idx])
+                qerr = abs(got_g[idx] - qref_tri[idx])
+                if qerr > max_q_diff:
+                    max_q_diff = qerr
+                if i == j:
+                    if err > max_diag_diff:
+                        max_diag_diff = err
+                else:
+                    if err > max_off_diff:
+                        max_off_diff = err
+                idx += 1
+        assert max_q_diff <= 2e-6, f"{name}: f32 vs quant-ref max diff {max_q_diff:.3e} > 2e-6"
+        assert max_diag_diff <= 2e-6, f"{name}: diag max diff {max_diag_diff:.3e} > 2e-6"
+        assert max_off_diff <= 1.5e-3, f"{name}: f32 off-diag max diff {max_off_diff:.3e} > 1.5e-3"
+    print(f"  PASS {name} (diag_err={max_diag_diff:.2e}, off_err={max_off_diff:.2e})")
 
 
 def main():
@@ -367,6 +546,101 @@ def main():
             ["--grm-strip-rows", "64"],
             runs_dir,
         )
+
+        # 8. Quantized INT8 mean-imputation (--impute-mean)
+        for bad_args in (
+            ["--bfile", D("with_miss"), "--alg", "0", "--impute-mean"],
+            ["--bfile", D("with_miss"), "--dominance", "--impute-mean"],
+            ["--bfile", D("with_miss"), "--alg", "1", "--grm-legacy-engine", "--impute-mean"],
+        ):
+            rc_bad, _ = run_cmd([GCTAG_BIN, "grm", "make"] + bad_args + ["--out", os.path.join(runs_dir, "bad_imp")])
+            assert rc_bad != 0, f"Expected non-zero exit for invalid args: {bad_args}"
+        print("  PASS impute_mean_cli_validation")
+
+        for ds in ("with_miss", "late_miss"):
+            for layout in ("rowmajor", "colmajor"):
+                for diag in ("fused", "syrk"):
+                    verify_impute_mean_case(
+                        f"imp_{ds}_{layout}_{diag}",
+                        ["--bfile", D(ds), "--alg", "1", "--impute-mean", "--n-markers", "64"],
+                        ["--grm-strip-rows", "64", "--grm-layout", layout, "--grm-diag-mode", diag, "--grm-profile"],
+                        D(ds),
+                        runs_dir,
+                        check_profile=True,
+                    )
+            verify_impute_mean_case(
+                f"imp_{ds}_fast_dense",
+                ["--bfile", D(ds), "--fast", "--impute-mean", "--n-markers", "64"],
+                ["--grm-strip-rows", "64", "--grm-profile"],
+                D(ds),
+                runs_dir,
+                is_fast=True,
+                check_profile=True,
+            )
+            for layout in ("rowmajor", "colmajor"):
+                verify_impute_mean_case(
+                    f"imp_{ds}_fast_tiled_{layout}",
+                    ["--bfile", D(ds), "--fast", "--impute-mean", "--n-markers", "64", "--tile-budget", "0.0005"],
+                    ["--grm-strip-rows", "64", "--grm-layout", layout],
+                    D(ds),
+                    runs_dir,
+                    is_fast=True,
+                )
+
+        verify_impute_mean_case(
+            "imp_zero_miss_fast",
+            ["--bfile", D("zero_miss"), "--fast", "--impute-mean", "--n-markers", "64"],
+            ["--grm-strip-rows", "64"],
+            D("zero_miss"),
+            runs_dir,
+            is_fast=True,
+        )
+        verify_impute_mean_case(
+            "imp_with_miss_keep",
+            ["--bfile", D("with_miss"), "--alg", "1", "--impute-mean", "--keep", D("keep_sub.txt"), "--n-markers", "64"],
+            ["--grm-strip-rows", "64"],
+            D("with_miss"),
+            runs_dir,
+            keep_file=D("keep_sub.txt"),
+        )
+        verify_impute_mean_case(
+            "imp_all_miss_sample",
+            ["--bfile", D("all_miss_sample"), "--alg", "1", "--impute-mean", "--n-markers", "64"],
+            ["--grm-strip-rows", "64"],
+            D("all_miss_sample"),
+            runs_dir,
+        )
+        # Verify 100% missing sample has exact 0.0 diagonal
+        all_miss_g = array.array("f")
+        all_miss_g.frombytes(open(os.path.join(runs_dir, "imp_all_miss_sample.imp.grm.bin"), "rb").read())
+        assert all_miss_g[0] == 0.0, f"Expected 0.0 diagonal for 100%-missing sample 0, got {all_miss_g[0]}"
+        idx65 = 65 * 66 // 2 + 65
+        assert all_miss_g[idx65] == 0.0, f"Expected 0.0 diagonal for 100%-missing sample 65, got {all_miss_g[idx65]}"
+        print("  PASS imp_all_miss_sample_zero_diag")
+
+        verify_impute_mean_case(
+            "imp_mono_all_fast",
+            ["--bfile", D("mono_all"), "--fast", "--impute-mean"],
+            ["--grm-strip-rows", "64"],
+            D("mono_all"),
+            runs_dir,
+            is_fast=True,
+        )
+
+        # Partitioned & sparse with --impute-mean smoke checks
+        rc_p, log_p = run_cmd([
+            GCTAG_BIN, "grm", "make", "--bfile", D("with_miss"), "--alg", "1", "--impute-mean",
+            "--part", "3", "2", "--n-markers", "64", "--grm-strip-rows", "64",
+            "--threads", "4", "--out", os.path.join(runs_dir, "imp_part"),
+        ])
+        assert rc_p == 0, f"imp_part failed:\n{log_p}"
+        rc_sp, log_sp = run_cmd([
+            GCTAG_BIN, "grm", "make", "--bfile", D("with_miss"), "--alg", "1", "--impute-mean",
+            "--sparse-cutoff", "0.02", "--n-markers", "64", "--grm-strip-rows", "64",
+            "--threads", "4", "--out", os.path.join(runs_dir, "imp_sparse"),
+        ])
+        assert rc_sp == 0, f"imp_sparse failed:\n{log_sp}"
+        print("  PASS imp_part_and_sparse")
 
         print("ALL MULTI-STRIP & HIDDEN-FLAG TESTS PASSED")
     finally:

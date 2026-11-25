@@ -625,8 +625,9 @@ public:
             int re = part_re_;
             bool known_tile_missing = false;
             if (tiling_enabled_) {
-                const double cur_bpe = any_missing_seen_ ? 12.0 : initial_bpe;
-                if (any_missing_seen_ && !logged_missing_rebudget && rs > part_rs_) {
+                const bool effective_missing = any_missing_seen_ && !opts_.impute_mean;
+                const double cur_bpe = effective_missing ? 12.0 : initial_bpe;
+                if (effective_missing && !logged_missing_rebudget && rs > part_rs_) {
                     logged_missing_rebudget = true;
                     LOGGER.info(0, "  Missing genotypes detected; adapting remaining tile budget to 12 B/elem (double GRM + N).");
                 }
@@ -639,7 +640,7 @@ public:
                                  cur_bpe,
                                  tile_budget_bytes_ / (1024.0 * 1024.0 * 1024.0));
                 }
-                if (skip_global_state_ && any_missing_seen_) {
+                if (skip_global_state_ && effective_missing) {
                     for (int s = 0; s < re; ++s) {
                         if (sub_miss_[static_cast<size_t>(s)] > 0) {
                             known_tile_missing = true;
@@ -664,6 +665,11 @@ public:
                 grm_is_i32_ = true;
                 tile_i32_markers_ = 0;
                 R_total_.assign(static_cast<size_t>(tile_cols_), 0.0);
+                if (opts_.impute_mean) {
+                    diag_err_total_.assign(static_cast<size_t>(tile_cols_), 0.0);
+                } else {
+                    diag_err_total_.clear();
+                }
                 S_total_ = 0.0;
             } else {
                 allocate_strips(/*as_i32=*/false);
@@ -745,7 +751,7 @@ public:
                     } catch (const std::exception& e) {
                         LOGGER.e(0, std::string("GrmBedInt8 output open failed: ") + e.what());
                     }
-                    if (!write_fp16 || any_missing_seen_) {
+                    if (!write_fp16 || (any_missing_seen_ && !opts_.impute_mean)) {
                         N_fd = open_posix_write_trunc(N_path);
                         if (!N_fd) LOGGER.error(0, "can't open {} to write", N_path);
                     }
@@ -769,6 +775,7 @@ public:
         if (!is_sparse) {
             try {
                 if (write_fp16) {
+                    const bool effective_missing = any_missing_seen_ && !opts_.impute_mean;
                     gcta_grm_io::GrmFp16Header final_hdr{};
                     std::memcpy(final_hdr.magic, gcta_grm_io::kGrmF16MagicFinal, sizeof(final_hdr.magic));
                     final_hdr.version = gcta_grm_io::kGrmF16Version;
@@ -777,11 +784,11 @@ public:
                     final_hdr.flags = gcta_grm_io::kGrmF16FlagFinalized |
                                       gcta_grm_io::kGrmF16FlagHasTraces |
                                       gcta_grm_io::kGrmF16FlagHasDiagF32 |
-                                      (!any_missing_seen_ ? gcta_grm_io::kGrmF16FlagZeroMissing : 0u) |
+                                      (!effective_missing ? gcta_grm_io::kGrmF16FlagZeroMissing : 0u) |
                                       gcta_grm_io::kGrmF16FlagVanRaden;
                     final_hdr.n = n_out;
                     final_hdr.valid_markers = num_valid_markers_;
-                    if (!any_missing_seen_) {
+                    if (!effective_missing) {
                         final_hdr.m_snps_mean = static_cast<double>(num_valid_markers_);
                     } else {
                         double miss_sum = 0.0;
@@ -821,10 +828,13 @@ public:
         if (is_sparse) {
             LOGGER.i(0, "GRM has been saved in the file [" + out_prefix_ + ".grm.sp]");
         } else if (write_fp16) {
-            LOGGER.i(0, "Native FP16 GRM has been saved in the file [" + grm_path + "]" +
-                        (!any_missing_seen_
-                             ? " (zero missing genotypes; .grm.N.bin omitted, m_snps=" + std::to_string(num_valid_markers_) + " in header)"
-                             : " (missingness present; per-pair counts in [" + N_path + "])"));
+            const std::string fp16_note = !any_missing_seen_
+                ? " (zero missing genotypes; .grm.N.bin omitted, m_snps=" + std::to_string(num_valid_markers_) + " in header)"
+                : (opts_.impute_mean
+                       ? " (missing genotypes mean-imputed at q=" + std::to_string(quant_q_) +
+                             "; .grm.N.bin omitted, m_snps=" + std::to_string(num_valid_markers_) + " in header)"
+                       : " (missingness present; per-pair counts in [" + N_path + "])");
+            LOGGER.i(0, "Native FP16 GRM has been saved in the file [" + grm_path + "]" + fp16_note);
         } else {
             LOGGER.i(0, "GRM has been saved in the file [" + out_prefix_ + ".grm.bin]");
             LOGGER.i(0, "Number of SNPs in each pair of individuals has been saved in the file [" + out_prefix_ + ".grm.N.bin]");
@@ -972,6 +982,21 @@ private:
             all_locs_.push_back(BedMarkerLoc{f_idx, static_cast<uint32_t>(raw_i - file_raw_starts[f_idx])});
         }
         allow_i32_mode_ = (all_locs_.size() <= kMaxInt32Markers);
+        if (opts_.impute_mean) {
+            if (all_locs_.size() > kMaxInt32Markers) {
+                LOGGER.error(0, "--impute-mean requires at most {} autosomal markers (found {}).",
+                             kMaxInt32Markers, all_locs_.size());
+            }
+            if (all_locs_.empty()) {
+                quant_q_ = 1;
+            } else {
+                // Cap worst-case dot product M * (2*q)^2 <= 2.0e9 (< INT32_MAX and < float32 2^31 rounding boundary).
+                const double max_q_d = std::floor(std::sqrt(2000000000.0 / static_cast<double>(all_locs_.size())) * 0.5);
+                quant_q_ = std::clamp(static_cast<int>(max_q_d), 1, 63);
+            }
+        } else {
+            quant_q_ = 1;
+        }
 
         // Engine config defaults (RowMajor strips, fused diagonal, unchunked GEMM, 256 MiB I/O slots)
         const double dense_i32_bytes = static_cast<double>(num_grm_) * 4.0;
@@ -1018,6 +1043,10 @@ private:
             if (opts_.grm_fp16) msg += " --grm-fp16 (native .grm.f16, exact float32 diagonal, zero-missing .grm.N.bin omitted)";
             LOGGER.i(0, msg + ".");
         }
+        if (opts_.impute_mean) {
+            LOGGER.i(0, "Mean-imputing missing genotypes in INT8 VanRaden GRM (quantization scale q=" +
+                        std::to_string(quant_q_) + ", staying in 4 B/elem int32 mode).");
+        }
         LOGGER.i(0, "Computing the genetic relationship matrix (GRM) v2  using " +
                     std::to_string(cfg_.n_marker_block) + " markers per block ...");
         LOGGER.i(0, "Subset " + std::to_string(part) + "/" + std::to_string(num_parts) +
@@ -1052,6 +1081,12 @@ private:
         valid_buf_idx_.resize(mb);
         valid_mu_.resize(mb);
         valid_has_miss_.resize(mb);
+        if (opts_.impute_mean) {
+            valid_miss_q_.resize(mb);
+            valid_mu_q_.resize(mb);
+            valid_miss_err_q2_.resize(mb);
+            diag_err_blk_.resize(static_cast<size_t>(grm_n_));
+        }
         miss_col_of_.resize(mb);
         miss_markers_.reserve(mb);
         marker_miss_offset_.resize(mb + 1);
@@ -1179,7 +1214,7 @@ private:
             const double dre = tile_re_;
             const double tile_elems = (dre * (dre + 1.0) - drs * (drs + 1.0)) * 0.5;
             if (tile_elems * 12.0 > tile_budget_bytes_) {
-                LOGGER.warn(0, "Missing genotypes promoted strip-packed int32 GRM to double+N (~{:.2f} GB > --GRM-tile-budget {:.2f} GB); lower --GRM-tile-budget if memory is tight.",
+                LOGGER.warn(0, "Missing genotypes promoted strip-packed int32 GRM to double+N (~{:.2f} GB > --GRM-tile-budget {:.2f} GB); lower --GRM-tile-budget if memory is tight (or pass --impute-mean to stay at 4 B/elem INT8).",
                             tile_elems * 12.0 / (1024.0 * 1024.0 * 1024.0),
                             tile_budget_bytes_ / (1024.0 * 1024.0 * 1024.0));
             }
@@ -1353,6 +1388,9 @@ private:
 
             #pragma omp single
             {
+                const bool do_impute = opts_.impute_mean;
+                const double q_d = static_cast<double>(quant_q_);
+                const int max_q2 = 2 * quant_q_;
                 if (!use_tile1_cache_) {
                     for (int i = 0; i < num_marker; ++i) {
                         if (raw_valid_[static_cast<size_t>(i)]) {
@@ -1361,7 +1399,18 @@ private:
                             valid_buf_idx_[static_cast<size_t>(K)] = i;
                             valid_mu_[static_cast<size_t>(K)] = mu_m;
                             valid_has_miss_[static_cast<size_t>(K)] = has_miss;
-                            S_mu2 += mu_m * mu_m;
+                            if (do_impute) {
+                                const double mu_q = q_d * mu_m;
+                                const int8_t mq = static_cast<int8_t>(std::clamp<int>(
+                                    static_cast<int>(std::llround(mu_q)), 0, max_q2));
+                                const double err = static_cast<double>(mq) - mu_q;
+                                valid_miss_q_[static_cast<size_t>(K)] = mq;
+                                valid_mu_q_[static_cast<size_t>(K)] = mu_q;
+                                valid_miss_err_q2_[static_cast<size_t>(K)] = err * err;
+                                S_mu2 += mu_q * mu_q;
+                            } else {
+                                S_mu2 += mu_m * mu_m;
+                            }
                             sd_sum_ += raw_sd_[static_cast<size_t>(i)];
                             if (has_miss) any_missing_full = true;
                             if (tiling_enabled_) {
@@ -1387,7 +1436,18 @@ private:
                         valid_buf_idx_[static_cast<size_t>(m)] = m;
                         valid_mu_[static_cast<size_t>(m)] = mu_m;
                         valid_has_miss_[static_cast<size_t>(m)] = has_miss;
-                        S_mu2 += mu_m * mu_m;
+                        if (do_impute) {
+                            const double mu_q = q_d * mu_m;
+                            const int8_t mq = static_cast<int8_t>(std::clamp<int>(
+                                static_cast<int>(std::llround(mu_q)), 0, max_q2));
+                            const double err = static_cast<double>(mq) - mu_q;
+                            valid_miss_q_[static_cast<size_t>(m)] = mq;
+                            valid_mu_q_[static_cast<size_t>(m)] = mu_q;
+                            valid_miss_err_q2_[static_cast<size_t>(m)] = err * err;
+                            S_mu2 += mu_q * mu_q;
+                        } else {
+                            S_mu2 += mu_m * mu_m;
+                        }
                         if (has_miss) any_missing_full = true;
                     }
                     tile1_cursor_ += static_cast<size_t>(K);
@@ -1407,12 +1467,23 @@ private:
                     const uint32_t start_raw = keep_mask
                         ? index_keep_[static_cast<size_t>(s_beg)]
                         : static_cast<uint32_t>(s_beg);
-                    bed_simd::decode_i8_kmajor_band(
-                        raw_base, rb, valid_buf_idx_.data(), K,
-                        keep_mask, raw_ct, start_raw, static_cast<uint32_t>(s_end - s_beg),
-                        kmajor_base + static_cast<size_t>(s_beg) * ldK,
-                        static_cast<size_t>(ldK),
-                        valid_mu_.data(), r_raw_.data() + s_beg);
+                    if (opts_.impute_mean) {
+                        bed_simd::decode_i8_kmajor_band_quant(
+                            raw_base, rb, valid_buf_idx_.data(), K,
+                            keep_mask, raw_ct, start_raw, static_cast<uint32_t>(s_end - s_beg),
+                            kmajor_base + static_cast<size_t>(s_beg) * ldK,
+                            static_cast<size_t>(ldK),
+                            static_cast<int8_t>(quant_q_), valid_miss_q_.data(),
+                            valid_mu_q_.data(), r_raw_.data() + s_beg,
+                            valid_miss_err_q2_.data(), diag_err_blk_.data() + s_beg);
+                    } else {
+                        bed_simd::decode_i8_kmajor_band(
+                            raw_base, rb, valid_buf_idx_.data(), K,
+                            keep_mask, raw_ct, start_raw, static_cast<uint32_t>(s_end - s_beg),
+                            kmajor_base + static_cast<size_t>(s_beg) * ldK,
+                            static_cast<size_t>(ldK),
+                            valid_mu_.data(), r_raw_.data() + s_beg);
+                    }
                 }
             }
         }
@@ -1423,12 +1494,12 @@ private:
         }
         if (K == 0) return;
 
-        // Missingness extraction (ONLY when block has missing genotypes)
+        // Missingness extraction (ONLY when block has missing genotypes and not mean-imputing)
         bool tile_has_missing = false;
         const int H = cfg_.strip_rows;
         const int num_strips = (tile_rows_ + H - 1) / H;
 
-        if (any_missing_full) {
+        if (any_missing_full && !opts_.impute_mean) {
             const auto t_miss0 = Clock::now();
             miss_markers_.clear();
             for (int m = 0; m < K; ++m) {
@@ -1612,9 +1683,19 @@ private:
             S_total_ += S_mu2;
             double* __restrict__ R_tot = R_total_.data();
             const double* __restrict__ r_cur = r_raw_.data();
-            #pragma omp parallel for schedule(static) if (decode_rows >= 4096)
-            for (int i = 0; i < decode_rows; ++i) {
-                R_tot[i] += r_cur[i];
+            if (opts_.impute_mean) {
+                double* __restrict__ de_tot = diag_err_total_.data();
+                const double* __restrict__ de_cur = diag_err_blk_.data();
+                #pragma omp parallel for schedule(static) if (decode_rows >= 4096)
+                for (int i = 0; i < decode_rows; ++i) {
+                    R_tot[i] += r_cur[i];
+                    de_tot[i] += de_cur[i];
+                }
+            } else {
+                #pragma omp parallel for schedule(static) if (decode_rows >= 4096)
+                for (int i = 0; i < decode_rows; ++i) {
+                    R_tot[i] += r_cur[i];
+                }
             }
             tile_i32_markers_ += static_cast<uint32_t>(K);
         } else {
@@ -2084,7 +2165,12 @@ private:
         }
 
         const bool zero_missing = (N_ == nullptr);
-        const double inv_scale = mtd_weight / static_cast<double>(num_valid_markers_);
+        const double q_scale = opts_.impute_mean
+            ? (static_cast<double>(quant_q_) * static_cast<double>(quant_q_))
+            : 1.0;
+        const double inv_scale = (mtd_weight / static_cast<double>(num_valid_markers_)) / q_scale;
+        const double* const diag_err_ptr = (opts_.impute_mean && grm_is_i32_ && !diag_err_total_.empty())
+            ? diag_err_total_.data() : nullptr;
         const size_t out_elem_bytes = (write_fp16 && !is_sparse) ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
         const size_t target_elems = std::max<size_t>(1, cfg_.io_slot_bytes / out_elem_bytes);
         const int flush_nt = is_sparse ? omp_get_max_threads() : std::max(1, omp_get_max_threads() - 1);
@@ -2209,7 +2295,12 @@ private:
                                         const double vd = static_cast<double>(v);
                                         off_sq += vd * vd;
                                     }
-                                    const float dv = static_cast<float>(((static_cast<double>(src[pair1]) - R_i) + (S_tot - R_ptr[pair1])) * inv_scale);
+                                    double d_num = (static_cast<double>(src[pair1]) - R_i) + (S_tot - R_ptr[pair1]);
+                                    if (diag_err_ptr) {
+                                        d_num -= diag_err_ptr[pair1];
+                                        if (d_num < 0.0) d_num = 0.0;
+                                    }
+                                    const float dv = static_cast<float>(d_num * inv_scale);
                                     dst[pair1] = gcta_grm_io::f32_to_fp16(dv);
                                     fp16_diag_[static_cast<size_t>(pair1 - part_rs_)] = dv;
                                     const double dd = static_cast<double>(dv);
@@ -2218,9 +2309,15 @@ private:
                                 } else {
                                     float* __restrict__ dst = out_f32 + dst_off;
                                     #pragma omp simd
-                                    for (int c = 0; c <= pair1; ++c) {
+                                    for (int c = 0; c < pair1; ++c) {
                                         dst[c] = static_cast<float>(((static_cast<double>(src[c]) - R_i) + (S_tot - R_ptr[c])) * inv_scale);
                                     }
+                                    double d_num = (static_cast<double>(src[pair1]) - R_i) + (S_tot - R_ptr[pair1]);
+                                    if (diag_err_ptr) {
+                                        d_num -= diag_err_ptr[pair1];
+                                        if (d_num < 0.0) d_num = 0.0;
+                                    }
+                                    dst[pair1] = static_cast<float>(d_num * inv_scale);
                                 }
                             } else {
                                 const double* __restrict__ src = strips_f64_[static_cast<size_t>(strip_idx)].get() + static_cast<size_t>(local_r) * s_ld;
@@ -2374,6 +2471,12 @@ private:
                                         for (int dr = dr_start; dr < r_len; ++dr) {
                                             tmp[dr][dc] = static_cast<float>(
                                                 (static_cast<double>(col_src[dr]) - R_row[dr] + r_j_plus_S) * inv_scale);
+                                        }
+                                        if (diag_err_ptr && c >= global_r0 && c < global_r0 + r_len) {
+                                            const int dr_diag = c - global_r0;
+                                            double d_num = static_cast<double>(col_src[dr_diag]) - R_row[dr_diag] + r_j_plus_S - diag_err_ptr[c];
+                                            if (d_num < 0.0) d_num = 0.0;
+                                            tmp[dr_diag][dc] = static_cast<float>(d_num * inv_scale);
                                         }
                                     }
                                 } else {
@@ -2612,6 +2715,7 @@ private:
     bool N_pairs_ready_ = false;
 
     // SoA per-block scratch
+    int quant_q_ = 1;
     std::vector<double> raw_mu_;
     std::vector<double> raw_sd_;
     std::vector<uint32_t> raw_nmiss_;
@@ -2619,12 +2723,17 @@ private:
     std::vector<int> valid_buf_idx_;
     std::vector<double> valid_mu_;
     std::vector<uint8_t> valid_has_miss_;
+    std::vector<int8_t> valid_miss_q_;
+    std::vector<double> valid_mu_q_;
+    std::vector<double> valid_miss_err_q2_;
     AlignedUniquePtr<int8_t, 64> kmajor_buf_;
 
     // Centering + missingness scratch
     std::vector<double> r_raw_;
     std::vector<double> r_tilde_;
     std::vector<double> R_total_;
+    std::vector<double> diag_err_blk_;
+    std::vector<double> diag_err_total_;
     double S_total_ = 0.0;
     std::vector<uint32_t> sub_miss_;
     size_t miss_col_ld_ = 64;

@@ -138,6 +138,22 @@ void decode_i8_kmajor_band(const uint8_t* raw_base, size_t rec_bytes,
                            int8_t* kmajor_out, size_t ldK,
                            const double* mu, double* r_out);
 
+/// Quantized mean-imputation K-major decode for K valid markers and n_out kept samples:
+///   PLINK1 code 0 (hom A1) -> 2*q,  2 (het) -> q,  3 (hom A2) -> 0,  1 (missing) -> miss_q[m]
+/// where q in [1, 63] and miss_q[m] in [0, 2*q] (outputs fit in [0, 127], valid as u8 and s8).
+/// If mu_q != nullptr && r_out != nullptr, overwrites r_out[s] with
+///   sum_{m=0..K-1} (double)kmajor_out[s * ldK + m] * mu_q[m]  (ascending marker order).
+/// If miss_err_q2 != nullptr && diag_err_out != nullptr, overwrites diag_err_out[s] with
+///   sum_{m=0..K-1, s missing at m} miss_err_q2[m]  (ascending marker order).
+void decode_i8_kmajor_band_quant(const uint8_t* raw_base, size_t rec_bytes,
+                                 const int* valid_idx, int K,
+                                 const uint64_t* keep, uint32_t n_raw,
+                                 uint32_t r_begin, uint32_t n_out,
+                                 int8_t* kmajor_out, size_t ldK,
+                                 int8_t q, const int8_t* miss_q,
+                                 const double* mu_q, double* r_out,
+                                 const double* miss_err_q2, double* diag_err_out);
+
 }  // namespace bed_simd
 
 #endif  // GCTA_BED_SIMD_HPP

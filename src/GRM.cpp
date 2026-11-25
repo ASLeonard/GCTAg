@@ -3969,6 +3969,9 @@ void GRM::runMake(const gcta_cli::GrmMakeOptions& opts, const std::string& out_p
         gcta_grm::run_bed_int8_grm(pheno, marker, opts, out_prefix);
         return;
     }
+    if (opts.impute_mean) {
+        LOGGER.e(0, "--impute-mean requires the clean-room BED INT8 GRM engine (unset GCTA_DISABLE_INT8_GRM).");
+    }
 
     GRM grm(&pheno, &marker, opts, out_prefix);
     grm.processMakeGRM(opts.homogametic);

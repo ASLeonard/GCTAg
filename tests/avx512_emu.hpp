@@ -132,6 +132,9 @@
 #ifdef _mm512_set1_epi16
 #  undef _mm512_set1_epi16
 #endif
+#ifdef _mm512_set1_epi32
+#  undef _mm512_set1_epi32
+#endif
 #ifdef _mm512_set1_epi8
 #  undef _mm512_set1_epi8
 #endif
@@ -251,6 +254,9 @@ inline __m512i _mm512_setzero_si512() { return __m512i{}; }
 inline __m512i _mm512_set1_epi8(char v) { __m512i r; std::memset(r.b, (uint8_t)v, 64); return r; }
 inline __m512i _mm512_set1_epi16(short v) {
     __m512i r; for (int i = 0; i < 32; ++i) detail::set_lane<uint16_t>(r, i, (uint16_t)v); return r;
+}
+inline __m512i _mm512_set1_epi32(int v) {
+    __m512i r; for (int i = 0; i < 16; ++i) detail::set_lane<int32_t>(r, i, (int32_t)v); return r;
 }
 inline __m512i _mm512_load_si512(const void* p) {
     detail::check_align64(p); __m512i r; std::memcpy(r.b, p, 64); return r;
@@ -558,6 +564,7 @@ inline uint64_t _pdep_u64(uint64_t src, uint64_t mask) {
     using ::avx512_emu::_mm512_reduce_add_epi64; \
     using ::avx512_emu::_mm512_reduce_add_pd; \
     using ::avx512_emu::_mm512_set1_epi16; \
+    using ::avx512_emu::_mm512_set1_epi32; \
     using ::avx512_emu::_mm512_set1_epi8; \
     using ::avx512_emu::_mm512_set1_pd; \
     using ::avx512_emu::_mm512_setzero_pd; \

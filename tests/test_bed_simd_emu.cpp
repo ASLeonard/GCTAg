@@ -500,6 +500,209 @@ static void test_decode_i8_kmajor_band() {
     }
 }
 
+static void test_decode_i8_kmajor_band_quant() {
+    constexpr int kTotalMarkers = 140;
+    const uint32_t kSizes[] = {1, 7, 63, 64, 65, 255, 256, 257, 350};
+    const int kKs[] = {0, 1, 7, 8, 9, 63, 64, 65, 131};
+    const int8_t kQs[] = {1, 7, 25, 63};
+
+    const bed_simd::Isa best = bed_simd::best_isa();
+    int q_idx = 0;
+    for (uint32_t n_raw : kSizes) {
+        const uint32_t nb = bed_simd::record_bytes(n_raw);
+        Exact<uint8_t> raw_all((size_t)kTotalMarkers * nb);
+        for (int m = 0; m < kTotalMarkers; ++m) {
+            gen_raw(raw_all.p + (size_t)m * nb, n_raw, (m % 3 == 0) ? 0.0 : 0.12);
+        }
+        std::vector<int> valid_idx(kTotalMarkers);
+        for (int m = 0; m < kTotalMarkers; ++m) valid_idx[m] = m;
+        for (int m = 0; m < 131; ++m) {
+            std::swap(valid_idx[m], valid_idx[m + (int)rndu((uint32_t)(kTotalMarkers - m))]);
+        }
+
+        const int8_t q = kQs[(q_idx++) % 4];
+        std::vector<int8_t> miss_q(131);
+        std::vector<double> mu_q(131);
+        std::vector<double> miss_err_q2(131);
+        for (int m = 0; m < 131; ++m) {
+            const double mu = 0.05 + 1.9 * rnd01();
+            mu_q[m] = (double)q * mu;
+            int8_t mq;
+            if (m % 11 == 0) mq = 0;
+            else if (m % 11 == 1) mq = q;
+            else if (m % 11 == 2) mq = (int8_t)(2 * (int)q);
+            else mq = (int8_t)std::clamp((int)std::llround(mu_q[m]), 0, 2 * (int)q);
+            miss_q[m] = mq;
+            const double err = (double)mq - mu_q[m];
+            miss_err_q2[m] = err * err;
+        }
+
+        std::vector<KeepSpec> specs;
+        specs.push_back({"full", true, {}});
+        specs.push_back({"empty", false, {}});
+        if (n_raw >= 1) specs.push_back({"first", false, {0u}});
+        specs.push_back({"p05", false, bernoulli_subset(n_raw, 0.05)});
+        specs.push_back({"p50", false, bernoulli_subset(n_raw, 0.5)});
+        {
+            std::vector<uint32_t> wg;
+            for (uint32_t i = 0; i < n_raw; ++i) {
+                if (((i >> 6) % 3u) == 1u && rnd01() < 0.7) wg.push_back(i);
+            }
+            specs.push_back({"wordgaps", false, wg});
+        }
+        {
+            std::vector<uint32_t> all(n_raw);
+            for (uint32_t i = 0; i < n_raw; ++i) all[i] = i;
+            specs.push_back({"all-mask", false, all});
+        }
+
+        for (const KeepSpec& spec : specs) {
+            const uint64_t* km = nullptr;
+            Exact<uint64_t> kbuf(bed_simd::keep_mask_words(n_raw));
+            if (!spec.full) {
+                CHECK(bed_simd::build_keep_mask(spec.idx.data(), spec.idx.size(), n_raw, kbuf.p),
+                      "kmajor_quant build_keep_mask failed");
+                km = kbuf.p;
+            }
+            const uint32_t n_keep = spec.full ? n_raw : (uint32_t)spec.idx.size();
+
+            struct SubRange { uint32_t k0; uint32_t n_out; };
+            std::vector<SubRange> ranges;
+            if (n_keep == 0) {
+                ranges.push_back({0u, 0u});
+            } else if (spec.full) {
+                for (uint32_t k0 : {0u, 4u, 64u, 128u}) {
+                    if (k0 >= n_keep) continue;
+                    const uint32_t rem = n_keep - k0;
+                    ranges.push_back({k0, rem});
+                    if (rem > 1) ranges.push_back({k0, 1u});
+                    if (rem > 64) ranges.push_back({k0, 64u});
+                    if (rem > 256) ranges.push_back({k0, 256u});
+                    if (rem > 257) ranges.push_back({k0, 257u});
+                }
+            } else {
+                for (uint32_t k0 : {0u, 1u, 7u, 63u, 64u, 65u}) {
+                    if (k0 >= n_keep) continue;
+                    const uint32_t rem = n_keep - k0;
+                    ranges.push_back({k0, rem});
+                    if (rem > 3) ranges.push_back({k0, 3u});
+                    if (rem > 65) ranges.push_back({k0, 65u});
+                    if (rem > 257) ranges.push_back({k0, 257u});
+                }
+                ranges.push_back({0u, 0u});
+            }
+
+            for (auto [k0, n_out] : ranges) {
+                const uint32_t r_begin = (n_out == 0u) ? 0u : (spec.full ? k0 : spec.idx[k0]);
+                for (int K : kKs) {
+                    const size_t pad64 = (K == 0) ? 0u : (size_t)(((K + 63) / 64) * 64);
+                    std::vector<size_t> ldks;
+                    if (K == 0) ldks = {64u};
+                    else if (pad64 == (size_t)K) ldks = {pad64, pad64 + 64u};
+                    else ldks = {(size_t)K, pad64, pad64 + 64u};
+
+                    for (size_t ldK : ldks) {
+                        for (int mode = 0; mode < 4; ++mode) {
+                            const int want_r = (mode >> 1) & 1;
+                            const int want_derr = mode & 1;
+                            char ctx[220];
+                            std::snprintf(ctx, sizeof ctx,
+                                "kmajor_quant q=%d n_raw=%u keep=%s k0=%u n_out=%u K=%d ldK=%zu wr=%d wd=%d",
+                                (int)q, n_raw, spec.name.c_str(), k0, n_out, K, ldK, want_r, want_derr);
+                            g_ctx = ctx;
+                            ++g_cases;
+
+                            const size_t total_out = (size_t)n_out * ldK;
+                            Guarded<int8_t> g_emu(total_out), g_sca(total_out), g_best(total_out);
+                            Guarded<double> r_emu(n_out), r_sca(n_out), r_best(n_out);
+                            Guarded<double> d_emu(n_out), d_sca(n_out), d_best(n_out);
+                            const double* mu_ptr = want_r ? mu_q.data() : nullptr;
+                            const double* derr_ptr = want_derr ? miss_err_q2.data() : nullptr;
+
+                            emu::decode_i8_kmajor_band_quant(
+                                raw_all.p, nb, valid_idx.data(), K, km, n_raw, r_begin, n_out,
+                                g_emu.p, ldK, q, miss_q.data(),
+                                mu_ptr, want_r ? r_emu.p : nullptr,
+                                derr_ptr, want_derr ? d_emu.p : nullptr);
+
+                            bed_simd::set_isa(bed_simd::Isa::Scalar);
+                            bed_simd::decode_i8_kmajor_band_quant(
+                                raw_all.p, nb, valid_idx.data(), K, km, n_raw, r_begin, n_out,
+                                g_sca.p, ldK, q, miss_q.data(),
+                                mu_ptr, want_r ? r_sca.p : nullptr,
+                                derr_ptr, want_derr ? d_sca.p : nullptr);
+
+                            CHECK(g_emu.guard_ok(), "emu kmajor_quant overrun");
+                            CHECK(g_sca.guard_ok(), "scalar kmajor_quant overrun");
+                            CHECK(r_emu.guard_ok(), "emu r_out overrun");
+                            CHECK(r_sca.guard_ok(), "scalar r_out overrun");
+                            CHECK(d_emu.guard_ok(), "emu diag_err_out overrun");
+                            CHECK(d_sca.guard_ok(), "scalar diag_err_out overrun");
+
+                            if (K == 0 || n_out == 0) {
+                                CHECK(g_emu.untouched(), "emu touched output on K==0 || n_out==0");
+                                CHECK(g_sca.untouched(), "scalar touched output on K==0 || n_out==0");
+                                CHECK(r_emu.untouched(), "emu touched r_out on K==0 || n_out==0");
+                                CHECK(d_emu.untouched(), "emu touched diag_err_out on K==0 || n_out==0");
+                            } else {
+                                bool pad_ok = true;
+                                for (uint32_t s = 0; s < n_out; ++s) {
+                                    const size_t row_off = (size_t)s * ldK;
+                                    CHECK(std::memcmp(g_sca.p + row_off, g_emu.p + row_off, (size_t)K) == 0,
+                                          "emu vs scalar kmajor_quant mismatch row=%u", s);
+                                    for (size_t c = (size_t)K; c < ldK; ++c) {
+                                        if ((uint8_t)g_emu.p[row_off + c] != kFillByte) pad_ok = false;
+                                    }
+                                }
+                                CHECK(pad_ok, "emu overwrote ldK padding bytes");
+                                if (want_r) {
+                                    CHECK(std::memcmp(r_sca.p, r_emu.p, n_out * sizeof(double)) == 0,
+                                          "emu vs scalar r_out mismatch (not bit-exact)");
+                                } else {
+                                    CHECK(r_emu.untouched(), "emu touched r_out when want_r==0");
+                                }
+                                if (want_derr) {
+                                    CHECK(std::memcmp(d_sca.p, d_emu.p, n_out * sizeof(double)) == 0,
+                                          "emu vs scalar diag_err_out mismatch (not bit-exact)");
+                                } else {
+                                    CHECK(d_emu.untouched(), "emu touched diag_err_out when want_derr==0");
+                                }
+                            }
+
+                            if (best != bed_simd::Isa::Scalar && bed_simd::set_isa(best)) {
+                                bed_simd::decode_i8_kmajor_band_quant(
+                                    raw_all.p, nb, valid_idx.data(), K, km, n_raw, r_begin, n_out,
+                                    g_best.p, ldK, q, miss_q.data(),
+                                    mu_ptr, want_r ? r_best.p : nullptr,
+                                    derr_ptr, want_derr ? d_best.p : nullptr);
+                                CHECK(g_best.guard_ok(), "best ISA kmajor_quant overrun");
+                                CHECK(r_best.guard_ok(), "best ISA r_out overrun");
+                                CHECK(d_best.guard_ok(), "best ISA diag_err_out overrun");
+                                if (K > 0 && n_out > 0) {
+                                    for (uint32_t s = 0; s < n_out; ++s) {
+                                        const size_t row_off = (size_t)s * ldK;
+                                        CHECK(std::memcmp(g_sca.p + row_off, g_best.p + row_off, (size_t)K) == 0,
+                                              "best ISA vs scalar kmajor_quant mismatch row=%u", s);
+                                    }
+                                    if (want_r) {
+                                        CHECK(std::memcmp(r_sca.p, r_best.p, n_out * sizeof(double)) == 0,
+                                              "best ISA vs scalar r_out mismatch");
+                                    }
+                                    if (want_derr) {
+                                        CHECK(std::memcmp(d_sca.p, d_best.p, n_out * sizeof(double)) == 0,
+                                              "best ISA vs scalar diag_err_out mismatch");
+                                    }
+                                }
+                                bed_simd::set_isa(bed_simd::Isa::Scalar);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc > 1) g_rng.seed(std::strtoull(argv[1], nullptr, 0));   // optional RNG seed
     if (!bed_simd::set_isa(bed_simd::Isa::Scalar)) {
@@ -564,6 +767,7 @@ int main(int argc, char** argv) {
         }
     }
     test_decode_i8_kmajor_band();
+    test_decode_i8_kmajor_band_quant();
     std::printf("%s: %llu cases, %llu checks, %llu failures\n", g_fail ? "FAIL" : "PASS",
                 (unsigned long long)g_cases, (unsigned long long)g_checks, (unsigned long long)g_fail);
     return g_fail ? 1 : 0;

@@ -223,6 +223,78 @@ static inline uint32_t plan_band_chunks(const uint64_t* keep, uint32_t nw,
         }                                                                                      \
     }
 
+#define BED_DEFINE_KMAJOR_BAND_QUANT(NAME, ATTR, CHUNK_CODES, MAP_I8)                          \
+    ATTR static void NAME(const uint8_t* raw_base, size_t rec_bytes, const int* valid_idx,     \
+                          int K, const uint64_t* keep, uint32_t n_raw, uint32_t r_begin,       \
+                          uint32_t n_out, int8_t* kmajor_out, size_t ldK, int8_t q,            \
+                          const int8_t* miss_q, const double* mu_q, double* r_out,             \
+                          const double* miss_err_q2, double* diag_err_out) {                   \
+        if (K <= 0 || n_out == 0u) return;                                                     \
+        const bool want_r = (mu_q != nullptr && r_out != nullptr);                             \
+        const bool want_derr = (miss_err_q2 != nullptr && diag_err_out != nullptr);            \
+        if (want_r) {                                                                          \
+            for (uint32_t s = 0; s < n_out; ++s) r_out[s] = 0.0;                               \
+        }                                                                                      \
+        if (want_derr) {                                                                       \
+            for (uint32_t s = 0; s < n_out; ++s) diag_err_out[s] = 0.0;                        \
+        }                                                                                      \
+        const uint32_t nw = (n_raw + 63u) >> 6;                                                \
+        uint32_t cursor = keep ? (r_begin >> 6) : r_begin;                                     \
+        uint64_t first = keep ? (~0ull << (r_begin & 63u)) : ~0ull;                            \
+        constexpr uint32_t kBand = 256u;                                                       \
+        alignas(64) uint8_t c_tmp[64];                                                         \
+        alignas(64) int8_t col[64][64];                                                        \
+        alignas(64) int8_t tr[64][64];                                                         \
+        for (uint32_t b_off = 0; b_off < n_out; b_off += kBand) {                              \
+            const uint32_t rem = n_out - b_off;                                                \
+            const uint32_t b_len = rem < kBand ? rem : kBand;                                  \
+            BandChunk64 chunks[4];                                                             \
+            const uint32_t n_chunks = plan_band_chunks(keep, nw, cursor, first, b_len, chunks);\
+            for (int m0 = 0; m0 < K; m0 += 64) {                                               \
+                const int m_len = (K - m0) < 64 ? (K - m0) : 64;                               \
+                for (uint32_t ci = 0; ci < n_chunks; ++ci) {                                   \
+                    const uint32_t s0 = ci * 64u;                                              \
+                    const uint32_t s_len = chunks[ci].s_len;                                   \
+                    if (s_len == 0u) continue;                                                 \
+                    for (int dm = 0; dm < m_len; ++dm) {                                       \
+                        const int m = m0 + dm;                                                 \
+                        const uint8_t* raw = raw_base + (size_t)valid_idx[m] * rec_bytes;      \
+                        CHUNK_CODES(raw, keep, n_raw, chunks[ci].r_begin, s_len, c_tmp);       \
+                        const int8_t mq = miss_q[m];                                           \
+                        MAP_I8(c_tmp, s_len, q, mq, col[dm]);                                  \
+                        if (want_r) {                                                          \
+                            const double mu_m = mu_q[m];                                       \
+                            const double vq1 = (double)q * mu_m;                               \
+                            const double vq2 = (double)(2 * (int)q) * mu_m;                    \
+                            const double vqm = (double)mq * mu_m;                              \
+                            double* rp = r_out + b_off + s0;                                   \
+                            for (uint32_t ds = 0; ds < s_len; ++ds) {                          \
+                                const uint8_t code = c_tmp[ds];                                \
+                                if (code == 0u) rp[ds] += vq2;                                 \
+                                else if (code == 2u) rp[ds] += vq1;                            \
+                                else if (code == 1u && mq != 0) rp[ds] += vqm;                 \
+                            }                                                                  \
+                        }                                                                      \
+                        if (want_derr) {                                                       \
+                            const double derr = miss_err_q2[m];                                \
+                            double* dp = diag_err_out + b_off + s0;                            \
+                            for (uint32_t ds = 0; ds < s_len; ++ds) {                          \
+                                if (c_tmp[ds] == 1u) dp[ds] += derr;                           \
+                            }                                                                  \
+                        }                                                                      \
+                    }                                                                          \
+                    for (uint32_t ds = 0; ds < s_len; ++ds) {                                  \
+                        for (int dm = 0; dm < m_len; ++dm) tr[ds][dm] = col[dm][ds];           \
+                    }                                                                          \
+                    for (uint32_t ds = 0; ds < s_len; ++ds) {                                  \
+                        __builtin_memcpy(kmajor_out + (size_t)(b_off + s0 + ds) * ldK + m0,    \
+                                         tr[ds], (size_t)m_len);                               \
+                    }                                                                          \
+                }                                                                              \
+            }                                                                                  \
+        }                                                                                      \
+    }
+
 namespace scalar {
 
 // Visit output samples [0, n_out) in order: f(out_pos, plink1_code).
@@ -404,6 +476,16 @@ static inline void decode_i8_chunk(const uint8_t* raw, const uint64_t* keep, uin
     decode_i8(raw, keep, n_raw, r_begin, n_out, out, nullptr, false);
 }
 BED_DEFINE_KMAJOR_BAND(decode_i8_kmajor_band, , decode_i8_chunk)
+
+static inline void decode_codes_chunk(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
+                                      uint32_t r_begin, uint32_t n_out, uint8_t* codes) {
+    for_each_code(raw, keep, n_raw, r_begin, n_out, [&](uint32_t s, uint32_t c) { codes[s] = (uint8_t)c; });
+}
+static inline void map_i8_quant(const uint8_t* codes, uint32_t n, int8_t q, int8_t mq, int8_t* out) {
+    const int8_t lut[4] = {(int8_t)(2 * (int)q), mq, q, 0};
+    for (uint32_t i = 0; i < n; ++i) out[i] = lut[codes[i]];
+}
+BED_DEFINE_KMAJOR_BAND_QUANT(decode_i8_kmajor_band_quant, , decode_codes_chunk, map_i8_quant)
 
 }  // namespace scalar
 
@@ -771,6 +853,28 @@ static inline void decode_i8_chunk(const uint8_t* raw, const uint64_t* keep, uin
 }
 BED_DEFINE_KMAJOR_BAND(decode_i8_kmajor_band, , decode_i8_chunk)
 
+static inline void decode_codes_chunk(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
+                                      uint32_t r_begin, uint32_t n_out, uint8_t* codes) {
+    if (!keep) {
+        const uint32_t rem_raw = n_raw - r_begin;
+        const uint32_t n_vis = n_out < rem_raw ? n_out : rem_raw;
+        const uint32_t nb = (n_vis + 3u) >> 2;
+        codes64(raw + (r_begin >> 2), nb, codes);
+        return;
+    }
+    run_stages(raw, keep, n_raw, r_begin, n_out,
+               [&](const uint8_t* c, uint32_t n, uint32_t p) { __builtin_memcpy(codes + p, c, n); });
+}
+static inline void map_i8_quant(const uint8_t* codes, uint32_t n, int8_t q, int8_t mq, int8_t* out) {
+    const uint8_t kLut[16] = {(uint8_t)(2 * (int)q), (uint8_t)mq, (uint8_t)q, 0,
+                              0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const uint8x16_t lut = vld1q_u8(kLut);
+    uint32_t i = 0;
+    for (; i + 16u <= n; i += 16u) vst1q_u8((uint8_t*)out + i, vqtbl1q_u8(lut, vld1q_u8(codes + i)));
+    for (; i < n; ++i) out[i] = (int8_t)kLut[codes[i]];
+}
+BED_DEFINE_KMAJOR_BAND_QUANT(decode_i8_kmajor_band_quant, , decode_codes_chunk, map_i8_quant)
+
 }  // namespace neon
 #endif  // BED_ARM64
 
@@ -1021,6 +1125,37 @@ BED_T256 static inline void decode_i8_chunk(const uint8_t* raw, const uint64_t* 
 }
 BED_DEFINE_KMAJOR_BAND(decode_i8_kmajor_band, BED_T256, decode_i8_chunk)
 
+BED_T256 static inline void decode_codes_chunk(const uint8_t* raw, const uint64_t* keep, uint32_t n_raw,
+                                               uint32_t r_begin, uint32_t s_len, uint8_t* codes) {
+    if (!keep) {
+        const uint32_t rem_raw = n_raw - r_begin;
+        const uint32_t n_vis = s_len < rem_raw ? s_len : rem_raw;
+        const uint32_t b0 = r_begin >> 2;
+        const uint32_t nb = (n_vis + 3u) >> 2;
+        const uint32_t nb0 = nb < 8u ? nb : 8u;
+        _mm256_store_si256((__m256i*)codes, codes32(raw + b0, nb0));
+        if (nb > 8u) {
+            _mm256_store_si256((__m256i*)(codes + 32), codes32(raw + b0 + 8u, nb - 8u));
+        }
+        return;
+    }
+    run_stages(raw, keep, n_raw, r_begin, s_len,
+               [&](const uint8_t* c, uint32_t n, uint32_t p) { __builtin_memcpy(codes + p, c, n); });
+}
+BED_T256 static inline void map_i8_quant(const uint8_t* codes, uint32_t n, int8_t q, int8_t mq, int8_t* out) {
+    const uint32_t lw = (uint32_t)(uint8_t)(2 * (int)q) |
+                        ((uint32_t)(uint8_t)mq << 8) |
+                        ((uint32_t)(uint8_t)q << 16);
+    const __m256i lut = _mm256_set1_epi32((int)lw);
+    uint32_t i = 0;
+    for (; i + 32u <= n; i += 32u)
+        _mm256_storeu_si256((__m256i*)(out + i),
+                            _mm256_shuffle_epi8(lut, _mm256_loadu_si256((const __m256i*)(codes + i))));
+    const int8_t larr[4] = {(int8_t)(2 * (int)q), mq, q, 0};
+    for (; i < n; ++i) out[i] = larr[codes[i]];
+}
+BED_DEFINE_KMAJOR_BAND_QUANT(decode_i8_kmajor_band_quant, BED_T256, decode_codes_chunk, map_i8_quant)
+
 }  // namespace avx2
 
 // AVX-512 kernels (shared with the emulator-based unit test).
@@ -1053,15 +1188,18 @@ struct Kernels {
     Counts (*f64)(const uint8_t*, const uint64_t*, uint32_t, uint32_t, const double*, double*, uint64_t*, bool);
     void (*i8_kmajor_band)(const uint8_t*, size_t, const int*, int, const uint64_t*, uint32_t,
                            uint32_t, uint32_t, int8_t*, size_t, const double*, double*);
+    void (*i8_kmajor_band_quant)(const uint8_t*, size_t, const int*, int, const uint64_t*, uint32_t,
+                                 uint32_t, uint32_t, int8_t*, size_t, int8_t, const int8_t*,
+                                 const double*, double*, const double*, double*);
 };
 
-static const Kernels kScalar = {Isa::Scalar, &count_scalar, &scalar::decode_i8, &scalar::decode_f32, &scalar::decode_f64, &scalar::decode_i8_kmajor_band};
+static const Kernels kScalar = {Isa::Scalar, &count_scalar, &scalar::decode_i8, &scalar::decode_f32, &scalar::decode_f64, &scalar::decode_i8_kmajor_band, &scalar::decode_i8_kmajor_band_quant};
 #if BED_ARM64
-static const Kernels kNeon = {Isa::Neon, &neon::count, &neon::decode_i8, &neon::decode_f32, &neon::decode_f64, &neon::decode_i8_kmajor_band};
+static const Kernels kNeon = {Isa::Neon, &neon::count, &neon::decode_i8, &neon::decode_f32, &neon::decode_f64, &neon::decode_i8_kmajor_band, &neon::decode_i8_kmajor_band_quant};
 #endif
 #if BED_X86
-static const Kernels kAvx2 = {Isa::Avx2, &count_popcnt, &avx2::decode_i8, &avx2::decode_f32, &avx2::decode_f64, &avx2::decode_i8_kmajor_band};
-static const Kernels kAvx512 = {Isa::Avx512, &avx512::count, &avx512::decode_i8, &avx512_decode_f32_wrap, &avx512_decode_f64_wrap, &avx512::decode_i8_kmajor_band};
+static const Kernels kAvx2 = {Isa::Avx2, &count_popcnt, &avx2::decode_i8, &avx2::decode_f32, &avx2::decode_f64, &avx2::decode_i8_kmajor_band, &avx2::decode_i8_kmajor_band_quant};
+static const Kernels kAvx512 = {Isa::Avx512, &avx512::count, &avx512::decode_i8, &avx512_decode_f32_wrap, &avx512_decode_f64_wrap, &avx512::decode_i8_kmajor_band, &avx512::decode_i8_kmajor_band_quant};
 
 static bool cpu_has_avx512() {
 #if BED_STATIC_AVX512
@@ -1231,6 +1369,19 @@ void decode_i8_kmajor_band(const uint8_t* raw_base, size_t rec_bytes,
                            const double* mu, double* r_out) {
     detail::K().i8_kmajor_band(raw_base, rec_bytes, valid_idx, K, keep, n_raw, r_begin, n_out,
                                kmajor_out, ldK, mu, r_out);
+}
+
+void decode_i8_kmajor_band_quant(const uint8_t* raw_base, size_t rec_bytes,
+                                 const int* valid_idx, int K,
+                                 const uint64_t* keep, uint32_t n_raw,
+                                 uint32_t r_begin, uint32_t n_out,
+                                 int8_t* kmajor_out, size_t ldK,
+                                 int8_t q, const int8_t* miss_q,
+                                 const double* mu_q, double* r_out,
+                                 const double* miss_err_q2, double* diag_err_out) {
+    detail::K().i8_kmajor_band_quant(raw_base, rec_bytes, valid_idx, K, keep, n_raw, r_begin, n_out,
+                                     kmajor_out, ldK, q, miss_q, mu_q, r_out,
+                                     miss_err_q2, diag_err_out);
 }
 
 }  // namespace bed_simd

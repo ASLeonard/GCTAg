@@ -94,6 +94,9 @@ struct PhenoCovarOptions {
 };
 
 enum class RemlReuseStream { Auto = 0, Off = 1, On = 2 };
+enum class RemlWoodburySolver { Auto = 0, Cholesky = 1, Eigh = 2 };
+enum class RemlQrMode : uint8_t { Auto = 0, Sketched = 1, Standard = 2 };
+enum class RemlSvdFilter : uint8_t { Power = 0, Chebyshev = 1 };
 
 struct RemlOptions {
     std::string grm;
@@ -144,6 +147,9 @@ struct RemlOptions {
     int reml_eigh_threads = 0;
     int reml_io_slot_mb = 256;
     RemlReuseStream reml_reuse_stream = RemlReuseStream::Auto;
+    RemlWoodburySolver reml_woodbury_solver = RemlWoodburySolver::Auto;
+    RemlQrMode reml_qr_mode = RemlQrMode::Auto;
+    RemlSvdFilter reml_svd_filter = RemlSvdFilter::Power;
 };
 
 struct GrmMakeOptions {
@@ -158,6 +164,7 @@ struct GrmMakeOptions {
     bool alg_explicit = false;
     bool grm_fp16 = false;
     bool fast = false;
+    bool impute_mean = false;
     std::optional<double> tile_budget_gb;
     std::optional<int> n_markers;
     std::optional<double> sparse_cutoff;

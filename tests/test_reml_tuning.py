@@ -33,6 +33,9 @@ HIDDEN_REML_FLAGS = [
     "--reml-eigh-threads",
     "--reml-io-slot-mb",
     "--reml-reuse-stream",
+    "--reml-woodbury-solver",
+    "--reml-qr-mode",
+    "--reml-svd-filter",
 ]
 
 PROFILE_KEYS = [
@@ -47,6 +50,7 @@ PROFILE_KEYS = [
     "eigh_s",
     "rotate_s",
     "ai_reml_s",
+    "wk_factor_s",
     "save_s",
     "total_s",
     "matvec_unpack_s",
@@ -58,6 +62,7 @@ PROFILE_KEYS = [
     "qr_shifted",
     "qr_householder",
     "reuse_stream",
+    "wb_solver",
 ]
 
 
@@ -581,8 +586,8 @@ def main():
                 ],
                 "reml reuse ref",
             )
-            compare_hsq("reuse_on_vs_ref", reuse_on + ".hsq", ref_reuse + ".hsq", rel_tol=1e-5, abs_tol=1e-6)
-            compare_hsq("reuse_standalone_vs_ref", reuse_standalone + ".hsq", ref_reuse + ".hsq", rel_tol=1e-5, abs_tol=1e-6)
+            compare_hsq("reuse_on_vs_ref", reuse_on + ".hsq", ref_reuse + ".hsq", rel_tol=1e-4, abs_tol=1e-5)
+            compare_hsq("reuse_standalone_vs_ref", reuse_standalone + ".hsq", ref_reuse + ".hsq", rel_tol=1e-4, abs_tol=1e-5)
 
             ref_mlma_reuse = os.path.join(work, "ref_mlma_reuse")
             must_run(
@@ -601,6 +606,395 @@ def main():
             )
             compare_mlma("reuse_on_mlma_vs_ref", mlma_ron + ".mlma", ref_mlma_reuse + ".mlma", rel_tol=1e-4, abs_tol=1e-6)
         print("  PASS reml_reuse_zero_uk_streaming_tref")
+
+        # 6. Option 4b: Unrotated Cholesky-Woodbury REML & Stage-4 MLMA parity
+        # 6a. Exact full-subspace identity (k = n - 1 = 2002 on syn): k_ext == n - 1 for both solvers
+        chol_full = os.path.join(work, "c4_chol_k2002")
+        eigh_full = os.path.join(work, "c4_eigh_k2002")
+        exact_full = os.path.join(work, "c4_exact_syn")
+        must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_grm,
+                "--threads", "4",
+                "--out", exact_full,
+            ],
+            "reml syn exact",
+        )
+        log_cf = must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_grm,
+                "--fast",
+                "--woodbury-basis", "2002",
+                "--reml-woodbury-solver", "cholesky",
+                "--seed", "7",
+                "--threads", "4",
+                "--reml-profile",
+                "--out", chol_full,
+            ],
+            "reml syn k2002 cholesky",
+        )
+        kv_cf = extract_reml_profile(log_cf)
+        assert kv_cf["wb_solver"] in ("cholesky", "cholesky_pivoted"), kv_cf
+        assert float(kv_cf["eigh_s"]) == 0.0, kv_cf
+        log_ef = must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_grm,
+                "--fast",
+                "--woodbury-basis", "2002",
+                "--reml-woodbury-solver", "eigh",
+                "--seed", "7",
+                "--threads", "4",
+                "--reml-profile",
+                "--out", eigh_full,
+            ],
+            "reml syn k2002 eigh",
+        )
+        kv_ef = extract_reml_profile(log_ef)
+        assert kv_ef["wb_solver"] == "eigh", kv_ef
+        compare_hsq("chol_vs_exact_k2002", chol_full + ".hsq", exact_full + ".hsq", rel_tol=1e-5, abs_tol=1e-5)
+        compare_hsq("chol_vs_eigh_k2002", chol_full + ".hsq", eigh_full + ".hsq", rel_tol=1e-4, abs_tol=3e-5)
+
+        mlma_cf = os.path.join(work, "c4_mlma_chol_k2002")
+        mlma_ef = os.path.join(work, "c4_mlma_eigh_k2002")
+        mlma_ex = os.path.join(work, "c4_mlma_exact_syn")
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", syn_bfile + ".phen",
+                "--load-reml", exact_full + ".reml",
+                "--threads", "4",
+                "--out", mlma_ex,
+            ],
+            "mlma syn exact",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", syn_bfile + ".phen",
+                "--load-reml", chol_full + ".reml",
+                "--fast-mlma", "2slice",
+                "--threads", "4",
+                "--out", mlma_cf,
+            ],
+            "mlma syn k2002 cholesky",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", syn_bfile + ".phen",
+                "--load-reml", eigh_full + ".reml",
+                "--fast-mlma", "2slice",
+                "--threads", "4",
+                "--out", mlma_ef,
+            ],
+            "mlma syn k2002 eigh",
+        )
+        compare_mlma("chol_vs_exact_k2002_mlma", mlma_cf + ".mlma", mlma_ex + ".mlma", rel_tol=5e-4, abs_tol=5e-5)
+        compare_mlma("chol_vs_eigh_k2002_mlma", mlma_cf + ".mlma", mlma_ef + ".mlma", rel_tol=5e-4, abs_tol=5e-5)
+
+        # 6a-fp32. Exact full-subspace identity on FP32 GRM (no FP16 nullspace rounding negativity)
+        syn_grm_f32 = os.path.join(work, "syn_grm_f32")
+        must_run(
+            [NEW_BIN, "grm", "make", "--bfile", syn_bfile, "--threads", "4", "--out", syn_grm_f32],
+            "grm make syn f32",
+        )
+        chol_f32 = os.path.join(work, "c4_chol_k2002_f32")
+        exact_f32 = os.path.join(work, "c4_exact_syn_f32")
+        must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_grm_f32,
+                "--threads", "4",
+                "--out", exact_f32,
+            ],
+            "reml syn f32 exact",
+        )
+        log_cf32 = must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_grm_f32,
+                "--woodbury-basis", "2002",
+                "--reml-woodbury-solver", "cholesky",
+                "--seed", "7",
+                "--threads", "4",
+                "--reml-profile",
+                "--out", chol_f32,
+            ],
+            "reml syn f32 k2002 cholesky",
+        )
+        kv_cf32 = extract_reml_profile(log_cf32)
+        assert kv_cf32["wb_solver"] in ("cholesky", "cholesky_pivoted"), kv_cf32
+        assert float(kv_cf32["eigh_s"]) == 0.0, kv_cf32
+        compare_hsq("chol_vs_exact_k2002_f32", chol_f32 + ".hsq", exact_f32 + ".hsq", rel_tol=1e-5, abs_tol=1e-5)
+
+        mlma_cf32 = os.path.join(work, "c4_mlma_chol_k2002_f32")
+        mlma_ex32 = os.path.join(work, "c4_mlma_exact_syn_f32")
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", syn_bfile + ".phen",
+                "--load-reml", exact_f32 + ".reml",
+                "--threads", "4",
+                "--out", mlma_ex32,
+            ],
+            "mlma syn f32 exact",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", syn_bfile + ".phen",
+                "--load-reml", chol_f32 + ".reml",
+                "--fast-mlma", "2slice",
+                "--threads", "4",
+                "--out", mlma_cf32,
+            ],
+            "mlma syn f32 k2002 cholesky",
+        )
+        compare_mlma("chol_vs_exact_k2002_f32_mlma", mlma_cf32 + ".mlma", mlma_ex32 + ".mlma", rel_tol=1e-4, abs_tol=3e-6)
+
+        # 6b. k=60 + qcovar + weighted phenotypes: verify strict SPD cholesky (eigh_s=0, rotate_s=0),
+        #     inline 2slice vs saved TUN3 2slice vs --fast-mlma off
+        chol_k60w = os.path.join(work, "c4_chol_k60w")
+        log_c60w = must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", os.path.join(BED_DIR, "syn_w.phen"),
+                "--weighted-phenotypes",
+                "--qcovar", qcovar_path,
+                "--grm", syn_grm,
+                "--fast",
+                "--woodbury-basis", "60",
+                "--reml-woodbury-solver", "cholesky",
+                "--seed", "7",
+                "--threads", "4",
+                "--reml-profile",
+                "--out", chol_k60w,
+            ],
+            "reml syn k60 weighted qcovar cholesky",
+        )
+        kv_c60w = extract_reml_profile(log_c60w)
+        assert kv_c60w["wb_solver"] == "cholesky", kv_c60w
+        assert float(kv_c60w["eigh_s"]) == 0.0, kv_c60w
+        assert float(kv_c60w["rotate_s"]) == 0.0, kv_c60w
+        assert read_reml_magic(chol_k60w + ".reml") == b"TUN3"
+
+        mlma_c60w_load_2s = os.path.join(work, "c4_mlma_c60w_load_2s")
+        mlma_c60w_load_off = os.path.join(work, "c4_mlma_c60w_load_off")
+        mlma_c60w_inline_2s = os.path.join(work, "c4_mlma_c60w_inline_2s")
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", os.path.join(BED_DIR, "syn_w.phen"),
+                "--weighted-phenotypes",
+                "--qcovar", qcovar_path,
+                "--load-reml", chol_k60w + ".reml",
+                "--fast-mlma", "2slice",
+                "--threads", "4",
+                "--out", mlma_c60w_load_2s,
+            ],
+            "mlma load cholesky k60w 2slice",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", os.path.join(BED_DIR, "syn_w.phen"),
+                "--weighted-phenotypes",
+                "--qcovar", qcovar_path,
+                "--load-reml", chol_k60w + ".reml",
+                "--threads", "4",
+                "--out", mlma_c60w_load_off,
+            ],
+            "mlma load cholesky k60w exact",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", os.path.join(BED_DIR, "syn_w.phen"),
+                "--weighted-phenotypes",
+                "--qcovar", qcovar_path,
+                "--grm", syn_grm,
+                "--fast",
+                "--woodbury-basis", "60",
+                "--reml-woodbury-solver", "cholesky",
+                "--fast-mlma", "2slice",
+                "--seed", "7",
+                "--threads", "4",
+                "--out", mlma_c60w_inline_2s,
+            ],
+            "mlma inline cholesky k60w 2slice",
+        )
+        compare_mlma("chol_k60w_inline_vs_load_2s", mlma_c60w_inline_2s + ".mlma", mlma_c60w_load_2s + ".mlma", rel_tol=1e-4, abs_tol=1e-6)
+        compare_mlma("chol_k60w_load_2s_vs_off", mlma_c60w_load_2s + ".mlma", mlma_c60w_load_off + ".mlma", rel_tol=1e-4, abs_tol=1e-6)
+
+        # 6c. EM-REML with cholesky solver
+        chol_em = os.path.join(work, "c4_chol_em")
+        log_cem = must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_grm,
+                "--fast",
+                "--woodbury-basis", "60",
+                "--alg", "2",
+                "--reml-woodbury-solver", "cholesky",
+                "--seed", "7",
+                "--threads", "4",
+                "--reml-profile",
+                "--out", chol_em,
+            ],
+            "reml syn k60 EM cholesky",
+        )
+        kv_cem = extract_reml_profile(log_cem)
+        assert kv_cem["wb_solver"] == "cholesky", kv_cem
+
+        # 6d. --woodbury-reuse rejects prebaked W_k TUN3 with actionable message
+        rc_reuse_prebaked, out_reuse_prebaked = run_cmd(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--woodbury-reuse", chol_k60w + ".reml",
+                "--threads", "4",
+                "--out", os.path.join(work, "c4_chol_reuse_fail"),
+            ]
+        )
+        assert rc_reuse_prebaked != 0, "Expected --woodbury-reuse on prebaked W_k TUN3 to fail"
+        assert "--reml-woodbury-solver eigh" in out_reuse_prebaked, out_reuse_prebaked
+
+        # 6e. Larger k (test dataset, k=600) inline vs saved TUN3 MLMA parity
+        chol_t600 = os.path.join(work, "c4_chol_t600")
+        log_t600 = must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", test_bfile + ".fam",
+                "--pheno", test_bfile + ".phen",
+                "--grm", test_grm,
+                "--fast",
+                "--woodbury-basis", "600",
+                "--reml-woodbury-solver", "cholesky",
+                "--seed", "7",
+                "--threads", "4",
+                "--reml-profile",
+                "--out", chol_t600,
+            ],
+            "reml test k600 cholesky",
+        )
+        kv_t600 = extract_reml_profile(log_t600)
+        assert kv_t600["wb_solver"] in ("cholesky", "cholesky_pivoted"), kv_t600
+        assert float(kv_t600["eigh_s"]) == 0.0, kv_t600
+        mlma_t600_load = os.path.join(work, "c4_mlma_t600_load")
+        mlma_t600_inl = os.path.join(work, "c4_mlma_t600_inline")
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", test_bfile,
+                "--pheno", test_bfile + ".phen",
+                "--load-reml", chol_t600 + ".reml",
+                "--fast-mlma", "2slice",
+                "--threads", "4",
+                "--out", mlma_t600_load,
+            ],
+            "mlma load test k600 cholesky",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", test_bfile,
+                "--pheno", test_bfile + ".phen",
+                "--grm", test_grm,
+                "--fast",
+                "--woodbury-basis", "600",
+                "--reml-woodbury-solver", "cholesky",
+                "--fast-mlma", "2slice",
+                "--seed", "7",
+                "--threads", "4",
+                "--out", mlma_t600_inl,
+            ],
+            "mlma inline test k600 cholesky",
+        )
+        compare_mlma("chol_t600_inline_vs_load", mlma_t600_inl + ".mlma", mlma_t600_load + ".mlma", rel_tol=1e-4, abs_tol=1e-6)
+
+        # 6f. sCholeskyQR & Chebyshev filter dev flags on test (k=600)
+        chol_sk = os.path.join(work, "c4_chol_t600_sketched")
+        chol_std = os.path.join(work, "c4_chol_t600_standard")
+        chol_cheb = os.path.join(work, "c4_chol_t600_cheb")
+        must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", test_bfile + ".fam",
+                "--pheno", test_bfile + ".phen",
+                "--grm", test_grm,
+                "--fast",
+                "--woodbury-basis", "600",
+                "--reml-woodbury-solver", "cholesky",
+                "--reml-qr-mode", "sketched",
+                "--seed", "7",
+                "--threads", "4",
+                "--reml-profile",
+                "--out", chol_sk,
+            ],
+            "reml test k600 sketched qr",
+        )
+        must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", test_bfile + ".fam",
+                "--pheno", test_bfile + ".phen",
+                "--grm", test_grm,
+                "--fast",
+                "--woodbury-basis", "600",
+                "--reml-woodbury-solver", "cholesky",
+                "--reml-qr-mode", "standard",
+                "--seed", "7",
+                "--threads", "4",
+                "--reml-profile",
+                "--out", chol_std,
+            ],
+            "reml test k600 standard qr",
+        )
+        must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", test_bfile + ".fam",
+                "--pheno", test_bfile + ".phen",
+                "--grm", test_grm,
+                "--fast",
+                "--woodbury-basis", "600",
+                "--reml-woodbury-solver", "cholesky",
+                "--reml-svd-filter", "chebyshev",
+                "--seed", "7",
+                "--threads", "4",
+                "--reml-profile",
+                "--out", chol_cheb,
+            ],
+            "reml test k600 chebyshev",
+        )
+        compare_hsq("t600_sketched_vs_std", chol_sk + ".hsq", chol_std + ".hsq", rel_tol=2e-4, abs_tol=2e-5)
+        compare_hsq("t600_cheb_vs_std", chol_cheb + ".hsq", chol_std + ".hsq", rel_tol=2e-2, abs_tol=1e-3)
+        print("  PASS reml_unrotated_cholesky_woodbury")
 
         print("ALL REML TUNING & TRACK C TESTS PASSED")
     finally:

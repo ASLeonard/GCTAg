@@ -525,6 +525,31 @@ RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r, bool add_subcmd_level
              {"on", RemlReuseStream::On}},
             "RemlReuseStream", /*allow_numeric=*/false))
         ->group("");
+    reml->add_option("--reml-woodbury-solver", r.reml_woodbury_solver,
+                     "Dev: Woodbury REML solver: auto (default), cholesky (unrotated, no dsyevd), or eigh")
+        ->transform(make_enum_transformer<RemlWoodburySolver>(
+            {{"auto", RemlWoodburySolver::Auto},
+             {"cholesky", RemlWoodburySolver::Cholesky},
+             {"eigh", RemlWoodburySolver::Eigh}},
+            "{auto,cholesky,eigh}"))
+        ->group("");
+    reml->add_option("--reml-qr-mode", r.reml_qr_mode,
+                     "Dev: CholeskyQR mode {auto,sketched,standard}")
+        ->transform(make_enum_transformer<RemlQrMode>(
+            {{"auto", RemlQrMode::Auto},
+             {"sketched", RemlQrMode::Sketched},
+             {"standard", RemlQrMode::Standard}},
+            "{auto,sketched,standard}",
+            /*allow_numeric=*/false))
+        ->group("");
+    reml->add_option("--reml-svd-filter", r.reml_svd_filter,
+                     "Dev: rSVD subspace filter {power,chebyshev}")
+        ->transform(make_enum_transformer<RemlSvdFilter>(
+            {{"power", RemlSvdFilter::Power},
+             {"chebyshev", RemlSvdFilter::Chebyshev}},
+            "{power,chebyshev}",
+            /*allow_numeric=*/false))
+        ->group("");
 
     const std::vector<CLI::Option*> wb_tuning_opts = {
         o_wb_mp_margin, o_wb_mp_confirm, o_wb_eig_mass, o_wb_eig_k_buffer,
@@ -704,6 +729,9 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
     grm_make->add_flag("--fast", grm_make_opts.fast,
                        "Hyperscale fast preset: VanRaden INT8 (--alg 1) + native FP16 GRM (--grm-fp16)")
         ->group("GRM Build");
+    grm_make->add_flag("--impute-mean,--grm-impute-mean", grm_make_opts.impute_mean,
+                       "Mean-impute missing genotypes in INT8 VanRaden GRM (keeps 4 B/elem int32 path; omits .grm.N.bin for .grm.f16)")
+        ->group("GRM Build");
     gm_fp16->excludes(gm_sparse, gm_part);
 
     // Hidden developer tuning options (omitted from --help via group(""))
@@ -768,6 +796,23 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
         }
         if (grm_make_opts.grm_fp16 && grm_make_opts.part.has_value()) {
             throw CLI::ValidationError("--grm-fp16", "cannot be combined with --part (use --tile-budget instead).");
+        }
+        if (grm_make_opts.impute_mean) {
+            if (grm_make_opts.dominance || grm_make_opts.homogametic) {
+                throw CLI::ValidationError("--impute-mean", "is only supported for autosomal additive VanRaden GRM (--alg 1 or --fast).");
+            }
+            if (grm_make_opts.alg != GrmAlg::VanRaden) {
+                throw CLI::ValidationError("--impute-mean", "requires --alg 1 (vanraden) or --fast.");
+            }
+            if (grm_make_opts.legacy_engine) {
+                throw CLI::ValidationError("--impute-mean", "cannot be combined with --grm-legacy-engine.");
+            }
+            if (grm_make_opts.geno.bfile.empty() && grm_make_opts.geno.mbfile.empty()) {
+                throw CLI::ValidationError("--impute-mean", "requires PLINK1 BED input (--bfile or --mbfile).");
+            }
+            if (!grm_make_opts.geno.update_freq.empty()) {
+                throw CLI::ValidationError("--impute-mean", "cannot be combined with --update-freq.");
+            }
         }
         out.command = std::move(grm_make_opts);
     });

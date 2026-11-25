@@ -2708,9 +2708,10 @@ inline void PackedGrmFp16::symm_large_k(
         strip_scratch_bf16_.clear();
     }
 
-    const int H = std::clamp(band_rows > 0 ? band_rows : 8192, 64, n_);
+    const int auto_H = (n_ >= 32768 && cols >= 2048) ? 16384 : 8192;
+    const int H = std::clamp(band_rows > 0 ? band_rows : auto_H, 64, n_);
     const size_t elem_b = use_bf16 ? sizeof(uint16_t) : sizeof(float);
-    const size_t max_elems = (1ULL << 30) / elem_b;
+    const size_t max_elems = ((use_bf16 ? 1ULL : 2ULL) << 30) / elem_b;
     int C = (col_chunk > 0)
         ? col_chunk
         : static_cast<int>(std::clamp<size_t>(

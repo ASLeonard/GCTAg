@@ -234,9 +234,62 @@ double wb_inner(const RemlCtx& ctx, const WoodburySubspaceVec& u, const Woodbury
     return par_dot + perp_dot;
 }
 
+RemlVec wb_apply_B_vec(const RemlCtx& ctx, const RemlVec& v) {
+    const int k = ctx.woodbury_basis_rank_;
+    RemlVec out = RemlVec::Zero(k);
+    if (k <= 0) return out;
+    cblas_dsymv(CblasColMajor, CblasUpper,
+                static_cast<gcta_blas_int>(k),
+                1.0, ctx.wb_B.data(), static_cast<gcta_blas_int>(k),
+                v.data(), 1,
+                0.0, out.data(), 1);
+    return out;
+}
+
+RemlMat wb_apply_B_mat(const RemlCtx& ctx, const RemlMat& M) {
+    const int k = ctx.woodbury_basis_rank_;
+    const int cols = static_cast<int>(M.cols());
+    RemlMat out = RemlMat::Zero(k, cols);
+    if (k <= 0 || cols <= 0) return out;
+    cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
+                static_cast<gcta_blas_int>(k), static_cast<gcta_blas_int>(cols),
+                1.0, ctx.wb_B.data(), static_cast<gcta_blas_int>(k),
+                M.data(), static_cast<gcta_blas_int>(M.outerStride()),
+                0.0, out.data(), static_cast<gcta_blas_int>(out.outerStride()));
+    return out;
+}
+
+// Compute V_Q^{-1} v = U^{-1} (U^{-T} v), where ctx.wb_VQ_Uinv holds upper-triangular T = U^{-1}.
+RemlVec wb_apply_VQi_vec(const RemlCtx& ctx, const RemlVec& v) {
+    const int k = ctx.woodbury_basis_rank_;
+    RemlVec out = v;
+    if (k <= 0) return out;
+    const gcta_blas_int bk = static_cast<gcta_blas_int>(k);
+    cblas_dtrmv(CblasColMajor, CblasUpper, CblasTrans, CblasNonUnit,
+                bk, ctx.wb_VQ_Uinv.data(), bk, out.data(), 1);
+    cblas_dtrmv(CblasColMajor, CblasUpper, CblasNoTrans, CblasNonUnit,
+                bk, ctx.wb_VQ_Uinv.data(), bk, out.data(), 1);
+    return out;
+}
+
+RemlMat wb_apply_VQi_mat(const RemlCtx& ctx, const RemlMat& M) {
+    const int k = ctx.woodbury_basis_rank_;
+    const int cols = static_cast<int>(M.cols());
+    RemlMat out = M;
+    if (k <= 0 || cols <= 0) return out;
+    const gcta_blas_int bk = static_cast<gcta_blas_int>(k);
+    const gcta_blas_int bc = static_cast<gcta_blas_int>(cols);
+    const gcta_blas_int ld = static_cast<gcta_blas_int>(out.outerStride());
+    cblas_dtrmm(CblasColMajor, CblasLeft, CblasUpper, CblasTrans, CblasNonUnit,
+                bk, bc, 1.0, ctx.wb_VQ_Uinv.data(), bk, out.data(), ld);
+    cblas_dtrmm(CblasColMajor, CblasLeft, CblasUpper, CblasNoTrans, CblasNonUnit,
+                bk, bc, 1.0, ctx.wb_VQ_Uinv.data(), bk, out.data(), ld);
+    return out;
+}
+
 WoodburySubspaceVec wb_apply_K(const RemlCtx& ctx, const WoodburySubspaceVec& v) {
     WoodburySubspaceVec out;
-    out.par   = ctx.dk.cwiseProduct(v.par);
+    out.par   = ctx.wb_unrotated ? wb_apply_B_vec(ctx, v.par) : ctx.dk.cwiseProduct(v.par);
     out.alpha = ctx.lambda_tail * v.alpha;
     out.beta  = ctx.lambda_tail * v.beta;
     return out;
@@ -244,7 +297,9 @@ WoodburySubspaceVec wb_apply_K(const RemlCtx& ctx, const WoodburySubspaceVec& v)
 
 WoodburySubspaceVec wb_apply_P(const RemlCtx& ctx, const WoodburySubspaceVec& v) {
     const double inv_s2 = 1.0 / ctx.sigma2_eff;
-    const RemlVec w_par   = ((1.0 - ctx.ck.array()) * inv_s2).matrix().cwiseProduct(v.par);
+    const RemlVec w_par = ctx.wb_unrotated
+        ? wb_apply_VQi_vec(ctx, v.par)
+        : ((1.0 - ctx.ck.array()) * inv_s2).matrix().cwiseProduct(v.par);
     const RemlVec w_alpha = inv_s2 * v.alpha;
     const double  w_beta  = inv_s2 * v.beta;
 
@@ -276,7 +331,11 @@ RemlMat woodbury_basis_KZ(const RemlCtx& ctx, const RemlMat& Z) {
     const int k = ctx.woodbury_basis_rank_;
     const Eigen::MatrixXf Zf = Z.cast<float>();
     RemlMat UkZ = (ctx.Uk_is_transposed ? (ctx.Uk * Zf).eval() : (ctx.Uk.leftCols(k).transpose() * Zf).eval()).cast<double>();
-    UkZ.array().colwise() *= (ctx.dk.array() - ctx.lambda_tail);
+    if (ctx.wb_unrotated) {
+        UkZ = wb_apply_B_mat(ctx, UkZ) - ctx.lambda_tail * UkZ;
+    } else {
+        UkZ.array().colwise() *= (ctx.dk.array() - ctx.lambda_tail);
+    }
     const Eigen::MatrixXf UkZf = UkZ.cast<float>();
     const Eigen::MatrixXf back = ctx.Uk_is_transposed ? (ctx.Uk.transpose() * UkZf).eval() : (ctx.Uk.leftCols(k) * UkZf).eval();
     return ctx.lambda_tail * Z + back.cast<double>();
@@ -286,7 +345,11 @@ RemlVec woodbury_basis_Viv(const RemlCtx& ctx, const RemlVec& v) {
     const int k = ctx.woodbury_basis_rank_;
     const Eigen::VectorXf vf = v.cast<float>();
     RemlVec Ukv = (ctx.Uk_is_transposed ? (ctx.Uk * vf).eval() : (ctx.Uk.leftCols(k).transpose() * vf).eval()).cast<double>();
-    Ukv.array() *= ctx.ck.array();
+    if (ctx.wb_unrotated) {
+        Ukv.noalias() -= ctx.sigma2_eff * wb_apply_VQi_vec(ctx, Ukv);
+    } else {
+        Ukv.array() *= ctx.ck.array();
+    }
     const Eigen::VectorXf Ukvf = Ukv.cast<float>();
     const Eigen::VectorXf back = ctx.Uk_is_transposed ? (ctx.Uk.transpose() * Ukvf).eval() : (ctx.Uk.leftCols(k) * Ukvf).eval();
     return (v - back.cast<double>()) / ctx.sigma2_eff;
@@ -296,7 +359,11 @@ RemlMat woodbury_basis_ViZ(const RemlCtx& ctx, const RemlMat& Z) {
     const int k = ctx.woodbury_basis_rank_;
     const Eigen::MatrixXf Zf = Z.cast<float>();
     RemlMat UkZ = (ctx.Uk_is_transposed ? (ctx.Uk * Zf).eval() : (ctx.Uk.leftCols(k).transpose() * Zf).eval()).cast<double>();
-    UkZ.array().colwise() *= ctx.ck.array();
+    if (ctx.wb_unrotated) {
+        UkZ.noalias() -= ctx.sigma2_eff * wb_apply_VQi_mat(ctx, UkZ);
+    } else {
+        UkZ.array().colwise() *= ctx.ck.array();
+    }
     const Eigen::MatrixXf UkZf = UkZ.cast<float>();
     const Eigen::MatrixXf back = ctx.Uk_is_transposed ? (ctx.Uk.transpose() * UkZf).eval() : (ctx.Uk.leftCols(k) * UkZf).eval();
     return (Z - back.cast<double>()) / ctx.sigma2_eff;
@@ -450,9 +517,15 @@ bool init_varcomp(RemlCtx& ctx,
             // Pure spectral-subspace HE warm-start: O(k * c^2), zero Uk scans after cache build.
             ensure_woodbury_subspace_cache(ctx);
             const int k = ctx.woodbury_basis_rank_;
-            trK  = ctx.dk.sum() + static_cast<double>(n - k) * ctx.lambda_tail;
-            trK2 = ctx.dk.squaredNorm()
-                 + static_cast<double>(n - k) * (ctx.tail_d_var + ctx.lambda_tail * ctx.lambda_tail);
+            if (ctx.wb_unrotated) {
+                trK  = ctx.wb_tr_B + static_cast<double>(n - k) * ctx.lambda_tail;
+                trK2 = ctx.wb_tr_B2
+                     + static_cast<double>(n - k) * (ctx.tail_d_var + ctx.lambda_tail * ctx.lambda_tail);
+            } else {
+                trK  = ctx.dk.sum() + static_cast<double>(n - k) * ctx.lambda_tail;
+                trK2 = ctx.dk.squaredNorm()
+                     + static_cast<double>(n - k) * (ctx.tail_d_var + ctx.lambda_tail * ctx.lambda_tail);
+            }
 
             const RemlMat XtX = ctx.UkTX.transpose() * ctx.UkTX + ctx.wb_XtX_perp;
             XtX_ldlt.compute(XtX);
@@ -461,10 +534,17 @@ bool init_varcomp(RemlCtx& ctx,
             const RemlVec Xty = ctx.UkTX.transpose() * ctx.UkTy + ctx.wb_Xty_perp;
             const RemlVec beta_ols = XtX_ldlt.solve(Xty);
 
-            const RemlMat dk_UkTX = ctx.dk.asDiagonal() * ctx.UkTX;
-            XtKX.noalias()  = ctx.UkTX.transpose() * dk_UkTX + ctx.lambda_tail * ctx.wb_XtX_perp;
-            XtK2X.noalias() = dk_UkTX.transpose() * dk_UkTX
-                            + (ctx.lambda_tail * ctx.lambda_tail) * ctx.wb_XtX_perp;
+            if (ctx.wb_unrotated) {
+                const RemlMat B_UkTX = wb_apply_B_mat(ctx, ctx.UkTX);
+                XtKX.noalias()  = ctx.UkTX.transpose() * B_UkTX + ctx.lambda_tail * ctx.wb_XtX_perp;
+                XtK2X.noalias() = B_UkTX.transpose() * B_UkTX
+                                + (ctx.lambda_tail * ctx.lambda_tail) * ctx.wb_XtX_perp;
+            } else {
+                const RemlMat dk_UkTX = ctx.dk.asDiagonal() * ctx.UkTX;
+                XtKX.noalias()  = ctx.UkTX.transpose() * dk_UkTX + ctx.lambda_tail * ctx.wb_XtX_perp;
+                XtK2X.noalias() = dk_UkTX.transpose() * dk_UkTX
+                                + (ctx.lambda_tail * ctx.lambda_tail) * ctx.wb_XtX_perp;
+            }
 
             WoodburySubspaceVec yr_sub;
             yr_sub.par   = ctx.UkTy - ctx.UkTX * beta_ols;
@@ -716,6 +796,67 @@ bool calcu_Vi(RemlCtx& ctx, RemlVec& prev_varcmp, double& logdet, int& iter, boo
         if (ctx.sigma2_eff <= 0.0) return false;
         ctx.sg2 = sg2;
         const int k = ctx.woodbury_basis_rank_;
+
+        if (ctx.wb_unrotated) {
+            if (ctx.wb_VQ_Uinv.rows() != k || ctx.wb_VQ_Uinv.cols() != k) {
+                ctx.wb_VQ_Uinv.resize(k, k);
+            }
+            const double* const b_ptr = ctx.wb_B.data();
+            double* const u_ptr = ctx.wb_VQ_Uinv.data();
+            #pragma omp parallel for schedule(guided) if (k >= 128)
+            for (int j = 0; j < k; ++j) {
+                const double* __restrict__ bcol = b_ptr + static_cast<size_t>(j) * static_cast<size_t>(k);
+                double* __restrict__ ucol = u_ptr + static_cast<size_t>(j) * static_cast<size_t>(k);
+                #pragma omp simd
+                for (int i = 0; i < j; ++i) {
+                    ucol[i] = sg2 * bcol[i];
+                }
+                ucol[j] = sg2 * bcol[j] + se2;
+            }
+            const gcta_blas_int bk = static_cast<gcta_blas_int>(k);
+            {
+                ScopedBlasThreadCap cap(k >= 512 ? std::min(omp_get_max_threads(), 48) : 0);
+                if (gcta_dpotrf(bk, u_ptr, bk, 'U') != 0) return false;
+            }
+
+            double logdet_vq = 0.0;
+            bool diag_ok = true;
+            for (int j = 0; j < k; ++j) {
+                const double d = u_ptr[static_cast<size_t>(j) * static_cast<size_t>(k) + static_cast<size_t>(j)];
+                if (!(d > 0.0) || !std::isfinite(d)) {
+                    diag_ok = false;
+                    break;
+                }
+                logdet_vq += std::log(d);
+            }
+            if (!diag_ok) return false;
+
+            logdet = static_cast<double>(ctx.n - k) * std::log(ctx.sigma2_eff) + 2.0 * logdet_vq;
+            if (ctx.tail_d_var > 0.0) {
+                const double r = sg2 / ctx.sigma2_eff;
+                logdet -= 0.5 * r * r * static_cast<double>(ctx.n - k) * ctx.tail_d_var;
+            }
+
+            {
+                ScopedBlasThreadCap cap(k >= 512 ? std::min(omp_get_max_threads(), 48) : 0);
+                if (gcta_dtrtri(bk, u_ptr, bk, 'U') != 0) return false;
+            }
+
+            double tr_vqi = 0.0;
+            #pragma omp parallel for reduction(+:tr_vqi) schedule(guided) if (k >= 128)
+            for (int j = 0; j < k; ++j) {
+                const double* __restrict__ ucol = u_ptr + static_cast<size_t>(j) * static_cast<size_t>(k);
+                double col_sq = 0.0;
+                #pragma omp simd reduction(+:col_sq)
+                for (int i = 0; i <= j; ++i) {
+                    col_sq += ucol[i] * ucol[i];
+                }
+                tr_vqi += col_sq;
+            }
+            ctx.wb_tr_VQi = tr_vqi;
+            return true;
+        }
+
         ctx.ck.resize(k);
         logdet = static_cast<double>(ctx.n - k) * std::log(ctx.sigma2_eff);
         for (int j = 0; j < k; ++j) {
@@ -809,16 +950,22 @@ double calcu_P_impl(RemlCtx& ctx, RemlMat* P) {
     if (ctx.Vi_use_woodbury_basis) {
         ensure_woodbury_subspace_cache(ctx);
         const double inv_s2 = 1.0 / ctx.sigma2_eff;
-        ctx.Uk_Vi_X = ((1.0 - ctx.ck.array()) * inv_s2).matrix().asDiagonal() * ctx.UkTX;
+        ctx.Uk_Vi_X = ctx.wb_unrotated
+            ? wb_apply_VQi_mat(ctx, ctx.UkTX)
+            : ((1.0 - ctx.ck.array()) * inv_s2).matrix().asDiagonal() * ctx.UkTX;
         ctx.Xt_Vi_X_i.noalias()  = ctx.UkTX.transpose() * ctx.Uk_Vi_X;
         ctx.Xt_Vi_X_i.noalias() += inv_s2 * ctx.wb_XtX_perp;
         if (P) {
-            const RemlMat ck_UkTX = ctx.ck.asDiagonal() * ctx.UkTX;
-            const Eigen::MatrixXf ck_UkTX_f = ck_UkTX.cast<float>();
-            const Eigen::MatrixXf back = ctx.Uk_is_transposed
-                ? (ctx.Uk.transpose() * ck_UkTX_f).eval()
-                : (ctx.Uk.leftCols(ctx.woodbury_basis_rank_) * ck_UkTX_f).eval();
-            ctx.Vi_X = (ctx.X - back.cast<double>()) * inv_s2;
+            if (ctx.wb_unrotated) {
+                ctx.Vi_X = woodbury_basis_ViZ(ctx, ctx.X);
+            } else {
+                const RemlMat ck_UkTX = ctx.ck.asDiagonal() * ctx.UkTX;
+                const Eigen::MatrixXf ck_UkTX_f = ck_UkTX.cast<float>();
+                const Eigen::MatrixXf back = ctx.Uk_is_transposed
+                    ? (ctx.Uk.transpose() * ck_UkTX_f).eval()
+                    : (ctx.Uk.leftCols(ctx.woodbury_basis_rank_) * ck_UkTX_f).eval();
+                ctx.Vi_X = (ctx.X - back.cast<double>()) * inv_s2;
+            }
         }
     } else if (ctx.Vi_use_llt) {
         ctx.Vi_X = ctx.X;
@@ -888,11 +1035,24 @@ void calcu_tr_PA_woodbury(const RemlCtx& ctx, RemlVec& tr_PA, RemlVec* tr_PA_cor
     const double lambda_t   = ctx.lambda_tail;
     const int    n          = ctx.n;
     const int    k          = ctx.woodbury_basis_rank_;
-    const double sum_ck     = ctx.ck.sum();
-    const double tr_Vinv    = (n - sum_ck) * inv_s2;
-    const double tr_Vinv_K  = (sg2 > 1e-15)
-        ? (n * lambda_t * inv_s2 + (se2 / (sg2 * sigma2_eff)) * sum_ck)
-        : tr_Vinv * lambda_t;
+    double tr_Vinv = 0.0;
+    double tr_Vinv_K = 0.0;
+    if (ctx.wb_unrotated) {
+        tr_Vinv = ctx.wb_tr_VQi + static_cast<double>(n - k) * inv_s2;
+        double tr_VQi_B = 0.0;
+        if (std::fabs(sg2) > 1e-6 * std::max(1.0, std::fabs(se2))) {
+            tr_VQi_B = (static_cast<double>(k) - se2 * ctx.wb_tr_VQi) / sg2;
+        } else if (std::fabs(se2) > 1e-15) {
+            tr_VQi_B = ctx.wb_tr_B / se2 - (sg2 / (se2 * se2)) * ctx.wb_tr_B2;
+        }
+        tr_Vinv_K = tr_VQi_B + static_cast<double>(n - k) * lambda_t * inv_s2;
+    } else {
+        const double sum_ck = ctx.ck.sum();
+        tr_Vinv   = (n - sum_ck) * inv_s2;
+        tr_Vinv_K = (sg2 > 1e-15)
+            ? (n * lambda_t * inv_s2 + (se2 / (sg2 * sigma2_eff)) * sum_ck)
+            : tr_Vinv * lambda_t;
+    }
 
     // Spectral-subspace Gram: Vi_X^T Vi_X = Uk_Vi_X^T Uk_Vi_X + inv_s2^2 * XtX_perp (O(k * c^2)).
     const int c = ctx.X_c;
@@ -903,10 +1063,16 @@ void calcu_tr_PA_woodbury(const RemlCtx& ctx, RemlVec& tr_PA, RemlVec* tr_PA_cor
 
     tr_PA(ncomp - 1) = tr_Vinv - tr_corr_I;
 
-    RemlVec delta = ctx.dk.array() - ctx.lambda_tail;
-    RemlMat delta_UkViX = delta.asDiagonal() * ctx.Uk_Vi_X;
     RemlMat ViX_K_ViX = lambda_t * ViXTViX;
-    ViX_K_ViX.noalias() += ctx.Uk_Vi_X.transpose() * delta_UkViX;
+    if (ctx.wb_unrotated) {
+        RemlMat B_UkViX = wb_apply_B_mat(ctx, ctx.Uk_Vi_X);
+        B_UkViX.noalias() -= lambda_t * ctx.Uk_Vi_X;
+        ViX_K_ViX.noalias() += ctx.Uk_Vi_X.transpose() * B_UkViX;
+    } else {
+        RemlVec delta = ctx.dk.array() - ctx.lambda_tail;
+        RemlMat delta_UkViX = delta.asDiagonal() * ctx.Uk_Vi_X;
+        ViX_K_ViX.noalias() += ctx.Uk_Vi_X.transpose() * delta_UkViX;
+    }
     const double tr_corr_K = ctx.Xt_Vi_X_i.cwiseProduct(ViX_K_ViX.transpose()).sum();
 
     tr_PA(0) = tr_Vinv_K - tr_corr_K;
@@ -2265,7 +2431,303 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     rsvd_opts.eigh_fp32          = ctx.reml_eigh_fp32;
     rsvd_opts.eigh_threads       = ctx.reml_eigh_threads;
     rsvd_opts.keep_trailing_cols = true;
+    rsvd_opts.qr_mode            = ctx.reml_qr_mode;
+    rsvd_opts.chebyshev_filter   = ctx.svd_chebyshev;
     gcta_eigh::RsvdProfileStats* const prof_ptr = ctx.reml_profile ? &ctx.reml_rsvd_prof : nullptr;
+
+    const bool unrotated_allowed = (mode == WoodburyBasisSpec::Kind::Fixed && !ctx.svd_nystrom);
+    bool use_unrotated = false;
+    if (ctx.reml_woodbury_solver == RemlWoodburySolver::Cholesky) {
+        if (!unrotated_allowed) {
+            LOGGER.w(0, "--reml-woodbury-solver cholesky requires fixed-k power-iteration rSVD; "
+                        "falling back to eigh.");
+        } else {
+            use_unrotated = true;
+        }
+    } else if (ctx.reml_woodbury_solver == RemlWoodburySolver::Auto) {
+        use_unrotated = unrotated_allowed && !ctx.reml_eigh_fp32 && (k_svd >= 1024);
+    }
+
+    auto deflate_bottom_modes_of_range_gram = [&](Eigen::MatrixXf& Q, Eigen::MatrixXd& B, int k_work) {
+        const int k_ext = static_cast<int>(B.rows());
+        const int n_rows = static_cast<int>(Q.rows());
+        const int p_drop = k_ext - k_work;
+        if (p_drop <= 0 || k_work <= 0 || n_rows <= 0) return;
+
+        // Mirror upper -> lower triangle so B is full symmetric.
+        B.triangularView<Eigen::StrictlyLower>() = B.triangularView<Eigen::StrictlyUpper>().transpose();
+        const gcta_blas_int b_kext = static_cast<gcta_blas_int>(k_ext);
+        const int lapack_cap = (k_ext >= 512) ? std::min(omp_get_max_threads(), 48) : 0;
+
+        RemlMat Z_bot;
+        if (k_ext <= 256) {
+            RemlMat B_copy = B;
+            Eigen::VectorXd w_tmp;
+            Eigen::MatrixXd Z_all;
+            gcta_eigh::detail::eigh_upper_asc_d(B_copy, w_tmp, Z_all, lapack_cap);
+            Z_bot = Z_all.leftCols(p_drop);
+        } else {
+            // Estimate upper bound mu > lambda_max(B) via 8 power steps.
+            RemlVec v = RemlVec::Ones(k_ext) / std::sqrt(static_cast<double>(k_ext));
+            RemlVec Bv(k_ext);
+            double mu_est = 1.0;
+            for (int it = 0; it < 8; ++it) {
+                cblas_dsymv(CblasColMajor, CblasUpper, b_kext,
+                            1.0, B.data(), b_kext, v.data(), 1, 0.0, Bv.data(), 1);
+                const double rq = v.dot(Bv);
+                const double nrm = Bv.norm();
+                mu_est = std::max(mu_est, std::max(rq, nrm));
+                if (nrm > 1e-15) v = Bv / nrm;
+            }
+            const double mu = 1.05 * mu_est + 1.0e-6;
+            const double tr_est = B.diagonal().sum() / static_cast<double>(k_ext);
+            const double a_cut = std::max(0.0, std::min(0.5 * tr_est, 0.25 * mu));
+            const double c_ch = 0.5 * (mu + a_cut);
+            const double e_ch = std::max(1.0e-6, 0.5 * (mu - a_cut));
+            const double inv_e = 1.0 / e_ch;
+            const double two_inv_e = 2.0 * inv_e;
+
+            // 2 rounds of degree-8 Chebyshev polynomial filtering mapped to [a_cut, mu]
+            // to suppress bulk/top modes exponentially and isolate the bottom p_drop modes.
+            const int b = std::min(k_ext / 2, std::max(p_drop + 32, 64));
+            const gcta_blas_int bw = static_cast<gcta_blas_int>(b);
+            RemlMat T0(k_ext, b);
+            RemlMat T1(k_ext, b);
+            RemlMat BT(k_ext, b);
+            gcta_eigh::fill_standard_normal(T0);
+            gcta_qr_thin_Q(b_kext, bw, T0.data(), b_kext);
+
+            for (int rnd = 0; rnd < 2; ++rnd) {
+                cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
+                            b_kext, bw, 1.0, B.data(), b_kext,
+                            T0.data(), b_kext, 0.0, BT.data(), b_kext);
+                T1.noalias() = (BT - c_ch * T0) * inv_e;
+                for (int deg = 2; deg <= 8; ++deg) {
+                    cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
+                                b_kext, bw, 1.0, B.data(), b_kext,
+                                T1.data(), b_kext, 0.0, BT.data(), b_kext);
+                    T0.noalias() = two_inv_e * (BT - c_ch * T1) - T0;
+                    T0.swap(T1);
+                }
+                T0.swap(T1);
+                gcta_qr_thin_Q(b_kext, bw, T0.data(), b_kext);
+            }
+
+            cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
+                        b_kext, bw, 1.0, B.data(), b_kext,
+                        T0.data(), b_kext, 0.0, BT.data(), b_kext);
+            RemlMat H_K = T0.transpose() * BT;
+            H_K = 0.5 * (H_K + H_K.transpose());
+
+            Eigen::VectorXd w_K;
+            Eigen::MatrixXd Z_K;
+            gcta_eigh::detail::eigh_upper_asc_d(H_K, w_K, Z_K, lapack_cap);
+            Z_bot.noalias() = T0 * Z_K.leftCols(p_drop);
+        }
+
+        // Deflate span(Z_bot) via Compact-WY Householder reflector:
+        //   Z_bot = H * R, H = I - V_H T_H V_H^T -> new span is H[:, p_drop : k_ext].
+        RemlVec tau(p_drop);
+        if (gcta_dgeqrf(b_kext, static_cast<gcta_blas_int>(p_drop),
+                        Z_bot.data(), b_kext, tau.data()) != 0) {
+            return;
+        }
+        RemlMat V_H = RemlMat::Zero(k_ext, p_drop);
+        for (int j = 0; j < p_drop; ++j) {
+            V_H(j, j) = 1.0;
+            for (int i = j + 1; i < k_ext; ++i) {
+                V_H(i, j) = Z_bot(i, j);
+            }
+        }
+        Z_bot.resize(0, 0);
+
+        RemlMat T_H = RemlMat::Zero(p_drop, p_drop);
+        for (int j = 0; j < p_drop; ++j) {
+            if (j > 0) {
+                const RemlVec z = -tau[j] * (V_H.leftCols(j).transpose() * V_H.col(j));
+                T_H.col(j).head(j) = T_H.topLeftCorner(j, j).triangularView<Eigen::Upper>() * z;
+            }
+            T_H(j, j) = tau[j];
+        }
+        const RemlMat M_H = T_H * V_H.bottomRows(k_work).transpose();  // p_drop x k_work
+
+        // Update Q (n x k_ext -> n x k_work) in float32.
+        {
+            const Eigen::MatrixXf V_Hf = V_H.cast<float>();
+            const Eigen::MatrixXf M_Hf = M_H.cast<float>();
+            Eigen::MatrixXf W_Q(n_rows, p_drop);
+            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<gcta_blas_int>(n_rows),
+                        static_cast<gcta_blas_int>(p_drop),
+                        b_kext,
+                        1.0f, Q.data(), static_cast<gcta_blas_int>(n_rows),
+                        V_Hf.data(), b_kext,
+                        0.0f, W_Q.data(), static_cast<gcta_blas_int>(n_rows));
+
+            // Shift Q[:, p_drop : k_ext] -> Q[:, 0 : k_work] in parallel by row slabs.
+            #pragma omp parallel if (static_cast<size_t>(n_rows) * static_cast<size_t>(k_work) >= 32768)
+            {
+                const int tid = omp_get_thread_num();
+                const int nt = omp_get_num_threads();
+                const int r0 = static_cast<int>((static_cast<int64_t>(n_rows) * tid) / nt);
+                const int r1 = static_cast<int>((static_cast<int64_t>(n_rows) * (tid + 1)) / nt);
+                const size_t bytes = static_cast<size_t>(r1 - r0) * sizeof(float);
+                if (bytes > 0) {
+                    for (int j = 0; j < k_work; ++j) {
+                        std::memcpy(Q.col(j).data() + r0, Q.col(j + p_drop).data() + r0, bytes);
+                    }
+                }
+            }
+            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<gcta_blas_int>(n_rows),
+                        static_cast<gcta_blas_int>(k_work),
+                        static_cast<gcta_blas_int>(p_drop),
+                        -1.0f, W_Q.data(), static_cast<gcta_blas_int>(n_rows),
+                        M_Hf.data(), static_cast<gcta_blas_int>(p_drop),
+                        1.0f, Q.data(), static_cast<gcta_blas_int>(n_rows));
+            W_Q.resize(0, 0);
+            Q.conservativeResize(Eigen::NoChange, k_work);
+        }
+
+        // Update B (k_ext x k_ext -> k_work x k_work) in double.
+        {
+            RemlMat U_B(k_ext, p_drop);
+            cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
+                        b_kext, static_cast<gcta_blas_int>(p_drop),
+                        1.0, B.data(), b_kext,
+                        V_H.data(), b_kext,
+                        0.0, U_B.data(), b_kext);
+            const RemlMat S_B = V_H.transpose() * U_B;  // p_drop x p_drop
+            const RemlMat M_HT = M_H.transpose();       // k_work x p_drop
+            const RemlMat Y_B = U_B.bottomRows(k_work) - 0.5 * (M_HT * S_B);  // k_work x p_drop
+            RemlMat B_new = B.bottomRightCorner(k_work, k_work);
+            cblas_dsyr2k(CblasColMajor, CblasUpper, CblasNoTrans,
+                         static_cast<gcta_blas_int>(k_work),
+                         static_cast<gcta_blas_int>(p_drop),
+                         -1.0,
+                         Y_B.data(), static_cast<gcta_blas_int>(k_work),
+                         M_HT.data(), static_cast<gcta_blas_int>(k_work),
+                         1.0,
+                         B_new.data(), static_cast<gcta_blas_int>(k_work));
+            B.swap(B_new);
+        }
+    };
+
+    if (use_unrotated) {
+        const int oversample = gcta_eigh::recommended_oversample(k_svd);
+        const int k_ext = std::min(k_svd + oversample, n - 1);
+        const int k_work = std::min(k_svd, k_ext);
+        const bool has_warm = (ctx.Uk.rows() == n && ctx.Uk.cols() > 0);
+        if (has_warm) {
+            const int k_warm = std::min(static_cast<int>(ctx.Uk.cols()), k_ext);
+            LOGGER << "Woodbury: seeding initial rSVD sketch with " << k_warm
+                   << " warm-start vector(s) (--reml-woodbury-basis-warm-start)." << std::endl;
+        }
+        const bool can_bf16_inplace =
+            ctx.grm_fp16 &&
+            static_cast<bool>(ctx.grm_tile_reader_f32.large_k_symm_fn) &&
+            gcta_chunked::default_bf16_sketch();
+
+        gcta_eigh::RangeGramResultF rg;
+        try {
+            if (can_bf16_inplace) {
+                auto apply_bf16_inplace = [&](const uint16_t* X_bf16_ptr, Eigen::MatrixXf& Y_mat) {
+                    double* tr_ptr  = have_chunked_traces ? nullptr : &trace_K_full;
+                    double* tr2_ptr = have_chunked_traces ? nullptr : &trace_K2;
+                    ctx.grm_tile_reader_f32.large_k_symm_fn(
+                        nullptr, static_cast<gcta_blas_int>(n), X_bf16_ptr, k_ext,
+                        Y_mat.data(), static_cast<gcta_blas_int>(n), /*use_bf16=*/true,
+                        ctx.reml_matvec_band_rows, ctx.reml_matvec_col_chunk,
+                        tr_ptr, tr2_ptr, mv_stats_ptr);
+                    if (!have_chunked_traces) {
+                        have_chunked_traces = true;
+                    }
+                };
+                auto apply_fp32 = [&](const Eigen::Ref<const Eigen::MatrixXf>& Q_ref) -> Eigen::MatrixXf {
+                    return apply(Q_ref, /*exact_fp32=*/true);
+                };
+                rg = gcta_eigh::randomized_symmetric_range_and_gram_bf16_inplace(
+                    apply_bf16_inplace, apply_fp32, n, k_ext, q_pow,
+                    has_warm ? &ctx.Uk : nullptr, rsvd_opts, prof_ptr, release_grm_storage);
+            } else {
+                using Clock = std::chrono::steady_clock;
+                const auto t_sk0 = prof_ptr ? Clock::now() : Clock::time_point{};
+                auto [omega, Y] = gcta_eigh::build_randomized_sketch_consume<float>(
+                    apply, n, k_ext, has_warm ? &ctx.Uk : nullptr, /*exact_fp32=*/false);
+                omega.resize(0, 0);
+                if (prof_ptr) {
+                    prof_ptr->sketch_matvec_s += std::chrono::duration<double>(Clock::now() - t_sk0).count();
+                }
+                rg = gcta_eigh::power_iterate_and_gram_ex<float>(
+                    apply, std::move(Y), q_pow, rsvd_opts, prof_ptr, release_grm_storage);
+            }
+        } catch (const std::exception& e) {
+            LOGGER.e(0, std::string("Woodbury: ") + e.what());
+        }
+
+        release_grm_storage();
+        if (k_ext > k_work) {
+            const auto t_def0 = ctx.reml_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            deflate_bottom_modes_of_range_gram(rg.Q, rg.B, k_work);
+            if (ctx.reml_profile) {
+                ctx.reml_wk_factor_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_def0).count();
+            }
+        }
+        if (prof_ptr) {
+            prof_ptr->matvec_unpack_s += mv_stats.unpack_s;
+            prof_ptr->matvec_gemm_s += mv_stats.gemm_s;
+            prof_ptr->matvec_tiles += mv_stats.tiles;
+            prof_ptr->matvec_gemm_calls += mv_stats.gemm_calls;
+        }
+
+        const double* const b_ptr = rg.B.data();
+        double tr_b = 0.0, diag_sq = 0.0, off_sq = 0.0;
+        #pragma omp parallel for reduction(+:tr_b,diag_sq,off_sq) schedule(guided) if (k_work >= 128)
+        for (int j = 0; j < k_work; ++j) {
+            const double* __restrict__ bcol = b_ptr + static_cast<size_t>(j) * static_cast<size_t>(k_work);
+            const double d = bcol[j];
+            tr_b += d;
+            diag_sq += d * d;
+            double col_off = 0.0;
+            #pragma omp simd reduction(+:col_off)
+            for (int i = 0; i < j; ++i) {
+                col_off += bcol[i] * bcol[i];
+            }
+            off_sq += col_off;
+        }
+        const double tr_b2 = diag_sq + 2.0 * off_sq;
+
+        ctx.lambda_tail = (n - k_work > 0)
+            ? ((trace_K_full - tr_b) / static_cast<double>(n - k_work))
+            : 0.0;
+        if (ctx.lambda_tail < 0.0) {
+            LOGGER.w(0, "Woodbury: lambda_tail < 0 (" + std::to_string(ctx.lambda_tail) + "); clamped to 0.");
+            ctx.lambda_tail = 0.0;
+        }
+        const double tail_sum_sq = std::max(0.0, trace_K2 - tr_b2);
+        ctx.tail_d_var = (n - k_work > 0)
+            ? std::max(0.0, tail_sum_sq / static_cast<double>(n - k_work) - ctx.lambda_tail * ctx.lambda_tail)
+            : 0.0;
+
+        ctx.Uk = std::move(rg.Q);
+        ctx.wb_B = std::move(rg.B);
+        ctx.wb_tr_B = tr_b;
+        ctx.wb_tr_B2 = tr_b2;
+        ctx.Uk_is_transposed = false;
+        ctx.woodbury_basis_rank_ = k_work;
+        ctx.Vi_use_woodbury_basis = true;
+        ctx.wb_unrotated = true;
+        ctx.wb_uk_is_prebaked_wk = false;
+        ctx.wb_subspace_ready = false;
+        ctx.reml_wb_solver_used = "cholesky";
+        ctx.dk.resize(0);
+        ctx.ck.resize(0);
+
+        LOGGER << "Woodbury basis (unrotated Cholesky): k=" << k_work
+               << ", lambda_tail=" << ctx.lambda_tail
+               << ", tail_d_var=" << ctx.tail_d_var << std::endl;
+        return;
+    }
 
     for (;;) {
         const int oversample = gcta_eigh::recommended_oversample(k_svd);
@@ -2497,12 +2959,334 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     ctx.Uk_is_transposed = false;
     ctx.woodbury_basis_rank_ = k;
     ctx.Vi_use_woodbury_basis = true;
+    ctx.wb_unrotated = false;
+    ctx.wb_uk_is_prebaked_wk = false;
     ctx.wb_subspace_ready = false;
+    ctx.reml_wb_solver_used = "eigh";
 
     LOGGER << "Woodbury basis: k=" << k
            << ", lambda_tail=" << ctx.lambda_tail
            << ", tail_d_var=" << ctx.tail_d_var << std::endl;
 }
+
+namespace {
+
+// Converts converged unrotated (Q, B) into pre-baked Stage-4 MLMA factors W_k = Q * R_C^T
+// in-place inside ctx.Uk (with ctx.ck == Ones(k)). When C = I - sig2e * V_Q^{-1} is not
+// strictly SPD (rank-deficient GRM / negative Ritz boundary), clamps tiny negative modes of C
+// via Block Krylov on -C and factors C_+ with pivoted Cholesky (gcta_dpstrf), eliminating dsyevd(k).
+void finalize_unrotated_woodbury_factor(RemlCtx& ctx) {
+    if (!ctx.Vi_use_woodbury_basis || !ctx.wb_unrotated) return;
+
+    const int k = ctx.woodbury_basis_rank_;
+    const int n = ctx.n;
+    const double sg2 = ctx.varcmp.empty() ? 0.0 : ctx.varcmp[0];
+    const double se2 = ctx.varcmp.empty() ? 0.0 : ctx.varcmp.back();
+    const double sig2e = sg2 * ctx.lambda_tail + se2;
+    ctx.sg2 = sg2;
+    ctx.sigma2_eff = sig2e;
+
+    if (std::fabs(sg2) <= 1e-15 && se2 > 0.0) {
+        ctx.Uk.leftCols(k).setZero();
+        ctx.dk = RemlVec::Zero(k);
+        ctx.ck = RemlVec::Ones(k);
+        ctx.wb_uk_is_prebaked_wk = true;
+        ctx.wb_unrotated = false;
+        ctx.wb_B.resize(0, 0);
+        ctx.wb_VQ_Uinv.resize(0, 0);
+        ctx.reml_wb_solver_used = "cholesky";
+        return;
+    }
+
+    if (sg2 <= -1e-12 || sig2e <= 0.0) {
+        LOGGER.e(0, "Woodbury Cholesky finalization: invalid variance components (sg2=" +
+                    std::to_string(sg2) + ", sigma2_eff=" + std::to_string(sig2e) + ").");
+    }
+
+    const gcta_blas_int bk = static_cast<gcta_blas_int>(k);
+    const int lapack_cap = (k >= 512) ? std::min(omp_get_max_threads(), 48) : 0;
+    if (ctx.wb_VQ_Uinv.rows() != k || ctx.wb_VQ_Uinv.cols() != k) {
+        ctx.wb_VQ_Uinv.resize(k, k);
+    }
+    const double* const b_ptr = ctx.wb_B.data();
+    double* const t_ptr = ctx.wb_VQ_Uinv.data();
+    #pragma omp parallel for schedule(guided) if (k >= 128)
+    for (int j = 0; j < k; ++j) {
+        const double* __restrict__ bcol = b_ptr + static_cast<size_t>(j) * static_cast<size_t>(k);
+        double* __restrict__ tcol = t_ptr + static_cast<size_t>(j) * static_cast<size_t>(k);
+        #pragma omp simd
+        for (int i = 0; i < j; ++i) {
+            tcol[i] = sg2 * bcol[i];
+        }
+        tcol[j] = sg2 * bcol[j] + se2;
+    }
+    ctx.wb_B.resize(0, 0);
+
+    bool vq_ok = false;
+    {
+        ScopedBlasThreadCap cap(lapack_cap);
+        vq_ok = (gcta_dpotrf(bk, t_ptr, bk, 'U') == 0 && gcta_dtrtri(bk, t_ptr, bk, 'U') == 0);
+    }
+    if (!vq_ok) {
+        LOGGER.e(0, "Woodbury Cholesky finalization: V_Q factorization failed.");
+    }
+
+    // Zero strict lower triangle of T = U^{-1} before cblas_dsyrk reads it densely.
+    #pragma omp parallel for schedule(guided) if (k >= 128)
+    for (int j = 0; j < k - 1; ++j) {
+        std::memset(t_ptr + static_cast<size_t>(j) * static_cast<size_t>(k) + j + 1,
+                    0, static_cast<size_t>(k - 1 - j) * sizeof(double));
+    }
+
+    auto build_C_upper = [&](Eigen::MatrixXd& C_mat) {
+        double* const cp = C_mat.data();
+        #pragma omp parallel for schedule(guided) if (k >= 128)
+        for (int j = 0; j < k; ++j) {
+            double* __restrict__ ccol = cp + static_cast<size_t>(j) * static_cast<size_t>(k);
+            std::memset(ccol, 0, static_cast<size_t>(j) * sizeof(double));
+            ccol[j] = 1.0;
+        }
+        cblas_dsyrk(CblasColMajor, CblasUpper, CblasNoTrans,
+                    bk, bk, -sig2e, t_ptr, bk, 1.0, cp, bk);
+    };
+
+    Eigen::MatrixXd C(k, k);
+    build_C_upper(C);
+
+    int c_info = 0;
+    {
+        ScopedBlasThreadCap cap(lapack_cap);
+        c_info = gcta_dpotrf(bk, C.data(), bk, 'U');
+    }
+
+    auto permute_uk_cols = [&](const std::vector<int>& src_idx) {
+        constexpr int kSlabM = 4096;
+        const Eigen::Index ldU = ctx.Uk.outerStride();
+        float* const uk_ptr = ctx.Uk.data();
+        Eigen::MatrixXf slab_buf(std::min(n, kSlabM), k);
+        for (int r0 = 0; r0 < n; r0 += kSlabM) {
+            const int rb = std::min(kSlabM, n - r0);
+            const size_t bytes = static_cast<size_t>(rb) * sizeof(float);
+            #pragma omp parallel for schedule(static) if (k >= 64)
+            for (int j = 0; j < k; ++j) {
+                const int src_j = src_idx[static_cast<size_t>(j)];
+                std::memcpy(slab_buf.col(j).data(), uk_ptr + r0 + static_cast<size_t>(src_j) * ldU, bytes);
+            }
+            #pragma omp parallel for schedule(static) if (k >= 64)
+            for (int j = 0; j < k; ++j) {
+                std::memcpy(uk_ptr + r0 + static_cast<size_t>(j) * ldU, slab_buf.col(j).data(), bytes);
+            }
+        }
+    };
+
+    auto sort_wk_columns_desc = [&]() {
+        const Eigen::Index ldU = ctx.Uk.outerStride();
+        const float* const uk_ptr = ctx.Uk.data();
+        std::vector<double> col_norm_sq(static_cast<size_t>(k), 0.0);
+        #pragma omp parallel for schedule(static) if (k >= 64)
+        for (int j = 0; j < k; ++j) {
+            const float* const col = uk_ptr + static_cast<size_t>(j) * ldU;
+            double acc = 0.0;
+            #pragma omp simd reduction(+:acc)
+            for (int i = 0; i < n; ++i) {
+                const double v = static_cast<double>(col[i]);
+                acc += v * v;
+            }
+            col_norm_sq[static_cast<size_t>(j)] = acc;
+        }
+        std::vector<int> order(static_cast<size_t>(k));
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            return col_norm_sq[static_cast<size_t>(a)] > col_norm_sq[static_cast<size_t>(b)];
+        });
+        bool already_sorted = true;
+        for (int j = 0; j < k; ++j) {
+            if (order[static_cast<size_t>(j)] != j) {
+                already_sorted = false;
+                break;
+            }
+        }
+        if (!already_sorted) {
+            permute_uk_cols(order);
+        }
+    };
+
+    if (c_info == 0) {
+        ctx.wb_VQ_Uinv.resize(0, 0);
+        // Transpose upper-triangular R_C into lower-triangular L_f = R_C^T (strict upper zeroed).
+        Eigen::MatrixXf L_f(k, k);
+        float* const lf_ptr = L_f.data();
+        const double* const c_ptr = C.data();
+        #pragma omp parallel for schedule(guided) if (k >= 128)
+        for (int i = 0; i < k; ++i) {
+            float* __restrict__ lcol = lf_ptr + static_cast<size_t>(i) * static_cast<size_t>(k);
+            std::memset(lcol, 0, static_cast<size_t>(i) * sizeof(float));
+            for (int j = i; j < k; ++j) {
+                lcol[j] = static_cast<float>(c_ptr[i + static_cast<size_t>(j) * static_cast<size_t>(k)]);
+            }
+        }
+        C.resize(0, 0);
+
+        gcta_right_tri_sgemm_inplace(static_cast<gcta_blas_int>(n), bk,
+                                     ctx.Uk.data(), static_cast<gcta_blas_int>(ctx.Uk.outerStride()),
+                                     lf_ptr, bk, /*T_is_upper=*/false);
+        L_f.resize(0, 0);
+        sort_wk_columns_desc();
+
+        ctx.dk = RemlVec::Zero(k);
+        ctx.ck = RemlVec::Ones(k);
+        ctx.wb_uk_is_prebaked_wk = true;
+        ctx.wb_unrotated = false;
+        ctx.reml_wb_solver_used = "cholesky";
+        return;
+    }
+
+    // Indefinite / rank-deficient C = I - sig2e * V_Q^{-1}: rebuild clean C and run
+    // complete-pivoting Cholesky (gcta_dpstrf), then complete any unfactored Schur complement
+    // block S22 = (P^T C P)_22 - U12^T U12 via exact m_rem x m_rem eigendecomposition + QR.
+    build_C_upper(C);
+    double max_diag = 0.0;
+    for (int j = 0; j < k; ++j) {
+        max_diag = std::max(max_diag, C(j, j));
+    }
+    const double dpstrf_tol = (k <= 4096)
+        ? std::max(1.0e-8, 5.0e-4 * max_diag)
+        : 1.0e-8;
+
+    std::vector<gcta_blas_int> piv(static_cast<size_t>(k), 0);
+    gcta_blas_int rank = 0;
+    int p_info = 0;
+    {
+        ScopedBlasThreadCap cap(lapack_cap);
+        p_info = gcta_dpstrf(bk, C.data(), bk, piv.data(), &rank, dpstrf_tol, 'U');
+    }
+    if (p_info < 0) {
+        LOGGER.e(0, "Woodbury Pivoted Cholesky failed (info=" + std::to_string(p_info) + ").");
+    }
+    int r_eff = std::clamp(static_cast<int>(rank), 0, k);
+    const int m_rem = k - r_eff;
+    if (m_rem > 0 && m_rem <= 4096) {
+        // Compute S22 = I - sig2e * T_sub * T_sub^T - U12^T * U12 where rows of T_sub
+        // match piv[r_eff .. k-1] - 1 of T = ctx.wb_VQ_Uinv.
+        RemlMat T_sub(m_rem, k);
+        const Eigen::Index ldT = ctx.wb_VQ_Uinv.outerStride();
+        const double* const tp = ctx.wb_VQ_Uinv.data();
+        double* const ts_p = T_sub.data();
+        for (int u = 0; u < m_rem; ++u) {
+            const int src_row = static_cast<int>(piv[static_cast<size_t>(r_eff + u)] - 1);
+            for (int col = 0; col < k; ++col) {
+                ts_p[u + static_cast<size_t>(col) * static_cast<size_t>(m_rem)] =
+                    tp[src_row + static_cast<size_t>(col) * static_cast<size_t>(ldT)];
+            }
+        }
+        ctx.wb_VQ_Uinv.resize(0, 0);
+
+        RemlMat S22 = RemlMat::Identity(m_rem, m_rem);
+        const gcta_blas_int bm = static_cast<gcta_blas_int>(m_rem);
+        cblas_dsyrk(CblasColMajor, CblasUpper, CblasNoTrans,
+                    bm, bk, -sig2e, ts_p, bm, 1.0, S22.data(), bm);
+        T_sub.resize(0, 0);
+        if (r_eff > 0) {
+            cblas_dsyrk(CblasColMajor, CblasUpper, CblasTrans,
+                        bm, static_cast<gcta_blas_int>(r_eff), -1.0,
+                        &C(0, r_eff), bk, 1.0, S22.data(), bm);
+        }
+
+        Eigen::VectorXd w_s;
+        Eigen::MatrixXd Z_s;
+        gcta_eigh::detail::eigh_upper_asc_d(S22, w_s, Z_s, lapack_cap);
+        S22.resize(0, 0);
+
+        int first_pos = m_rem;
+        for (int j = 0; j < m_rem; ++j) {
+            if (w_s[j] > 1.0e-12) {
+                first_pos = j;
+                break;
+            }
+        }
+        const int p_pos = m_rem - first_pos;
+        if (p_pos > 0) {
+            RemlMat F2(p_pos, m_rem);
+            for (int r = 0; r < p_pos; ++r) {
+                const double s = std::sqrt(w_s[first_pos + r]);
+                F2.row(r) = s * Z_s.col(first_pos + r).transpose();
+            }
+            std::vector<double> tau(static_cast<size_t>(std::min(p_pos, m_rem)), 0.0);
+            const gcta_blas_int bp = static_cast<gcta_blas_int>(p_pos);
+            int q_info = 0;
+            {
+                ScopedBlasThreadCap cap(lapack_cap);
+                q_info = gcta_dgeqrf(bp, bm, F2.data(), bp, tau.data());
+            }
+            if (q_info == 0) {
+                for (int c_loc = 0; c_loc < m_rem; ++c_loc) {
+                    const int r_max = std::min(p_pos, c_loc + 1);
+                    for (int r_loc = 0; r_loc < r_max; ++r_loc) {
+                        C(r_eff + r_loc, r_eff + c_loc) = F2(r_loc, c_loc);
+                    }
+                }
+                r_eff += p_pos;
+            }
+        }
+    } else {
+        ctx.wb_VQ_Uinv.resize(0, 0);
+    }
+
+    LOGGER.i(0, "Woodbury pivoted Cholesky: rank=" + std::to_string(r_eff) + "/" + std::to_string(k) +
+                " (p_info=" + std::to_string(p_info) + ").");
+    if (r_eff == 0) {
+        C.resize(0, 0);
+        ctx.Uk.leftCols(k).setZero();
+        ctx.dk = RemlVec::Zero(k);
+        ctx.ck = RemlVec::Ones(k);
+        ctx.wb_uk_is_prebaked_wk = true;
+        ctx.wb_unrotated = false;
+        ctx.reml_wb_solver_used = "cholesky_pivoted";
+        return;
+    }
+
+    // C_+ = P * U^T * U * P^T => W_k = (Q * P) * U^T.
+    // Permute columns of ctx.Uk (n x k) in-place by 1-based piv[] in 4096-row slabs.
+    {
+        std::vector<int> piv0(static_cast<size_t>(k));
+        for (int j = 0; j < k; ++j) {
+            piv0[static_cast<size_t>(j)] = static_cast<int>(piv[static_cast<size_t>(j)] - 1);
+        }
+        permute_uk_cols(piv0);
+    }
+
+    // Transpose rank-r_eff upper trapezoidal U (rows 0..r_eff-1 of C) into lower-triangular L_f = U^T.
+    Eigen::MatrixXf L_f(k, k);
+    float* const lf_ptr = L_f.data();
+    const double* const c_ptr = C.data();
+    #pragma omp parallel for schedule(guided) if (k >= 128)
+    for (int i = 0; i < k; ++i) {
+        float* __restrict__ lcol = lf_ptr + static_cast<size_t>(i) * static_cast<size_t>(k);
+        std::memset(lcol, 0, static_cast<size_t>(i) * sizeof(float));
+        if (i >= r_eff) {
+            std::memset(lcol + i, 0, static_cast<size_t>(k - i) * sizeof(float));
+        } else {
+            for (int j = i; j < k; ++j) {
+                lcol[j] = static_cast<float>(c_ptr[i + static_cast<size_t>(j) * static_cast<size_t>(k)]);
+            }
+        }
+    }
+    C.resize(0, 0);
+
+    gcta_right_tri_sgemm_inplace(static_cast<gcta_blas_int>(n), bk,
+                                 ctx.Uk.data(), static_cast<gcta_blas_int>(ctx.Uk.outerStride()),
+                                 lf_ptr, bk, /*T_is_upper=*/false);
+    L_f.resize(0, 0);
+    sort_wk_columns_desc();
+
+    ctx.dk = RemlVec::Zero(k);
+    ctx.ck = RemlVec::Ones(k);
+    ctx.wb_uk_is_prebaked_wk = true;
+    ctx.wb_unrotated = false;
+    ctx.reml_wb_solver_used = "cholesky_pivoted";
+}
+
+} // anonymous namespace
 
 void compute(RemlCtx& ctx,
              const std::vector<double>& priors,
@@ -2539,6 +3323,9 @@ void compute(RemlCtx& ctx,
 
     // Woodbury basis (must be done before init_varcomp for HE warm-start)
     if (ctx.woodbury_basis_preloaded) {
+        ctx.wb_unrotated = false;
+        ctx.wb_uk_is_prebaked_wk = false;
+        ctx.reml_wb_solver_used = "eigh";
         // Basis supplied by the caller (--reml-woodbury-reuse): Uk/dk/lambda_tail/
         // woodbury_basis_rank_ (or precomputed streaming subspace cache) are already set.
         if (ctx.reml_mtd == RemlAlg::Fisher)
@@ -2654,6 +3441,12 @@ void compute(RemlCtx& ctx,
     }
     if (ctx.reml_profile) {
         ctx.reml_ai_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ai0).count();
+    }
+
+    const auto t_wk0 = ctx.reml_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    finalize_unrotated_woodbury_factor(ctx);
+    if (ctx.reml_profile && ctx.Vi_use_woodbury_basis) {
+        ctx.reml_wk_factor_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_wk0).count();
     }
 }
 

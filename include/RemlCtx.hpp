@@ -27,6 +27,8 @@
 using RemlMat = Eigen::MatrixXd;
 using RemlVec = Eigen::VectorXd;
 
+enum class RemlWoodburySolver : uint8_t { Auto = 0, Cholesky = 1, Eigh = 2 };
+
 // ──────────────────────────────────────────────────────────────────────────────
 // RemlCtx: input + config + workspace + output
 // Caller fills the "Input" and "Config" sections, then calls reml::compute().
@@ -162,6 +164,13 @@ struct RemlCtx {
     double  sigma2_eff      = 0.0;   // sigma2_g * lambda_tail + sigma2_e (updated per AI iter)
     double  sg2             = 0.0;   // sigma2_g (cached for calcu_tr_PA_woodbury)
     RemlVec ck;                      // Woodbury corrections c_j
+    bool    wb_unrotated          = false; // true during AI/EM-REML when operating on unrotated (Q, B)
+    bool    wb_uk_is_prebaked_wk  = false; // true after post-REML finalization when ctx.Uk holds W_k = Q * R_C^T (with ck == 1)
+    RemlMat wb_B;                          // k x k symmetric Q^T K Q (double, upper triangle populated)
+    RemlMat wb_VQ_Uinv;                    // k x k upper triangular T = U^{-1} where V_Q = U^T U (double)
+    double  wb_tr_B               = 0.0;   // tr(B)
+    double  wb_tr_B2              = 0.0;   // tr(B^2) = ||B||_F^2
+    double  wb_tr_VQi             = 0.0;   // tr(V_Q^{-1}) = ||U^{-1}||_F^2
 
     // ── Iteration workspace (managed by reml::compute()) ─────────────────────
     bool    Vi_use_llt = false; // true when Vi_L is valid (factorize_only path)
@@ -226,8 +235,13 @@ struct RemlCtx {
     int  reml_matvec_band_rows = 0;   // 0 = auto (8192 for PackedGrmFp16)
     int  reml_matvec_col_chunk = 0;   // 0 = auto (<= 1 GiB strip)
     int  reml_qr_power_passes  = 0;   // 0 = auto (1 when BF16 sketch, else 2)
-    bool reml_eigh_fp32        = false;
-    int  reml_eigh_threads     = 0;   // 0 = all threads
+    bool   reml_eigh_fp32        = false;
+    int    reml_eigh_threads     = 0;   // 0 = all threads
+    RemlWoodburySolver reml_woodbury_solver = RemlWoodburySolver::Auto;
+    CholeskyQrMode reml_qr_mode = CholeskyQrMode::Auto;
+    bool svd_chebyshev = false;
     gcta_eigh::RsvdProfileStats reml_rsvd_prof{};
     double reml_ai_s = 0.0;
+    double reml_wk_factor_s = 0.0;
+    std::string reml_wb_solver_used = "none"; // "none", "eigh", "cholesky", "cholesky_fallback"
 };

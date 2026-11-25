@@ -91,6 +91,35 @@ inline int gcta_dpotri(gcta_blas_int n, double* a, gcta_blas_int lda, char uplo 
 #endif
 }
 
+// Portable dtrtri: in-place inversion of a triangular matrix
+// (defaults to upper triangle, non-unit diagonal, column-major).
+// Returns 0 on success, non-zero on failure.
+inline int gcta_dtrtri(gcta_blas_int n, double* a, gcta_blas_int lda, char uplo = 'U', char diag = 'N') {
+#if defined(GCTA_USE_ACCELERATE)
+    gcta_blas_int info = 0;
+    dtrtri_(&uplo, &diag, &n, a, &lda, &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(LAPACKE_dtrtri(LAPACK_COL_MAJOR, uplo, diag, n, a, lda));
+#endif
+}
+
+// Portable dpstrf: Cholesky factorization with complete pivoting of a symmetric
+// positive semidefinite matrix (P^T A P = U^T U when uplo='U', piv is 1-based).
+// Returns 0 if full rank, >0 if stopped at rank < n (valid rank-`rank` factor), <0 on bad arg.
+inline int gcta_dpstrf(gcta_blas_int n, double* a, gcta_blas_int lda,
+                       gcta_blas_int* piv, gcta_blas_int* rank,
+                       double tol = -1.0, char uplo = 'U') {
+#if defined(GCTA_USE_ACCELERATE)
+    gcta_blas_int info = 0;
+    std::vector<double> work(static_cast<size_t>(std::max<gcta_blas_int>(1, 2 * n)));
+    dpstrf_(&uplo, &n, a, &lda, piv, rank, &tol, work.data(), &info);
+    return static_cast<int>(info);
+#else
+    return static_cast<int>(LAPACKE_dpstrf(LAPACK_COL_MAJOR, uplo, n, a, lda, piv, rank, tol));
+#endif
+}
+
 // Portable dgetrf: LU factorization with partial pivoting.
 // ipiv must be pre-allocated to length n.  Returns 0 on success.
 inline int gcta_dgetrf(gcta_blas_int n, double* a, gcta_blas_int lda, gcta_blas_int* ipiv) {
@@ -568,19 +597,182 @@ struct CholeskyQrStats {
     int householder = 0;
 };
 
-// Mixed-precision Shifted CholeskyQR for float32 m x k subspace matrices:
+enum class CholeskyQrMode : uint8_t { Auto = 0, Sketched = 1, Standard = 2 };
+
+// Parallel row-slabbed in-place triangular right multiply:
+//   Y <- Y * T   (Y is m x k ColMajor, ldY >= m; T is k x k ColMajor, ldT >= k)
+// Strict off-triangle entries of T MUST already be zeroed:
+//   T_is_upper == true  => T(i, j) == 0 for i > j (reverse column-block sweep)
+//   T_is_upper == false => T(i, j) == 0 for i < j (forward column-block sweep)
+// Uses 4096-row x 2048-col cblas_sgemm blocks so AOCL-BLIS parallelizes both
+// JC and IC loops across all 192 cores instead of serializing cblas_strmm/strsm(Right).
+inline void gcta_right_tri_sgemm_inplace(
+    gcta_blas_int m, gcta_blas_int k,
+    float* Y, gcta_blas_int ldY,
+    const float* T, gcta_blas_int ldT,
+    bool T_is_upper)
+{
+    if (m <= 0 || k <= 0) return;
+    if (k < 512) {
+        cblas_strmm(CblasColMajor, CblasRight,
+                    T_is_upper ? CblasUpper : CblasLower,
+                    CblasNoTrans, CblasNonUnit,
+                    m, k, 1.0f, T, ldT, Y, ldY);
+        return;
+    }
+
+    constexpr gcta_blas_int kSlabM   = 4096;
+    constexpr gcta_blas_int kTriBlk  = 2048;
+    const gcta_blas_int max_rb = std::min(m, kSlabM);
+    const gcta_blas_int max_cb = std::min(k, kTriBlk);
+    std::vector<float> tile_out(static_cast<size_t>(max_rb) * static_cast<size_t>(max_cb));
+    const gcta_blas_int nb = (k + kTriBlk - 1) / kTriBlk;
+
+    for (gcta_blas_int r0 = 0; r0 < m; r0 += kSlabM) {
+        const gcta_blas_int rb = std::min(kSlabM, m - r0);
+        if (T_is_upper) {
+            for (gcta_blas_int cb = nb - 1; cb >= 0; --cb) {
+                const gcta_blas_int c0   = cb * kTriBlk;
+                const gcta_blas_int clen = std::min(kTriBlk, k - c0);
+                const gcta_blas_int k_len = c0 + clen;
+                cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                            rb, clen, k_len,
+                            1.0f,
+                            Y + r0, ldY,
+                            T + static_cast<size_t>(c0) * static_cast<size_t>(ldT), ldT,
+                            0.0f, tile_out.data(), rb);
+                #pragma omp parallel for schedule(static) if (static_cast<size_t>(rb) * static_cast<size_t>(clen) >= 32768)
+                for (gcta_blas_int j = 0; j < clen; ++j) {
+                    std::memcpy(Y + r0 + static_cast<size_t>(c0 + j) * static_cast<size_t>(ldY),
+                                tile_out.data() + static_cast<size_t>(j) * static_cast<size_t>(rb),
+                                static_cast<size_t>(rb) * sizeof(float));
+                }
+            }
+        } else {
+            for (gcta_blas_int cb = 0; cb < nb; ++cb) {
+                const gcta_blas_int c0   = cb * kTriBlk;
+                const gcta_blas_int clen = std::min(kTriBlk, k - c0);
+                const gcta_blas_int k_len = k - c0;
+                cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                            rb, clen, k_len,
+                            1.0f,
+                            Y + r0 + static_cast<size_t>(c0) * static_cast<size_t>(ldY), ldY,
+                            T + c0 + static_cast<size_t>(c0) * static_cast<size_t>(ldT), ldT,
+                            0.0f, tile_out.data(), rb);
+                #pragma omp parallel for schedule(static) if (static_cast<size_t>(rb) * static_cast<size_t>(clen) >= 32768)
+                for (gcta_blas_int j = 0; j < clen; ++j) {
+                    std::memcpy(Y + r0 + static_cast<size_t>(c0 + j) * static_cast<size_t>(ldY),
+                                tile_out.data() + static_cast<size_t>(j) * static_cast<size_t>(rb),
+                                static_cast<size_t>(rb) * sizeof(float));
+                }
+            }
+        }
+    }
+}
+
+namespace gcta_cpu_detail {
+
+// Apply Y <- Y * L^{-T} for lower Cholesky factor G_lower (k x k, col-major, ld=k).
+// For k >= 512, uses 48-thread capped dtrtri('L') + parallel transpose into upper U_inv_f
+// + parallel gcta_right_tri_sgemm_inplace to avoid AOCL-BLIS single-threaded Right TRSM.
+inline bool apply_lower_chol_inv_right(
+    gcta_blas_int m, gcta_blas_int k,
+    double* G_lower, float* G_f,
+    float* Y, gcta_blas_int ldY)
+{
+    if (k < 512) {
+        copy_lower_d2f(k, G_lower, G_f);
+        cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
+                    m, k, 1.0f, G_f, k, Y, ldY);
+        return true;
+    }
+    {
+        const int lapack_cap = std::min(omp_get_max_threads(), 48);
+        ScopedBlasThreadCap cap(lapack_cap);
+        if (gcta_dtrtri(k, G_lower, k, 'L', 'N') != 0) {
+            return false;
+        }
+    }
+    // Transpose lower-triangular G_lower into upper-triangular G_f with strict lower zeroed.
+    #pragma omp parallel for schedule(static)
+    for (gcta_blas_int j = 0; j < k; ++j) {
+        float* __restrict__ dst = G_f + static_cast<size_t>(j) * static_cast<size_t>(k);
+        for (gcta_blas_int i = 0; i <= j; ++i) {
+            dst[i] = static_cast<float>(G_lower[j + static_cast<size_t>(i) * static_cast<size_t>(k)]);
+        }
+        std::memset(dst + j + 1, 0, static_cast<size_t>(k - 1 - j) * sizeof(float));
+    }
+    gcta_right_tri_sgemm_inplace(m, k, Y, ldY, G_f, k, /*T_is_upper=*/true);
+    return true;
+}
+
+inline uint64_t osnap_splitmix64(uint64_t x) noexcept {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+// Column-parallel partitioned OSNAP sparse sign sketch W = S * Y (s x k, d = 4 nonzeros/row).
+inline void build_osnap_sketch(
+    gcta_blas_int m, gcta_blas_int k, gcta_blas_int s,
+    const float* Y, gcta_blas_int ldY,
+    float* W, gcta_blas_int ldW)
+{
+    const uint32_t part_sz = static_cast<uint32_t>(s / 4);
+    std::vector<uint32_t> tbl(static_cast<size_t>(m) * 4ULL);
+    #pragma omp parallel for schedule(static) if (m >= 8192)
+    for (gcta_blas_int i = 0; i < m; ++i) {
+        const uint64_t r0 = osnap_splitmix64(static_cast<uint64_t>(i) * 2ULL);
+        const uint64_t r1 = osnap_splitmix64(static_cast<uint64_t>(i) * 2ULL + 1ULL);
+        uint32_t* dst = tbl.data() + static_cast<size_t>(i) * 4ULL;
+        const uint32_t i0 = 0U * part_sz + static_cast<uint32_t>(static_cast<uint32_t>(r0) % part_sz);
+        const uint32_t i1 = 1U * part_sz + static_cast<uint32_t>(static_cast<uint32_t>(r0 >> 32) % part_sz);
+        const uint32_t i2 = 2U * part_sz + static_cast<uint32_t>(static_cast<uint32_t>(r1) % part_sz);
+        const uint32_t i3 = 3U * part_sz + static_cast<uint32_t>(static_cast<uint32_t>(r1 >> 32) % part_sz);
+        dst[0] = i0 | (static_cast<uint32_t>((r0 >> 30) & 1ULL) << 31);
+        dst[1] = i1 | (static_cast<uint32_t>((r0 >> 62) & 1ULL) << 31);
+        dst[2] = i2 | (static_cast<uint32_t>((r1 >> 30) & 1ULL) << 31);
+        dst[3] = i3 | (static_cast<uint32_t>((r1 >> 62) & 1ULL) << 31);
+    }
+
+    const uint32_t* const tptr = tbl.data();
+    #pragma omp parallel for schedule(static) if (k >= 4)
+    for (gcta_blas_int j = 0; j < k; ++j) {
+        float* __restrict__ w_col = W + static_cast<size_t>(j) * static_cast<size_t>(ldW);
+        std::memset(w_col, 0, static_cast<size_t>(s) * sizeof(float));
+        const float* __restrict__ y_col = Y + static_cast<size_t>(j) * static_cast<size_t>(ldY);
+        for (gcta_blas_int i = 0; i < m; ++i) {
+            const float yv = 0.5f * y_col[i];
+            const float nv = -yv;
+            const uint32_t* const tp = tptr + static_cast<size_t>(i) * 4ULL;
+            const uint32_t p0 = tp[0];
+            const uint32_t p1 = tp[1];
+            const uint32_t p2 = tp[2];
+            const uint32_t p3 = tp[3];
+            w_col[p0 & 0x7FFFFFFFu] += (p0 & 0x80000000u) ? nv : yv;
+            w_col[p1 & 0x7FFFFFFFu] += (p1 & 0x80000000u) ? nv : yv;
+            w_col[p2 & 0x7FFFFFFFu] += (p2 & 0x80000000u) ? nv : yv;
+            w_col[p3 & 0x7FFFFFFFu] += (p3 & 0x80000000u) ? nv : yv;
+        }
+    }
+}
+
+}  // namespace gcta_cpu_detail
+
+// Mixed-precision Shifted / Sketched CholeskyQR for float32 m x k subspace matrices:
 //   - Column L2 pre-normalization balances wildly scaled power-iteration columns.
-//   - O(m * k^2) SYRK and TRSM run in float32 (cblas_ssyrk / cblas_strsm), while
-//     the tiny k x k Gram Cholesky factorization runs in double (gcta_dpotrf).
-//   - Callers supply `workspace` and `workspace_f` to avoid multi-GB k x k reallocation.
-//   - `min_passes=1` runs 1 unshifted CholeskyQR pass (or 1 shifted + 1 unshifted if
-//     dpotrf fails), saving >= 50% of QR compute/barriers on intermediate BF16 power
-//     iterations while keeping `min_passes=2` (Shifted CholeskyQR3) on the final Q.
+//   - When qr_mode resolves to Sketched (Auto when k >= 512 && m >= 3*k), Pass 0 forms
+//     G_0 = (S Y)^T (S Y) from an OSNAP sparse sign sketch of height s = 2k + 256,
+//     avoiding the O(m k^2) Pass-0 SSYRK; min_passes >= 2 adds 1 exact full-m polish pass.
+//   - LAPACK dpotrf/dtrtri on k >= 512 are capped at 48 threads and Right triangular
+//     updates run via parallel gcta_right_tri_sgemm_inplace.
 inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, gcta_blas_int ldY,
                                     Eigen::MatrixXd* workspace = nullptr,
                                     Eigen::MatrixXf* workspace_f = nullptr,
                                     int min_passes = 2,
-                                    CholeskyQrStats* stats = nullptr) {
+                                    CholeskyQrStats* stats = nullptr,
+                                    CholeskyQrMode qr_mode = CholeskyQrMode::Auto) {
     if (m <= 0 || k <= 0) return 0;
     if (stats) ++stats->calls;
 
@@ -657,17 +849,74 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, g
     Eigen::MatrixXf& G_f = workspace_f ? *workspace_f : local_Gf;
     G_f.resize(k, k);
 
-    bool used_shift = false;
     const int base_passes = std::clamp(min_passes, 1, 2);
+    const int lapack_cap = (k >= 512) ? std::min(omp_get_max_threads(), 48) : 0;
+
+    // Sketched CholeskyQR (sCholeskyQR): replace O(m k^2) Pass-0 SSYRK with OSNAP sketch.
+    const bool try_sketched =
+        (qr_mode == CholeskyQrMode::Sketched) ? (k >= 64 && m >= 3 * k)
+                                              : (qr_mode == CholeskyQrMode::Auto && k >= 512 && m >= 3 * k);
+    if (try_sketched) {
+        gcta_blas_int s = std::min<gcta_blas_int>(
+            m, std::max<gcta_blas_int>(2 * k + 256, 4096));
+        s = (s / 4) * 4;
+        if (s >= 2 * k && s < m) {
+            Eigen::MatrixXf W(s, k);
+            gcta_cpu_detail::build_osnap_sketch(m, k, s, Y, ldY, W.data(), s);
+            cblas_ssyrk(CblasColMajor, CblasLower, CblasTrans, k, s, 1.0f, W.data(), s, 0.0f, G_f.data(), k);
+            W.resize(0, 0);
+            gcta_cpu_detail::copy_lower_f2d(k, G_f.data(), G.data());
+
+            int sk_info = 0;
+            {
+                ScopedBlasThreadCap cap(lapack_cap);
+                sk_info = gcta_dpotrf(k, G.data(), k);
+            }
+            if (sk_info == 0 &&
+                gcta_cpu_detail::apply_lower_chol_inv_right(m, k, G.data(), G_f.data(), Y, ldY)) {
+                if (stats) ++stats->passes;
+                if (base_passes == 1) {
+                    return 0;
+                }
+                // Pass 1: 1 exact full-m unshifted polish pass.
+                if (stats) ++stats->passes;
+                cblas_ssyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0f, Y, ldY, 0.0f, G_f.data(), k);
+                gcta_cpu_detail::copy_lower_f2d(k, G_f.data(), G.data());
+                int p1_info = 0;
+                {
+                    ScopedBlasThreadCap cap(lapack_cap);
+                    p1_info = gcta_dpotrf(k, G.data(), k);
+                }
+                if (p1_info == 0 &&
+                    gcta_cpu_detail::apply_lower_chol_inv_right(m, k, G.data(), G_f.data(), Y, ldY)) {
+                    return 0;
+                }
+                // If exact polish failed on extreme ill-conditioning, fall through cleanly below
+                // (or keep Pass-0 Q if it was simply near-singular roundoff).
+                if (p1_info == 0) return 0;
+            }
+        }
+    }
+
+    bool used_shift = false;
     int max_passes = base_passes;
     for (int pass = 0; pass < max_passes; ++pass) {
         if (stats) ++stats->passes;
         cblas_ssyrk(CblasColMajor, CblasLower, CblasTrans, k, m, 1.0f, Y, ldY, 0.0f, G_f.data(), k);
         gcta_cpu_detail::copy_lower_f2d(k, G_f.data(), G.data());
-        const int info = gcta_dpotrf(k, G.data(), k);
+        int info = 0;
+        {
+            ScopedBlasThreadCap cap(lapack_cap);
+            info = gcta_dpotrf(k, G.data(), k);
+        }
         if (info != 0) {
             if (pass == 0) {
-                if (gcta_cpu_detail::try_shifted_dpotrf(m, k, G_f.data(), G.data()) == 0) {
+                int sh_info = -1;
+                {
+                    ScopedBlasThreadCap cap(lapack_cap);
+                    sh_info = gcta_cpu_detail::try_shifted_dpotrf(m, k, G_f.data(), G.data());
+                }
+                if (sh_info == 0) {
                     used_shift = true;
                     if (stats) ++stats->shifted;
                     max_passes = base_passes + 1;
@@ -685,9 +934,10 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, g
                 break;
             }
         }
-        gcta_cpu_detail::copy_lower_d2f(k, G.data(), G_f.data());
-        cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
-                    m, k, 1.0f, G_f.data(), k, Y, ldY);
+        if (!gcta_cpu_detail::apply_lower_chol_inv_right(m, k, G.data(), G_f.data(), Y, ldY)) {
+            if (stats) ++stats->householder;
+            return gcta_qr_thin_Q(m, k, Y, ldY);
+        }
     }
     return 0;
 }

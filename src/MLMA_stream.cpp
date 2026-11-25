@@ -153,8 +153,9 @@ constexpr std::string_view kMagicLegacyTuna = "TUNA";
 constexpr std::string_view kMagicEvec       = "EVEC";
 constexpr size_t kRemlPrefixBytes = sizeof(Header) + sizeof(uint64_t);
 
-constexpr uint32_t kTun3FlagHasViY     = 1u << 0;
-constexpr uint32_t kTun3FlagNoAdjCovar = 1u << 1;
+constexpr uint32_t kTun3FlagHasViY       = 1u << 0;
+constexpr uint32_t kTun3FlagNoAdjCovar   = 1u << 1;
+constexpr uint32_t kTun3FlagPrebakedWk   = 1u << 2;
 
 struct EvecHeader {
     char     magic[4]{'E', 'V', 'E', 'C'};
@@ -727,8 +728,17 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
     const int32_t k = basis_meta.k;
     const int32_t n = hdr.n;
     const double lambda_tail = basis_meta.lambda_tail;
-    compute_woodbury_ck_from_saved(st.dk_f, lambda_tail, st.varcmp,
-                                   st.wb.ck_f, st.wb.sqrt_ck_f, st.wb.sigma2_eff_f);
+    if ((basis_meta.flags & kTun3FlagPrebakedWk) != 0u) {
+        const double sg2   = static_cast<double>(st.varcmp[0]);
+        const double se2   = static_cast<double>(st.varcmp[st.varcmp.size() - 1]);
+        const double sig2e = sg2 * lambda_tail + se2;
+        st.wb.ck_f         = Eigen::VectorXf::Ones(k);
+        st.wb.sqrt_ck_f    = Eigen::VectorXf::Ones(k);
+        st.wb.sigma2_eff_f = static_cast<float>(sig2e);
+    } else {
+        compute_woodbury_ck_from_saved(st.dk_f, lambda_tail, st.varcmp,
+                                       st.wb.ck_f, st.wb.sqrt_ck_f, st.wb.sigma2_eff_f);
+    }
 
     const Eigen::VectorXf y_adj_f = (!no_adj_covar && st.b.size() == expected_xc)
         ? compute_y_adj_deterministic(y_raw_f, X_design, st.b)
@@ -1084,7 +1094,13 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
 
         Eigen::VectorXf ck_f, sqrt_ck_f;
         float sig2e_f = 0.0f;
-        compute_woodbury_ck_from_saved(dk_f, ctx.lambda_tail, varcmp_f, ck_f, sqrt_ck_f, sig2e_f);
+        if (ctx.wb_uk_is_prebaked_wk) {
+            ck_f      = Eigen::VectorXf::Ones(k);
+            sqrt_ck_f = Eigen::VectorXf::Ones(k);
+            sig2e_f   = static_cast<float>(ctx.sigma2_eff);
+        } else {
+            compute_woodbury_ck_from_saved(dk_f, ctx.lambda_tail, varcmp_f, ck_f, sqrt_ck_f, sig2e_f);
+        }
 
         std::vector<float> max_abs;
         bool have_max_abs = false;
@@ -1126,7 +1142,9 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
             vi_y_f = (y_adj_f - ctx.Uk.leftCols(k) * uy) / sig2e_f;
         }
 
-        const uint32_t flags = kTun3FlagHasViY | (no_adj_covar ? kTun3FlagNoAdjCovar : 0u);
+        const uint32_t flags = kTun3FlagHasViY
+                             | (no_adj_covar ? kTun3FlagNoAdjCovar : 0u)
+                             | (ctx.wb_uk_is_prebaked_wk ? kTun3FlagPrebakedWk : 0u);
 
         // --- Thin TREF Branch (--woodbury-reuse --save-reml without --reml-standalone) ---
         if (!reuse_basis_tun3_path.empty() && reuse_basis_hash != 0 && !reml_standalone) {
@@ -1521,6 +1539,11 @@ LoadedBasisInfo load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ct
     }
 
     const int32_t k = meta.k;
+    if ((meta.flags & kTun3FlagPrebakedWk) != 0u) {
+        LOGGER.e(0, "[" + tun3_path + "] stores pre-baked Stage-4 weights (W_k) from unrotated Cholesky-Woodbury REML "
+                    "and cannot be reused across phenotypes. Re-run initial REML with --reml-woodbury-solver eigh "
+                    "to save a reusable eigenbasis.");
+    }
     if (k <= 0 || k >= ctx.n) {
         LOGGER.e(0, "[" + tun3_path + "] has invalid Woodbury rank k=" + to_string(k) + ".");
     }
@@ -1630,6 +1653,11 @@ StreamingReuseHandle preload_woodbury_subspace_streaming(const string& filename,
     const int32_t k = out.meta.k;
     const int n = ctx.n;
     const int c = ctx.X_c;
+    if ((out.meta.flags & kTun3FlagPrebakedWk) != 0u) {
+        LOGGER.e(0, "[" + out.tun3_path + "] stores pre-baked Stage-4 weights (W_k) from unrotated Cholesky-Woodbury REML "
+                    "and cannot be reused across phenotypes. Re-run initial REML with --reml-woodbury-solver eigh "
+                    "to save a reusable eigenbasis.");
+    }
     if (k <= 0 || k >= n) {
         LOGGER.e(0, "[" + out.tun3_path + "] has invalid Woodbury rank k=" + to_string(k) + ".");
     }
@@ -2808,6 +2836,9 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             ctx.reml_qr_power_passes  = r.reml_qr_power_passes;
             ctx.reml_eigh_fp32        = r.reml_eigh_fp32;
             ctx.reml_eigh_threads     = r.reml_eigh_threads;
+            ctx.reml_woodbury_solver  = static_cast<RemlWoodburySolver>(r.reml_woodbury_solver);
+            ctx.reml_qr_mode          = static_cast<CholeskyQrMode>(r.reml_qr_mode);
+            ctx.svd_chebyshev         = (r.reml_svd_filter == gcta_cli::RemlSvdFilter::Chebyshev);
 
             if (!r.woodbury_warm_start.empty()) {
                 if (!have_wb)
@@ -2860,16 +2891,16 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                 LOGGER.i(0, std::format(
                     "[reml-profile] grm_load_s={:.3f} sketch_fill_s={:.3f} sketch_matvec_s={:.3f} "
                     "power_qr_s={:.3f} power_matvec_s={:.3f} final_qr_s={:.3f} rr_matvec_s={:.3f} "
-                    "gram_s={:.3f} eigh_s={:.3f} rotate_s={:.3f} ai_reml_s={:.3f} save_s={:.3f} "
+                    "gram_s={:.3f} eigh_s={:.3f} rotate_s={:.3f} ai_reml_s={:.3f} wk_factor_s={:.3f} save_s={:.3f} "
                     "total_s={:.3f} matvec_unpack_s={:.3f} matvec_gemm_s={:.3f} matvec_tiles={} "
                     "matvec_gemm_calls={} qr_calls={} qr_passes={} qr_shifted={} qr_householder={} "
-                    "reuse_stream={}",
+                    "reuse_stream={} wb_solver={}",
                     reml_grm_load_s, p.sketch_fill_s, p.sketch_matvec_s,
                     p.power_qr_s, p.power_matvec_s, p.final_qr_s, p.rr_matvec_s,
-                    p.gram_s, p.eigh_s, p.rotate_s, ctx.reml_ai_s, reml_save_s,
+                    p.gram_s, p.eigh_s, p.rotate_s, ctx.reml_ai_s, ctx.reml_wk_factor_s, reml_save_s,
                     total_s, p.matvec_unpack_s, p.matvec_gemm_s, p.matvec_tiles,
                     p.matvec_gemm_calls, p.qr_calls, p.qr_passes, p.qr_shifted, p.qr_householder,
-                    streaming_reuse_info.active ? 1 : 0));
+                    streaming_reuse_info.active ? 1 : 0, ctx.reml_wb_solver_used));
             };
 
             if (reml_only) {

@@ -263,7 +263,7 @@ struct MlmaOptions {
 
     // Hidden developer tuning flags
     bool mlma_profile = false;
-    int mlma_p_budget_mb = 384;
+    int mlma_p_budget_mb = 0; // 0 = auto (576 MiB baseline, 1-pass headroom-aware)
     int mlma_q_rows = 8192;
     int mlma_snp_tile = 0;
     MlmaReorderQ mlma_reorder_q = MlmaReorderQ::Auto;

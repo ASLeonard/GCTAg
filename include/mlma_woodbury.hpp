@@ -53,7 +53,7 @@ struct WoodburyMLMACache {
 enum class MlmaReorderPolicy { Auto = 0, Off = 1, On = 2 };
 
 struct MlmaTuningOptions {
-    int p_budget_mb = 384;       // 1-pass P_i32 tile budget for 2slice BLOCK=8192..16384
+    int p_budget_mb = 0;         // 0 = auto (576 MiB baseline + headroom-aware 1-pass)
     int q_rows = 8192;           // max q_rows per Q tile
     int snp_tile = 0;            // 0 = auto from p_budget_mb
     MlmaReorderPolicy reorder_q = MlmaReorderPolicy::Auto;
@@ -2079,6 +2079,19 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk_from_nxk(
     return out;
 }
 
+// Partition `bs` into `ceil(bs / aligned_max)` balanced 64-column-aligned sub-tiles
+// (guaranteed <= aligned_max when bs > aligned_max, e.g. 16384 -> 8192 + 8192 instead of 12224 + 4160).
+[[nodiscard]] inline int balanced_snp_tile_cols(int bs, int max_cols) noexcept
+{
+    if (bs <= 0) return 0;
+    const int aligned_max = std::max(64, (max_cols / 64) * 64);
+    if (bs <= aligned_max) return bs;
+    const int n_sub = (bs + aligned_max - 1) / aligned_max;
+    const int total_u = (bs + 63) / 64;
+    const int sub_u = (total_u + n_sub - 1) / n_sub;
+    return std::min(bs, sub_u * 64);
+}
+
 inline void woodbury_xvx_diag_block_fast_i8(
     const WoodburyMLMACache& wb,
     const QuantizedWoodburyUk& q_uk,
@@ -2097,7 +2110,7 @@ inline void woodbury_xvx_diag_block_fast_i8(
     bool block_has_miss = true,
     std::vector<double>* ukx_norm_sq_scratch = nullptr,
     AlignedRawBuffer<int32_t, 64>* thr_miss_acc_buf = nullptr,
-    int p_budget_mb = 384,
+    int p_budget_mb = 0,
     int snp_tile_override = 0,
     MlmaProfileStats* prof = nullptr,
     std::vector<double>* ukx_norm_sq_hi_out = nullptr)
@@ -2151,6 +2164,27 @@ inline void woodbury_xvx_diag_block_fast_i8(
         1;
     #endif
 
+    size_t max_ldP_block = 64;
+    for (size_t ti = 0; ti < num_tiles; ++ti) {
+        const int qr_t = q_uk.tiles[ti].q_rows;
+        int ldp_t = ((qr_t + 15) / 16) * 16;
+        if ((static_cast<size_t>(ldp_t) * sizeof(int32_t)) % 4096 == 0) ldp_t += 16;
+        max_ldP_block = std::max(max_ldP_block, static_cast<size_t>(std::max(qr_t, ldp_t)));
+    }
+    size_t eff_p_budget_bytes = 576ULL << 20; // covers ldP=8208 (qr=8192 + 4K pad) x bs=16384 (513 MiB) in 1 pass
+    if (p_budget_mb > 0) {
+        eff_p_budget_bytes = static_cast<size_t>(std::max(16, p_budget_mb)) << 20;
+    } else {
+        const size_t one_pass_bytes = max_ldP_block * static_cast<size_t>(bs) * sizeof(int32_t);
+        if (one_pass_bytes > eff_p_budget_bytes && one_pass_bytes <= (2048ULL << 20)) {
+            const uint64_t avail = detect_available_memory_bytes();
+            constexpr uint64_t kReserve = 4ULL << 30;
+            if (avail > kReserve + 2ULL * static_cast<uint64_t>(one_pass_bytes)) {
+                eff_p_budget_bytes = one_pass_bytes;
+            }
+        }
+    }
+
     for (size_t ti = 0; ti < num_tiles; ++ti) {
         const auto& tile = q_uk.tiles[ti];
         const bool is_last_tile = (ti + 1 == num_tiles);
@@ -2169,14 +2203,13 @@ inline void woodbury_xvx_diag_block_fast_i8(
             kSnpTile = std::min(bs, snp_tile_override);
         } else {
 #if GCTA_HAS_AOCL_S8_GEMM
-            const size_t p_budget_bytes = static_cast<size_t>(std::max(16, p_budget_mb)) << 20;
-            const size_t budget_cols = p_budget_bytes / (static_cast<size_t>(ldP) * sizeof(int32_t));
+            const size_t budget_cols = eff_p_budget_bytes / (static_cast<size_t>(ldP) * sizeof(int32_t));
             const size_t aligned_cols = (budget_cols / 64ULL) * 64ULL;
-            kSnpTile = std::min(
-                bs,
-                std::clamp(static_cast<int>(std::min<size_t>(aligned_cols, 16384ULL)), 2048, 16384));
+            const int max_cols = std::clamp(
+                static_cast<int>(std::min<size_t>(aligned_cols, 32768ULL)), 256, 32768);
+            kSnpTile = balanced_snp_tile_cols(bs, max_cols);
 #else
-            kSnpTile = std::min(bs, 1024);
+            kSnpTile = balanced_snp_tile_cols(bs, 1024);
 #endif
         }
         const size_t need_p = static_cast<size_t>(ldP) * static_cast<size_t>(kSnpTile);

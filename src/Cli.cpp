@@ -1113,8 +1113,8 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
                        "Dev: Log detailed phase timing breakdown for mlma")
         ->group("");
     mlma_cmd->add_option("--mlma-p-budget-mb", mlma_opts.mlma_p_budget_mb,
-                         "Dev: Persistent P_i32 tile buffer budget in MiB for quantized fast-mlma")
-        ->check(CLI::PositiveNumber)
+                         "Dev: Persistent P_i32 tile buffer budget in MiB for quantized fast-mlma (0 = auto)")
+        ->check(CLI::NonNegativeNumber)
         ->group("");
     mlma_cmd->add_option("--mlma-q-rows", mlma_opts.mlma_q_rows,
                          "Dev: Max sample rows per quantized Q tile for 2slice/1slice/hybrid")

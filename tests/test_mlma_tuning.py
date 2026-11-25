@@ -288,6 +288,36 @@ def main():
             "new 2slice reorder-q auto p64",
         )
         compare_mlma(W("new_2slice_rq_auto_p64.mlma"), W("ref_2slice_maf.mlma"), exact=False)
+
+        must_run(
+            [NEW_BIN]
+            + base_2slice
+            + [
+                "--mlma-p-budget-mb",
+                "16",
+                "--mlma-q-rows",
+                "8192",
+                "--mlma-block-size",
+                "1536",
+                "--out",
+                W("new_2slice_split_p16"),
+            ],
+            "new 2slice balanced snp split p16",
+        )
+        compare_mlma(W("new_2slice_split_p16.mlma"), W("ref_2slice_maf.mlma"), exact=False)
+
+        must_run(
+            [NEW_BIN]
+            + base_2slice
+            + [
+                "--mlma-p-budget-mb",
+                "0",
+                "--out",
+                W("new_2slice_p_auto"),
+            ],
+            "new 2slice p_budget_mb=0 auto",
+        )
+        compare_mlma(W("new_2slice_p_auto.mlma"), W("ref_2slice_maf.mlma"), exact=False)
         print("  PASS reorder_q_off_and_auto_p64")
 
         # 2. syn0 (0% missingness fast path)

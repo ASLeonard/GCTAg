@@ -251,6 +251,7 @@ def main():
             "blocks",
             "valid_snps",
             "total_snps",
+            "refined_snps",
             "q_tiles",
             "block_size",
         ):
@@ -435,7 +436,7 @@ def main():
         compare_mlma(W("new_w_tun3.mlma"), W("ref_w_tun3.mlma"), exact=False)
         print("  PASS weighted_pheno_tun3")
 
-        # 7. Inline MLMA with --fast --woodbury-basis 40
+        # 7. Inline MLMA with --fast (default adaptive vs explicit 2slice parity + weighted adaptive)
         inline_cmd = [
             "mlma",
             "--bfile",
@@ -451,15 +452,63 @@ def main():
             "7",
         ]
         must_run([REF_BIN] + inline_cmd + ["--out", W("ref_inline_fast")], "ref inline fast")
+        must_run(
+            [NEW_BIN]
+            + inline_cmd
+            + ["--fast-mlma", "2slice", "--mlma-q-rows", "256", "--mlma-profile", "--out", W("new_inline_2s")],
+            "new inline fast 2slice",
+        )
+        compare_mlma(W("new_inline_2s.mlma"), W("ref_inline_fast.mlma"), exact=False)
+
         inline_out = must_run(
             [NEW_BIN]
             + inline_cmd
             + ["--mlma-q-rows", "256", "--mlma-profile", "--out", W("new_inline_fast")],
-            "new inline fast",
+            "new inline fast adaptive",
         )
         in_prof = parse_profile_kv(extract_profile_line(inline_out))
+        assert "refined_snps" in in_prof and int(in_prof["refined_snps"]) >= 0, in_prof
         assert int(in_prof["q_tiles"]) > 1 and int(in_prof["blocks"]) > 0, in_prof
-        compare_mlma(W("new_inline_fast.mlma"), W("ref_inline_fast.mlma"), exact=False)
+        compare_mlma(W("new_inline_fast.mlma"), W("ref_inline_fast.mlma"), exact=False, rel_tol=3e-3, abs_tol=5e-5)
+
+        # Saved TUN3 adaptive + weighted TUN3 adaptive: strict parity on p < 0.02
+        must_run(
+            [
+                NEW_BIN, "mlma", "--bfile", D("syn"), "--load-reml", W("reml_syn.reml"),
+                "--pheno", D("syn.phen"), "--fast-mlma", "adaptive", "--mlma-q-rows", "256",
+                "--mlma-profile", "--out", W("new_tun3_adapt"),
+            ],
+            "new tun3 adaptive",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma", "--bfile", D("syn"), "--load-reml", W("reml_syn.reml"),
+                "--pheno", D("syn.phen"), "--fast-mlma", "2slice", "--mlma-q-rows", "256",
+                "--out", W("new_tun3_2s"),
+            ],
+            "new tun3 2slice",
+        )
+        compare_mlma(W("new_tun3_adapt.mlma"), W("new_tun3_2s.mlma"), exact=False, rel_tol=3e-3, abs_tol=5e-5)
+        _, rows_ad = parse_mlma(W("new_tun3_adapt.mlma"))
+        _, rows_2s = parse_mlma(W("new_tun3_2s.mlma"))
+        for ra, r2 in zip(rows_ad, rows_2s):
+            if r2[8].lower() in ("nan", "na"):
+                continue
+            if float(r2[8]) < 0.02:
+                for col in (6, 7, 8):
+                    fa, fb = float(ra[col]), float(r2[col])
+                    lim = max(1e-6, 1e-5 * max(abs(fa), abs(fb)))
+                    assert abs(fa - fb) <= lim, f"Adaptive p<0.02 mismatch {ra[1]} col {col}: {fa} vs {fb}"
+
+        must_run(
+            [
+                NEW_BIN, "mlma", "--bfile", D("syn"), "--load-reml", W("reml_syn_w.reml"),
+                "--pheno", D("syn_w.phen"), "--weighted-phenotypes", "--fast-mlma", "adaptive",
+                "--mlma-q-rows", "256", "--out", W("new_w_adapt"),
+            ],
+            "new weighted adaptive",
+        )
+        compare_mlma(W("new_w_adapt.mlma"), W("ref_w_tun3.mlma"), exact=False, rel_tol=3e-3, abs_tol=5e-5)
         print("  PASS inline_mlma_fast_woodbury_basis_40")
 
         print("ALL MLMA TUNING & TRACK B TESTS PASSED")

@@ -630,13 +630,20 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
     AlignedRawBuffer<float, 64> X_panel_f32;
     AlignedRawBuffer<int32_t, 64> P_i32;
     AlignedRawBuffer<int32_t, 64> thr_miss_acc;
+    AlignedRawBuffer<int8_t, 64> cand_G_buf;
+    AlignedRawBuffer<int32_t, 64> P_hi_cand;
+    AlignedRawBuffer<int32_t, 64> P_lo_cand;
     std::vector<float> scratch_A_f32, scratch_B_f32, scratch_C_f32;
     std::vector<double> ukx_norm_sq(static_cast<size_t>(BLOCK), 0.0);
+    std::vector<double> ukx_norm_sq_hi(static_cast<size_t>(BLOCK), 0.0);
 
     std::vector<int>     compact_idx(static_cast<size_t>(BLOCK));
+    std::vector<int>     compact_dst(static_cast<size_t>(BLOCK));
+    std::vector<int>     compact_src(static_cast<size_t>(BLOCK));
     std::vector<uint8_t> compact_valid(static_cast<size_t>(BLOCK), 1);
     std::vector<float>   compact_mu(static_cast<size_t>(BLOCK));
     std::vector<float>   compact_x_norm(static_cast<size_t>(BLOCK));
+    Eigen::VectorXf      compact_xt_vi_y(BLOCK);
     Eigen::VectorXf      compact_xvx(BLOCK);
 
     int snp_done = 0;
@@ -702,6 +709,7 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                 BedI8Fused fz;
                 fz.vw = vw_ptr;
                 fz.w2 = unit_weights ? nullptr : w2_ptr;
+                snp_miss_samples[i].clear();
                 fz.miss_list = &snp_miss_samples[i];
                 geno->getGenoInt8_bed(buf, i, col_i8, af, add_af, mu, nValidN,
                                       miss_ptr, valid, exIdx[i], &fz);
@@ -746,14 +754,12 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
             prof->decode_s += std::chrono::duration<double>(Clock::now() - t_dec0).count();
         }
 
-        // Compact valid SNPs before Woodbury GEMM so filtered SNPs are skipped cleanly.
+        // Compact valid SNPs into [0, n_valid) before Woodbury GEMM so filtered SNPs are skipped cleanly.
         int n_valid = 0;
         for (int i = 0; i < bs; ++i) {
-            if (valid_v[i]) {
-                compact_idx[static_cast<size_t>(n_valid)] = i;
-                ++n_valid;
-            }
+            if (valid_v[i]) ++n_valid;
         }
+        const bool use_adaptive = use_fast_i8 && (q_uk.mode == FastMlmaMode::Adaptive);
 
         if (n_valid == 0) {
             xvx_diag.head(bs).setZero();
@@ -764,7 +770,16 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                                                 xvx_diag, P_i32,
                                                 scratch_A_f32, scratch_B_f32, scratch_C_f32,
                                                 block_has_miss != 0, &ukx_norm_sq, &thr_miss_acc,
-                                                tuning.p_budget_mb, tuning.snp_tile, prof);
+                                                tuning.p_budget_mb, tuning.snp_tile, prof,
+                                                use_adaptive ? &ukx_norm_sq_hi : nullptr);
+                if (use_adaptive) {
+                    refine_adaptive_candidates_fast_i8(
+                        wb, q_uk, G_block_i8.get(), ldG, bs,
+                        valid_v, mu_v, x_norm_v, Xt_Vi_y, snp_miss_samples,
+                        ukx_norm_sq_hi, xvx_diag, block_has_miss != 0,
+                        cand_G_buf, P_hi_cand, P_lo_cand, thr_miss_acc,
+                        scratch_A_f32, scratch_B_f32, scratch_C_f32, prof);
+                }
             } else {
                 woodbury_xvx_diag_block_i8(wb, u_sum, w_sqrt, unit_weights,
                                            G_block_i8.get(), ldG, bs,
@@ -774,16 +789,42 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                                            tuning.sample_tile, tuning.ukx_budget_mb, prof);
             }
         } else {
-            for (int c = 0; c < n_valid; ++c) {
-                const int src = compact_idx[static_cast<size_t>(c)];
-                compact_mu[static_cast<size_t>(c)]     = mu_v[src];
-                compact_x_norm[static_cast<size_t>(c)] = x_norm_v[src];
-                if (src != c) {
-                    std::memcpy(G_block_i8.get() + static_cast<size_t>(c) * static_cast<size_t>(ldG),
+            // In-place tail-swap compaction: leave valid SNPs in [0, n_valid) untouched
+            // and move only valid SNPs from [n_valid, bs) into the invalid slots of [0, n_valid).
+            // Because Woodbury xvx_diag computation is column-order-independent and
+            // compact_idx scatters results back, this reduces copied columns from O(n_valid)
+            // to min(n_invalid, n_valid) and makes all (dst, src) moves pairwise disjoint.
+            int n_moves = 0;
+            int tail = n_valid;
+            for (int dst = 0; dst < n_valid; ++dst) {
+                if (valid_v[dst]) {
+                    compact_idx[static_cast<size_t>(dst)]    = dst;
+                    compact_mu[static_cast<size_t>(dst)]     = mu_v[dst];
+                    compact_x_norm[static_cast<size_t>(dst)] = x_norm_v[dst];
+                    compact_xt_vi_y[dst]                     = Xt_Vi_y[dst];
+                } else {
+                    while (!valid_v[tail]) ++tail;
+                    const int src = tail++;
+                    compact_idx[static_cast<size_t>(dst)]     = src;
+                    compact_mu[static_cast<size_t>(dst)]      = mu_v[src];
+                    compact_x_norm[static_cast<size_t>(dst)]  = x_norm_v[src];
+                    compact_xt_vi_y[dst]                      = Xt_Vi_y[src];
+                    compact_dst[static_cast<size_t>(n_moves)] = dst;
+                    compact_src[static_cast<size_t>(n_moves)] = src;
+                    ++n_moves;
+                }
+            }
+            if (n_moves > 0) {
+                #pragma omp parallel for schedule(static) if (n_moves >= 4 && n >= 4096)
+                for (int m = 0; m < n_moves; ++m) {
+                    const int dst = compact_dst[static_cast<size_t>(m)];
+                    const int src = compact_src[static_cast<size_t>(m)];
+                    std::memcpy(G_block_i8.get() + static_cast<size_t>(dst) * static_cast<size_t>(ldG),
                                 G_block_i8.get() + static_cast<size_t>(src) * static_cast<size_t>(ldG),
                                 static_cast<size_t>(n));
                     if (block_has_miss != 0) {
-                        snp_miss_samples[static_cast<size_t>(c)].swap(snp_miss_samples[static_cast<size_t>(src)]);
+                        snp_miss_samples[static_cast<size_t>(dst)].swap(
+                            snp_miss_samples[static_cast<size_t>(src)]);
                     }
                 }
             }
@@ -793,7 +834,16 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                                                 compact_xvx, P_i32,
                                                 scratch_A_f32, scratch_B_f32, scratch_C_f32,
                                                 block_has_miss != 0, &ukx_norm_sq, &thr_miss_acc,
-                                                tuning.p_budget_mb, tuning.snp_tile, prof);
+                                                tuning.p_budget_mb, tuning.snp_tile, prof,
+                                                use_adaptive ? &ukx_norm_sq_hi : nullptr);
+                if (use_adaptive) {
+                    refine_adaptive_candidates_fast_i8(
+                        wb, q_uk, G_block_i8.get(), ldG, n_valid,
+                        compact_valid, compact_mu, compact_x_norm, compact_xt_vi_y, snp_miss_samples,
+                        ukx_norm_sq_hi, compact_xvx, block_has_miss != 0,
+                        cand_G_buf, P_hi_cand, P_lo_cand, thr_miss_acc,
+                        scratch_A_f32, scratch_B_f32, scratch_C_f32, prof);
+                }
             } else {
                 woodbury_xvx_diag_block_i8(wb, u_sum, w_sqrt, unit_weights,
                                            G_block_i8.get(), ldG, n_valid,

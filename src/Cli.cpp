@@ -1072,7 +1072,7 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
                          "Override basis .reml file path referenced by a thin TREF .reml")
         ->check(CLI::ExistingFile)->group("GRM / Model Source");
     mlma_cmd->add_flag("--fast", mlma_opts.fast,
-                       "Hyperscale fast preset: FP16 GRM + Woodbury MP + --fast-mlma 2slice")
+                       "Hyperscale fast preset: FP16 GRM + Woodbury MP + --fast-mlma adaptive")
         ->group(g_assoc);
 
     auto* mlma_save = mlma_cmd->add_flag("--save-reml", mlma_opts.save_reml,
@@ -1082,13 +1082,14 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
                                              "Genotype streaming memory budget in GB (optional)")
                             ->check(CLI::PositiveNumber)->type_name("GB")->group(g_assoc);
     auto* mlma_fast = mlma_cmd->add_option("--fast-mlma", mlma_opts.fast_mlma,
-                                           "Quantized Woodbury association mode: 2slice, hybrid, or 1slice [default: 2slice]")
-                          ->expected(0, 1)->default_str("2slice")
+                                           "Quantized Woodbury association mode: adaptive, 2slice, hybrid, or 1slice [default: adaptive]")
+                          ->expected(0, 1)->default_str("adaptive")
                           ->transform(make_enum_transformer<FastMlmaMode>(
                               {{"2slice", FastMlmaMode::Slice2},
                                {"hybrid", FastMlmaMode::Hybrid},
-                               {"1slice", FastMlmaMode::Slice1}},
-                              "{2slice,hybrid,1slice}"))
+                               {"1slice", FastMlmaMode::Slice1},
+                               {"adaptive", FastMlmaMode::Adaptive}},
+                              "{adaptive,2slice,hybrid,1slice}"))
                           ->type_name("MODE")->group(g_assoc);
     auto* mlma_model = mlma_cmd->add_option("--model", mlma_opts.model,
                                             "Genotype coding model: additive (default), nonadditive, or dominance")

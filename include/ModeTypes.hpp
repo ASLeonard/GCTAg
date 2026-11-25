@@ -40,18 +40,20 @@ constexpr const char* woodbury_mode_name(WoodburyBasisSpec::Kind kind) {
 }
 
 enum class FastMlmaMode : int {
-    Off    = 0,
-    Slice1 = 1,
-    Slice2 = 2,
-    Hybrid = 3
+    Off      = 0,
+    Slice1   = 1,
+    Slice2   = 2,
+    Hybrid   = 3,
+    Adaptive = 4
 };
 
 constexpr const char* fast_mlma_mode_name(FastMlmaMode mode) {
     switch (mode) {
-        case FastMlmaMode::Slice1: return "1slice";
-        case FastMlmaMode::Slice2: return "2slice";
-        case FastMlmaMode::Hybrid: return "hybrid";
+        case FastMlmaMode::Slice1:   return "1slice";
+        case FastMlmaMode::Slice2:   return "2slice";
+        case FastMlmaMode::Hybrid:   return "hybrid";
+        case FastMlmaMode::Adaptive: return "adaptive";
         case FastMlmaMode::Off:
-        default:                   return "off";
+        default:                     return "off";
     }
 }

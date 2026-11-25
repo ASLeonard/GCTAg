@@ -750,7 +750,7 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
                         const Eigen::MatrixXd& X_design,
                         const Eigen::VectorXf& w_sqrt,
                         size_t tun3_slot_bytes = (256ULL << 20),
-                        int max_q_rows = 4096)
+                        int max_q_rows = 8192)
 {
     ScopedFd fd(::open(filename.c_str(), O_RDONLY));
     if (!fd) LOGGER.e(0, "Cannot open file [" + filename + "].");
@@ -895,7 +895,7 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
             S_w2 = w_sqrt.cast<double>().array().square().sum();
         }
 
-        const int raw_q = (max_q_rows <= 0) ? 4096 : max_q_rows;
+        const int raw_q = (max_q_rows <= 0) ? 8192 : max_q_rows;
         const int effective_q_rows = std::clamp(((raw_q + 63) / 64) * 64, 256, 32768);
 
         // Path A: zero-repack parallel pread directly into QuantizedWoodburyUk::tiles.
@@ -1030,7 +1030,9 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
                     const int r = tt.r_begin + rl;
                     row_to_tt[static_cast<size_t>(r)] = ti;
                     tt.alpha_hi[static_cast<size_t>(rl)] = disk_ahi[static_cast<size_t>(r)];
-                    if (tt.is_2slice) tt.alpha_lo[static_cast<size_t>(rl)] = disk_alo[static_cast<size_t>(r)];
+                    if (tt.is_2slice || tt.has_lo_refine) {
+                        tt.alpha_lo[static_cast<size_t>(rl)] = disk_alo[static_cast<size_t>(r)];
+                    }
                 }
             }
 
@@ -1055,14 +1057,14 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
                 const size_t tt_beg = row_to_tt[static_cast<size_t>(r0)];
                 const size_t tt_end = row_to_tt[static_cast<size_t>(r0 + rc - 1)] + 1;
 
-                struct OverlapSeg { size_t tt_idx; int r_start; int r_len; int d_off; int t_off; bool t_2s; };
+                struct OverlapSeg { size_t tt_idx; int r_start; int r_len; int d_off; int t_off; bool t_2s; bool t_lo_ref; };
                 std::vector<OverlapSeg> segs;
                 for (size_t tti = tt_beg; tti < tt_end; ++tti) {
                     const auto& tt = q_uk.tiles[tti];
                     const int rs = std::max(r0, tt.r_begin);
                     const int re = std::min(r0 + rc, tt.r_begin + tt.r_count);
                     if (re > rs) {
-                        segs.push_back(OverlapSeg{tti, rs, re - rs, rs - r0, rs - tt.r_begin, tt.is_2slice});
+                        segs.push_back(OverlapSeg{tti, rs, re - rs, rs - r0, rs - tt.r_begin, tt.is_2slice, tt.has_lo_refine});
                     }
                 }
 
@@ -1097,6 +1099,10 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
                                 if (sg.t_2s) {
                                     std::memcpy(t_qh + tt.r_count, d_ql + sg.d_off, static_cast<size_t>(sg.r_len));
                                 } else {
+                                    if (sg.t_lo_ref) {
+                                        int8_t* const t_ql = tt.Q_lo_refine.get() + static_cast<size_t>(s) * static_cast<size_t>(tt.q_lo_ld) + sg.t_off;
+                                        std::memcpy(t_ql, d_ql + sg.d_off, static_cast<size_t>(sg.r_len));
+                                    }
                                     for (int i = 0; i < sg.r_len; ++i) {
                                         const int r = sg.r_start + i;
                                         const int32_t qlv = static_cast<int32_t>(d_ql[sg.d_off + i]);
@@ -1134,11 +1140,15 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
                         for (int t = 0; t < max_t; ++t) sql += thr_sum_ql[static_cast<size_t>(t) * k_pad + r];
                         tt.u_sum_q[static_cast<size_t>(rl)] = disk_usum[static_cast<size_t>(r)]
                             - disk_alo[static_cast<size_t>(r)] * static_cast<double>(sql);
+                        if (tt.has_lo_refine) {
+                            tt.u_sum_q_2s[static_cast<size_t>(rl)] = disk_usum[static_cast<size_t>(r)];
+                        }
                     }
                 }
             }
             const double norm_denom = (n > 1) ? static_cast<double>(n - 1) : 1.0;
-            q_uk.delta_quant = meta.delta_quant + extra_eps_1s / norm_denom;
+            q_uk.delta_quant    = meta.delta_quant + extra_eps_1s / norm_denom;
+            q_uk.delta_quant_2s = meta.delta_quant;
 
             if (!vi_y_hit) {
                 LOGGER.i(0, "Phenotype/covariate adjustment differs from saved .reml Vi_y cache; "
@@ -1339,7 +1349,9 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
         float w_spread_ratio = 1.0f;
         if (!unit_weights) {
             S_w2 = w_sqrt.cast<double>().array().square().sum();
-            if (stream_fast_mode == FastMlmaMode::Slice1 || stream_fast_mode == FastMlmaMode::Hybrid) {
+            if (stream_fast_mode == FastMlmaMode::Slice1 ||
+                stream_fast_mode == FastMlmaMode::Hybrid ||
+                stream_fast_mode == FastMlmaMode::Adaptive) {
                 std::vector<float> abs_w(static_cast<size_t>(n));
                 for (int s = 0; s < n; ++s) abs_w[static_cast<size_t>(s)] = std::fabs(w_sqrt[s]);
                 const float w_max = *std::max_element(abs_w.begin(), abs_w.end());
@@ -3312,12 +3324,12 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
         LOGGER.i(0, std::format(
             "[mlma-profile] reml_load_s={:.3f} q_build_s={:.3f} q_reorder_s={:.3f} "
             "decode_s={:.3f} xvx_gemm_s={:.3f} xvx_reduce_s={:.3f} format_write_s={:.3f} "
-            "total_s={:.3f} blocks={} valid_snps={} total_snps={} q_tiles={} block_size={}",
+            "total_s={:.3f} blocks={} valid_snps={} total_snps={} refined_snps={} q_tiles={} block_size={}",
             mlma_prof.reml_load_s, mlma_prof.q_build_s, mlma_prof.q_reorder_s,
             mlma_prof.decode_s, mlma_prof.xvx_gemm_s, mlma_prof.xvx_reduce_s,
             mlma_prof.format_write_s, total_s, mlma_prof.blocks,
-            mlma_prof.valid_snps, mlma_prof.total_snps, mlma_prof.q_tiles,
-            mlma_prof.block_size));
+            mlma_prof.valid_snps, mlma_prof.total_snps, mlma_prof.refined_snps,
+            mlma_prof.q_tiles, mlma_prof.block_size));
     };
 
     const auto& r = opts.reml;
@@ -3334,7 +3346,7 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
     FastMlmaMode fast_mlma_mode = opts.fast_mlma.value_or(FastMlmaMode::Off);
     const bool fast_enabled_mlma = fast_preset && !reml_only && !opts.fast_mlma.has_value();
     if (fast_enabled_mlma) {
-        fast_mlma_mode = FastMlmaMode::Slice2;
+        fast_mlma_mode = FastMlmaMode::Adaptive;
     }
     if (opts.fast_mlma.has_value() && reml_only) {
         LOGGER.w(0, "--fast-mlma applies to association scanning and has no effect with --save-reml.");
@@ -3444,7 +3456,7 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
 
         if (!opts.load_reml.empty()) {
             if (fast_enabled_mlma) {
-                LOGGER.i(0, "[--fast] enabled: fast-mlma=2slice (1-pass streaming TUN3 load).");
+                LOGGER.i(0, "[--fast] enabled: fast-mlma=adaptive (1-pass streaming REML load).");
             }
             const string& load_reml_file = opts.load_reml;
             const bool can_stream_fast = (fast_mlma_mode != FastMlmaMode::Off) &&
@@ -3502,7 +3514,7 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                     }
                 }
                 if (fast_enabled_mlma) {
-                    fast_notes.push_back("fast-mlma=2slice");
+                    fast_notes.push_back("fast-mlma=adaptive");
                 }
                 if (!fast_notes.empty()) {
                     string summary;

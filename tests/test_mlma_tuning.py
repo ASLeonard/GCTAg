@@ -262,7 +262,7 @@ def main():
         )
         print("  PASS 2slice_missing_maf_compaction_and_profile")
 
-        # Test explicit --mlma-reorder-q off
+        # Test explicit --mlma-reorder-q off and --mlma-reorder-q auto with --mlma-p-budget-mb 64
         must_run(
             [NEW_BIN]
             + base_2slice
@@ -270,7 +270,24 @@ def main():
             "new 2slice reorder-q off",
         )
         compare_mlma(W("new_2slice_rq_off.mlma"), W("ref_2slice_maf.mlma"), exact=False)
-        print("  PASS reorder_q_off")
+
+        must_run(
+            [NEW_BIN]
+            + base_2slice
+            + [
+                "--mlma-reorder-q",
+                "auto",
+                "--mlma-p-budget-mb",
+                "64",
+                "--mlma-q-rows",
+                "256",
+                "--out",
+                W("new_2slice_rq_auto_p64"),
+            ],
+            "new 2slice reorder-q auto p64",
+        )
+        compare_mlma(W("new_2slice_rq_auto_p64.mlma"), W("ref_2slice_maf.mlma"), exact=False)
+        print("  PASS reorder_q_off_and_auto_p64")
 
         # 2. syn0 (0% missingness fast path)
         syn0_cmd = [

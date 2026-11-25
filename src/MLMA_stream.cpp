@@ -2421,13 +2421,15 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
     mlma_tuning.q_rows        = opts.mlma_q_rows;
     mlma_tuning.snp_tile      = opts.mlma_snp_tile;
     if (opts.mlma_reorder_q == gcta_cli::MlmaReorderQ::On) {
-        mlma_tuning.reorder_q = true;
+        mlma_tuning.reorder_q = MlmaReorderPolicy::On;
     } else if (opts.mlma_reorder_q == gcta_cli::MlmaReorderQ::Off) {
-        mlma_tuning.reorder_q = false;
+        mlma_tuning.reorder_q = MlmaReorderPolicy::Off;
     } else if (const char* env_rq = std::getenv("GCTA_MLMA_REORDER_Q")) {
-        mlma_tuning.reorder_q = (std::strcmp(env_rq, "1") == 0);
+        mlma_tuning.reorder_q = (std::strcmp(env_rq, "1") == 0)
+            ? MlmaReorderPolicy::On
+            : MlmaReorderPolicy::Off;
     } else {
-        mlma_tuning.reorder_q = false;
+        mlma_tuning.reorder_q = MlmaReorderPolicy::Auto;
     }
     mlma_tuning.block_size    = opts.mlma_block_size;
     mlma_tuning.sample_tile   = opts.mlma_sample_tile;

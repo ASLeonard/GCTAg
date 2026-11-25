@@ -14,11 +14,16 @@
 #include <Eigen/Dense>
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <string>
+#include <string_view>
 #include <vector>
 #ifdef _OPENMP
   #include <omp.h>
@@ -45,11 +50,13 @@ struct WoodburyMLMACache {
     float           sigma2_eff_f = 0.0f;
 };
 
+enum class MlmaReorderPolicy { Auto = 0, Off = 1, On = 2 };
+
 struct MlmaTuningOptions {
-    int p_budget_mb = 64;        // safe default per dc3dd31
+    int p_budget_mb = 256;       // 1-pass P_i32 tile budget for 2slice BLOCK=8192..16384
     int q_rows = 4096;           // max q_rows per Q tile
     int snp_tile = 0;            // 0 = auto from p_budget_mb
-    bool reorder_q = false;      // default off per dc3dd31
+    MlmaReorderPolicy reorder_q = MlmaReorderPolicy::Auto;
     int block_size = 0;          // 0 = auto from --stream-budget / resolve_mlma_block_size
     int sample_tile = 8192;      // std_i8 X_panel_f32 sample tile
     int ukx_budget_mb = 160;     // std_i8 UkX_scratch budget
@@ -411,8 +418,186 @@ inline void reorder_quantized_woodbury_uk(QuantizedWoodburyUk& q_uk)
     }
 }
 
-// Allocate evenly-balanced, 4K-alias-free Q tiles covering [0, k) for the chosen
-// FastMlmaMode. Returns k_hi (the split boundary between 2-slice and 1-slice rows).
+namespace mlma_woodbury_detail {
+
+inline bool parse_uint64_trimmed(std::string_view sv, uint64_t& out) noexcept
+{
+    while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t' || sv.front() == '\r' || sv.front() == '\n')) {
+        sv.remove_prefix(1);
+    }
+    while (!sv.empty() && (sv.back() == ' ' || sv.back() == '\t' || sv.back() == '\r' || sv.back() == '\n')) {
+        sv.remove_suffix(1);
+    }
+    if (sv.empty()) return false;
+    const char* const beg = sv.data();
+    const char* const end = beg + sv.size();
+    uint64_t val = 0;
+    const auto [ptr, ec] = std::from_chars(beg, end, val, 10);
+    if (ec != std::errc{} || ptr != end) return false;
+    out = val;
+    return true;
+}
+
+inline bool read_uint64_file(const std::string& path, uint64_t& out)
+{
+    std::ifstream in(path);
+    if (!in) return false;
+    std::string content;
+    if (!std::getline(in, content)) return false;
+    return parse_uint64_trimmed(content, out);
+}
+
+inline bool read_proc_kb_line(const char* path, std::string_view key, uint64_t& bytes_out)
+{
+    std::ifstream in(path);
+    if (!in) return false;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.size() <= key.size() || std::string_view(line).substr(0, key.size()) != key) continue;
+        std::string_view rest = std::string_view(line).substr(key.size());
+        while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) rest.remove_prefix(1);
+        const char* const beg = rest.data();
+        const char* const end = beg + rest.size();
+        uint64_t kb = 0;
+        const auto [ptr, ec] = std::from_chars(beg, end, kb, 10);
+        if (ec == std::errc{} && ptr != beg) {
+            if (kb > (std::numeric_limits<uint64_t>::max() >> 10)) return false;
+            bytes_out = kb << 10;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+inline bool read_env_uint64(const char* name, uint64_t& val) noexcept
+{
+    const char* const raw = std::getenv(name);
+    if (raw == nullptr) return false;
+    return parse_uint64_trimmed(raw, val);
+}
+
+} // namespace mlma_woodbury_detail
+
+// Return total AOCL pre-reorder buffer size in bytes across all tiles of q_uk,
+// or 0 when pre-reordering is unavailable/unsupported for this kernel/size.
+inline size_t estimate_quantized_woodbury_reorder_bytes(const QuantizedWoodburyUk& q_uk)
+{
+    constexpr int kAoclMaxSampleTile = 8388608;
+    if (q_uk.n <= 0 || q_uk.n > kAoclMaxSampleTile) return 0;
+    size_t total = 0;
+    for (const auto& tile : q_uk.tiles) {
+        if (tile.q_rows <= 0 || !tile.Q) continue;
+        const size_t sz = gcta_u8s8s32_reorder_b_size(
+            static_cast<gcta_blas_int>(tile.q_rows),
+            static_cast<gcta_blas_int>(q_uk.n));
+        if (sz == 0) return 0;
+        total += sz;
+    }
+    return total;
+}
+
+// Conservative estimate of remaining usable memory headroom in bytes on Linux
+// (minimum across /proc/meminfo MemAvailable, cgroup v2/v1 limits, and Slurm
+// node/CPU limits minus current VmRSS). Returns 0 if unknown or non-Linux.
+inline uint64_t detect_available_memory_bytes()
+{
+#if defined(__linux__)
+    bool has_bound = false;
+    uint64_t min_avail = std::numeric_limits<uint64_t>::max();
+    auto tighten = [&](uint64_t headroom) noexcept {
+        has_bound = true;
+        min_avail = std::min(min_avail, headroom);
+    };
+
+    if (uint64_t mem_avail = 0;
+        mlma_woodbury_detail::read_proc_kb_line("/proc/meminfo", "MemAvailable:", mem_avail)) {
+        tighten(mem_avail);
+    }
+
+    bool found_cg_v2 = false;
+    {
+        std::ifstream cg_in("/proc/self/cgroup");
+        std::string line;
+        while (std::getline(cg_in, line)) {
+            if (line.size() < 3 || line[0] != '0' || line[1] != ':' || line[2] != ':') continue;
+            std::string rel = line.substr(3);
+            while (!rel.empty() && (rel.back() == '\r' || rel.back() == '\n')) rel.pop_back();
+            std::string dir = (rel.empty() || rel == "/")
+                ? std::string("/sys/fs/cgroup")
+                : (std::string("/sys/fs/cgroup") + rel);
+            for (;;) {
+                uint64_t max_b = 0;
+                uint64_t cur_b = 0;
+                if (mlma_woodbury_detail::read_uint64_file(dir + "/memory.max", max_b) &&
+                    mlma_woodbury_detail::read_uint64_file(dir + "/memory.current", cur_b) &&
+                    max_b > 0) {
+                    found_cg_v2 = true;
+                    tighten(max_b > cur_b ? (max_b - cur_b) : 0ULL);
+                }
+                if (dir == "/sys/fs/cgroup") break;
+                const size_t slash = dir.rfind('/');
+                if (slash == std::string::npos || slash < 13) break; // stop at /sys/fs/cgroup
+                dir.resize(slash);
+            }
+            break;
+        }
+    }
+    if (!found_cg_v2) {
+        uint64_t lim_b = 0;
+        uint64_t cur_b = 0;
+        if (mlma_woodbury_detail::read_uint64_file("/sys/fs/cgroup/memory/memory.limit_in_bytes", lim_b) &&
+            mlma_woodbury_detail::read_uint64_file("/sys/fs/cgroup/memory/memory.usage_in_bytes", cur_b) &&
+            lim_b > 0 && lim_b < (1ULL << 60)) {
+            tighten(lim_b > cur_b ? (lim_b - cur_b) : 0ULL);
+        }
+    }
+
+    uint64_t slurm_mib = 0;
+    if (!mlma_woodbury_detail::read_env_uint64("SLURM_MEM_PER_NODE", slurm_mib)) {
+        uint64_t mem_per_cpu = 0;
+        uint64_t cpus = 0;
+        if (mlma_woodbury_detail::read_env_uint64("SLURM_MEM_PER_CPU", mem_per_cpu) &&
+            (mlma_woodbury_detail::read_env_uint64("SLURM_CPUS_ON_NODE", cpus) ||
+             mlma_woodbury_detail::read_env_uint64("SLURM_CPUS_PER_TASK", cpus)) &&
+            mem_per_cpu > 0 && cpus > 0 &&
+            mem_per_cpu <= (std::numeric_limits<uint64_t>::max() / cpus)) {
+            slurm_mib = mem_per_cpu * cpus;
+        }
+    }
+    if (slurm_mib > 0 && slurm_mib <= (std::numeric_limits<uint64_t>::max() >> 20)) {
+        const uint64_t slurm_bytes = slurm_mib << 20;
+        uint64_t rss_bytes = 0;
+        mlma_woodbury_detail::read_proc_kb_line("/proc/self/status", "VmRSS:", rss_bytes);
+        tighten(slurm_bytes > rss_bytes ? (slurm_bytes - rss_bytes) : 0ULL);
+    }
+
+    return has_bound ? min_avail : 0ULL;
+#else
+    return 0ULL;
+#endif
+}
+
+// Auto-enable AOCL pre-reordering of q_uk when multiple SNP blocks amortize the
+// one-time reorder cost and remaining headroom exceeds 2x reorder size + 2 GiB.
+inline bool should_auto_reorder_woodbury_uk(
+    const QuantizedWoodburyUk& q_uk,
+    uint32_t total_m,
+    int block_size)
+{
+    const uint64_t reord_bytes = static_cast<uint64_t>(estimate_quantized_woodbury_reorder_bytes(q_uk));
+    if (reord_bytes == 0) return false;
+    const uint64_t bs = static_cast<uint64_t>(std::max(1, block_size));
+    const uint64_t n_blocks = (static_cast<uint64_t>(total_m) + bs - 1ULL) / bs;
+    if (n_blocks < 4) return false;
+    const uint64_t avail = detect_available_memory_bytes();
+    constexpr uint64_t kHeadroomReserve = 2ULL << 30;
+    if (avail <= kHeadroomReserve) return false;
+    return reord_bytes <= (avail - kHeadroomReserve) / 2ULL;
+}
+
+// Allocate evenly-balanced, 64-row-aligned, 4K-alias-free Q tiles covering [0, k)
+// for the chosen FastMlmaMode. Returns k_hi (the split boundary between 2-slice and 1-slice rows).
 inline int populate_quantized_woodbury_tiles(
     QuantizedWoodburyUk& out,
     int k,
@@ -435,54 +620,39 @@ inline int populate_quantized_woodbury_tiles(
         if (total <= 0) return;
         const int rc_max = is_2slice ? std::max(1, capped_q_rows / 2) : capped_q_rows;
         const int num_t = (total + rc_max - 1) / rc_max;
-        const int total_q16 = (total + 15) / 16;
+        const int rc_unit = is_2slice ? 32 : 64;
+        const int total_u = (total + rc_unit - 1) / rc_unit;
         int r_cur = beg;
+        auto append_tile = [&](int rc) {
+            QuantizedWoodburyTile t;
+            t.r_begin = r_cur;
+            t.r_count = rc;
+            t.is_2slice = is_2slice;
+            t.q_rows = is_2slice ? (2 * rc) : rc;
+            int q_ld = ((t.q_rows + 63) / 64) * 64;
+            if (q_ld % 4096 == 0) q_ld += 64;
+            t.q_ld = q_ld;
+            t.q_bytes = static_cast<size_t>(t.q_ld) * static_cast<size_t>(n);
+            t.Q = make_aligned_uninitialized<int8_t, 64>(t.q_bytes);
+            if (t.q_bytes > 0 && !t.Q) {
+                LOGGER.e(0, "Failed to allocate quantized Woodbury Q tile.");
+            }
+            t.alpha_hi.assign(static_cast<size_t>(rc), 0.0);
+            if (is_2slice) t.alpha_lo.assign(static_cast<size_t>(rc), 0.0);
+            t.u_sum_q.assign(static_cast<size_t>(rc), 0.0);
+            out.tiles.push_back(std::move(t));
+            r_cur += rc;
+        };
         for (int ti = 0; ti < num_t && r_cur < end; ++ti) {
-            const int q16_this = (total_q16 / num_t) + (ti < (total_q16 % num_t) ? 1 : 0);
+            const int u_this = (total_u / num_t) + (ti < (total_u % num_t) ? 1 : 0);
             const int rem_rows = end - r_cur;
             const int rc_want = (ti + 1 == num_t)
                 ? rem_rows
-                : std::min(rem_rows, std::max(16, q16_this * 16));
-            const int rc = std::clamp(rc_want, 1, rc_max);
-            QuantizedWoodburyTile t;
-            t.r_begin = r_cur;
-            t.r_count = rc;
-            t.is_2slice = is_2slice;
-            t.q_rows = is_2slice ? (2 * rc) : rc;
-            int q_ld = ((t.q_rows + 63) / 64) * 64;
-            if (q_ld % 4096 == 0) q_ld += 64;
-            t.q_ld = q_ld;
-            t.q_bytes = static_cast<size_t>(t.q_ld) * static_cast<size_t>(n);
-            t.Q = make_aligned_uninitialized<int8_t, 64>(t.q_bytes);
-            if (t.q_bytes > 0 && !t.Q) {
-                LOGGER.e(0, "Failed to allocate quantized Woodbury Q tile.");
-            }
-            t.alpha_hi.assign(static_cast<size_t>(rc), 0.0);
-            if (is_2slice) t.alpha_lo.assign(static_cast<size_t>(rc), 0.0);
-            t.u_sum_q.assign(static_cast<size_t>(rc), 0.0);
-            out.tiles.push_back(std::move(t));
-            r_cur += rc;
+                : std::min(rem_rows, std::max(rc_unit, u_this * rc_unit));
+            append_tile(std::clamp(rc_want, 1, rc_max));
         }
         while (r_cur < end) {
-            const int rc = std::min(rc_max, end - r_cur);
-            QuantizedWoodburyTile t;
-            t.r_begin = r_cur;
-            t.r_count = rc;
-            t.is_2slice = is_2slice;
-            t.q_rows = is_2slice ? (2 * rc) : rc;
-            int q_ld = ((t.q_rows + 63) / 64) * 64;
-            if (q_ld % 4096 == 0) q_ld += 64;
-            t.q_ld = q_ld;
-            t.q_bytes = static_cast<size_t>(t.q_ld) * static_cast<size_t>(n);
-            t.Q = make_aligned_uninitialized<int8_t, 64>(t.q_bytes);
-            if (t.q_bytes > 0 && !t.Q) {
-                LOGGER.e(0, "Failed to allocate quantized Woodbury Q tile.");
-            }
-            t.alpha_hi.assign(static_cast<size_t>(rc), 0.0);
-            if (is_2slice) t.alpha_lo.assign(static_cast<size_t>(rc), 0.0);
-            t.u_sum_q.assign(static_cast<size_t>(rc), 0.0);
-            out.tiles.push_back(std::move(t));
-            r_cur += rc;
+            append_tile(std::min(rc_max, end - r_cur));
         }
     };
     if (k_hi > 0) push_tiles(0, k_hi, true);
@@ -1675,7 +1845,7 @@ inline void woodbury_xvx_diag_block_fast_i8(
     bool block_has_miss = true,
     std::vector<double>* ukx_norm_sq_scratch = nullptr,
     AlignedRawBuffer<int32_t, 64>* thr_miss_acc_buf = nullptr,
-    int p_budget_mb = 64,
+    int p_budget_mb = 256,
     int snp_tile_override = 0,
     MlmaProfileStats* prof = nullptr)
 {
@@ -1741,9 +1911,10 @@ inline void woodbury_xvx_diag_block_fast_i8(
 #if GCTA_HAS_AOCL_S8_GEMM
             const size_t p_budget_bytes = static_cast<size_t>(std::max(16, p_budget_mb)) << 20;
             const size_t budget_cols = p_budget_bytes / (static_cast<size_t>(ldP) * sizeof(int32_t));
+            const size_t aligned_cols = (budget_cols / 64ULL) * 64ULL;
             kSnpTile = std::min(
                 bs,
-                std::clamp(static_cast<int>(budget_cols), 2048, 8192));
+                std::clamp(static_cast<int>(std::min<size_t>(aligned_cols, 16384ULL)), 2048, 16384));
 #else
             kSnpTile = std::min(bs, 1024);
 #endif

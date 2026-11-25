@@ -524,7 +524,11 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
             // before optional AOCL pre-reordered Q buffers.
             const_cast<WoodburyMLMACache&>(wb).Uk_f.resize(0, 0);
         }
-        if (tuning.reorder_q) {
+        const bool do_reorder_q =
+            (tuning.reorder_q == MlmaReorderPolicy::On) ||
+            (tuning.reorder_q == MlmaReorderPolicy::Auto &&
+             should_auto_reorder_woodbury_uk(q_uk, total_m, block_size));
+        if (do_reorder_q) {
             const auto t_qr0 = prof ? Clock::now() : Clock::time_point{};
             reorder_quantized_woodbury_uk(q_uk);
             if (prof) {

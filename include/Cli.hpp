@@ -255,7 +255,7 @@ struct MlmaOptions {
 
     // Hidden developer tuning flags
     bool mlma_profile = false;
-    int mlma_p_budget_mb = 64;
+    int mlma_p_budget_mb = 256;
     int mlma_q_rows = 4096;
     int mlma_snp_tile = 0;
     MlmaReorderQ mlma_reorder_q = MlmaReorderQ::Auto;

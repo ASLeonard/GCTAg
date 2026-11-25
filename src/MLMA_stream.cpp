@@ -141,6 +141,15 @@ string to_text(T x)
 //     [int32 k][double lambda_tail][double tail_d_var]
 //     [dk: k float][b: x_c float (unless kTun3FlagNoAdjCovar)]
 //     [varcmp: num_varcmp float][uint64 y_adj_hash][Vi_y: n float (if kTun3FlagHasViY)]
+//   "TANG" (Pre-quantized 2-slice INT8 Cholesky-Woodbury weights W_k, ready for
+//           parallel pread / zero-float Stage-4 fast MLMA):
+//     [uint32 version=1][uint32 flags][int32 k][int32 q_rows_file][int32 num_tiles]
+//     [float sigma2_eff_f][double lambda_tail][double tail_d_var][double delta_quant]
+//     [b: x_c float (unless kTun3FlagNoAdjCovar)][varcmp: num_varcmp float]
+//     [uint64 y_adj_hash][Vi_y: n float (if kTun3FlagHasViY)]
+//     [num_tiles tile headers: r_begin, r_count, q_rows, q_ld, q_offset, q_bytes,
+//      alpha_hi[rc], alpha_lo[rc], u_sum_q[rc]]
+//     [num_tiles tile payloads: q_ld x n int8 ColMajor]
 //   "GOBY" (Exact dense float32 Cholesky factor):
 //     [int32 factor_kind][packed upper-triangular Vi_L: n(n+1)/2 float]
 //     [b: x_c float, omitted if no_adj_covar][varcmp: num_varcmp float]
@@ -148,6 +157,7 @@ string to_text(T x)
 // ---------------------------------------------------------------------------
 constexpr std::string_view kMagicTun3       = "TUN3";
 constexpr std::string_view kMagicTref       = "TREF";
+constexpr std::string_view kMagicTang       = "TANG";
 constexpr std::string_view kMagicDense      = "GOBY";
 constexpr std::string_view kMagicLegacyTuna = "TUNA";
 constexpr std::string_view kMagicEvec       = "EVEC";
@@ -170,7 +180,7 @@ struct EvecHeader {
 static_assert(sizeof(EvecHeader) == 40, "EvecHeader must be 40 bytes");
 static_assert(std::is_trivially_copyable_v<EvecHeader>, "EvecHeader must be trivially copyable");
 
-enum class RemlKind : uint8_t { Tun3 = 0, Tref = 1, Goby = 2 };
+enum class RemlKind : uint8_t { Tun3 = 0, Tref = 1, Goby = 2, Tang = 3 };
 
 struct RemlPrefix {
     Header   hdr{};
@@ -257,6 +267,8 @@ RemlPrefix read_reml_prefix(int fd, const string& filename)
         p.kind = RemlKind::Tun3;
     } else if (magic == kMagicTref) {
         p.kind = RemlKind::Tref;
+    } else if (magic == kMagicTang) {
+        p.kind = RemlKind::Tang;
     } else if (magic == kMagicDense) {
         p.kind = RemlKind::Goby;
     } else if (magic == kMagicLegacyTuna) {
@@ -451,6 +463,165 @@ TrefMetadata read_tref_metadata(int fd, const RemlPrefix& p, const string& filen
     if ((m.flags & kTun3FlagHasViY) != 0u && load_vi_y) {
         m.vi_y_f.resize(m.hdr.n);
         rd(m.vi_y_f.data(), static_cast<size_t>(m.hdr.n) * sizeof(float));
+    }
+    return m;
+}
+
+struct TangTileHeader {
+    int32_t  r_begin  = 0;
+    int32_t  r_count  = 0;
+    int32_t  q_rows   = 0;
+    int32_t  q_ld     = 0;
+    uint64_t q_offset = 0;
+    uint64_t q_bytes  = 0;
+};
+
+struct TangTileEntry {
+    TangTileHeader h{};
+    std::vector<double> alpha_hi;
+    std::vector<double> alpha_lo;
+    std::vector<double> u_sum_q;
+};
+
+struct TangMetadata {
+    Header   hdr{};
+    uint64_t id_hash     = 0;
+    uint32_t version     = 1;
+    uint32_t flags       = 0;
+    int32_t  k           = 0;
+    int32_t  q_rows_file = 8192;
+    int32_t  num_tiles   = 0;
+    float    sigma2_eff_f = 0.0f;
+    double   lambda_tail = 0.0;
+    double   tail_d_var  = 0.0;
+    double   delta_quant = 0.0;
+    Eigen::VectorXf b_f;
+    Eigen::VectorXf varcmp_f;
+    uint64_t y_adj_hash  = 0;
+    Eigen::VectorXf vi_y_f;
+    std::vector<TangTileEntry> tiles;
+};
+
+// Plan 2-slice TANG tile geometry identically to populate_quantized_woodbury_tiles
+// so default fast loads can parallel-pread directly into QuantizedWoodburyUk::tiles.
+std::vector<TangTileHeader> plan_tang_tiles(int32_t k, int32_t n, int32_t q_rows_target = 8192)
+{
+    std::vector<TangTileHeader> out;
+    if (k <= 0 || n <= 0) return out;
+    const int capped_q = std::clamp(((q_rows_target + 63) / 64) * 64, 256, 32768);
+    const int rc_max   = std::max(1, capped_q / 2);
+    const int num_t    = (k + rc_max - 1) / rc_max;
+    constexpr int rc_unit = 32;
+    const int total_u  = (k + rc_unit - 1) / rc_unit;
+    int r_cur = 0;
+    auto push_one = [&](int rc) {
+        TangTileHeader th;
+        th.r_begin = r_cur;
+        th.r_count = rc;
+        th.q_rows  = 2 * rc;
+        int q_ld = ((th.q_rows + 63) / 64) * 64;
+        if (q_ld % 4096 == 0) q_ld += 64;
+        th.q_ld    = q_ld;
+        th.q_bytes = static_cast<uint64_t>(q_ld) * static_cast<uint64_t>(n);
+        out.push_back(th);
+        r_cur += rc;
+    };
+    for (int ti = 0; ti < num_t && r_cur < k; ++ti) {
+        const int u_this   = (total_u / num_t) + (ti < (total_u % num_t) ? 1 : 0);
+        const int rem_rows = k - r_cur;
+        const int rc_want  = (ti + 1 == num_t) ? rem_rows : std::min(rem_rows, std::max(rc_unit, u_this * rc_unit));
+        push_one(std::clamp(rc_want, 1, rc_max));
+    }
+    while (r_cur < k) push_one(std::min(rc_max, k - r_cur));
+    return out;
+}
+
+TangMetadata read_tang_metadata(int fd, const RemlPrefix& p, size_t file_size,
+                                const string& filename, bool load_vi_y)
+{
+    TangMetadata m;
+    m.hdr     = p.hdr;
+    m.id_hash = p.id_hash;
+    if (m.hdr.n <= 0 || m.hdr.x_c < 0 || m.hdr.num_varcmp <= 0) {
+        LOGGER.e(0, "[" + filename + "] has invalid TANG header dimensions.");
+    }
+
+    size_t pos = kRemlPrefixBytes;
+    auto rd = [&](void* dst, size_t bytes) {
+        try {
+            gcta_io::read_exact_throwing(fd, dst, bytes, filename);
+        } catch (const std::exception& e) {
+            LOGGER.e(0, e.what());
+        }
+        pos += bytes;
+    };
+
+    rd(&m.version, sizeof(uint32_t));
+    if (m.version != 1u) {
+        LOGGER.e(0, "[" + filename + "] uses unsupported TANG version=" + to_string(m.version) + ".");
+    }
+    rd(&m.flags, sizeof(uint32_t));
+    rd(&m.k, sizeof(int32_t));
+    rd(&m.q_rows_file, sizeof(int32_t));
+    rd(&m.num_tiles, sizeof(int32_t));
+    rd(&m.sigma2_eff_f, sizeof(float));
+    rd(&m.lambda_tail, sizeof(double));
+    rd(&m.tail_d_var, sizeof(double));
+    rd(&m.delta_quant, sizeof(double));
+
+    if (m.k <= 0 || m.k > m.hdr.n || m.num_tiles <= 0) {
+        LOGGER.e(0, "[" + filename + "] has invalid TANG dimensions.");
+    }
+    if (!std::isfinite(m.sigma2_eff_f) || !std::isfinite(m.delta_quant) || m.delta_quant < 0.0) {
+        LOGGER.e(0, "[" + filename + "] has invalid TANG scalar metadata.");
+    }
+
+    const bool has_b = ((m.flags & kTun3FlagNoAdjCovar) == 0u) && (m.hdr.x_c > 0);
+    if (has_b) {
+        m.b_f.resize(m.hdr.x_c);
+        rd(m.b_f.data(), static_cast<size_t>(m.hdr.x_c) * sizeof(float));
+    }
+    m.varcmp_f.resize(m.hdr.num_varcmp);
+    rd(m.varcmp_f.data(), static_cast<size_t>(m.hdr.num_varcmp) * sizeof(float));
+
+    rd(&m.y_adj_hash, sizeof(uint64_t));
+    if ((m.flags & kTun3FlagHasViY) != 0u) {
+        const size_t viy_bytes = static_cast<size_t>(m.hdr.n) * sizeof(float);
+        if (load_vi_y) {
+            m.vi_y_f.resize(m.hdr.n);
+            rd(m.vi_y_f.data(), viy_bytes);
+        } else {
+            pos += viy_bytes;
+            if (::lseek(fd, static_cast<off_t>(pos), SEEK_SET) == static_cast<off_t>(-1)) {
+                LOGGER.e(0, "lseek() failed on [" + filename + "]: " + string(std::strerror(errno)));
+            }
+        }
+    }
+
+    m.tiles.resize(static_cast<size_t>(m.num_tiles));
+    int32_t expected_r = 0;
+    for (int32_t ti = 0; ti < m.num_tiles; ++ti) {
+        auto& te = m.tiles[static_cast<size_t>(ti)];
+        rd(&te.h, sizeof(TangTileHeader));
+        if (te.h.r_begin != expected_r || te.h.r_count <= 0 ||
+            te.h.q_rows != 2 * te.h.r_count || te.h.q_ld < te.h.q_rows ||
+            te.h.q_bytes != static_cast<uint64_t>(te.h.q_ld) * static_cast<uint64_t>(m.hdr.n)) {
+            LOGGER.e(0, "[" + filename + "] has malformed TANG tile header.");
+        }
+        expected_r += te.h.r_count;
+        const size_t rc_sz = static_cast<size_t>(te.h.r_count);
+        te.alpha_hi.resize(rc_sz);
+        te.alpha_lo.resize(rc_sz);
+        te.u_sum_q.resize(rc_sz);
+        rd(te.alpha_hi.data(), rc_sz * sizeof(double));
+        rd(te.alpha_lo.data(), rc_sz * sizeof(double));
+        rd(te.u_sum_q.data(), rc_sz * sizeof(double));
+        if (te.h.q_offset + te.h.q_bytes > static_cast<uint64_t>(file_size)) {
+            LOGGER.e(0, "[" + filename + "] is truncated inside TANG tile payload.");
+        }
+    }
+    if (expected_r != m.k) {
+        LOGGER.e(0, "[" + filename + "] TANG tiles do not partition k.");
     }
     return m;
 }
@@ -682,6 +853,401 @@ RemlState readRemlState(const string& filename, bool no_adj_covar,
                 static_cast<size_t>(hdr.num_varcmp) * sizeof(float), tail_off, filename);
         } catch (const std::exception& e) {
             LOGGER.e(0, e.what());
+        }
+        return st;
+    }
+
+    // ------------------------------------------------------------------ TANG
+    if (prefix.kind == RemlKind::Tang) {
+        const TangMetadata meta = read_tang_metadata(fd.get(), prefix, file_size, filename, /*load_vi_y=*/true);
+        const int32_t k = meta.k;
+        const int32_t n = meta.hdr.n;
+        st.is_woodbury   = true;
+        st.dk_f          = Eigen::VectorXf::Zero(k);
+        st.lambda_tail_f = static_cast<float>(meta.lambda_tail);
+        if (!no_adj_covar) st.b = meta.b_f;
+        st.varcmp        = meta.varcmp_f;
+        st.wb.ck_f       = Eigen::VectorXf::Ones(k);
+        st.wb.sqrt_ck_f  = Eigen::VectorXf::Ones(k);
+        st.wb.sigma2_eff_f = meta.sigma2_eff_f;
+
+        const Eigen::VectorXf y_adj_f = (!no_adj_covar && st.b.size() == expected_xc)
+            ? compute_y_adj_deterministic(y_raw_f, X_design, st.b)
+            : y_raw_f;
+        const uint64_t cur_y_hash = hash_bytes(y_adj_f.data(), static_cast<size_t>(n) * sizeof(float));
+        const bool vi_y_hit = ((meta.flags & kTun3FlagHasViY) != 0u) &&
+                              (meta.vi_y_f.size() == n) &&
+                              (cur_y_hash == meta.y_adj_hash);
+        if (vi_y_hit) {
+            st.cached_Vi_y = meta.vi_y_f;
+            st.has_cached_Vi_y = true;
+        }
+
+        bool unit_weights = true;
+        double S_w2 = static_cast<double>(n);
+        for (int s = 0; s < n; ++s) {
+            if (std::abs(w_sqrt[s] - 1.0f) > 1.0e-7f) {
+                unit_weights = false;
+                break;
+            }
+        }
+        if (!unit_weights) {
+            S_w2 = w_sqrt.cast<double>().array().square().sum();
+        }
+
+        const int raw_q = (max_q_rows <= 0) ? 4096 : max_q_rows;
+        const int effective_q_rows = std::clamp(((raw_q + 63) / 64) * 64, 256, 32768);
+
+        // Path A: zero-repack parallel pread directly into QuantizedWoodburyUk::tiles.
+        if (stream_fast_mode == FastMlmaMode::Slice2 && unit_weights && effective_q_rows == meta.q_rows_file) {
+            QuantizedWoodburyUk q_uk;
+            q_uk.k = k;
+            q_uk.n = n;
+            q_uk.mode = FastMlmaMode::Slice2;
+            q_uk.delta_quant = meta.delta_quant;
+            q_uk.tiles.resize(meta.tiles.size());
+
+            struct ReadStripe { size_t ti; uint64_t rel_off; size_t len; };
+            std::vector<ReadStripe> stripes;
+            constexpr uint64_t kStripeBytes = 8ULL << 20;
+
+            for (size_t ti = 0; ti < meta.tiles.size(); ++ti) {
+                const auto& te = meta.tiles[ti];
+                auto& qt = q_uk.tiles[ti];
+                qt.r_begin = te.h.r_begin;
+                qt.r_count = te.h.r_count;
+                qt.q_rows  = te.h.q_rows;
+                qt.q_ld    = te.h.q_ld;
+                qt.is_2slice = true;
+                qt.q_bytes = static_cast<size_t>(te.h.q_bytes);
+                qt.Q = make_aligned_uninitialized<int8_t, 64>(qt.q_bytes);
+                if (qt.q_bytes > 0 && !qt.Q) {
+                    LOGGER.e(0, "Failed to allocate TANG Q tile buffer.");
+                }
+                qt.alpha_hi = te.alpha_hi;
+                qt.alpha_lo = te.alpha_lo;
+                qt.u_sum_q  = te.u_sum_q;
+
+                for (uint64_t off = 0; off < te.h.q_bytes; off += kStripeBytes) {
+                    const size_t len = static_cast<size_t>(std::min<uint64_t>(kStripeBytes, te.h.q_bytes - off));
+                    stripes.push_back(ReadStripe{ti, off, len});
+                }
+            }
+
+            std::atomic<bool> io_err{false};
+            string err_msg;
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (size_t si = 0; si < stripes.size(); ++si) {
+                if (io_err.load(std::memory_order_relaxed)) continue;
+                const auto& sp = stripes[si];
+                const auto& te = meta.tiles[sp.ti];
+                try {
+                    gcta_io::read_exact_at_throwing(
+                        fd.get(),
+                        q_uk.tiles[sp.ti].Q.get() + sp.rel_off,
+                        sp.len,
+                        static_cast<off_t>(te.h.q_offset + sp.rel_off),
+                        filename);
+                } catch (const std::exception& e) {
+                    #pragma omp critical
+                    {
+                        if (!io_err.exchange(true)) err_msg = e.what();
+                    }
+                }
+            }
+            if (io_err.load()) LOGGER.e(0, err_msg);
+
+            if (!vi_y_hit) {
+                LOGGER.i(0, "Phenotype/covariate adjustment differs from saved .reml Vi_y cache; "
+                            "reconstructing V^{-1} y_adj from TANG weights.");
+                Eigen::VectorXd u_y = Eigen::VectorXd::Zero(k);
+                const float* const y_ptr = y_adj_f.data();
+                for (size_t ti = 0; ti < q_uk.tiles.size(); ++ti) {
+                    const auto& qt = q_uk.tiles[ti];
+                    const int r0 = qt.r_begin;
+                    const int rc = qt.r_count;
+                    const int q_ld = qt.q_ld;
+                    const int8_t* const q_base = qt.Q.get();
+                    const double* const ahi = qt.alpha_hi.data();
+                    const double* const alo = qt.alpha_lo.data();
+                    const int max_t = std::max(1, omp_get_max_threads());
+                    std::vector<double> thr_u(static_cast<size_t>(max_t) * static_cast<size_t>(rc), 0.0);
+                    #pragma omp parallel
+                    {
+                        const int tid = omp_get_thread_num();
+                        double* const lu = thr_u.data() + static_cast<size_t>(tid) * static_cast<size_t>(rc);
+                        #pragma omp for schedule(static)
+                        for (int s = 0; s < n; ++s) {
+                            const double ys = static_cast<double>(y_ptr[s]);
+                            const int8_t* const qh = q_base + static_cast<size_t>(s) * static_cast<size_t>(q_ld);
+                            const int8_t* const ql = qh + rc;
+                            #pragma omp simd
+                            for (int rl = 0; rl < rc; ++rl) {
+                                const double w = ahi[rl] * static_cast<double>(qh[rl])
+                                               + alo[rl] * static_cast<double>(ql[rl]);
+                                lu[rl] += w * ys;
+                            }
+                        }
+                    }
+                    for (int rl = 0; rl < rc; ++rl) {
+                        double acc = 0.0;
+                        for (int t = 0; t < max_t; ++t) acc += thr_u[static_cast<size_t>(t) * static_cast<size_t>(rc) + rl];
+                        u_y[r0 + rl] = acc;
+                    }
+                }
+                st.cached_Vi_y = reconstruct_vi_y_from_q_uk(
+                    q_uk, st.wb.sqrt_ck_f, st.wb.sigma2_eff_f, y_adj_f, w_sqrt, true, u_y);
+                st.has_cached_Vi_y = true;
+            }
+            st.prebuilt_q_uk = std::move(q_uk);
+            return st;
+        }
+
+        // Path B: zero-float INT8 repack for Slice1/Hybrid or custom q_rows when unit-weighted.
+        if (stream_fast_mode != FastMlmaMode::Off && unit_weights) {
+            QuantizedWoodburyUk q_uk;
+            q_uk.k = k;
+            q_uk.n = n;
+            q_uk.mode = stream_fast_mode;
+            populate_quantized_woodbury_tiles(q_uk, k, n, stream_fast_mode, max_q_rows);
+
+            // Map each row r in [0, k) to its disk tile and target tile.
+            std::vector<double> disk_ahi(static_cast<size_t>(k), 0.0);
+            std::vector<double> disk_alo(static_cast<size_t>(k), 0.0);
+            std::vector<double> disk_usum(static_cast<size_t>(k), 0.0);
+            for (const auto& te : meta.tiles) {
+                for (int rl = 0; rl < te.h.r_count; ++rl) {
+                    const size_t r = static_cast<size_t>(te.h.r_begin + rl);
+                    disk_ahi[r]  = te.alpha_hi[static_cast<size_t>(rl)];
+                    disk_alo[r]  = te.alpha_lo[static_cast<size_t>(rl)];
+                    disk_usum[r] = te.u_sum_q[static_cast<size_t>(rl)];
+                }
+            }
+            std::vector<size_t> row_to_tt(static_cast<size_t>(k), 0);
+            for (size_t ti = 0; ti < q_uk.tiles.size(); ++ti) {
+                auto& tt = q_uk.tiles[ti];
+                for (int rl = 0; rl < tt.r_count; ++rl) {
+                    const int r = tt.r_begin + rl;
+                    row_to_tt[static_cast<size_t>(r)] = ti;
+                    tt.alpha_hi[static_cast<size_t>(rl)] = disk_ahi[static_cast<size_t>(r)];
+                    if (tt.is_2slice) tt.alpha_lo[static_cast<size_t>(rl)] = disk_alo[static_cast<size_t>(r)];
+                }
+            }
+
+            const int max_t = std::max(1, omp_get_max_threads());
+            const size_t k_pad = (static_cast<size_t>(k) + 7) / 8 * 8;
+            std::vector<int64_t> thr_sum_ql(static_cast<size_t>(max_t) * k_pad, 0);
+            std::vector<double> thr_eps_1s(static_cast<size_t>(max_t), 0.0);
+            std::vector<double> thr_uy(!vi_y_hit ? (static_cast<size_t>(max_t) * k_pad) : 0, 0.0);
+
+            int32_t max_q_ld = 1;
+            for (const auto& te : meta.tiles) max_q_ld = std::max(max_q_ld, te.h.q_ld);
+            constexpr size_t kSlabBytes = 32ULL << 20;
+            const int max_cols = std::min(n, std::max(1, static_cast<int>(kSlabBytes / static_cast<size_t>(max_q_ld))));
+            AlignedRawBuffer<int8_t, 64> disk_slab(static_cast<size_t>(max_cols) * static_cast<size_t>(max_q_ld));
+
+            const float* const y_ptr = y_adj_f.data();
+            for (size_t dti = 0; dti < meta.tiles.size(); ++dti) {
+                const auto& te = meta.tiles[dti];
+                const int r0 = te.h.r_begin;
+                const int rc = te.h.r_count;
+                const int d_ld = te.h.q_ld;
+                const size_t tt_beg = row_to_tt[static_cast<size_t>(r0)];
+                const size_t tt_end = row_to_tt[static_cast<size_t>(r0 + rc - 1)] + 1;
+
+                struct OverlapSeg { size_t tt_idx; int r_start; int r_len; int d_off; int t_off; bool t_2s; };
+                std::vector<OverlapSeg> segs;
+                for (size_t tti = tt_beg; tti < tt_end; ++tti) {
+                    const auto& tt = q_uk.tiles[tti];
+                    const int rs = std::max(r0, tt.r_begin);
+                    const int re = std::min(r0 + rc, tt.r_begin + tt.r_count);
+                    if (re > rs) {
+                        segs.push_back(OverlapSeg{tti, rs, re - rs, rs - r0, rs - tt.r_begin, tt.is_2slice});
+                    }
+                }
+
+                for (int s0 = 0; s0 < n; s0 += max_cols) {
+                    const int cols = std::min(max_cols, n - s0);
+                    const size_t bytes = static_cast<size_t>(cols) * static_cast<size_t>(d_ld);
+                    try {
+                        gcta_io::read_exact_at_throwing(
+                            fd.get(), disk_slab.data(), bytes,
+                            static_cast<off_t>(te.h.q_offset + static_cast<uint64_t>(s0) * static_cast<uint64_t>(d_ld)),
+                            filename);
+                    } catch (const std::exception& e) {
+                        LOGGER.e(0, e.what());
+                    }
+
+                    #pragma omp parallel
+                    {
+                        const int tid = omp_get_thread_num();
+                        int64_t* const lsql = thr_sum_ql.data() + static_cast<size_t>(tid) * k_pad;
+                        double local_eps = 0.0;
+                        double* const luy = !vi_y_hit ? (thr_uy.data() + static_cast<size_t>(tid) * k_pad) : nullptr;
+
+                        #pragma omp for schedule(static) nowait
+                        for (int ds = 0; ds < cols; ++ds) {
+                            const int s = s0 + ds;
+                            const int8_t* const d_qh = disk_slab.data() + static_cast<size_t>(ds) * static_cast<size_t>(d_ld);
+                            const int8_t* const d_ql = d_qh + rc;
+                            for (const auto& sg : segs) {
+                                auto& tt = q_uk.tiles[sg.tt_idx];
+                                int8_t* const t_qh = tt.Q.get() + static_cast<size_t>(s) * static_cast<size_t>(tt.q_ld) + sg.t_off;
+                                std::memcpy(t_qh, d_qh + sg.d_off, static_cast<size_t>(sg.r_len));
+                                if (sg.t_2s) {
+                                    std::memcpy(t_qh + tt.r_count, d_ql + sg.d_off, static_cast<size_t>(sg.r_len));
+                                } else {
+                                    for (int i = 0; i < sg.r_len; ++i) {
+                                        const int r = sg.r_start + i;
+                                        const int32_t qlv = static_cast<int32_t>(d_ql[sg.d_off + i]);
+                                        lsql[r] += qlv;
+                                        const double err = disk_alo[r] * static_cast<double>(qlv);
+                                        local_eps += err * err;
+                                    }
+                                }
+                            }
+                            if (!vi_y_hit) {
+                                const double ys = static_cast<double>(y_ptr[s]);
+                                #pragma omp simd
+                                for (int rl = 0; rl < rc; ++rl) {
+                                    const int r = r0 + rl;
+                                    const double w = disk_ahi[r] * static_cast<double>(d_qh[rl])
+                                                   + disk_alo[r] * static_cast<double>(d_ql[rl]);
+                                    luy[r] += w * ys;
+                                }
+                            }
+                        }
+                        thr_eps_1s[static_cast<size_t>(tid)] += local_eps;
+                    }
+                }
+            }
+
+            double extra_eps_1s = 0.0;
+            for (int t = 0; t < max_t; ++t) extra_eps_1s += thr_eps_1s[static_cast<size_t>(t)];
+            for (auto& tt : q_uk.tiles) {
+                for (int rl = 0; rl < tt.r_count; ++rl) {
+                    const int r = tt.r_begin + rl;
+                    if (tt.is_2slice) {
+                        tt.u_sum_q[static_cast<size_t>(rl)] = disk_usum[static_cast<size_t>(r)];
+                    } else {
+                        int64_t sql = 0;
+                        for (int t = 0; t < max_t; ++t) sql += thr_sum_ql[static_cast<size_t>(t) * k_pad + r];
+                        tt.u_sum_q[static_cast<size_t>(rl)] = disk_usum[static_cast<size_t>(r)]
+                            - disk_alo[static_cast<size_t>(r)] * static_cast<double>(sql);
+                    }
+                }
+            }
+            const double norm_denom = (n > 1) ? static_cast<double>(n - 1) : 1.0;
+            q_uk.delta_quant = meta.delta_quant + extra_eps_1s / norm_denom;
+
+            if (!vi_y_hit) {
+                LOGGER.i(0, "Phenotype/covariate adjustment differs from saved .reml Vi_y cache; "
+                            "reconstructing V^{-1} y_adj from TANG weights.");
+                Eigen::VectorXd u_y(k);
+                for (int r = 0; r < k; ++r) {
+                    double acc = 0.0;
+                    for (int t = 0; t < max_t; ++t) acc += thr_uy[static_cast<size_t>(t) * k_pad + r];
+                    u_y[r] = acc;
+                }
+                if (stream_fast_mode == FastMlmaMode::Slice2) {
+                    st.cached_Vi_y = reconstruct_vi_y_from_q_uk(
+                        q_uk, st.wb.sqrt_ck_f, st.wb.sigma2_eff_f, y_adj_f, w_sqrt, true, u_y);
+                } else {
+                    Eigen::VectorXf proj_y = Eigen::VectorXf::Zero(n);
+                    const double* const u_yp = u_y.data();
+                    for (size_t dti = 0; dti < meta.tiles.size(); ++dti) {
+                        const auto& te = meta.tiles[dti];
+                        const int r0 = te.h.r_begin;
+                        const int rc = te.h.r_count;
+                        const int d_ld = te.h.q_ld;
+                        for (int s0 = 0; s0 < n; s0 += max_cols) {
+                            const int cols = std::min(max_cols, n - s0);
+                            const size_t bytes = static_cast<size_t>(cols) * static_cast<size_t>(d_ld);
+                            try {
+                                gcta_io::read_exact_at_throwing(
+                                    fd.get(), disk_slab.data(), bytes,
+                                    static_cast<off_t>(te.h.q_offset + static_cast<uint64_t>(s0) * static_cast<uint64_t>(d_ld)),
+                                    filename);
+                            } catch (const std::exception& e) {
+                                LOGGER.e(0, e.what());
+                            }
+                            #pragma omp parallel for schedule(static)
+                            for (int ds = 0; ds < cols; ++ds) {
+                                const int8_t* const d_qh = disk_slab.data() + static_cast<size_t>(ds) * static_cast<size_t>(d_ld);
+                                const int8_t* const d_ql = d_qh + rc;
+                                double acc = 0.0;
+                                #pragma omp simd reduction(+:acc)
+                                for (int rl = 0; rl < rc; ++rl) {
+                                    const int r = r0 + rl;
+                                    const double w = disk_ahi[r] * static_cast<double>(d_qh[rl])
+                                                   + disk_alo[r] * static_cast<double>(d_ql[rl]);
+                                    acc += u_yp[r] * w;
+                                }
+                                proj_y[s0 + ds] += static_cast<float>(acc);
+                            }
+                        }
+                    }
+                    st.cached_Vi_y = (y_adj_f - proj_y) / st.wb.sigma2_eff_f;
+                }
+                st.has_cached_Vi_y = true;
+            }
+            st.prebuilt_q_uk = std::move(q_uk);
+            return st;
+        }
+
+        // Path C: full dequantize into k x n float32 Uk_f (Off or weighted phenotypes).
+        Eigen::MatrixXf Uk(k, n);
+        int32_t max_q_ld = 1;
+        for (const auto& te : meta.tiles) max_q_ld = std::max(max_q_ld, te.h.q_ld);
+        constexpr size_t kSlabBytes = 32ULL << 20;
+        const int max_cols = std::min(n, std::max(1, static_cast<int>(kSlabBytes / static_cast<size_t>(max_q_ld))));
+        AlignedRawBuffer<int8_t, 64> disk_slab(static_cast<size_t>(max_cols) * static_cast<size_t>(max_q_ld));
+        float* const uk_ptr = Uk.data();
+        const size_t k_stride = static_cast<size_t>(k);
+
+        for (size_t dti = 0; dti < meta.tiles.size(); ++dti) {
+            const auto& te = meta.tiles[dti];
+            const int r0 = te.h.r_begin;
+            const int rc = te.h.r_count;
+            const int d_ld = te.h.q_ld;
+            const double* const ahi = te.alpha_hi.data();
+            const double* const alo = te.alpha_lo.data();
+            for (int s0 = 0; s0 < n; s0 += max_cols) {
+                const int cols = std::min(max_cols, n - s0);
+                const size_t bytes = static_cast<size_t>(cols) * static_cast<size_t>(d_ld);
+                try {
+                    gcta_io::read_exact_at_throwing(
+                        fd.get(), disk_slab.data(), bytes,
+                        static_cast<off_t>(te.h.q_offset + static_cast<uint64_t>(s0) * static_cast<uint64_t>(d_ld)),
+                        filename);
+                } catch (const std::exception& e) {
+                    LOGGER.e(0, e.what());
+                }
+                #pragma omp parallel for schedule(static)
+                for (int ds = 0; ds < cols; ++ds) {
+                    const int s = s0 + ds;
+                    const int8_t* const d_qh = disk_slab.data() + static_cast<size_t>(ds) * static_cast<size_t>(d_ld);
+                    const int8_t* const d_ql = d_qh + rc;
+                    float* const dst = uk_ptr + static_cast<size_t>(s) * k_stride + r0;
+                    #pragma omp simd
+                    for (int rl = 0; rl < rc; ++rl) {
+                        dst[rl] = static_cast<float>(ahi[rl] * static_cast<double>(d_qh[rl])
+                                                   + alo[rl] * static_cast<double>(d_ql[rl]));
+                    }
+                }
+            }
+        }
+        disk_slab.reset();
+        st.wb.Uk_f.swap(Uk);
+
+        if (stream_fast_mode != FastMlmaMode::Off) {
+            if (!vi_y_hit) {
+                st.cached_Vi_y = woodbury_apply_Vi_f(st.wb, y_adj_f);
+                st.has_cached_Vi_y = true;
+            }
+            st.prebuilt_q_uk = build_quantized_woodbury_uk(
+                st.wb, w_sqrt, unit_weights, S_w2, stream_fast_mode, max_q_rows);
+            st.wb.Uk_f.resize(0, 0);
         }
         return st;
     }
@@ -1146,6 +1712,300 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
                              | (no_adj_covar ? kTun3FlagNoAdjCovar : 0u)
                              | (ctx.wb_uk_is_prebaked_wk ? kTun3FlagPrebakedWk : 0u);
 
+        auto ensure_max_abs = [&]() {
+            if (have_max_abs) return;
+            const float* const uk_src = ctx.Uk.data();
+            max_abs.assign(static_cast<size_t>(k), 0.0f);
+            if (!ctx.Uk_is_transposed) {
+                #pragma omp parallel for schedule(static)
+                for (int32_t r = 0; r < k; ++r) {
+                    const float* const col = uk_src + static_cast<size_t>(r) * static_cast<size_t>(n);
+                    float m = 0.0f;
+                    #pragma omp simd reduction(max:m)
+                    for (int32_t s = 0; s < n; ++s) {
+                        const float av = std::fabs(col[s]);
+                        if (av > m) m = av;
+                    }
+                    max_abs[static_cast<size_t>(r)] = m;
+                }
+            } else {
+                const int max_t = std::max(1, omp_get_max_threads());
+                const size_t k_pad = (static_cast<size_t>(k) + 15) / 16 * 16;
+                std::vector<float> thr_max(static_cast<size_t>(max_t) * k_pad, 0.0f);
+                #pragma omp parallel
+                {
+                    const int tid = omp_get_thread_num();
+                    float* const lmax = thr_max.data() + static_cast<size_t>(tid) * k_pad;
+                    #pragma omp for schedule(static)
+                    for (int32_t s = 0; s < n; ++s) {
+                        const float* const col = uk_src + static_cast<size_t>(s) * static_cast<size_t>(k);
+                        #pragma omp simd
+                        for (int32_t r = 0; r < k; ++r) {
+                            const float av = std::fabs(col[r]);
+                            if (av > lmax[r]) lmax[r] = av;
+                        }
+                    }
+                }
+                for (int32_t r = 0; r < k; ++r) {
+                    float m = 0.0f;
+                    for (int t = 0; t < max_t; ++t) {
+                        m = std::max(m, thr_max[static_cast<size_t>(t) * k_pad + static_cast<size_t>(r)]);
+                    }
+                    max_abs[static_cast<size_t>(r)] = m;
+                }
+            }
+            have_max_abs = true;
+        };
+
+        // --- Pre-quantized 2-slice INT8 TANG Branch (Cholesky-Woodbury pre-baked W_k) ---
+        if (ctx.wb_uk_is_prebaked_wk) {
+            ensure_max_abs();
+            constexpr int32_t kTangQRows = 8192;
+            std::vector<TangTileHeader> disk_tiles = plan_tang_tiles(k, n, kTangQRows);
+            const int32_t num_tiles = static_cast<int32_t>(disk_tiles.size());
+
+            std::vector<double> ahi_d(static_cast<size_t>(k), 0.0);
+            std::vector<double> alo_d(static_cast<size_t>(k), 0.0);
+            std::vector<float>  ahi_f(static_cast<size_t>(k), 0.0f);
+            std::vector<float>  ihi_f(static_cast<size_t>(k), 0.0f);
+            std::vector<float>  alo_f(static_cast<size_t>(k), 0.0f);
+            std::vector<float>  ilo_f(static_cast<size_t>(k), 0.0f);
+            for (int32_t r = 0; r < k; ++r) {
+                const float m = max_abs[static_cast<size_t>(r)];
+                if (m > 1.0e-30f) {
+                    const double ahi = static_cast<double>(m) / 127.0;
+                    const double alo = ahi / 254.0;
+                    ahi_d[static_cast<size_t>(r)] = ahi;
+                    alo_d[static_cast<size_t>(r)] = alo;
+                    ahi_f[static_cast<size_t>(r)] = static_cast<float>(ahi);
+                    ihi_f[static_cast<size_t>(r)] = static_cast<float>(1.0 / ahi);
+                    alo_f[static_cast<size_t>(r)] = static_cast<float>(alo);
+                    ilo_f[static_cast<size_t>(r)] = static_cast<float>(1.0 / alo);
+                }
+            }
+
+            size_t file_pos = 0;
+            auto wr_pos = [&](const void* buf, size_t bytes) {
+                wr(buf, bytes);
+                file_pos += bytes;
+            };
+
+            Header hdr{};
+            std::memcpy(hdr.magic, kMagicTang.data(), 4);
+            hdr.n          = n;
+            hdr.x_c        = static_cast<int32_t>(ctx.X_c);
+            hdr.num_varcmp = static_cast<int32_t>(ctx.varcmp.size());
+            hdr.num_r_indx = static_cast<int32_t>(ctx.varcmp.size());
+            const uint32_t tang_ver = 1u;
+            const double zero_d = 0.0;
+
+            wr_pos(&hdr, sizeof(hdr));
+            wr_pos(&id_hash, sizeof(uint64_t));
+            wr_pos(&tang_ver, sizeof(uint32_t));
+            wr_pos(&flags, sizeof(uint32_t));
+            wr_pos(&k, sizeof(int32_t));
+            wr_pos(&kTangQRows, sizeof(int32_t));
+            wr_pos(&num_tiles, sizeof(int32_t));
+            wr_pos(&sig2e_f, sizeof(float));
+            wr_pos(&ctx.lambda_tail, sizeof(double));
+            wr_pos(&ctx.tail_d_var, sizeof(double));
+            const off_t delta_off = static_cast<off_t>(file_pos);
+            wr_pos(&zero_d, sizeof(double));
+
+            if (!no_adj_covar && ctx.X_c > 0) {
+                wr_pos(b_f.data(), static_cast<size_t>(ctx.X_c) * sizeof(float));
+            }
+            wr_pos(varcmp_f.data(), static_cast<size_t>(hdr.num_varcmp) * sizeof(float));
+            wr_pos(&y_adj_hash, sizeof(uint64_t));
+            wr_pos(vi_y_f.data(), static_cast<size_t>(n) * sizeof(float));
+
+            size_t tile_hdrs_bytes = 0;
+            for (const auto& th : disk_tiles) {
+                tile_hdrs_bytes += sizeof(TangTileHeader) + 3ULL * static_cast<size_t>(th.r_count) * sizeof(double);
+            }
+            uint64_t cur_pay_off = static_cast<uint64_t>(file_pos + tile_hdrs_bytes);
+            std::vector<off_t> tile_usum_off(static_cast<size_t>(num_tiles), 0);
+            for (int32_t ti = 0; ti < num_tiles; ++ti) {
+                auto& th = disk_tiles[static_cast<size_t>(ti)];
+                th.q_offset = cur_pay_off;
+                cur_pay_off += th.q_bytes;
+                const size_t rc_sz = static_cast<size_t>(th.r_count);
+                std::vector<double> zero_usum(rc_sz, 0.0);
+                wr_pos(&th, sizeof(TangTileHeader));
+                wr_pos(ahi_d.data() + th.r_begin, rc_sz * sizeof(double));
+                wr_pos(alo_d.data() + th.r_begin, rc_sz * sizeof(double));
+                tile_usum_off[static_cast<size_t>(ti)] = static_cast<off_t>(file_pos);
+                wr_pos(zero_usum.data(), rc_sz * sizeof(double));
+            }
+
+            const size_t kTangWriteSlotBytes = std::clamp<size_t>(io_slot_bytes, 1ULL << 20, 256ULL << 20);
+            const int io_nt = std::max(1, omp_get_max_threads() - 1);
+            const float* const uk_src = ctx.Uk.data();
+            const size_t n_stride = static_cast<size_t>(n);
+            const size_t k_stride = static_cast<size_t>(k);
+
+            double total_eps_sq = 0.0;
+            std::vector<std::vector<double>> tile_usum(static_cast<size_t>(num_tiles));
+            try {
+                gcta_io::AsyncSeqWriter writer(fd.get(), filename, kTangWriteSlotBytes, /*take_ownership=*/false);
+                for (int32_t ti = 0; ti < num_tiles; ++ti) {
+                    const auto& th = disk_tiles[static_cast<size_t>(ti)];
+                    const int32_t r0 = th.r_begin;
+                    const int32_t rc = th.r_count;
+                    const int32_t q_ld = th.q_ld;
+                    const size_t col_bytes = static_cast<size_t>(q_ld);
+                    const int32_t cols_per_chunk = static_cast<int32_t>(
+                        std::max<size_t>(1, kTangWriteSlotBytes / std::max<size_t>(1, col_bytes)));
+
+                    const size_t rc_pad = (static_cast<size_t>(rc) + 7) / 8 * 8;
+                    std::vector<int64_t> thr_hi(static_cast<size_t>(io_nt) * rc_pad, 0);
+                    std::vector<int64_t> thr_lo(static_cast<size_t>(io_nt) * rc_pad, 0);
+                    const float* const ahi_t = ahi_f.data() + r0;
+                    const float* const ihi_t = ihi_f.data() + r0;
+                    const float* const alo_t = alo_f.data() + r0;
+                    const float* const ilo_t = ilo_f.data() + r0;
+                    const int32_t pad_tail = q_ld - 2 * rc;
+
+                    for (int32_t i0 = 0; i0 < n; i0 += cols_per_chunk) {
+                        const int32_t i_len = std::min(cols_per_chunk, n - i0);
+                        const size_t chunk_bytes = static_cast<size_t>(i_len) * col_bytes;
+                        AlignedRawBuffer<char, 64>& slot = writer.acquire_slot();
+                        if (slot.size() < chunk_bytes) slot.resize(chunk_bytes);
+                        int8_t* const dst_i8 = reinterpret_cast<int8_t*>(slot.data());
+
+                        if (ctx.Uk_is_transposed) {
+                            #pragma omp parallel num_threads(io_nt) reduction(+:total_eps_sq)
+                            {
+                                const int tid = omp_get_thread_num();
+                                int64_t* const lhi = thr_hi.data() + static_cast<size_t>(tid) * rc_pad;
+                                int64_t* const llo = thr_lo.data() + static_cast<size_t>(tid) * rc_pad;
+                                double eps_local = 0.0;
+                                #pragma omp for schedule(static)
+                                for (int32_t di = 0; di < i_len; ++di) {
+                                    const float* const src_col = uk_src + static_cast<size_t>(i0 + di) * k_stride + r0;
+                                    int8_t* const qh_col = dst_i8 + static_cast<size_t>(di) * col_bytes;
+                                    int8_t* const ql_col = qh_col + rc;
+                                    for (int32_t rl = 0; rl < rc; ++rl) {
+                                        const float v    = src_col[rl];
+                                        const float qh_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(v * ihi_t[rl])));
+                                        const float rem  = std::fmaf(-ahi_t[rl], qh_f, v);
+                                        const float ql_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(rem * ilo_t[rl])));
+                                        const int32_t qh = static_cast<int32_t>(qh_f);
+                                        const int32_t ql = static_cast<int32_t>(ql_f);
+                                        qh_col[rl] = static_cast<int8_t>(qh);
+                                        ql_col[rl] = static_cast<int8_t>(ql);
+                                        lhi[rl] += qh;
+                                        llo[rl] += ql;
+                                        const double err = static_cast<double>(rem) - static_cast<double>(alo_t[rl]) * static_cast<double>(ql_f);
+                                        eps_local += err * err;
+                                    }
+                                    if (pad_tail > 0) std::memset(ql_col + rc, 0, static_cast<size_t>(pad_tail));
+                                }
+                                total_eps_sq += eps_local;
+                            }
+                        } else {
+                            constexpr int32_t kBlk = 64;
+                            const int32_t ni_tiles = (i_len + kBlk - 1) / kBlk;
+                            const int32_t nj_tiles = (rc + kBlk - 1) / kBlk;
+                            const int64_t n_sub_tiles = static_cast<int64_t>(ni_tiles) * static_cast<int64_t>(nj_tiles);
+
+                            #pragma omp parallel num_threads(io_nt) reduction(+:total_eps_sq)
+                            {
+                                const int tid = omp_get_thread_num();
+                                int64_t* const lhi = thr_hi.data() + static_cast<size_t>(tid) * rc_pad;
+                                int64_t* const llo = thr_lo.data() + static_cast<size_t>(tid) * rc_pad;
+                                double eps_local = 0.0;
+                                #pragma omp for schedule(static)
+                                for (int64_t t = 0; t < n_sub_tiles; ++t) {
+                                    const int32_t di0 = static_cast<int32_t>(t / nj_tiles) * kBlk;
+                                    const int32_t j0  = static_cast<int32_t>(t % nj_tiles) * kBlk;
+                                    const int32_t di_len = std::min(kBlk, i_len - di0);
+                                    const int32_t j_len  = std::min(kBlk, rc - j0);
+                                    alignas(64) int8_t qh_blk[kBlk][kBlk + 4];
+                                    alignas(64) int8_t ql_blk[kBlk][kBlk + 4];
+
+                                    for (int32_t dj = 0; dj < j_len; ++dj) {
+                                        const int32_t rl = j0 + dj;
+                                        const float* const src_col = uk_src + static_cast<size_t>(r0 + rl) * n_stride + (i0 + di0);
+                                        const float ahi = ahi_t[rl];
+                                        const float ihi = ihi_t[rl];
+                                        const float alo = alo_t[rl];
+                                        const float ilo = ilo_t[rl];
+                                        int64_t sum_h = 0, sum_l = 0;
+                                        double col_err = 0.0;
+                                        for (int32_t ddi = 0; ddi < di_len; ++ddi) {
+                                            const float v    = src_col[ddi];
+                                            const float qh_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(v * ihi)));
+                                            const float rem  = std::fmaf(-ahi, qh_f, v);
+                                            const float ql_f = std::min(127.0f, std::max(-127.0f, std::nearbyintf(rem * ilo)));
+                                            const int32_t qh = static_cast<int32_t>(qh_f);
+                                            const int32_t ql = static_cast<int32_t>(ql_f);
+                                            qh_blk[ddi][dj] = static_cast<int8_t>(qh);
+                                            ql_blk[ddi][dj] = static_cast<int8_t>(ql);
+                                            sum_h += qh;
+                                            sum_l += ql;
+                                            const double err = static_cast<double>(rem) - static_cast<double>(alo) * static_cast<double>(ql_f);
+                                            col_err += err * err;
+                                        }
+                                        lhi[rl] += sum_h;
+                                        llo[rl] += sum_l;
+                                        eps_local += col_err;
+                                    }
+                                    for (int32_t ddi = 0; ddi < di_len; ++ddi) {
+                                        int8_t* const qh_col = dst_i8 + static_cast<size_t>(di0 + ddi) * col_bytes;
+                                        std::memcpy(qh_col + j0, qh_blk[ddi], static_cast<size_t>(j_len));
+                                        std::memcpy(qh_col + rc + j0, ql_blk[ddi], static_cast<size_t>(j_len));
+                                        if (j0 + j_len == rc && pad_tail > 0) {
+                                            std::memset(qh_col + 2 * rc, 0, static_cast<size_t>(pad_tail));
+                                        }
+                                    }
+                                }
+                                total_eps_sq += eps_local;
+                            }
+                        }
+                        writer.submit_slot(chunk_bytes);
+                    }
+
+                    tile_usum[static_cast<size_t>(ti)].resize(static_cast<size_t>(rc));
+                    for (int32_t rl = 0; rl < rc; ++rl) {
+                        int64_t sh = 0, sl = 0;
+                        for (int t = 0; t < io_nt; ++t) {
+                            sh += thr_hi[static_cast<size_t>(t) * rc_pad + rl];
+                            sl += thr_lo[static_cast<size_t>(t) * rc_pad + rl];
+                        }
+                        tile_usum[static_cast<size_t>(ti)][static_cast<size_t>(rl)] =
+                            ahi_d[static_cast<size_t>(r0 + rl)] * static_cast<double>(sh)
+                          + alo_d[static_cast<size_t>(r0 + rl)] * static_cast<double>(sl);
+                    }
+                }
+                writer.finish();
+            } catch (const std::exception& e) {
+                LOGGER.e(0, e.what());
+            }
+
+            const double delta_quant = (n > 1)
+                ? (total_eps_sq / static_cast<double>(n - 1))
+                : total_eps_sq;
+            if (::lseek(fd.get(), delta_off, SEEK_SET) == static_cast<off_t>(-1)) {
+                LOGGER.e(0, "lseek() failed patching TANG delta_quant in [" + filename + "].");
+            }
+            wr(&delta_quant, sizeof(double));
+            for (int32_t ti = 0; ti < num_tiles; ++ti) {
+                if (::lseek(fd.get(), tile_usum_off[static_cast<size_t>(ti)], SEEK_SET) == static_cast<off_t>(-1)) {
+                    LOGGER.e(0, "lseek() failed patching TANG u_sum_q in [" + filename + "].");
+                }
+                wr(tile_usum[static_cast<size_t>(ti)].data(),
+                   static_cast<size_t>(disk_tiles[static_cast<size_t>(ti)].r_count) * sizeof(double));
+            }
+
+            ctx.Uk.resize(0, 0);
+            const double q_mb = static_cast<double>(cur_pay_off) / (1024.0 * 1024.0);
+            LOGGER.i(0, "Saved pre-quantized TANG REML state: n=" + to_string(n) + ", k=" + to_string(k) +
+                        " (" + to_string(num_tiles) + " 2-slice INT8 tile(s), " +
+                        std::format("{:.2f}", q_mb) + " MiB total).");
+            return;
+        }
+
         // --- Thin TREF Branch (--woodbury-reuse --save-reml without --reml-standalone) ---
         if (!reuse_basis_tun3_path.empty() && reuse_basis_hash != 0 && !reml_standalone) {
             Header hdr{};
@@ -1188,48 +2048,8 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
         }
 
         // --- Compact 16-bit TUN3 Branch ---
+        ensure_max_abs();
         const float* const uk_src = ctx.Uk.data();
-        if (!have_max_abs) {
-            max_abs.assign(static_cast<size_t>(k), 0.0f);
-            if (!ctx.Uk_is_transposed) {
-                #pragma omp parallel for schedule(static)
-                for (int32_t r = 0; r < k; ++r) {
-                    const float* const col = uk_src + static_cast<size_t>(r) * static_cast<size_t>(n);
-                    float m = 0.0f;
-                    #pragma omp simd reduction(max:m)
-                    for (int32_t s = 0; s < n; ++s) {
-                        const float av = std::fabs(col[s]);
-                        if (av > m) m = av;
-                    }
-                    max_abs[static_cast<size_t>(r)] = m;
-                }
-            } else {
-                const int max_t = std::max(1, omp_get_max_threads());
-                const size_t k_pad = (static_cast<size_t>(k) + 15) / 16 * 16;
-                std::vector<float> thr_max(static_cast<size_t>(max_t) * k_pad, 0.0f);
-                #pragma omp parallel
-                {
-                    const int tid = omp_get_thread_num();
-                    float* const lmax = thr_max.data() + static_cast<size_t>(tid) * k_pad;
-                    #pragma omp for schedule(static)
-                    for (int32_t s = 0; s < n; ++s) {
-                        const float* const col = uk_src + static_cast<size_t>(s) * static_cast<size_t>(k);
-                        #pragma omp simd
-                        for (int32_t r = 0; r < k; ++r) {
-                            const float av = std::fabs(col[r]);
-                            if (av > lmax[r]) lmax[r] = av;
-                        }
-                    }
-                }
-                for (int32_t r = 0; r < k; ++r) {
-                    float m = 0.0f;
-                    for (int t = 0; t < max_t; ++t) {
-                        m = std::max(m, thr_max[static_cast<size_t>(t) * k_pad + static_cast<size_t>(r)]);
-                    }
-                    max_abs[static_cast<size_t>(r)] = m;
-                }
-            }
-        }
 
         std::vector<float> uk_row_scale(static_cast<size_t>(k), 0.0f);
         std::vector<float> inv_row_scale(static_cast<size_t>(k), 0.0f);
@@ -1520,6 +2340,11 @@ LoadedBasisInfo load_woodbury_basis_into_ctx(const string& filename, RemlCtx& ct
         LOGGER.e(0, "[" + filename + "] is a dense (GOBY) REML state; --reml-woodbury-reuse needs a "
                     "Woodbury (TUN3/TREF) state saved from a --reml-woodbury-basis fit.");
     }
+    if (prefix.kind == RemlKind::Tang) {
+        LOGGER.e(0, "[" + filename + "] stores pre-quantized Stage-4 weights (TANG) from unrotated "
+                    "Cholesky-Woodbury REML and cannot be reused across phenotypes. Re-run initial REML "
+                    "with --reml-woodbury-solver eigh to save a reusable eigenbasis.");
+    }
     check_reml_samples(prefix, ctx.n, expected_id_hash, filename);
 
     ScopedFd tun3_fd_owner;
@@ -1631,6 +2456,11 @@ StreamingReuseHandle preload_woodbury_subspace_streaming(const string& filename,
     if (prefix.kind == RemlKind::Goby) {
         LOGGER.e(0, "[" + filename + "] is a dense (GOBY) REML state; --reml-woodbury-reuse needs a "
                     "Woodbury (TUN3/TREF) state saved from a --reml-woodbury-basis fit.");
+    }
+    if (prefix.kind == RemlKind::Tang) {
+        LOGGER.e(0, "[" + filename + "] stores pre-quantized Stage-4 weights (TANG) from unrotated "
+                    "Cholesky-Woodbury REML and cannot be reused across phenotypes. Re-run initial REML "
+                    "with --reml-woodbury-solver eigh to save a reusable eigenbasis.");
     }
     check_reml_samples(prefix, ctx.n, expected_id_hash, filename);
 
@@ -2020,6 +2850,10 @@ Eigen::MatrixXf load_reml_as_warm_start(const string& path, const vector<string>
     const RemlPrefix prefix = read_reml_prefix(fd.get(), path);
     if (prefix.kind == RemlKind::Goby) {
         LOGGER.e(0, "--reml-woodbury-basis-warm-start: [" + path + "] is a dense GOBY state (no eigenvectors).");
+    }
+    if (prefix.kind == RemlKind::Tang) {
+        LOGGER.e(0, "--reml-woodbury-basis-warm-start: [" + path + "] stores pre-quantized Stage-4 weights (TANG) "
+                    "and cannot be used as a warm-start. Re-run initial REML with --reml-woodbury-solver eigh.");
     }
     const int n = static_cast<int>(analysis_ids.size());
     check_reml_samples(prefix, n, hash_sample_ids(analysis_ids), path);
@@ -2418,6 +3252,11 @@ Eigen::MatrixXf load_pca_warm_start(const string& eigenvec_prefix,
                 }
                 if (mv == kMagicTun3 || mv == kMagicTref) {
                     return load_reml_as_warm_start(eigenvec_prefix, analysis_ids, basis_file_override);
+                }
+                if (mv == kMagicTang) {
+                    LOGGER.e(0, "--reml-woodbury-basis-warm-start: [" + eigenvec_prefix +
+                                "] stores pre-quantized Stage-4 weights (TANG) and cannot be used as a warm-start. "
+                                "Re-run initial REML with --reml-woodbury-solver eigh.");
                 }
                 if (mv == kMagicLegacyTuna) {
                     LOGGER.e(0, "--reml-woodbury-basis-warm-start: [" + eigenvec_prefix +

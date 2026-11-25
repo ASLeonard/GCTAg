@@ -795,7 +795,7 @@ def main():
         assert kv_c60w["wb_solver"] == "cholesky", kv_c60w
         assert float(kv_c60w["eigh_s"]) == 0.0, kv_c60w
         assert float(kv_c60w["rotate_s"]) == 0.0, kv_c60w
-        assert read_reml_magic(chol_k60w + ".reml") == b"TUN3"
+        assert read_reml_magic(chol_k60w + ".reml") == b"TANG"
 
         mlma_c60w_load_2s = os.path.join(work, "c4_mlma_c60w_load_2s")
         mlma_c60w_load_off = os.path.join(work, "c4_mlma_c60w_load_off")
@@ -905,7 +905,12 @@ def main():
         kv_t600 = extract_reml_profile(log_t600)
         assert kv_t600["wb_solver"] in ("cholesky", "cholesky_pivoted"), kv_t600
         assert float(kv_t600["eigh_s"]) == 0.0, kv_t600
+        assert read_reml_magic(chol_t600 + ".reml") == b"TANG"
         mlma_t600_load = os.path.join(work, "c4_mlma_t600_load")
+        mlma_t600_q8192 = os.path.join(work, "c4_mlma_t600_q8192")
+        mlma_t600_hyb = os.path.join(work, "c4_mlma_t600_hyb")
+        mlma_t600_1s = os.path.join(work, "c4_mlma_t600_1s")
+        mlma_t600_off = os.path.join(work, "c4_mlma_t600_off")
         mlma_t600_inl = os.path.join(work, "c4_mlma_t600_inline")
         must_run(
             [
@@ -924,6 +929,56 @@ def main():
                 NEW_BIN, "mlma",
                 "--bfile", test_bfile,
                 "--pheno", test_bfile + ".phen",
+                "--load-reml", chol_t600 + ".reml",
+                "--fast-mlma", "2slice",
+                "--mlma-q-rows", "8192",
+                "--threads", "4",
+                "--out", mlma_t600_q8192,
+            ],
+            "mlma load test k600 TANG pread q8192",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", test_bfile,
+                "--pheno", test_bfile + ".phen",
+                "--load-reml", chol_t600 + ".reml",
+                "--fast-mlma", "hybrid",
+                "--mlma-q-rows", "256",
+                "--threads", "4",
+                "--out", mlma_t600_hyb,
+            ],
+            "mlma load test k600 TANG hybrid",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", test_bfile,
+                "--pheno", test_bfile + ".phen",
+                "--load-reml", chol_t600 + ".reml",
+                "--fast-mlma", "1slice",
+                "--mlma-q-rows", "256",
+                "--threads", "4",
+                "--out", mlma_t600_1s,
+            ],
+            "mlma load test k600 TANG 1slice",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", test_bfile,
+                "--pheno", test_bfile + ".phen",
+                "--load-reml", chol_t600 + ".reml",
+                "--threads", "4",
+                "--out", mlma_t600_off,
+            ],
+            "mlma load test k600 TANG off",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", test_bfile,
+                "--pheno", test_bfile + ".phen",
                 "--grm", test_grm,
                 "--fast",
                 "--woodbury-basis", "600",
@@ -936,6 +991,26 @@ def main():
             "mlma inline test k600 cholesky",
         )
         compare_mlma("chol_t600_inline_vs_load", mlma_t600_inl + ".mlma", mlma_t600_load + ".mlma", rel_tol=1e-4, abs_tol=1e-6)
+        compare_mlma("tang_t600_q8192_vs_off", mlma_t600_q8192 + ".mlma", mlma_t600_off + ".mlma", rel_tol=1e-4, abs_tol=1e-6)
+        compare_mlma("tang_t600_hyb_vs_off", mlma_t600_hyb + ".mlma", mlma_t600_off + ".mlma", rel_tol=3e-3, abs_tol=5e-5)
+        compare_mlma("tang_t600_1s_vs_off", mlma_t600_1s + ".mlma", mlma_t600_off + ".mlma", rel_tol=5e-3, abs_tol=1e-4)
+
+        # Verify !vi_y_hit reconstruction on TANG across Paths A, B, and C
+        neg_phen_path = os.path.join(work, "test_neg.phen")
+        with open(test_bfile + ".phen") as fin, open(neg_phen_path, "w") as fout:
+            for line in fin:
+                ps = line.strip().split()
+                if len(ps) >= 3:
+                    val = ps[2] if ps[2].upper() in ("NA", "-9") else str(-float(ps[2]))
+                    fout.write(f"{ps[0]}\t{ps[1]}\t{val}\n")
+        tang_mis_a = os.path.join(work, "c4_tang_mis_a")
+        tang_mis_b = os.path.join(work, "c4_tang_mis_b")
+        tang_mis_c = os.path.join(work, "c4_tang_mis_c")
+        must_run([NEW_BIN, "mlma", "--bfile", test_bfile, "--pheno", neg_phen_path, "--load-reml", chol_t600 + ".reml", "--fast-mlma", "2slice", "--mlma-q-rows", "8192", "--threads", "4", "--out", tang_mis_a], "TANG mismatch path A")
+        must_run([NEW_BIN, "mlma", "--bfile", test_bfile, "--pheno", neg_phen_path, "--load-reml", chol_t600 + ".reml", "--fast-mlma", "hybrid", "--mlma-q-rows", "256", "--threads", "4", "--out", tang_mis_b], "TANG mismatch path B")
+        must_run([NEW_BIN, "mlma", "--bfile", test_bfile, "--pheno", neg_phen_path, "--load-reml", chol_t600 + ".reml", "--threads", "4", "--out", tang_mis_c], "TANG mismatch path C")
+        compare_mlma("tang_mis_a_vs_c", tang_mis_a + ".mlma", tang_mis_c + ".mlma", rel_tol=1e-4, abs_tol=2e-6)
+        compare_mlma("tang_mis_b_vs_c", tang_mis_b + ".mlma", tang_mis_c + ".mlma", rel_tol=3e-3, abs_tol=5e-5)
 
         # 6f. sCholeskyQR & Chebyshev filter dev flags on test (k=600)
         chol_sk = os.path.join(work, "c4_chol_t600_sketched")

@@ -1007,7 +1007,8 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
 
         const auto t_qb0 = prof ? Clock::now() : Clock::time_point{};
         QuantizedWoodburyUk q_uk = build_quantized_woodbury_uk_from_nxk(
-            Uk_view, sqrt_ck_f, w_sqrt, unit_weights, S_w2, fast_mlma, tuning.q_rows);
+            Uk_view, sqrt_ck_f, w_sqrt, unit_weights, S_w2, fast_mlma, tuning.q_rows,
+            /*release_src_pages=*/true);
         if (prof) {
             prof->q_build_s += std::chrono::duration<double>(Clock::now() - t_qb0).count();
         }

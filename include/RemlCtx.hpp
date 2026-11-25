@@ -240,8 +240,12 @@ struct RemlCtx {
     RemlWoodburySolver reml_woodbury_solver = RemlWoodburySolver::Auto;
     CholeskyQrMode reml_qr_mode = CholeskyQrMode::Auto;
     bool svd_chebyshev = false;
+    bool reml_pcg = false;
+    int reml_pcg_k = 2000;
+    Eigen::VectorXf pcg_cached_Vi_y_f;
+    bool has_pcg_cached_Vi_y = false;
     gcta_eigh::RsvdProfileStats reml_rsvd_prof{};
     double reml_ai_s = 0.0;
     double reml_wk_factor_s = 0.0;
-    std::string reml_wb_solver_used = "none"; // "none", "eigh", "cholesky", "cholesky_fallback"
+    std::string reml_wb_solver_used = "none"; // "none", "eigh", "cholesky", "cholesky_fallback", "pcg"
 };

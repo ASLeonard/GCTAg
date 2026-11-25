@@ -1071,6 +1071,142 @@ def main():
         compare_hsq("t600_cheb_vs_std", chol_cheb + ".hsq", chol_std + ".hsq", rel_tol=2e-2, abs_tol=1e-3)
         print("  PASS reml_unrotated_cholesky_woodbury")
 
+        # 7. Opt-in --reml-pcg (Woodbury-preconditioned PCG + SLQ/CV AI-REML) on FP16, FP32, and covariates
+        pcg_fp16 = os.path.join(work, "c4_pcg_syn_fp16")
+        pcg_fp32 = os.path.join(work, "c4_pcg_syn_fp32")
+        exact_qcov = os.path.join(work, "c4_exact_syn_qcov")
+        pcg_qcov = os.path.join(work, "c4_pcg_syn_qcov")
+
+        log_pcg16 = must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_grm,
+                "--fast",
+                "--reml-pcg", "80",
+                "--seed", "7",
+                "--threads", "4",
+                "--reml-profile",
+                "--out", pcg_fp16,
+            ],
+            "reml syn fp16 pcg k80",
+        )
+        kv_pcg16 = extract_reml_profile(log_pcg16)
+        assert kv_pcg16["wb_solver"] == "pcg", kv_pcg16
+        assert read_reml_magic(pcg_fp16 + ".reml") == b"TANG"
+        compare_hsq("pcg_fp16_vs_exact", pcg_fp16 + ".hsq", exact_full + ".hsq", rel_tol=1.5e-2, abs_tol=3e-3)
+
+        log_pcg32 = must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_grm_f32,
+                "--reml-pcg", "80",
+                "--seed", "7",
+                "--threads", "4",
+                "--reml-profile",
+                "--out", pcg_fp32,
+            ],
+            "reml syn fp32 pcg k80",
+        )
+        kv_pcg32 = extract_reml_profile(log_pcg32)
+        assert kv_pcg32["wb_solver"] == "pcg", kv_pcg32
+        assert read_reml_magic(pcg_fp32 + ".reml") == b"TANG"
+        compare_hsq("pcg_fp32_vs_exact", pcg_fp32 + ".hsq", exact_f32 + ".hsq", rel_tol=1.5e-2, abs_tol=3e-3)
+
+        must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--qcovar", qcovar_path,
+                "--grm", syn_grm_f32,
+                "--threads", "4",
+                "--out", exact_qcov,
+            ],
+            "reml syn fp32 exact qcovar",
+        )
+        log_pcgq = must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--qcovar", qcovar_path,
+                "--grm", syn_grm_f32,
+                "--reml-pcg", "80",
+                "--seed", "7",
+                "--threads", "4",
+                "--reml-profile",
+                "--out", pcg_qcov,
+            ],
+            "reml syn fp32 pcg k80 qcovar",
+        )
+        kv_pcgq = extract_reml_profile(log_pcgq)
+        assert kv_pcgq["wb_solver"] == "pcg", kv_pcgq
+        compare_hsq("pcg_qcov_vs_exact", pcg_qcov + ".hsq", exact_qcov + ".hsq", rel_tol=1.5e-2, abs_tol=3e-3)
+
+        mlma_pcg_load = os.path.join(work, "c4_mlma_pcg_load")
+        mlma_pcg_inl = os.path.join(work, "c4_mlma_pcg_inl")
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", syn_bfile + ".phen",
+                "--load-reml", pcg_fp16 + ".reml",
+                "--fast-mlma", "adaptive",
+                "--threads", "4",
+                "--out", mlma_pcg_load,
+            ],
+            "mlma syn load TANG pcg adaptive",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_grm,
+                "--fast",
+                "--reml-pcg", "80",
+                "--seed", "7",
+                "--threads", "4",
+                "--out", mlma_pcg_inl,
+            ],
+            "mlma syn inline fast pcg k80",
+        )
+        compare_mlma("pcg_mlma_load_vs_exact", mlma_pcg_load + ".mlma", mlma_ex + ".mlma", rel_tol=5e-2, abs_tol=2e-3)
+        compare_mlma("pcg_mlma_inl_vs_load", mlma_pcg_inl + ".mlma", mlma_pcg_load + ".mlma", rel_tol=1e-4, abs_tol=1e-6)
+
+        bad_reuse = subprocess.run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--reml-woodbury-reuse", pcg_fp16 + ".reml",
+                "--threads", "4",
+                "--out", os.path.join(work, "c4_bad_pcg_reuse"),
+            ],
+            capture_output=True, text=True,
+        )
+        assert bad_reuse.returncode != 0, "Expected TANG pcg reuse rejection"
+
+        bad_fisher = subprocess.run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_grm,
+                "--reml-pcg", "80",
+                "--reml-alg", "1",
+                "--threads", "4",
+                "--out", os.path.join(work, "c4_bad_pcg_fisher"),
+            ],
+            capture_output=True, text=True,
+        )
+        assert bad_fisher.returncode != 0, "Expected --reml-pcg + --reml-alg 1 rejection"
+        print("  PASS reml_pcg_exact_woodbury_preconditioned")
+
         print("ALL REML TUNING & TRACK C TESTS PASSED")
     finally:
         if tmp_ctx is not None:

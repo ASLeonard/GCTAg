@@ -137,6 +137,7 @@ struct RemlOptions {
     std::optional<double> ai_robust_risk;
     bool print_trajectory = false;
     std::optional<uint64_t> seed;
+    std::optional<int> reml_pcg;
 
     // Hidden developer tuning flags (group("") in CLI)
     bool reml_profile = false;

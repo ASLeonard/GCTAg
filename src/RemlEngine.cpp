@@ -2236,6 +2236,169 @@ static int eigmass_min_k_next(const Eigen::VectorXd& eval_full, int k_svd, doubl
     return k_svd + static_cast<int>(std::max(1.0, std::min(m_needed, 1.0e9)));
 }
 
+void deflate_bottom_modes_of_range_gram(Eigen::MatrixXf& Q, Eigen::MatrixXd& B, int k_work) {
+    const int k_ext = static_cast<int>(B.rows());
+    const int n_rows = static_cast<int>(Q.rows());
+    const int p_drop = k_ext - k_work;
+    if (p_drop <= 0 || k_work <= 0 || n_rows <= 0) return;
+
+    // Mirror upper -> lower triangle so B is full symmetric.
+    B.triangularView<Eigen::StrictlyLower>() = B.triangularView<Eigen::StrictlyUpper>().transpose();
+    const gcta_blas_int b_kext = static_cast<gcta_blas_int>(k_ext);
+    const int lapack_cap = (k_ext >= 512) ? std::min(omp_get_max_threads(), 48) : 0;
+
+    RemlMat Z_bot;
+    if (k_ext <= 256) {
+        RemlMat B_copy = B;
+        Eigen::VectorXd w_tmp;
+        Eigen::MatrixXd Z_all;
+        gcta_eigh::detail::eigh_upper_asc_d(B_copy, w_tmp, Z_all, lapack_cap);
+        Z_bot = Z_all.leftCols(p_drop);
+    } else {
+        // Estimate upper bound mu > lambda_max(B) via 8 power steps.
+        RemlVec v = RemlVec::Ones(k_ext) / std::sqrt(static_cast<double>(k_ext));
+        RemlVec Bv(k_ext);
+        double mu_est = 1.0;
+        for (int it = 0; it < 8; ++it) {
+            cblas_dsymv(CblasColMajor, CblasUpper, b_kext,
+                        1.0, B.data(), b_kext, v.data(), 1, 0.0, Bv.data(), 1);
+            const double rq = v.dot(Bv);
+            const double nrm = Bv.norm();
+            mu_est = std::max(mu_est, std::max(rq, nrm));
+            if (nrm > 1e-15) v = Bv / nrm;
+        }
+        const double mu = 1.05 * mu_est + 1.0e-6;
+        const double tr_est = B.diagonal().sum() / static_cast<double>(k_ext);
+        const double a_cut = std::max(0.0, std::min(0.5 * tr_est, 0.25 * mu));
+        const double c_ch = 0.5 * (mu + a_cut);
+        const double e_ch = std::max(1.0e-6, 0.5 * (mu - a_cut));
+        const double inv_e = 1.0 / e_ch;
+        const double two_inv_e = 2.0 * inv_e;
+
+        // 2 rounds of degree-8 Chebyshev polynomial filtering mapped to [a_cut, mu]
+        // to suppress bulk/top modes exponentially and isolate the bottom p_drop modes.
+        const int b = std::min(k_ext / 2, std::max(p_drop + 32, 64));
+        const gcta_blas_int bw = static_cast<gcta_blas_int>(b);
+        RemlMat T0(k_ext, b);
+        RemlMat T1(k_ext, b);
+        RemlMat BT(k_ext, b);
+        gcta_eigh::fill_standard_normal(T0);
+        gcta_qr_thin_Q(b_kext, bw, T0.data(), b_kext);
+
+        for (int rnd = 0; rnd < 2; ++rnd) {
+            cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
+                        b_kext, bw, 1.0, B.data(), b_kext,
+                        T0.data(), b_kext, 0.0, BT.data(), b_kext);
+            T1.noalias() = (BT - c_ch * T0) * inv_e;
+            for (int deg = 2; deg <= 8; ++deg) {
+                cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
+                            b_kext, bw, 1.0, B.data(), b_kext,
+                            T1.data(), b_kext, 0.0, BT.data(), b_kext);
+                T0.noalias() = two_inv_e * (BT - c_ch * T1) - T0;
+                T0.swap(T1);
+            }
+            T0.swap(T1);
+            gcta_qr_thin_Q(b_kext, bw, T0.data(), b_kext);
+        }
+
+        cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
+                    b_kext, bw, 1.0, B.data(), b_kext,
+                    T0.data(), b_kext, 0.0, BT.data(), b_kext);
+        RemlMat H_K = T0.transpose() * BT;
+        H_K = 0.5 * (H_K + H_K.transpose());
+
+        Eigen::VectorXd w_K;
+        Eigen::MatrixXd Z_K;
+        gcta_eigh::detail::eigh_upper_asc_d(H_K, w_K, Z_K, lapack_cap);
+        Z_bot.noalias() = T0 * Z_K.leftCols(p_drop);
+    }
+
+    RemlVec tau(p_drop);
+    if (gcta_dgeqrf(b_kext, static_cast<gcta_blas_int>(p_drop),
+                    Z_bot.data(), b_kext, tau.data()) != 0) {
+        return;
+    }
+    RemlMat V_H = RemlMat::Zero(k_ext, p_drop);
+    for (int j = 0; j < p_drop; ++j) {
+        V_H(j, j) = 1.0;
+        for (int i = j + 1; i < k_ext; ++i) {
+            V_H(i, j) = Z_bot(i, j);
+        }
+    }
+    Z_bot.resize(0, 0);
+
+    RemlMat T_H = RemlMat::Zero(p_drop, p_drop);
+    for (int j = 0; j < p_drop; ++j) {
+        if (j > 0) {
+            const RemlVec z = -tau[j] * (V_H.leftCols(j).transpose() * V_H.col(j));
+            T_H.col(j).head(j) = T_H.topLeftCorner(j, j).triangularView<Eigen::Upper>() * z;
+        }
+        T_H(j, j) = tau[j];
+    }
+    const RemlMat M_H = T_H * V_H.bottomRows(k_work).transpose();  // p_drop x k_work
+
+    // Update Q (n x k_ext -> n x k_work) in float32.
+    {
+        const Eigen::MatrixXf V_Hf = V_H.cast<float>();
+        const Eigen::MatrixXf M_Hf = M_H.cast<float>();
+        Eigen::MatrixXf W_Q(n_rows, p_drop);
+        cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                    static_cast<gcta_blas_int>(n_rows),
+                    static_cast<gcta_blas_int>(p_drop),
+                    b_kext,
+                    1.0f, Q.data(), static_cast<gcta_blas_int>(n_rows),
+                    V_Hf.data(), b_kext,
+                    0.0f, W_Q.data(), static_cast<gcta_blas_int>(n_rows));
+
+        // Shift Q[:, p_drop : k_ext] -> Q[:, 0 : k_work] in parallel by row slabs.
+        #pragma omp parallel if (static_cast<size_t>(n_rows) * static_cast<size_t>(k_work) >= 32768)
+        {
+            const int tid = omp_get_thread_num();
+            const int nt = omp_get_num_threads();
+            const int r0 = static_cast<int>((static_cast<int64_t>(n_rows) * tid) / nt);
+            const int r1 = static_cast<int>((static_cast<int64_t>(n_rows) * (tid + 1)) / nt);
+            const size_t bytes = static_cast<size_t>(r1 - r0) * sizeof(float);
+            if (bytes > 0) {
+                for (int j = 0; j < k_work; ++j) {
+                    std::memcpy(Q.col(j).data() + r0, Q.col(j + p_drop).data() + r0, bytes);
+                }
+            }
+        }
+        cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                    static_cast<gcta_blas_int>(n_rows),
+                    static_cast<gcta_blas_int>(k_work),
+                    static_cast<gcta_blas_int>(p_drop),
+                    -1.0f, W_Q.data(), static_cast<gcta_blas_int>(n_rows),
+                    M_Hf.data(), static_cast<gcta_blas_int>(p_drop),
+                    1.0f, Q.data(), static_cast<gcta_blas_int>(n_rows));
+        W_Q.resize(0, 0);
+        Q.conservativeResize(Eigen::NoChange, k_work);
+    }
+
+    // Update B (k_ext x k_ext -> k_work x k_work) in double.
+    {
+        RemlMat U_B(k_ext, p_drop);
+        cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
+                    b_kext, static_cast<gcta_blas_int>(p_drop),
+                    1.0, B.data(), b_kext,
+                    V_H.data(), b_kext,
+                    0.0, U_B.data(), b_kext);
+        const RemlMat S_B = V_H.transpose() * U_B;  // p_drop x p_drop
+        const RemlMat M_HT = M_H.transpose();       // k_work x p_drop
+        const RemlMat Y_B = U_B.bottomRows(k_work) - 0.5 * (M_HT * S_B);  // k_work x p_drop
+        RemlMat B_new = B.bottomRightCorner(k_work, k_work);
+        cblas_dsyr2k(CblasColMajor, CblasUpper, CblasNoTrans,
+                     static_cast<gcta_blas_int>(k_work),
+                     static_cast<gcta_blas_int>(p_drop),
+                     -1.0,
+                     Y_B.data(), static_cast<gcta_blas_int>(k_work),
+                     M_HT.data(), static_cast<gcta_blas_int>(k_work),
+                     1.0,
+                     B_new.data(), static_cast<gcta_blas_int>(k_work));
+        B.swap(B_new);
+    }
+}
+
 } // anonymous namespace
 
 void compute_woodbury_basis(RemlCtx& ctx) {
@@ -2447,171 +2610,6 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     } else if (ctx.reml_woodbury_solver == RemlWoodburySolver::Auto) {
         use_unrotated = unrotated_allowed && !ctx.reml_eigh_fp32 && (k_svd >= 1024);
     }
-
-    auto deflate_bottom_modes_of_range_gram = [&](Eigen::MatrixXf& Q, Eigen::MatrixXd& B, int k_work) {
-        const int k_ext = static_cast<int>(B.rows());
-        const int n_rows = static_cast<int>(Q.rows());
-        const int p_drop = k_ext - k_work;
-        if (p_drop <= 0 || k_work <= 0 || n_rows <= 0) return;
-
-        // Mirror upper -> lower triangle so B is full symmetric.
-        B.triangularView<Eigen::StrictlyLower>() = B.triangularView<Eigen::StrictlyUpper>().transpose();
-        const gcta_blas_int b_kext = static_cast<gcta_blas_int>(k_ext);
-        const int lapack_cap = (k_ext >= 512) ? std::min(omp_get_max_threads(), 48) : 0;
-
-        RemlMat Z_bot;
-        if (k_ext <= 256) {
-            RemlMat B_copy = B;
-            Eigen::VectorXd w_tmp;
-            Eigen::MatrixXd Z_all;
-            gcta_eigh::detail::eigh_upper_asc_d(B_copy, w_tmp, Z_all, lapack_cap);
-            Z_bot = Z_all.leftCols(p_drop);
-        } else {
-            // Estimate upper bound mu > lambda_max(B) via 8 power steps.
-            RemlVec v = RemlVec::Ones(k_ext) / std::sqrt(static_cast<double>(k_ext));
-            RemlVec Bv(k_ext);
-            double mu_est = 1.0;
-            for (int it = 0; it < 8; ++it) {
-                cblas_dsymv(CblasColMajor, CblasUpper, b_kext,
-                            1.0, B.data(), b_kext, v.data(), 1, 0.0, Bv.data(), 1);
-                const double rq = v.dot(Bv);
-                const double nrm = Bv.norm();
-                mu_est = std::max(mu_est, std::max(rq, nrm));
-                if (nrm > 1e-15) v = Bv / nrm;
-            }
-            const double mu = 1.05 * mu_est + 1.0e-6;
-            const double tr_est = B.diagonal().sum() / static_cast<double>(k_ext);
-            const double a_cut = std::max(0.0, std::min(0.5 * tr_est, 0.25 * mu));
-            const double c_ch = 0.5 * (mu + a_cut);
-            const double e_ch = std::max(1.0e-6, 0.5 * (mu - a_cut));
-            const double inv_e = 1.0 / e_ch;
-            const double two_inv_e = 2.0 * inv_e;
-
-            // 2 rounds of degree-8 Chebyshev polynomial filtering mapped to [a_cut, mu]
-            // to suppress bulk/top modes exponentially and isolate the bottom p_drop modes.
-            const int b = std::min(k_ext / 2, std::max(p_drop + 32, 64));
-            const gcta_blas_int bw = static_cast<gcta_blas_int>(b);
-            RemlMat T0(k_ext, b);
-            RemlMat T1(k_ext, b);
-            RemlMat BT(k_ext, b);
-            gcta_eigh::fill_standard_normal(T0);
-            gcta_qr_thin_Q(b_kext, bw, T0.data(), b_kext);
-
-            for (int rnd = 0; rnd < 2; ++rnd) {
-                cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
-                            b_kext, bw, 1.0, B.data(), b_kext,
-                            T0.data(), b_kext, 0.0, BT.data(), b_kext);
-                T1.noalias() = (BT - c_ch * T0) * inv_e;
-                for (int deg = 2; deg <= 8; ++deg) {
-                    cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
-                                b_kext, bw, 1.0, B.data(), b_kext,
-                                T1.data(), b_kext, 0.0, BT.data(), b_kext);
-                    T0.noalias() = two_inv_e * (BT - c_ch * T1) - T0;
-                    T0.swap(T1);
-                }
-                T0.swap(T1);
-                gcta_qr_thin_Q(b_kext, bw, T0.data(), b_kext);
-            }
-
-            cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
-                        b_kext, bw, 1.0, B.data(), b_kext,
-                        T0.data(), b_kext, 0.0, BT.data(), b_kext);
-            RemlMat H_K = T0.transpose() * BT;
-            H_K = 0.5 * (H_K + H_K.transpose());
-
-            Eigen::VectorXd w_K;
-            Eigen::MatrixXd Z_K;
-            gcta_eigh::detail::eigh_upper_asc_d(H_K, w_K, Z_K, lapack_cap);
-            Z_bot.noalias() = T0 * Z_K.leftCols(p_drop);
-        }
-
-        // Deflate span(Z_bot) via Compact-WY Householder reflector:
-        //   Z_bot = H * R, H = I - V_H T_H V_H^T -> new span is H[:, p_drop : k_ext].
-        RemlVec tau(p_drop);
-        if (gcta_dgeqrf(b_kext, static_cast<gcta_blas_int>(p_drop),
-                        Z_bot.data(), b_kext, tau.data()) != 0) {
-            return;
-        }
-        RemlMat V_H = RemlMat::Zero(k_ext, p_drop);
-        for (int j = 0; j < p_drop; ++j) {
-            V_H(j, j) = 1.0;
-            for (int i = j + 1; i < k_ext; ++i) {
-                V_H(i, j) = Z_bot(i, j);
-            }
-        }
-        Z_bot.resize(0, 0);
-
-        RemlMat T_H = RemlMat::Zero(p_drop, p_drop);
-        for (int j = 0; j < p_drop; ++j) {
-            if (j > 0) {
-                const RemlVec z = -tau[j] * (V_H.leftCols(j).transpose() * V_H.col(j));
-                T_H.col(j).head(j) = T_H.topLeftCorner(j, j).triangularView<Eigen::Upper>() * z;
-            }
-            T_H(j, j) = tau[j];
-        }
-        const RemlMat M_H = T_H * V_H.bottomRows(k_work).transpose();  // p_drop x k_work
-
-        // Update Q (n x k_ext -> n x k_work) in float32.
-        {
-            const Eigen::MatrixXf V_Hf = V_H.cast<float>();
-            const Eigen::MatrixXf M_Hf = M_H.cast<float>();
-            Eigen::MatrixXf W_Q(n_rows, p_drop);
-            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
-                        static_cast<gcta_blas_int>(n_rows),
-                        static_cast<gcta_blas_int>(p_drop),
-                        b_kext,
-                        1.0f, Q.data(), static_cast<gcta_blas_int>(n_rows),
-                        V_Hf.data(), b_kext,
-                        0.0f, W_Q.data(), static_cast<gcta_blas_int>(n_rows));
-
-            // Shift Q[:, p_drop : k_ext] -> Q[:, 0 : k_work] in parallel by row slabs.
-            #pragma omp parallel if (static_cast<size_t>(n_rows) * static_cast<size_t>(k_work) >= 32768)
-            {
-                const int tid = omp_get_thread_num();
-                const int nt = omp_get_num_threads();
-                const int r0 = static_cast<int>((static_cast<int64_t>(n_rows) * tid) / nt);
-                const int r1 = static_cast<int>((static_cast<int64_t>(n_rows) * (tid + 1)) / nt);
-                const size_t bytes = static_cast<size_t>(r1 - r0) * sizeof(float);
-                if (bytes > 0) {
-                    for (int j = 0; j < k_work; ++j) {
-                        std::memcpy(Q.col(j).data() + r0, Q.col(j + p_drop).data() + r0, bytes);
-                    }
-                }
-            }
-            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
-                        static_cast<gcta_blas_int>(n_rows),
-                        static_cast<gcta_blas_int>(k_work),
-                        static_cast<gcta_blas_int>(p_drop),
-                        -1.0f, W_Q.data(), static_cast<gcta_blas_int>(n_rows),
-                        M_Hf.data(), static_cast<gcta_blas_int>(p_drop),
-                        1.0f, Q.data(), static_cast<gcta_blas_int>(n_rows));
-            W_Q.resize(0, 0);
-            Q.conservativeResize(Eigen::NoChange, k_work);
-        }
-
-        // Update B (k_ext x k_ext -> k_work x k_work) in double.
-        {
-            RemlMat U_B(k_ext, p_drop);
-            cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
-                        b_kext, static_cast<gcta_blas_int>(p_drop),
-                        1.0, B.data(), b_kext,
-                        V_H.data(), b_kext,
-                        0.0, U_B.data(), b_kext);
-            const RemlMat S_B = V_H.transpose() * U_B;  // p_drop x p_drop
-            const RemlMat M_HT = M_H.transpose();       // k_work x p_drop
-            const RemlMat Y_B = U_B.bottomRows(k_work) - 0.5 * (M_HT * S_B);  // k_work x p_drop
-            RemlMat B_new = B.bottomRightCorner(k_work, k_work);
-            cblas_dsyr2k(CblasColMajor, CblasUpper, CblasNoTrans,
-                         static_cast<gcta_blas_int>(k_work),
-                         static_cast<gcta_blas_int>(p_drop),
-                         -1.0,
-                         Y_B.data(), static_cast<gcta_blas_int>(k_work),
-                         M_HT.data(), static_cast<gcta_blas_int>(k_work),
-                         1.0,
-                         B_new.data(), static_cast<gcta_blas_int>(k_work));
-            B.swap(B_new);
-        }
-    };
 
     if (use_unrotated) {
         const int oversample = gcta_eigh::recommended_oversample(k_svd);
@@ -3286,6 +3284,899 @@ void finalize_unrotated_woodbury_factor(RemlCtx& ctx) {
     ctx.reml_wb_solver_used = "cholesky_pivoted";
 }
 
+void run_pcg_reml(RemlCtx& ctx,
+                  const std::vector<double>& priors,
+                  const std::vector<double>& priors_var,
+                  bool no_constrain) {
+    if (ctx.reml_mtd != RemlAlg::AI)
+        LOGGER.e(0, "--reml-pcg requires AI-REML.");
+    if (static_cast<int>(ctx.r_indx.size()) != 2)
+        LOGGER.e(0, "--reml-pcg supports only single-GRM models.");
+    if (ctx.A[ctx.r_indx[0]].size() == 0 && ctx.grm_chunked_budget <= 0.0 && !ctx.grm_fp16)
+        LOGGER.e(0, "--reml-pcg: GRM component is identity; cannot run PCG REML.");
+    if ((ctx.grm_chunked_budget > 0.0 || ctx.grm_fp16) && !ctx.grm_tile_reader)
+        LOGGER.e(0, "--reml-pcg: tiled GRM mode is set but ctx.grm_tile_reader is empty.");
+
+    const int n = ctx.n;
+    const int c = ctx.X_c;
+    const int m = static_cast<int>(ctx.r_indx.size()); // 2
+    const int k_pc = std::max(1, std::min(ctx.reml_pcg_k, n - 1));
+    const bool grm_chunked = (ctx.grm_chunked_budget > 0.0) || ctx.grm_fp16;
+    if (grm_chunked) {
+        ctx.grm_chunk_rows = setup_chunked_grm_stream(ctx, "--reml-pcg");
+    }
+
+    LOGGER << "\nRunning exact Woodbury-preconditioned PCG AI-REML (k_pc=" << k_pc << ") ..." << std::endl;
+
+    double trace_K_full = 0.0;
+    double trace_K2 = 0.0;
+    bool have_chunked_traces = !grm_chunked || ctx.grm_fp16;
+    const Eigen::MatrixXf& K_f32 = ctx.A[ctx.r_indx[0]];
+    if (ctx.grm_fp16) {
+        trace_K_full = ctx.grm_fp16_trace_K;
+        trace_K2     = ctx.grm_fp16_trace_K2;
+    } else if (!grm_chunked) {
+        trace_K_full = K_f32.diagonal().cast<double>().sum();
+        const double diag_sq = K_f32.diagonal().cast<double>().squaredNorm();
+        double off_sq = 0.0;
+        #pragma omp parallel for reduction(+:off_sq) schedule(guided)
+        for (int j = 0; j < n; ++j) {
+            off_sq += K_f32.col(j).head(j).cast<double>().squaredNorm();
+        }
+        trace_K2 = diag_sq + 2.0 * off_sq;
+    }
+
+    auto release_grm_storage = [&]() {
+        ctx.A[ctx.r_indx[0]].resize(0, 0);
+        if (ctx.grm_fp16_release) {
+            ctx.grm_fp16_release();
+            ctx.grm_fp16_release = nullptr;
+        }
+        ctx.grm_tile_reader.release();
+        ctx.grm_tile_reader = nullptr;
+        ctx.grm_tile_reader_f32 = nullptr;
+        ctx.grm_chunk_rows = 0;
+    };
+
+    // 1. Build rank-k_pc Woodbury preconditioner (Q, B) keeping the GRM resident.
+    ctx.reml_rsvd_prof = {};
+    gcta_chunked::MatvecStats mv_stats{};
+    gcta_chunked::MatvecStats* const mv_stats_ptr = ctx.reml_profile ? &mv_stats : nullptr;
+    gcta_eigh::RsvdOptions rsvd_opts;
+    rsvd_opts.qr_power_passes    = ctx.reml_qr_power_passes;
+    rsvd_opts.eigh_fp32          = ctx.reml_eigh_fp32;
+    rsvd_opts.eigh_threads       = ctx.reml_eigh_threads;
+    rsvd_opts.keep_trailing_cols = true;
+    rsvd_opts.qr_mode            = ctx.reml_qr_mode;
+    rsvd_opts.chebyshev_filter   = ctx.svd_chebyshev;
+    gcta_eigh::RsvdProfileStats* const prof_ptr = ctx.reml_profile ? &ctx.reml_rsvd_prof : nullptr;
+
+    auto apply_f32 = [&](const Eigen::Ref<const Eigen::MatrixXf>& X, bool exact_fp32) -> Eigen::MatrixXf {
+        const bool use_bf16 = !exact_fp32 && gcta_chunked::default_bf16_sketch();
+        if (grm_chunked) {
+            if (ctx.grm_tile_reader_f32) {
+                double* tr_ptr  = have_chunked_traces ? nullptr : &trace_K_full;
+                double* tr2_ptr = have_chunked_traces ? nullptr : &trace_K2;
+                Eigen::MatrixXf Y = gcta_chunked::chunked_symmetric_matvec_f32(
+                    ctx.grm_tile_reader_f32, n, ctx.grm_chunk_rows, X, tr_ptr, tr2_ptr, use_bf16,
+                    ctx.reml_matvec_band_rows, ctx.reml_matvec_col_chunk, mv_stats_ptr);
+                have_chunked_traces = true;
+                return Y;
+            }
+            if (!have_chunked_traces) {
+                trace_K_full = gcta_chunked::chunked_diagonal(ctx.grm_tile_reader, n, ctx.grm_chunk_rows).sum();
+                trace_K2 = gcta_chunked::chunked_trace_K_squared(ctx.grm_tile_reader, n, ctx.grm_chunk_rows);
+                have_chunked_traces = true;
+            }
+            return gcta_chunked::chunked_symmetric_matvec(
+                ctx.grm_tile_reader, n, ctx.grm_chunk_rows, X.cast<double>()).cast<float>();
+        }
+        return gcta_chunked::dense_upper_symm_f32(K_f32, X, use_bf16);
+    };
+
+    const int q_pow = std::max(1, ctx.svd_power_iter);
+    const int oversample = gcta_eigh::recommended_oversample(k_pc);
+    const int k_ext = std::min(k_pc + oversample, n - 1);
+    const bool can_bf16_inplace =
+        ctx.grm_fp16 &&
+        static_cast<bool>(ctx.grm_tile_reader_f32.large_k_symm_fn) &&
+        gcta_chunked::default_bf16_sketch();
+
+    gcta_eigh::RangeGramResultF rg;
+    auto keep_grm_noop = [&]() {};
+    try {
+        if (can_bf16_inplace) {
+            auto apply_bf16_inplace = [&](const uint16_t* X_bf16_ptr, Eigen::MatrixXf& Y_mat) {
+                double* tr_ptr  = have_chunked_traces ? nullptr : &trace_K_full;
+                double* tr2_ptr = have_chunked_traces ? nullptr : &trace_K2;
+                ctx.grm_tile_reader_f32.large_k_symm_fn(
+                    nullptr, static_cast<gcta_blas_int>(n), X_bf16_ptr, k_ext,
+                    Y_mat.data(), static_cast<gcta_blas_int>(n), /*use_bf16=*/true,
+                    ctx.reml_matvec_band_rows, ctx.reml_matvec_col_chunk,
+                    tr_ptr, tr2_ptr, mv_stats_ptr);
+                have_chunked_traces = true;
+            };
+            auto apply_exact_fp32 = [&](const Eigen::Ref<const Eigen::MatrixXf>& Q_ref) -> Eigen::MatrixXf {
+                return apply_f32(Q_ref, /*exact_fp32=*/true);
+            };
+            rg = gcta_eigh::randomized_symmetric_range_and_gram_bf16_inplace(
+                apply_bf16_inplace, apply_exact_fp32, n, k_ext, q_pow,
+                nullptr, rsvd_opts, prof_ptr, keep_grm_noop);
+        } else {
+            using Clock = std::chrono::steady_clock;
+            const auto t_sk0 = prof_ptr ? Clock::now() : Clock::time_point{};
+            auto [omega, Y] = gcta_eigh::build_randomized_sketch_consume<float>(
+                apply_f32, n, k_ext, nullptr, /*exact_fp32=*/false);
+            omega.resize(0, 0);
+            if (prof_ptr) {
+                prof_ptr->sketch_matvec_s += std::chrono::duration<double>(Clock::now() - t_sk0).count();
+            }
+            rg = gcta_eigh::power_iterate_and_gram_ex<float>(
+                apply_f32, std::move(Y), q_pow, rsvd_opts, prof_ptr, keep_grm_noop);
+        }
+    } catch (const std::exception& e) {
+        LOGGER.e(0, std::string("PCG preconditioner rSVD: ") + e.what());
+    }
+
+    if (k_ext > k_pc) {
+        deflate_bottom_modes_of_range_gram(rg.Q, rg.B, k_pc);
+    }
+    if (prof_ptr) {
+        prof_ptr->matvec_unpack_s += mv_stats.unpack_s;
+        prof_ptr->matvec_gemm_s += mv_stats.gemm_s;
+        prof_ptr->matvec_tiles += mv_stats.tiles;
+        prof_ptr->matvec_gemm_calls += mv_stats.gemm_calls;
+    }
+
+    // Symmetrize B and compute exact trace summaries for control variate & finalization.
+    rg.B.triangularView<Eigen::StrictlyLower>() = rg.B.triangularView<Eigen::StrictlyUpper>().transpose();
+    const double* const b_ptr = rg.B.data();
+    double tr_b = 0.0, diag_sq = 0.0, off_sq = 0.0;
+    #pragma omp parallel for reduction(+:tr_b,diag_sq,off_sq) schedule(guided) if (k_pc >= 128)
+    for (int j = 0; j < k_pc; ++j) {
+        const double* __restrict__ bcol = b_ptr + static_cast<size_t>(j) * static_cast<size_t>(k_pc);
+        const double d = bcol[j];
+        tr_b += d;
+        diag_sq += d * d;
+        double col_off = 0.0;
+        #pragma omp simd reduction(+:col_off)
+        for (int i = 0; i < j; ++i) col_off += bcol[i] * bcol[i];
+        off_sq += col_off;
+    }
+    const double tr_b2 = diag_sq + 2.0 * off_sq;
+    double lambda_tail = (n - k_pc > 0)
+        ? std::max(0.0, (trace_K_full - tr_b) / static_cast<double>(n - k_pc))
+        : 0.0;
+    const double tail_sum_sq = std::max(0.0, trace_K2 - tr_b2);
+    const double tail_d_var = (n - k_pc > 0)
+        ? std::max(0.0, tail_sum_sq / static_cast<double>(n - k_pc) - lambda_tail * lambda_tail)
+        : 0.0;
+
+    ctx.Uk = std::move(rg.Q);       // n x k_pc float32
+    ctx.wb_B = std::move(rg.B);     // k_pc x k_pc double
+    ctx.wb_tr_B = tr_b;
+    ctx.wb_tr_B2 = tr_b2;
+    ctx.lambda_tail = lambda_tail;
+    ctx.tail_d_var = tail_d_var;
+    ctx.Uk_is_transposed = false;
+    ctx.woodbury_basis_rank_ = k_pc;
+    ctx.Vi_use_woodbury_basis = false; // keep exact GRM HE warm-start
+    ctx.wb_unrotated = true;
+    ctx.wb_uk_is_prebaked_wk = false;
+
+    const auto t_ai0 = ctx.reml_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
+    // 2. Exact HE warm-start (uses resident GRM).
+    RemlVec varcmp;
+    ctx.he_warm_start_applied = init_varcomp(ctx, priors_var, priors, varcmp);
+
+    // Helper for exact double K * Z using resident GRM.
+    auto apply_K_mat = [&](const Eigen::Ref<const RemlMat>& Z, RemlMat& KZ) {
+        if (grm_chunked) {
+            chunked_grm_matvec_into(ctx, Z, KZ);
+        } else {
+            symm_upper_f32_mat_into(ctx.A[ctx.r_indx[0]], Z, KZ);
+        }
+    };
+
+    // 3. Fixed deterministic Hutchinson trace (24 cols) & SLQ (8 cols) probes.
+    constexpr int kTrProbes = 24;
+    constexpr int kSlqProbes = 8;
+    constexpr int kMaxCg = 40;
+    constexpr double kTolXy = 1.0e-6;
+    constexpr double kTolProbe = 1.0e-5;
+
+    RemlMat G_tr(n, kTrProbes);
+    RemlMat U_slq(n, kSlqProbes);
+    {
+        const int nt = omp_get_max_threads();
+        std::vector<uint32_t> seeds(static_cast<size_t>(nt));
+        for (int t = 0; t < nt; ++t) {
+            seeds[static_cast<size_t>(t)] = static_cast<uint32_t>(gcta_eigh::shared_rng()());
+        }
+        const double inv_sqrt_n = 1.0 / std::sqrt(static_cast<double>(n));
+        #pragma omp parallel
+        {
+            const int tid = omp_get_thread_num();
+            std::mt19937 rng(seeds[static_cast<size_t>(tid)]);
+            const int r0 = static_cast<int>((static_cast<int64_t>(n) * tid) / nt);
+            const int r1 = static_cast<int>((static_cast<int64_t>(n) * (tid + 1)) / nt);
+            for (int j = 0; j < kTrProbes; ++j) {
+                double* col = G_tr.col(j).data();
+                for (int i = r0; i < r1; ++i) {
+                    col[i] = (rng() & 1u) ? 1.0 : -1.0;
+                }
+            }
+            for (int j = 0; j < kSlqProbes; ++j) {
+                double* col = U_slq.col(j).data();
+                for (int i = r0; i < r1; ++i) {
+                    col[i] = (rng() & 1u) ? inv_sqrt_n : -inv_sqrt_n;
+                }
+            }
+        }
+    }
+    RemlMat K_G_tr;
+    apply_K_mat(G_tr, K_G_tr);
+
+    // Precompute QtU_slq = Q^T U_slq once (k_pc x kSlqProbes double).
+    RemlMat QtU_slq;
+    {
+        Eigen::MatrixXf U_f = U_slq.cast<float>();
+        Eigen::MatrixXf QtU_f(k_pc, kSlqProbes);
+        cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans,
+                    static_cast<gcta_blas_int>(k_pc), static_cast<gcta_blas_int>(kSlqProbes),
+                    static_cast<gcta_blas_int>(n),
+                    1.0f, ctx.Uk.data(), static_cast<gcta_blas_int>(n),
+                    U_f.data(), static_cast<gcta_blas_int>(n),
+                    0.0f, QtU_f.data(), static_cast<gcta_blas_int>(k_pc));
+        QtU_slq = QtU_f.cast<double>();
+    }
+
+    // Reusable buffers for preconditioner, batched PCG, and trace evaluation.
+    const gcta_blas_int bk = static_cast<gcta_blas_int>(k_pc);
+    const int lapack_cap = (k_pc >= 512) ? std::min(omp_get_max_threads(), 48) : 0;
+    RemlMat VQ_work(k_pc, k_pc);
+    RemlMat M_G_tr(n, kTrProbes);
+    RemlMat B_slq(n, kSlqProbes);
+
+    auto setup_preconditioner = [&](double sg2, double se2,
+                                    bool& use_wb_precond,
+                                    double& sig2_eff_out,
+                                    double& logdet_M_out,
+                                    double& tr_Minv_out,
+                                    double& tr_MinvK_out) {
+        sig2_eff_out = std::max(1.0e-12, se2 + std::max(0.0, sg2) * lambda_tail);
+        use_wb_precond = (sg2 > 0.0 && se2 > 0.0);
+        if (use_wb_precond) {
+            const double* const wb_p = ctx.wb_B.data();
+            double* const t_p = VQ_work.data();
+            #pragma omp parallel for schedule(guided) if (k_pc >= 128)
+            for (int j = 0; j < k_pc; ++j) {
+                const double* __restrict__ bcol = wb_p + static_cast<size_t>(j) * static_cast<size_t>(k_pc);
+                double* __restrict__ tcol = t_p + static_cast<size_t>(j) * static_cast<size_t>(k_pc);
+                #pragma omp simd
+                for (int i = 0; i < j; ++i) tcol[i] = sg2 * bcol[i];
+                tcol[j] = sg2 * bcol[j] + se2;
+            }
+            int info = 0;
+            {
+                ScopedBlasThreadCap cap(lapack_cap);
+                info = gcta_dpotrf(bk, t_p, bk, 'U');
+            }
+            if (info != 0) {
+                use_wb_precond = false;
+            }
+        }
+
+        if (!use_wb_precond) {
+            const double inv_s = 1.0 / sig2_eff_out;
+            logdet_M_out = static_cast<double>(n) * std::log(sig2_eff_out);
+            tr_Minv_out = static_cast<double>(n) * inv_s;
+            tr_MinvK_out = trace_K_full * inv_s;
+            B_slq.noalias() = std::sqrt(sig2_eff_out) * U_slq;
+            M_G_tr.noalias() = inv_s * G_tr;
+            return;
+        }
+
+        // VQ_work currently stores upper Cholesky factor U_Q (V_Q = U_Q^T U_Q).
+        double logdet_VQ = 0.0;
+        const double* const t_p = VQ_work.data();
+        for (int j = 0; j < k_pc; ++j) {
+            const double dj = t_p[static_cast<size_t>(j) * static_cast<size_t>(k_pc) + j];
+            logdet_VQ += 2.0 * std::log(std::max(1.0e-300, dj));
+        }
+        logdet_M_out = static_cast<double>(n - k_pc) * std::log(sig2_eff_out) + logdet_VQ;
+
+        // Build B_slq = L_M * U_slq = sqrt(sig2_eff) * U_slq + Q * (U_Q^T * QtU_slq - sqrt(sig2_eff) * QtU_slq)
+        {
+            const double sqrt_eff = std::sqrt(sig2_eff_out);
+            RemlMat S_slq = QtU_slq;
+            cblas_dtrmm(CblasColMajor, CblasLeft, CblasUpper, CblasTrans, CblasNonUnit,
+                        bk, static_cast<gcta_blas_int>(kSlqProbes),
+                        1.0, VQ_work.data(), bk, S_slq.data(), bk);
+            S_slq.noalias() -= sqrt_eff * QtU_slq;
+            const Eigen::MatrixXf S_slqf = S_slq.cast<float>();
+            Eigen::MatrixXf Q_corr(n, kSlqProbes);
+            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<gcta_blas_int>(n), static_cast<gcta_blas_int>(kSlqProbes),
+                        bk,
+                        1.0f, ctx.Uk.data(), static_cast<gcta_blas_int>(n),
+                        S_slqf.data(), bk,
+                        0.0f, Q_corr.data(), static_cast<gcta_blas_int>(n));
+            B_slq.resize(n, kSlqProbes);
+            #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * kSlqProbes >= 32768)
+            for (int j = 0; j < kSlqProbes; ++j) {
+                const double* __restrict__ ucol = U_slq.col(j).data();
+                const float* __restrict__ qcol = Q_corr.col(j).data();
+                double* __restrict__ dst = B_slq.col(j).data();
+                #pragma omp simd
+                for (int i = 0; i < n; ++i) {
+                    dst[i] = sqrt_eff * ucol[i] + static_cast<double>(qcol[i]);
+                }
+            }
+        }
+
+        // Invert U_Q in-place -> VQ_work now holds T = U_Q^{-1}, so V_Q^{-1} = T T^T.
+        int inv_info = 0;
+        {
+            ScopedBlasThreadCap cap(lapack_cap);
+            inv_info = gcta_dtrtri(bk, VQ_work.data(), bk, 'U');
+        }
+        if (inv_info != 0) {
+            use_wb_precond = false;
+            const double inv_s = 1.0 / sig2_eff_out;
+            logdet_M_out = static_cast<double>(n) * std::log(sig2_eff_out);
+            tr_Minv_out = static_cast<double>(n) * inv_s;
+            tr_MinvK_out = trace_K_full * inv_s;
+            B_slq.noalias() = std::sqrt(sig2_eff_out) * U_slq;
+            M_G_tr.noalias() = inv_s * G_tr;
+            return;
+        }
+
+        // Exact tr(V_Q^{-1}) = ||T||_F^2 (upper triangle of T).
+        double tr_VQi = 0.0;
+        #pragma omp parallel for reduction(+:tr_VQi) schedule(guided) if (k_pc >= 128)
+        for (int j = 0; j < k_pc; ++j) {
+            const double* __restrict__ tcol = t_p + static_cast<size_t>(j) * static_cast<size_t>(k_pc);
+            double s = 0.0;
+            #pragma omp simd reduction(+:s)
+            for (int i = 0; i <= j; ++i) s += tcol[i] * tcol[i];
+            tr_VQi += s;
+        }
+        double tr_VQiB = 0.0;
+        if (sg2 >= 1.0e-5) {
+            tr_VQiB = (static_cast<double>(k_pc) - se2 * tr_VQi) / sg2;
+        } else {
+            // Stable fallback for tiny sg2: tr(T^T B T) = sum_{i<=j} ... compute V_Q^{-1} via T * T^T
+            RemlMat VQi = RemlMat::Zero(k_pc, k_pc);
+            cblas_dsyrk(CblasColMajor, CblasUpper, CblasNoTrans,
+                        bk, bk, 1.0, VQ_work.data(), bk, 0.0, VQi.data(), bk);
+            const double* const vq_p = VQi.data();
+            const double* const wb_p = ctx.wb_B.data();
+            double d_sum = 0.0, o_sum = 0.0;
+            #pragma omp parallel for reduction(+:d_sum,o_sum) schedule(guided) if (k_pc >= 128)
+            for (int j = 0; j < k_pc; ++j) {
+                const double* __restrict__ vc = vq_p + static_cast<size_t>(j) * static_cast<size_t>(k_pc);
+                const double* __restrict__ bc = wb_p + static_cast<size_t>(j) * static_cast<size_t>(k_pc);
+                d_sum += vc[j] * bc[j];
+                double col_o = 0.0;
+                #pragma omp simd reduction(+:col_o)
+                for (int i = 0; i < j; ++i) col_o += vc[i] * bc[i];
+                o_sum += col_o;
+            }
+            tr_VQiB = d_sum + 2.0 * o_sum;
+        }
+
+        const double inv_s = 1.0 / sig2_eff_out;
+        tr_Minv_out = static_cast<double>(n - k_pc) * inv_s + tr_VQi;
+        tr_MinvK_out = (trace_K_full - tr_b) * inv_s + tr_VQiB;
+    };
+
+    auto apply_Minv = [&](const Eigen::Ref<const RemlMat>& R, RemlMat& Z_out,
+                          bool use_wb_precond, double sig2_eff) {
+        const int cols = static_cast<int>(R.cols());
+        Z_out.resize(n, cols);
+        if (cols == 0) return;
+        const double inv_s = 1.0 / sig2_eff;
+        if (!use_wb_precond) {
+            Z_out.noalias() = inv_s * R;
+            return;
+        }
+        Eigen::MatrixXf Rf(n, cols);
+        #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(cols) >= 32768)
+        for (int j = 0; j < cols; ++j) {
+            const double* __restrict__ src = R.col(j).data();
+            float* __restrict__ dst = Rf.col(j).data();
+            #pragma omp simd
+            for (int i = 0; i < n; ++i) dst[i] = static_cast<float>(src[i]);
+        }
+        Eigen::MatrixXf Sf(k_pc, cols);
+        cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans,
+                    bk, static_cast<gcta_blas_int>(cols), static_cast<gcta_blas_int>(n),
+                    1.0f, ctx.Uk.data(), static_cast<gcta_blas_int>(n),
+                    Rf.data(), static_cast<gcta_blas_int>(n),
+                    0.0f, Sf.data(), bk);
+        const RemlMat S = Sf.cast<double>();
+        RemlMat VQiS = S;
+        cblas_dtrmm(CblasColMajor, CblasLeft, CblasUpper, CblasTrans, CblasNonUnit,
+                    bk, static_cast<gcta_blas_int>(cols),
+                    1.0, VQ_work.data(), bk, VQiS.data(), bk);
+        cblas_dtrmm(CblasColMajor, CblasLeft, CblasUpper, CblasNoTrans, CblasNonUnit,
+                    bk, static_cast<gcta_blas_int>(cols),
+                    1.0, VQ_work.data(), bk, VQiS.data(), bk);
+        VQiS.noalias() -= inv_s * S;
+        const Eigen::MatrixXf VQiSf = VQiS.cast<float>();
+        cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                    static_cast<gcta_blas_int>(n), static_cast<gcta_blas_int>(cols), bk,
+                    1.0f, ctx.Uk.data(), static_cast<gcta_blas_int>(n),
+                    VQiSf.data(), bk,
+                    0.0f, Rf.data(), static_cast<gcta_blas_int>(n));
+        #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * static_cast<size_t>(cols) >= 32768)
+        for (int j = 0; j < cols; ++j) {
+            const double* __restrict__ rc = R.col(j).data();
+            const float* __restrict__ qc = Rf.col(j).data();
+            double* __restrict__ dst = Z_out.col(j).data();
+            #pragma omp simd
+            for (int i = 0; i < n; ++i) {
+                dst[i] = inv_s * rc[i] + static_cast<double>(qc[i]);
+            }
+        }
+    };
+
+    auto run_batched_pcg = [&](const RemlMat& B_rhs,
+                               const std::vector<double>& col_tols,
+                               int max_it,
+                               double sg2, double se2,
+                               bool use_wb_precond, double sig2_eff,
+                               int slq_start, int slq_count,
+                               RemlMat& X_out,
+                               RemlMat& R_out,
+                               double& logdet_slq_out) {
+        const int ncols = static_cast<int>(B_rhs.cols());
+        X_out = RemlMat::Zero(n, ncols);
+        RemlMat R = B_rhs;
+        RemlMat Z(n, ncols);
+        apply_Minv(R, Z, use_wb_precond, sig2_eff);
+        RemlMat P = Z;
+
+        std::vector<double> gamma_old(static_cast<size_t>(ncols), 0.0);
+        std::vector<double> gamma0(static_cast<size_t>(ncols), 0.0);
+        std::vector<double> alpha_prev(static_cast<size_t>(ncols), 0.0);
+        std::vector<double> beta_prev(static_cast<size_t>(ncols), 0.0);
+        std::vector<uint8_t> active(static_cast<size_t>(ncols), 0);
+
+        for (int j = 0; j < ncols; ++j) {
+            const double g0 = R.col(j).dot(Z.col(j));
+            gamma_old[static_cast<size_t>(j)] = g0;
+            gamma0[static_cast<size_t>(j)] = g0;
+            active[static_cast<size_t>(j)] = (g0 > 1.0e-30) ? 1 : 0;
+        }
+
+        std::vector<std::vector<double>> slq_diag(static_cast<size_t>(std::max(0, slq_count)));
+        std::vector<std::vector<double>> slq_off(static_cast<size_t>(std::max(0, slq_count)));
+
+        std::vector<int> act_idx;
+        act_idx.reserve(static_cast<size_t>(ncols));
+        RemlMat P_act, KP_act, VP_act, R_act, Z_act;
+
+        for (int cg_it = 0; cg_it < max_it; ++cg_it) {
+            act_idx.clear();
+            for (int j = 0; j < ncols; ++j) {
+                if (active[static_cast<size_t>(j)]) act_idx.push_back(j);
+            }
+            if (act_idx.empty()) break;
+
+            const int na = static_cast<int>(act_idx.size());
+            P_act.resize(n, na);
+            for (int a = 0; a < na; ++a) {
+                P_act.col(a).noalias() = P.col(act_idx[static_cast<size_t>(a)]);
+            }
+            apply_K_mat(P_act, KP_act);
+            VP_act.resize(n, na);
+            #pragma omp parallel for schedule(static) if (static_cast<size_t>(n) * na >= 32768)
+            for (int a = 0; a < na; ++a) {
+                const double* __restrict__ kpc = KP_act.col(a).data();
+                const double* __restrict__ pc  = P_act.col(a).data();
+                double* __restrict__ vpc       = VP_act.col(a).data();
+                #pragma omp simd
+                for (int i = 0; i < n; ++i) {
+                    vpc[i] = sg2 * kpc[i] + se2 * pc[i];
+                }
+            }
+
+            std::vector<double> alpha_cur(static_cast<size_t>(na), 0.0);
+            for (int a = 0; a < na; ++a) {
+                const int j = act_idx[static_cast<size_t>(a)];
+                const double d_k = P_act.col(a).dot(VP_act.col(a));
+                const double pp = P_act.col(a).squaredNorm();
+                if (!(d_k > 1.0e-30 * std::max(1.0, pp))) {
+                    active[static_cast<size_t>(j)] = 0;
+                    continue;
+                }
+                const double alpha_k = gamma_old[static_cast<size_t>(j)] / d_k;
+                alpha_cur[static_cast<size_t>(a)] = alpha_k;
+
+                if (slq_count > 0 && j >= slq_start && j < slq_start + slq_count) {
+                    const int s = j - slq_start;
+                    if (!slq_diag[static_cast<size_t>(s)].empty()) {
+                        const double ap = alpha_prev[static_cast<size_t>(j)];
+                        const double bp = beta_prev[static_cast<size_t>(j)];
+                        slq_off[static_cast<size_t>(s)].push_back(std::sqrt(std::max(0.0, bp)) / ap);
+                        slq_diag[static_cast<size_t>(s)].push_back(1.0 / alpha_k + bp / ap);
+                    } else {
+                        slq_diag[static_cast<size_t>(s)].push_back(1.0 / alpha_k);
+                    }
+                }
+
+                X_out.col(j).noalias() += alpha_k * P_act.col(a);
+                R.col(j).noalias()     -= alpha_k * VP_act.col(a);
+            }
+
+            std::vector<int> next_idx;
+            std::vector<int> next_a;
+            next_idx.reserve(act_idx.size());
+            next_a.reserve(act_idx.size());
+            for (int a = 0; a < na; ++a) {
+                const int j = act_idx[static_cast<size_t>(a)];
+                if (active[static_cast<size_t>(j)]) {
+                    next_idx.push_back(j);
+                    next_a.push_back(a);
+                }
+            }
+            if (next_idx.empty()) break;
+
+            const int na2 = static_cast<int>(next_idx.size());
+            R_act.resize(n, na2);
+            for (int a = 0; a < na2; ++a) {
+                R_act.col(a).noalias() = R.col(next_idx[static_cast<size_t>(a)]);
+            }
+            apply_Minv(R_act, Z_act, use_wb_precond, sig2_eff);
+
+            for (int a = 0; a < na2; ++a) {
+                const int j = next_idx[static_cast<size_t>(a)];
+                Z.col(j).noalias() = Z_act.col(a);
+                const double g_new = R.col(j).dot(Z.col(j));
+                const double rel = std::sqrt(std::max(0.0, g_new) / gamma0[static_cast<size_t>(j)]);
+                if (!(g_new > 1.0e-30 * gamma0[static_cast<size_t>(j)]) ||
+                    rel <= col_tols[static_cast<size_t>(j)] ||
+                    cg_it + 1 == max_it) {
+                    active[static_cast<size_t>(j)] = 0;
+                    continue;
+                }
+                const double beta_k = g_new / gamma_old[static_cast<size_t>(j)];
+                P.col(j).noalias() = Z.col(j) + beta_k * P.col(j);
+                alpha_prev[static_cast<size_t>(j)] = alpha_cur[static_cast<size_t>(next_a[static_cast<size_t>(a)])];
+                beta_prev[static_cast<size_t>(j)]  = beta_k;
+                gamma_old[static_cast<size_t>(j)]  = g_new;
+            }
+        }
+
+        R_out = std::move(R);
+        logdet_slq_out = 0.0;
+        if (slq_count > 0) {
+            double sum_slq = 0.0;
+            int valid_slq = 0;
+            for (int s = 0; s < slq_count; ++s) {
+                const int m_s = static_cast<int>(slq_diag[static_cast<size_t>(s)].size());
+                if (m_s == 0) continue;
+                RemlMat T = RemlMat::Zero(m_s, m_s);
+                for (int i = 0; i < m_s; ++i) {
+                    T(i, i) = slq_diag[static_cast<size_t>(s)][static_cast<size_t>(i)];
+                    if (i + 1 < m_s) {
+                        const double off = slq_off[static_cast<size_t>(s)][static_cast<size_t>(i)];
+                        T(i, i + 1) = off;
+                        T(i + 1, i) = off;
+                    }
+                }
+                Eigen::SelfAdjointEigenSolver<RemlMat> es(T);
+                const RemlVec& ev = es.eigenvalues();
+                const RemlMat& evec = es.eigenvectors();
+                double quad = 0.0;
+                for (int r_i = 0; r_i < m_s; ++r_i) {
+                    const double v0 = evec(0, r_i);
+                    const double th = std::max(1.0e-12, ev[r_i]);
+                    quad += (v0 * v0) * std::log(th);
+                }
+                sum_slq += static_cast<double>(n) * gamma0[static_cast<size_t>(slq_start + s)] * quad;
+                ++valid_slq;
+            }
+            if (valid_slq > 0) {
+                logdet_slq_out = sum_slq / static_cast<double>(valid_slq);
+            }
+        }
+    };
+
+    const bool prior_var_flag = !priors_var.empty();
+    const bool priors_flag = !priors.empty() || !priors_var.empty();
+    if (!ctx.reml_fixed_var && !priors_flag && !no_constrain) {
+        constrain_varcmp(ctx, varcmp);
+    }
+
+    const int B_cols = c + 1 + kTrProbes + kSlqProbes;
+    RemlMat B_batch(n, B_cols);
+    B_batch.leftCols(c) = ctx.X;
+    B_batch.col(c) = ctx.y;
+    B_batch.block(0, c + 1, n, kTrProbes) = G_tr;
+    std::vector<double> batch_tols(static_cast<size_t>(B_cols), kTolProbe);
+    for (int j = 0; j <= c; ++j) batch_tols[static_cast<size_t>(j)] = kTolXy;
+    for (int j = c + 1 + kTrProbes; j < B_cols; ++j) batch_tols[static_cast<size_t>(j)] = kTolXy;
+    const std::vector<double> hi_tols = {kTolXy, kTolXy};
+
+    RemlMat Hi(m, m);
+    RemlVec varcomp_init = varcmp;
+    RemlVec prev_varcmp = varcmp;
+    RemlVec prev_prev_varcmp = varcmp;
+    double prev_lgL = 0.0;
+    double lgL = 0.0;
+    double dlogL = 1000.0;
+    double best_lgL = -std::numeric_limits<double>::infinity();
+    RemlVec best_varcmp = varcmp;
+    bool converged_flag = false;
+    int iter = 0;
+    const int M = 1;
+    int small_delta_streak = 0;
+
+    RemlMat X_sol, R_sol, W_hi_sol, R_hi_sol;
+    RemlMat XtWX(c, c), WtKW(c, c), WtW(c, c);
+    RemlVec XtWy(c), b_hat(c), Py(n);
+    RemlMat KPy_fallback;
+
+    for (iter = 0; iter < ctx.reml_max_iter; ++iter) {
+        if (iter == 0) {
+            prev_varcmp = varcomp_init;
+            LOGGER << (ctx.reml_fixed_var ? "Variance components fixed at: "
+                                          : "Variance components initialised at: ")
+                   << varcmp.transpose() << std::endl;
+            if (!prior_var_flag) {
+                LOGGER << "Round 0 iteration using "
+                       << ((ctx.reml_no_HE_start || !ctx.he_warm_start_applied) ? "EM-REML ..." : "AI-REML ...")
+                       << std::endl;
+            }
+        }
+        if (iter == 1) {
+            LOGGER << "Running AI-REML (PCG) algorithm ...\nIter.\tlogL\t";
+            for (int i = 0; i < m; ++i) LOGGER << ctx.var_name[ctx.r_indx[i]] << "\t";
+            LOGGER << std::endl;
+        }
+
+        const double sg2 = prev_varcmp[0];
+        const double se2 = prev_varcmp[1];
+        bool use_wb_precond = false;
+        double sig2_eff_it = 0.0, logdet_M = 0.0, tr_Minv = 0.0, tr_MinvK = 0.0;
+        setup_preconditioner(sg2, se2, use_wb_precond, sig2_eff_it, logdet_M, tr_Minv, tr_MinvK);
+        if (use_wb_precond) {
+            apply_Minv(G_tr, M_G_tr, true, sig2_eff_it);
+        }
+        B_batch.rightCols(kSlqProbes).noalias() = B_slq;
+
+        double logdet_slq = 0.0;
+        run_batched_pcg(B_batch, batch_tols, kMaxCg, sg2, se2, use_wb_precond, sig2_eff_it,
+                        c + 1 + kTrProbes, kSlqProbes, X_sol, R_sol, logdet_slq);
+        const double logdet_V = logdet_M + logdet_slq;
+
+        const auto W_X = X_sol.leftCols(c);
+        const auto r_X = R_sol.leftCols(c);
+        const auto w_y = X_sol.col(c);
+        const auto r_y = R_sol.col(c);
+        const auto Z_G = X_sol.block(0, c + 1, n, kTrProbes);
+
+        XtWX.noalias() = ctx.X.transpose() * W_X;
+        XtWX = 0.5 * (XtWX + XtWX.transpose());
+        Eigen::LLT<RemlMat> llt_x(XtWX);
+        if (llt_x.info() != Eigen::Success) {
+            LOGGER.e(0, "--reml-pcg: X'V^{-1}X is not positive definite.");
+        }
+        const RemlMat& Lx = llt_x.matrixL();
+        double logdet_XtViX = 0.0;
+        for (int j = 0; j < c; ++j) logdet_XtViX += 2.0 * std::log(std::max(1.0e-300, Lx(j, j)));
+
+        XtWy.noalias() = ctx.X.transpose() * w_y;
+        b_hat = llt_x.solve(XtWy);
+        Py.noalias() = w_y - W_X * b_hat;
+        const double yPy = ctx.y.dot(Py);
+
+        lgL = -0.5 * (logdet_XtViX + logdet_V + yPy);
+
+        // Fixed-effect trace adjustments: tr((X'V^{-1}X)^{-1} (W_X' K W_X)) and tr((X'V^{-1}X)^{-1} (W_X' W_X)).
+        WtW.noalias() = W_X.transpose() * W_X;
+        if (std::fabs(sg2) >= 1.0e-8) {
+            WtKW.noalias() = (XtWX - W_X.transpose() * r_X - se2 * WtW) / sg2;
+        } else {
+            RemlMat KW_X;
+            apply_K_mat(W_X, KW_X);
+            WtKW.noalias() = W_X.transpose() * KW_X;
+        }
+        const double fe_tr_I = llt_x.solve(WtW).trace();
+        const double fe_tr_K = llt_x.solve(WtKW).trace();
+
+        // Control-variate traces tr(PK) and tr(P).
+        double cv_diff_K = 0.0;
+        double cv_diff_I = 0.0;
+        for (int j = 0; j < kTrProbes; ++j) {
+            const auto diff_col = Z_G.col(j) - M_G_tr.col(j);
+            cv_diff_K += diff_col.dot(K_G_tr.col(j));
+            cv_diff_I += diff_col.dot(G_tr.col(j));
+        }
+        RemlVec tr_PA(m);
+        tr_PA(0) = tr_MinvK + cv_diff_K / static_cast<double>(kTrProbes) - fe_tr_K;
+        tr_PA(1) = tr_Minv  + cv_diff_I / static_cast<double>(kTrProbes) - fe_tr_I;
+
+        // F0 = K * Py = ((y - r_y) - (X - r_X) b_hat - se2 * Py) / sg2 when |sg2| >= 1e-8.
+        RemlMat F_hi(n, 2);
+        if (std::fabs(sg2) >= 1.0e-8) {
+            F_hi.col(0).noalias() = ((ctx.y - r_y) - (ctx.X - r_X) * b_hat - se2 * Py) / sg2;
+        } else {
+            apply_K_mat(Py, KPy_fallback);
+            F_hi.col(0).noalias() = KPy_fallback;
+        }
+        F_hi.col(1).noalias() = Py;
+
+        RemlVec R_score(m);
+        R_score(0) = Py.dot(F_hi.col(0));
+        R_score(1) = Py.squaredNorm();
+
+        const bool round0_em = (iter == 0 && !prior_var_flag && (ctx.reml_no_HE_start || !ctx.he_warm_start_applied));
+        double lambda_sq = -1.0;
+        if (round0_em) {
+            varcmp = prev_varcmp;
+            for (int i = 0; i < m; ++i) {
+                varcmp[i] = (prev_varcmp[i] * n - prev_varcmp[i] * prev_varcmp[i] * (tr_PA[i] - R_score[i])) / static_cast<double>(n);
+            }
+            if (!ctx.reml_fixed_var && !no_constrain) constrain_varcmp(ctx, varcmp);
+        } else {
+            double logdet_hi_unused = 0.0;
+            run_batched_pcg(F_hi, hi_tols, kMaxCg, sg2, se2, use_wb_precond, sig2_eff_it,
+                            0, 0, W_hi_sol, R_hi_sol, logdet_hi_unused);
+            const RemlMat XtW_hi = ctx.X.transpose() * W_hi_sol;
+            const RemlMat P_hi = W_hi_sol - W_X * llt_x.solve(XtW_hi);
+            Hi.noalias() = 0.5 * (F_hi.transpose() * P_hi);
+            Hi = 0.5 * (Hi + Hi.transpose());
+
+            if (!inverse_H(ctx, Hi)) {
+                if (ctx.reml_force_converge) {
+                    LOGGER.w(0, "the information matrix is not invertible.");
+                    ctx.reml_AI_not_invertible = true;
+                    break;
+                }
+                LOGGER.e(0, "the information matrix is not invertible.");
+            }
+            const RemlVec U = -0.5 * (tr_PA - R_score);
+            const RemlVec delta = Hi * U;
+            lambda_sq = U.dot(delta);
+            double step_scale = (dlogL > 1.0) ? 0.316 : 1.0;
+            constexpr double tau = 0.995;
+            for (int i = 0; i < m; ++i) {
+                if (delta[i] < 0.0 && prev_varcmp[i] > 0.0) {
+                    const double bnd = -tau * prev_varcmp[i] / delta[i];
+                    step_scale = std::min(step_scale, bnd);
+                }
+            }
+            varcmp = prev_varcmp + step_scale * delta;
+            if (!ctx.reml_fixed_var && !no_constrain) constrain_varcmp(ctx, varcmp);
+        }
+
+        if (iter > 0) {
+            LOGGER << iter << "\t" << std::fixed << LOGGER.setprecision(4) << lgL << "\t";
+            for (int i = 0; i < m; i++) LOGGER << LOGGER.setprecision(5) << varcmp[i] << "\t";
+            LOGGER << std::endl;
+        } else {
+            if (!prior_var_flag) LOGGER << "Updated prior values: " << varcmp.transpose() << std::endl;
+            LOGGER << "logL: " << std::fixed << LOGGER.setprecision(4) << lgL << std::endl;
+        }
+
+        if (ctx.reml_fixed_var) {
+            varcmp = prev_varcmp;
+            converged_flag = true;
+            break;
+        }
+
+        if ((ctx.reml_force_converge || ctx.reml_no_converge) && prev_lgL > lgL && iter > 0) {
+            varcmp = prev_varcmp;
+            break;
+        }
+
+        dlogL = lgL - prev_lgL;
+        const double lgL_scale = std::max(1.0, std::fabs(lgL));
+        const double dlogL_rel = std::fabs(dlogL) / lgL_scale;
+        const double var_rel = (varcmp - prev_varcmp).norm() / std::max(1.0e-8, prev_varcmp.norm());
+        const bool like_small = (iter > 0) &&
+            ((std::fabs(dlogL) < 1.0e-4) || (dlogL_rel < 1.0e-6) ||
+             (iter >= 2 && lambda_sq >= 0.0 && lambda_sq < 1.0e-5 && var_rel <= 1.0e-5));
+
+        if (lgL > best_lgL) {
+            best_lgL = lgL;
+            best_varcmp = varcmp;
+        }
+        small_delta_streak = like_small ? small_delta_streak + 1 : 0;
+        converged_flag = (small_delta_streak >= M);
+        if (converged_flag) break;
+
+        prev_prev_varcmp = prev_varcmp;
+        prev_varcmp = varcmp;
+        prev_lgL = lgL;
+    }
+
+    if (ctx.reml_fixed_var)
+        LOGGER.w(0, "model evaluated at fixed variance components; log-likelihood may not be maximised.");
+    else if (converged_flag)
+        LOGGER << "Log-likelihood ratio converged." << std::endl;
+    else if (ctx.reml_force_converge || ctx.reml_no_converge)
+        LOGGER.w(0, "Log-likelihood not converged. Results are not reliable.");
+    else if (iter == ctx.reml_max_iter) {
+        std::ostringstream errmsg;
+        errmsg << "Log-likelihood not converged (stop after " << ctx.reml_max_iter << " iterations). "
+               << "Use --reml-maxit for more iterations.";
+        if (ctx.reml_max_iter > 1) LOGGER.e(0, errmsg.str());
+    }
+
+    // Solve exact V^{-1}[X | y] at final varcmp for b and exact cached Py.
+    {
+        const double sg2_fin = varcmp[0];
+        const double se2_fin = varcmp[1];
+        bool use_wb_fin = false;
+        double sig2_eff_fin = 0.0, logdet_m_fin = 0.0, tr_m_fin = 0.0, tr_mk_fin = 0.0;
+        setup_preconditioner(sg2_fin, se2_fin, use_wb_fin, sig2_eff_fin, logdet_m_fin, tr_m_fin, tr_mk_fin);
+        RemlMat B_fin(n, c + 1);
+        B_fin.leftCols(c) = ctx.X;
+        B_fin.col(c) = ctx.y;
+        std::vector<double> tols_fin(static_cast<size_t>(c + 1), kTolXy);
+        double logdet_unused = 0.0;
+        run_batched_pcg(B_fin, tols_fin, kMaxCg, sg2_fin, se2_fin, use_wb_fin, sig2_eff_fin,
+                        0, 0, X_sol, R_sol, logdet_unused);
+        const auto W_X = X_sol.leftCols(c);
+        const auto w_y = X_sol.col(c);
+        XtWX.noalias() = ctx.X.transpose() * W_X;
+        XtWX = 0.5 * (XtWX + XtWX.transpose());
+        Eigen::LLT<RemlMat> llt_fin(XtWX);
+        if (llt_fin.info() != Eigen::Success) {
+            LOGGER.e(0, "--reml-pcg: final X'V^{-1}X is not positive definite.");
+        }
+        XtWy.noalias() = ctx.X.transpose() * w_y;
+        ctx.b = llt_fin.solve(XtWy);
+        ctx.pcg_cached_Vi_y_f = (w_y - W_X * ctx.b).cast<float>();
+        ctx.has_pcg_cached_Vi_y = true;
+    }
+
+    // Populate REML outputs before releasing GRM.
+    ctx.logL = lgL;
+    ctx.has_logL = true;
+    ctx.reml_iterations = std::max(0, iter + 1);
+    ctx.varcmp = {varcmp[0], varcmp[1]};
+    ctx.varcmp_se = {std::sqrt(std::max(0.0, Hi(0, 0))), std::sqrt(std::max(0.0, Hi(1, 1)))};
+    const double Vp = varcmp[0] + varcmp[1];
+    const double VarVp = Hi(0, 0) + Hi(1, 1) + 2.0 * Hi(0, 1);
+    ctx.Vp = Vp;
+    ctx.Vp_se = std::sqrt(std::max(0.0, VarVp));
+    ctx.hsq.assign(1, 0.0);
+    ctx.hsq_se.assign(1, 0.0);
+    if (Vp > 0.0 && varcmp[0] > 0.0) {
+        const double ratio = varcmp[0] / Vp;
+        const double cov12 = Hi(0, 0) + Hi(0, 1);
+        const double var_hsq = ratio * ratio *
+            (Hi(0, 0) / (varcmp[0] * varcmp[0]) + VarVp / (Vp * Vp) - (2.0 * cov12) / (varcmp[0] * Vp));
+        ctx.hsq[0] = ratio;
+        ctx.hsq_se[0] = std::sqrt(std::max(0.0, var_hsq));
+    }
+
+    ctx.Vi_use_woodbury_basis = true;
+    ctx.wb_unrotated = true;
+    ctx.wb_uk_is_prebaked_wk = false;
+    ctx.sigma2_eff = std::max(1.0e-12, varcmp[1] + std::max(0.0, varcmp[0]) * lambda_tail);
+
+    if (ctx.reml_profile) {
+        ctx.reml_ai_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ai0).count();
+    }
+
+    release_grm_storage();
+
+    const auto t_wk0 = ctx.reml_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    finalize_unrotated_woodbury_factor(ctx);
+    ctx.reml_wb_solver_used = "pcg";
+    if (ctx.reml_profile) {
+        ctx.reml_wk_factor_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_wk0).count();
+    }
+}
+
 } // anonymous namespace
 
 void compute(RemlCtx& ctx,
@@ -3320,6 +4211,11 @@ void compute(RemlCtx& ctx,
     if (ctx.n < 10) LOGGER.e(0, "sample size is too small.");
     LOGGER << ctx.n << " observations, " << ctx.X_c << " fixed effect(s), and "
            << ctx.r_indx.size() << " variance component(s) (including residual)." << std::endl;
+
+    if (ctx.reml_pcg) {
+        run_pcg_reml(ctx, priors, priors_var, no_constrain);
+        return;
+    }
 
     // Woodbury basis (must be done before init_varcomp for HE warm-start)
     if (ctx.woodbury_basis_preloaded) {
@@ -3524,6 +4420,12 @@ RemlState build_reml_state(RemlCtx& ctx) {
         ctx.dk.resize(0);
 
         rs.lambda_tail_f = static_cast<float>(ctx.lambda_tail);
+        if (ctx.has_pcg_cached_Vi_y && ctx.pcg_cached_Vi_y_f.size() == ctx.n) {
+            rs.cached_Vi_y = ctx.pcg_cached_Vi_y_f;
+            rs.has_cached_Vi_y = true;
+            ctx.pcg_cached_Vi_y_f.resize(0);
+            ctx.has_pcg_cached_Vi_y = false;
+        }
     } else if (ctx.Vi_use_llt) {
         // Vi_L holds the upper Cholesky factor U of V (V = U^T U, from dpotrf('U')).
         // Only cast the upper triangle (col(j).head(j + 1)) in parallel: MLMA_stream

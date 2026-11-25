@@ -398,6 +398,9 @@ RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r, bool add_subcmd_level
                    r.trace_hutchpp_fixed_probes,
                    "Reuse fixed Hutch++ probes across REML iterations")
         ->needs(o_hutch)->group(g_reml);
+    reml->add_option("--reml-pcg", r.reml_pcg,
+                     "Exact Woodbury-preconditioned PCG + SLQ/trace AI-REML with preconditioner rank k_pc")
+        ->expected(0, 1)->default_str("2000")->check(CLI::Range(10, 1000000))->needs(o_grm)->group(g_reml);
     reml->add_option("--seed", r.seed, "Random seed for rSVD / Hutch++")->group(g_reml);
 
     // Woodbury options

@@ -1690,6 +1690,8 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
             }
             const Eigen::VectorXf uy_scaled = uy_d.cast<float>().cwiseProduct(ck_f);
             vi_y_f = compute_vi_y_streaming_tun3(*streaming_reuse, n, y_adj_f, uy_scaled, sig2e_f);
+        } else if (ctx.has_pcg_cached_Vi_y && !no_adj_covar && ctx.pcg_cached_Vi_y_f.size() == n) {
+            vi_y_f = ctx.pcg_cached_Vi_y_f;
         } else if (ctx.Uk_is_transposed) {
             Eigen::VectorXf uy = ctx.Uk * y_adj_f;
             uy.array() *= ck_f.array();
@@ -3500,6 +3502,17 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             bool grm_chunked = grm_chunked_budget > 0.0;
             bool grm_fp16 = !reuse_basis && r.grm_fp16;
             std::optional<WoodburyBasisSpec> woodbury_basis_eff = r.woodbury_basis;
+            const bool use_pcg = r.reml_pcg.has_value();
+
+            if (use_pcg && r.alg == RemlAlg::Fisher)
+                LOGGER.e(0, "--reml-pcg is incompatible with Fisher-scoring REML (--reml-alg 1). Use AI-REML (default).");
+            if (use_pcg && reuse_basis)
+                LOGGER.e(0, "--reml-pcg is incompatible with --reml-woodbury-reuse.");
+            if (use_pcg && woodbury_basis_eff.has_value()) {
+                LOGGER.w(0, "--reml-pcg and --reml-woodbury-basis both given; --reml-pcg manages its own preconditioner rank k_pc=" +
+                            to_string(*r.reml_pcg) + " and ignores --reml-woodbury-basis.");
+                woodbury_basis_eff.reset();
+            }
 
             if (fast_preset) {
                 vector<string> fast_notes;
@@ -3508,7 +3521,7 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                         grm_fp16 = true;
                         fast_notes.push_back("grm-fp16=on");
                     }
-                    if (!woodbury_basis_eff.has_value()) {
+                    if (!woodbury_basis_eff.has_value() && !use_pcg) {
                         woodbury_basis_eff = WoodburyBasisSpec{WoodburyBasisSpec::Kind::MP, 0};
                         fast_notes.push_back("woodbury-basis=MP");
                     }
@@ -3572,13 +3585,16 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                 LOGGER.w(0, "--reml-woodbury-basis/--reml-woodbury-reuse and --reml-trace-hutchpp both given; "
                             "the Woodbury basis provides an exact tr(PA) and takes precedence — "
                             "--reml-trace-hutchpp is ignored.");
+            if (use_pcg && trace_hutchpp)
+                LOGGER.w(0, "--reml-pcg and --reml-trace-hutchpp both given; --reml-pcg uses its own control-variate trace and ignores --reml-trace-hutchpp.");
 
+            const bool need_m_snps = is_wb_mp || use_pcg;
             const size_t reml_io_slot_bytes = static_cast<size_t>(std::max(1, r.reml_io_slot_mb)) << 20;
             double reml_grm_load_s = 0.0;
             double reml_save_s = 0.0;
             int grm_chunk_rows = 0;
             Eigen::MatrixXf G_n;      // left empty when grm_chunked or grm_fp16
-            double m_all = is_wb_mp ? 0.0 : -1.0;  // only populated when Woodbury-MP mode is selected
+            double m_all = need_m_snps ? 0.0 : -1.0;  // populated when Woodbury-MP or --reml-pcg is selected
             gcta_grm_io::ChunkedGrmHandle chunked_grm;       // only populated when grm_chunked
             gcta_grm_io::PackedGrmFp16Handle fp16_grm;       // only populated when grm_fp16
 
@@ -3586,14 +3602,14 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                 const auto t_load0 = r.reml_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 if (grm_fp16) {
                     fp16_grm = gcta_grm_io::load_packed_grm_fp16(
-                        grm_pfx, analysis_ids, /*need_m_snps=*/is_wb_mp, "--grm-fp16",
+                        grm_pfx, analysis_ids, /*need_m_snps=*/need_m_snps, "--grm-fp16",
                         reml_io_slot_bytes);
                     grm_chunk_rows = fp16_grm.chunk_rows;
                     m_all = fp16_grm.m_snps;
                 } else if (grm_chunked) {
                     chunked_grm = gcta_grm_io::make_chunked_grm_reader(
                         grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget",
-                        /*need_m_snps=*/is_wb_mp);
+                        /*need_m_snps=*/need_m_snps);
                     grm_chunk_rows = chunked_grm.chunk_rows;
                     m_all = chunked_grm.m_snps;
                     if (grm_chunk_rows >= n) {
@@ -3690,6 +3706,8 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             ctx.reml_woodbury_solver  = static_cast<RemlWoodburySolver>(r.reml_woodbury_solver);
             ctx.reml_qr_mode          = static_cast<CholeskyQrMode>(r.reml_qr_mode);
             ctx.svd_chebyshev         = (r.reml_svd_filter == gcta_cli::RemlSvdFilter::Chebyshev);
+            ctx.reml_pcg              = use_pcg;
+            ctx.reml_pcg_k            = r.reml_pcg.value_or(2000);
 
             if (!r.woodbury_warm_start.empty()) {
                 if (!have_wb)

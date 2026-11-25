@@ -1039,9 +1039,14 @@ inline void run_mlma_stream_association(RemlCtx& ctx,
         const Eigen::VectorXf sqrt_ck_f = ck_f.cwiseSqrt();
         const float sig2e_f = static_cast<float>(ctx.sigma2_eff);
 
-        Eigen::VectorXf u_y = Uk_view.transpose() * y_adj;
-        u_y.array() *= ck_f.array();
-        Eigen::VectorXf vi_y = (y_adj - Uk_view * u_y) / sig2e_f;
+        Eigen::VectorXf vi_y;
+        if (ctx.has_pcg_cached_Vi_y && ctx.pcg_cached_Vi_y_f.size() == n) {
+            vi_y = ctx.pcg_cached_Vi_y_f;
+        } else {
+            Eigen::VectorXf u_y = Uk_view.transpose() * y_adj;
+            u_y.array() *= ck_f.array();
+            vi_y = (y_adj - Uk_view * u_y) / sig2e_f;
+        }
 
         bool unit_weights = true;
         double S_w2 = static_cast<double>(n);

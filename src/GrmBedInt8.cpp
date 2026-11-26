@@ -341,6 +341,172 @@ inline void write_const_N_with_cache_drop(int n_fd,
     }
 }
 
+class UniqueFd {
+public:
+    UniqueFd() = default;
+    explicit UniqueFd(int fd) noexcept : fd_(fd) {}
+    ~UniqueFd() { reset(); }
+    UniqueFd(const UniqueFd&) = delete;
+    UniqueFd& operator=(const UniqueFd&) = delete;
+    UniqueFd(UniqueFd&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
+    UniqueFd& operator=(UniqueFd&& o) noexcept {
+        if (this != &o) {
+            reset(o.fd_);
+            o.fd_ = -1;
+        }
+        return *this;
+    }
+    int get() const noexcept { return fd_; }
+    explicit operator bool() const noexcept { return fd_ >= 0; }
+    int release() noexcept { return std::exchange(fd_, -1); }
+    void reset(int new_fd = -1) noexcept {
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = new_fd;
+    }
+private:
+    int fd_ = -1;
+};
+
+struct StagedPackResult {
+    size_t payload_offset = 0;
+    size_t payload_bytes = 0;
+};
+
+#if defined(__linux__) && defined(O_DIRECT)
+inline bool try_write_buffer_odirect(int grm_fd,
+                                     const char* data,
+                                     size_t nbytes,
+                                     uint64_t file_off,
+                                     int n_writers,
+                                     const std::string& path)
+{
+    constexpr size_t kMinDirectBytes = 64ULL << 20;
+    constexpr size_t kDioAlign       = 4096ULL;
+    constexpr size_t kStripeBytes    = 4ULL << 20;
+    if (nbytes < kMinDirectBytes || n_writers < 1) return false;
+    if ((reinterpret_cast<uintptr_t>(data) & (kDioAlign - 1ULL)) !=
+        (file_off & (kDioAlign - 1ULL))) {
+        return false;
+    }
+
+    const uint64_t F_beg = file_off;
+    const uint64_t F_end = file_off + static_cast<uint64_t>(nbytes);
+    const size_t head = static_cast<size_t>((kDioAlign - (F_beg & (kDioAlign - 1ULL))) & (kDioAlign - 1ULL));
+    if (head >= nbytes) return false;
+    const size_t aligned_len = (nbytes - head) & ~(kDioAlign - 1ULL);
+    if (aligned_len < kMinDirectBytes) return false;
+    const uint64_t A_beg = F_beg + static_cast<uint64_t>(head);
+    const uint64_t A_end = A_beg + static_cast<uint64_t>(aligned_len);
+    const size_t tail = nbytes - head - aligned_len;
+
+    int dflags = O_WRONLY | O_DIRECT;
+#ifdef O_CLOEXEC
+    dflags |= O_CLOEXEC;
+#endif
+    UniqueFd direct_fd(::open(path.c_str(), dflags));
+    if (!direct_fd) {
+        if (errno == EINVAL || errno == EOPNOTSUPP || errno == EPERM) return false;
+        throw std::runtime_error("open(O_DIRECT) failed on [" + path + "]: " + std::string(std::strerror(errno)));
+    }
+
+    ssize_t probe_w = -1;
+    do {
+        probe_w = ::pwrite(direct_fd.get(), data + head, kDioAlign, static_cast<off_t>(A_beg));
+    } while (probe_w < 0 && errno == EINTR);
+    if (probe_w < 0) {
+        if (errno == EINVAL || errno == EOPNOTSUPP) return false;
+        throw std::runtime_error("pwrite(O_DIRECT) probe failed on [" + path + "]: " + std::string(std::strerror(errno)));
+    }
+    if (static_cast<size_t>(probe_w) != kDioAlign) {
+        return false;
+    }
+
+    if (head > 0) {
+        gcta_io::pwrite_exact_throwing(grm_fd, data, head, static_cast<off_t>(F_beg), path);
+    }
+
+    const uint64_t mid_beg = A_beg + static_cast<uint64_t>(kDioAlign);
+    const uint64_t mid_bytes = (A_end > mid_beg) ? (A_end - mid_beg) : 0ULL;
+    if (mid_bytes > 0) {
+        int W = std::clamp(n_writers, 1, 8);
+        if (mid_bytes < kMinDirectBytes) W = 1;
+        const uint64_t step = (mid_bytes >= static_cast<uint64_t>(W) * kStripeBytes)
+            ? static_cast<uint64_t>(kStripeBytes)
+            : static_cast<uint64_t>(kDioAlign);
+
+        auto split_off = [&](int k) -> uint64_t {
+            if (k <= 0) return mid_beg;
+            if (k >= W) return A_end;
+            const uint64_t raw = mid_beg + (mid_bytes * static_cast<uint64_t>(k)) / static_cast<uint64_t>(W);
+            const uint64_t aligned = (raw / step) * step;
+            return std::clamp(aligned, mid_beg, A_end);
+        };
+
+        auto write_slice = [&](uint64_t s_beg, uint64_t s_end) {
+            uint64_t off = s_beg;
+            while (off < s_end) {
+                const size_t chunk = static_cast<size_t>(std::min<uint64_t>(64ULL << 20, s_end - off));
+                const char* const p = data + static_cast<size_t>(off - F_beg);
+                const ssize_t w = ::pwrite(direct_fd.get(), p, chunk, static_cast<off_t>(off));
+                if (w < 0) {
+                    if (errno == EINTR) continue;
+                    throw std::runtime_error("pwrite(O_DIRECT) failed on [" + path + "]: " + std::string(std::strerror(errno)));
+                }
+                if (w == 0) {
+                    throw std::runtime_error("pwrite(O_DIRECT) made zero progress on [" + path + "].");
+                }
+                off += static_cast<uint64_t>(w);
+            }
+        };
+
+        if (W == 1) {
+            write_slice(mid_beg, A_end);
+        } else {
+            std::vector<std::exception_ptr> errs(static_cast<size_t>(W));
+            {
+                std::vector<std::jthread> workers;
+                workers.reserve(static_cast<size_t>(W - 1));
+                for (int k = 1; k < W; ++k) {
+                    const uint64_t sb = split_off(k);
+                    const uint64_t se = split_off(k + 1);
+                    workers.emplace_back([&, k, sb, se]() {
+                        try {
+                            if (sb < se) write_slice(sb, se);
+                        } catch (...) {
+                            errs[static_cast<size_t>(k)] = std::current_exception();
+                        }
+                    });
+                }
+                try {
+                    const uint64_t sb0 = split_off(0);
+                    const uint64_t se0 = split_off(1);
+                    if (sb0 < se0) write_slice(sb0, se0);
+                } catch (...) {
+                    errs[0] = std::current_exception();
+                }
+            }
+            for (const std::exception_ptr& e : errs) {
+                if (e) std::rethrow_exception(e);
+            }
+        }
+    }
+
+    if (tail > 0) {
+        gcta_io::pwrite_exact_throwing(
+            grm_fd, data + head + aligned_len, tail, static_cast<off_t>(A_end), path);
+    }
+
+    const int dfd = direct_fd.release();
+    if (dfd >= 0 && ::close(dfd) != 0) {
+        throw std::runtime_error("close(O_DIRECT) failed on [" + path + "]: " + std::string(std::strerror(errno)));
+    }
+    if (::lseek(grm_fd, static_cast<off_t>(F_end), SEEK_SET) == static_cast<off_t>(-1)) {
+        throw std::runtime_error("lseek() failed on [" + path + "]: " + std::string(std::strerror(errno)));
+    }
+    return true;
+}
+#endif
+
 // Background sequential flusher owning a persistent packed-output slab so tile t
 // streams to disk asynchronously while tile t+1 computes in i32_slab_.
 class StagedTileFlusher {
@@ -379,7 +545,10 @@ public:
 
     void submit(int grm_fd,
                 std::string grm_path,
+                size_t payload_offset,
+                uint64_t file_off,
                 size_t grm_bytes,
+                int n_writers,
                 int n_fd,
                 std::string n_path,
                 size_t n_elems,
@@ -391,7 +560,10 @@ public:
         }
         grm_fd_ = grm_fd;
         grm_path_ = std::move(grm_path);
+        payload_offset_ = payload_offset;
+        file_off_ = file_off;
         grm_bytes_ = grm_bytes;
+        n_writers_ = n_writers;
         n_fd_ = n_fd;
         n_path_ = std::move(n_path);
         n_elems_ = n_elems;
@@ -405,7 +577,10 @@ private:
         while (true) {
             int grm_fd = -1;
             std::string grm_path;
+            size_t payload_offset = 0;
+            uint64_t file_off = 0;
             size_t grm_bytes = 0;
+            int n_writers = 1;
             int n_fd = -1;
             std::string n_path;
             size_t n_elems = 0;
@@ -419,7 +594,10 @@ private:
                 }
                 grm_fd = grm_fd_;
                 grm_path = std::move(grm_path_);
+                payload_offset = payload_offset_;
+                file_off = file_off_;
                 grm_bytes = grm_bytes_;
+                n_writers = n_writers_;
                 n_fd = n_fd_;
                 n_path = std::move(n_path_);
                 n_elems = n_elems_;
@@ -428,7 +606,20 @@ private:
 
             std::exception_ptr err;
             try {
-                write_buffer_with_cache_drop(grm_fd, stage_slab_.data(), grm_bytes, grm_path);
+                const char* const payload = stage_slab_.data() + payload_offset;
+                bool wrote_direct = false;
+#if defined(__linux__) && defined(O_DIRECT)
+                wrote_direct = try_write_buffer_odirect(
+                    grm_fd, payload, grm_bytes, file_off, n_writers, grm_path);
+#else
+                (void)n_writers;
+#endif
+                if (!wrote_direct) {
+                    if (::lseek(grm_fd, static_cast<off_t>(file_off), SEEK_SET) == static_cast<off_t>(-1)) {
+                        throw std::runtime_error("lseek() failed on [" + grm_path + "]: " + std::string(std::strerror(errno)));
+                    }
+                    write_buffer_with_cache_drop(grm_fd, payload, grm_bytes, grm_path);
+                }
                 if (n_fd >= 0 && n_elems > 0) {
                     write_const_N_with_cache_drop(n_fd, n_elems, n_val, n_path, const_N_buf_);
                 }
@@ -458,38 +649,16 @@ private:
 
     int grm_fd_ = -1;
     std::string grm_path_;
+    size_t payload_offset_ = 0;
+    uint64_t file_off_ = 0;
     size_t grm_bytes_ = 0;
+    int n_writers_ = 1;
     int n_fd_ = -1;
     std::string n_path_;
     size_t n_elems_ = 0;
     float n_val_ = 0.0f;
 
     std::jthread worker_;
-};
-
-class UniqueFd {
-public:
-    UniqueFd() = default;
-    explicit UniqueFd(int fd) noexcept : fd_(fd) {}
-    ~UniqueFd() { reset(); }
-    UniqueFd(const UniqueFd&) = delete;
-    UniqueFd& operator=(const UniqueFd&) = delete;
-    UniqueFd(UniqueFd&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
-    UniqueFd& operator=(UniqueFd&& o) noexcept {
-        if (this != &o) {
-            reset(o.fd_);
-            o.fd_ = -1;
-        }
-        return *this;
-    }
-    int get() const noexcept { return fd_; }
-    explicit operator bool() const noexcept { return fd_ >= 0; }
-    void reset(int new_fd = -1) noexcept {
-        if (fd_ >= 0) ::close(fd_);
-        fd_ = new_fd;
-    }
-private:
-    int fd_ = -1;
 };
 
 inline std::string errno_str() {
@@ -1231,16 +1400,26 @@ public:
             if (can_stage) {
                 try {
                     staged_flusher.wait_idle();
-                    const size_t tile_bytes = pack_tile_to_stage(
-                        staged_flusher.stage_slab(), planned_stage_bytes_, write_fp16, mtd_weight);
+                    const uint64_t part_e0 =
+                        static_cast<uint64_t>(part_rs_) * (static_cast<uint64_t>(part_rs_) + 1ULL) / 2ULL;
+                    const uint64_t tile_e0 =
+                        static_cast<uint64_t>(tile_rs_) * (static_cast<uint64_t>(tile_rs_) + 1ULL) / 2ULL;
+                    const uint64_t tile_file_off = body_off + (tile_e0 - part_e0) * out_elem_bytes;
+                    const StagedPackResult packed = pack_tile_to_stage(
+                        staged_flusher.stage_slab(), planned_stage_bytes_, tile_file_off, write_fp16, mtd_weight);
                     grm_writer->drain();
                     const uint64_t dre = static_cast<uint64_t>(tile_re_);
                     const uint64_t drs = static_cast<uint64_t>(tile_rs_);
                     const size_t tile_elems = static_cast<size_t>((dre * (dre + 1ULL) - drs * (drs + 1ULL)) / 2ULL);
+                    const bool is_final_tile = (re >= part_re_);
+                    const int n_writers = std::min(omp_get_max_threads(), is_final_tile ? 8 : 4);
                     staged_flusher.submit(
                         grm_writer->fd(),
                         grm_path,
-                        tile_bytes,
+                        packed.payload_offset,
+                        tile_file_off,
+                        packed.payload_bytes,
+                        n_writers,
                         N_fd.get(),
                         N_path,
                         N_fd ? tile_elems : 0ULL,
@@ -2634,10 +2813,11 @@ private:
         (void)decode_rows;
     }
 
-    size_t pack_tile_to_stage(HugeAlignedSlab<char>& stage_slab,
-                              size_t planned_stage_bytes,
-                              bool write_fp16,
-                              double mtd_weight)
+    StagedPackResult pack_tile_to_stage(HugeAlignedSlab<char>& stage_slab,
+                                          size_t planned_stage_bytes,
+                                          uint64_t tile_file_off,
+                                          bool write_fp16,
+                                          double mtd_weight)
     {
         const uint64_t tile_e0 = static_cast<uint64_t>(tile_rs_) * (static_cast<uint64_t>(tile_rs_) + 1ULL) / 2ULL;
         const uint64_t tile_e1 = static_cast<uint64_t>(tile_re_) * (static_cast<uint64_t>(tile_re_) + 1ULL) / 2ULL;
@@ -2645,7 +2825,9 @@ private:
         const size_t out_elem_bytes = write_fp16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
         const size_t tile_bytes = tile_elems * out_elem_bytes;
 
-        const size_t ensure_bytes = std::max(tile_bytes, planned_stage_bytes);
+        constexpr size_t kDioAlign = 4096ULL;
+        const size_t skew = static_cast<size_t>(tile_file_off & (kDioAlign - 1ULL));
+        const size_t ensure_bytes = std::max(tile_bytes, planned_stage_bytes) + kDioAlign;
         if (!stage_slab.ensure(ensure_bytes, /*parallel_first_touch=*/false)) {
             LOGGER.error(0, "can't allocate enough memory for staged GRM output buffer ({:.2f} GiB).",
                          static_cast<double>(ensure_bytes) / static_cast<double>(1ULL << 30));
@@ -2662,10 +2844,11 @@ private:
         const int H = cfg_.strip_rows;
         const bool is_rowmajor = (cfg_.layout == gcta_cli::GrmStripLayout::RowMajor);
 
+        char* const dst_raw = stage_slab.data() + skew;
         gcta_grm_io::GrmFp16* const out_f16 = write_fp16
-            ? reinterpret_cast<gcta_grm_io::GrmFp16*>(stage_slab.data()) : nullptr;
+            ? reinterpret_cast<gcta_grm_io::GrmFp16*>(dst_raw) : nullptr;
         float* const out_f32 = !write_fp16
-            ? reinterpret_cast<float*>(stage_slab.data()) : nullptr;
+            ? reinterpret_cast<float*>(dst_raw) : nullptr;
 
         double tr_K_tile = 0.0;
         double tr_K2_tile = 0.0;
@@ -2857,7 +3040,7 @@ private:
             fp16_trace_K_ += tr_K_tile;
             fp16_trace_K2_ += tr_K2_tile;
         }
-        return tile_bytes;
+        return StagedPackResult{skew, tile_bytes};
     }
 
     void flush_tile(gcta_io::AsyncSeqWriter* grm_writer,

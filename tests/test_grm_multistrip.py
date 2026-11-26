@@ -502,6 +502,18 @@ def main():
             runs_dir,
         )
         run_pair(
+            "zero_miss_part_tiled_3_2",
+            ["--bfile", D("zero_miss"), "--alg", "1", "--part", "3", "2", "--n-markers", "64", "--tile-budget", "0.0004"],
+            ["--grm-strip-rows", "64"],
+            runs_dir,
+        )
+        run_pair(
+            "zero_miss_part_fast_tiled_3_2",
+            ["--bfile", D("zero_miss"), "--fast", "--part", "3", "2", "--n-markers", "64", "--tile-budget", "0.0004"],
+            ["--grm-strip-rows", "64"],
+            runs_dir,
+        )
+        run_pair(
             "late_miss_sparse_rm",
             ["--bfile", D("late_miss"), "--alg", "1", "--sparse-cutoff", "0.02", "--n-markers", "64"],
             ["--grm-strip-rows", "64", "--grm-layout", "rowmajor"],

@@ -509,8 +509,8 @@ RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r, bool add_subcmd_level
                      "Dev: CholeskyQR passes on intermediate rSVD power iterations (0 = auto, 1 or 2)")
         ->check(CLI::Range(0, 2))
         ->group("");
-    reml->add_flag("--reml-eigh-fp32", r.reml_eigh_fp32,
-                   "Dev: Use float32 ssyevd instead of double dsyevd on Rayleigh-Ritz Gram")
+    reml->add_flag("--reml-eigh-fp32,!--no-reml-eigh-fp32", r.reml_eigh_fp32,
+                   "Dev: Use float32 ssyevd instead of double dsyevd on Rayleigh-Ritz Gram (auto-enabled under --fast for k>=1024)")
         ->group("");
     reml->add_option("--reml-eigh-threads", r.reml_eigh_threads,
                      "Dev: Cap worker threads during Rayleigh-Ritz symmetric eigensolve (0 = all)")
@@ -529,7 +529,7 @@ RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r, bool add_subcmd_level
             "RemlReuseStream", /*allow_numeric=*/false))
         ->group("");
     reml->add_option("--reml-woodbury-solver", r.reml_woodbury_solver,
-                     "Dev: Woodbury REML solver: auto (default), cholesky (unrotated, no dsyevd), or eigh")
+                     "Dev: Woodbury REML solver: auto (default: eigh), eigh, or cholesky (unrotated, opt-in)")
         ->transform(make_enum_transformer<RemlWoodburySolver>(
             {{"auto", RemlWoodburySolver::Auto},
              {"cholesky", RemlWoodburySolver::Cholesky},
@@ -537,7 +537,7 @@ RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r, bool add_subcmd_level
             "{auto,cholesky,eigh}"))
         ->group("");
     reml->add_option("--reml-qr-mode", r.reml_qr_mode,
-                     "Dev: CholeskyQR mode {auto,sketched,standard}")
+                     "Dev: CholeskyQR mode {auto,sketched,standard} (auto defaults to standard; sketched is opt-in)")
         ->transform(make_enum_transformer<RemlQrMode>(
             {{"auto", RemlQrMode::Auto},
              {"sketched", RemlQrMode::Sketched},

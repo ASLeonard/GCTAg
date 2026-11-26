@@ -2248,69 +2248,68 @@ void deflate_bottom_modes_of_range_gram(Eigen::MatrixXf& Q, Eigen::MatrixXd& B, 
     const int lapack_cap = (k_ext >= 512) ? std::min(omp_get_max_threads(), 48) : 0;
 
     RemlMat Z_bot;
-    if (k_ext <= 256) {
+    if (k_ext <= 4096) {
         RemlMat B_copy = B;
         Eigen::VectorXd w_tmp;
         Eigen::MatrixXd Z_all;
         gcta_eigh::detail::eigh_upper_asc_d(B_copy, w_tmp, Z_all, lapack_cap);
         Z_bot = Z_all.leftCols(p_drop);
     } else {
-        // Estimate upper bound mu > lambda_max(B) via 8 power steps.
-        RemlVec v = RemlVec::Ones(k_ext) / std::sqrt(static_cast<double>(k_ext));
-        RemlVec Bv(k_ext);
-        double mu_est = 1.0;
-        for (int it = 0; it < 8; ++it) {
-            cblas_dsymv(CblasColMajor, CblasUpper, b_kext,
-                        1.0, B.data(), b_kext, v.data(), 1, 0.0, Bv.data(), 1);
-            const double rq = v.dot(Bv);
-            const double nrm = Bv.norm();
-            mu_est = std::max(mu_est, std::max(rq, nrm));
-            if (nrm > 1e-15) v = Bv / nrm;
+        // Shift-and-invert block subspace iteration on (B + sigma * I)^{-1} so skewed
+        // top eigenvalues collapse near 0 while bottom eigenvalues map cleanly to the top.
+        const double tr_est = std::max(0.0, B.diagonal().sum() / static_cast<double>(k_ext));
+        double sigma = std::max(1.0e-3, 0.02 * tr_est);
+        RemlMat B_shift(k_ext, k_ext);
+        bool shift_ok = false;
+        for (int attempt = 0; attempt < 12; ++attempt) {
+            B_shift = B;
+            B_shift.diagonal().array() += sigma;
+            int pot_info = 0;
+            {
+                ScopedBlasThreadCap cap(lapack_cap);
+                pot_info = gcta_dpotrf(b_kext, B_shift.data(), b_kext, 'U');
+            }
+            if (pot_info == 0) {
+                shift_ok = true;
+                break;
+            }
+            sigma *= 4.0;
         }
-        const double mu = 1.05 * mu_est + 1.0e-6;
-        const double tr_est = B.diagonal().sum() / static_cast<double>(k_ext);
-        const double a_cut = std::max(0.0, std::min(0.5 * tr_est, 0.25 * mu));
-        const double c_ch = 0.5 * (mu + a_cut);
-        const double e_ch = std::max(1.0e-6, 0.5 * (mu - a_cut));
-        const double inv_e = 1.0 / e_ch;
-        const double two_inv_e = 2.0 * inv_e;
+        if (!shift_ok) {
+            B_shift.resize(0, 0);
+            RemlMat B_copy = B;
+            Eigen::VectorXd w_tmp;
+            Eigen::MatrixXd Z_all;
+            gcta_eigh::detail::eigh_upper_asc_d(B_copy, w_tmp, Z_all, lapack_cap);
+            Z_bot = Z_all.leftCols(p_drop);
+        } else {
+            const int b = std::min(k_ext / 2, std::max(p_drop + 32, 64));
+            const gcta_blas_int bw = static_cast<gcta_blas_int>(b);
+            RemlMat T0(k_ext, b);
+            gcta_eigh::fill_standard_normal(T0);
+            gcta_qr_thin_Q(b_kext, bw, T0.data(), b_kext);
 
-        // 2 rounds of degree-8 Chebyshev polynomial filtering mapped to [a_cut, mu]
-        // to suppress bulk/top modes exponentially and isolate the bottom p_drop modes.
-        const int b = std::min(k_ext / 2, std::max(p_drop + 32, 64));
-        const gcta_blas_int bw = static_cast<gcta_blas_int>(b);
-        RemlMat T0(k_ext, b);
-        RemlMat T1(k_ext, b);
-        RemlMat BT(k_ext, b);
-        gcta_eigh::fill_standard_normal(T0);
-        gcta_qr_thin_Q(b_kext, bw, T0.data(), b_kext);
+            for (int it = 0; it < 4; ++it) {
+                cblas_dtrsm(CblasColMajor, CblasLeft, CblasUpper, CblasTrans, CblasNonUnit,
+                            b_kext, bw, 1.0, B_shift.data(), b_kext, T0.data(), b_kext);
+                cblas_dtrsm(CblasColMajor, CblasLeft, CblasUpper, CblasNoTrans, CblasNonUnit,
+                            b_kext, bw, 1.0, B_shift.data(), b_kext, T0.data(), b_kext);
+                gcta_qr_thin_Q(b_kext, bw, T0.data(), b_kext);
+            }
+            B_shift.resize(0, 0);
 
-        for (int rnd = 0; rnd < 2; ++rnd) {
+            RemlMat BT(k_ext, b);
             cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
                         b_kext, bw, 1.0, B.data(), b_kext,
                         T0.data(), b_kext, 0.0, BT.data(), b_kext);
-            T1.noalias() = (BT - c_ch * T0) * inv_e;
-            for (int deg = 2; deg <= 8; ++deg) {
-                cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
-                            b_kext, bw, 1.0, B.data(), b_kext,
-                            T1.data(), b_kext, 0.0, BT.data(), b_kext);
-                T0.noalias() = two_inv_e * (BT - c_ch * T1) - T0;
-                T0.swap(T1);
-            }
-            T0.swap(T1);
-            gcta_qr_thin_Q(b_kext, bw, T0.data(), b_kext);
+            RemlMat H_K = T0.transpose() * BT;
+            H_K = 0.5 * (H_K + H_K.transpose());
+
+            Eigen::VectorXd w_K;
+            Eigen::MatrixXd Z_K;
+            gcta_eigh::detail::eigh_upper_asc_d(H_K, w_K, Z_K, lapack_cap);
+            Z_bot.noalias() = T0 * Z_K.leftCols(p_drop);
         }
-
-        cblas_dsymm(CblasColMajor, CblasLeft, CblasUpper,
-                    b_kext, bw, 1.0, B.data(), b_kext,
-                    T0.data(), b_kext, 0.0, BT.data(), b_kext);
-        RemlMat H_K = T0.transpose() * BT;
-        H_K = 0.5 * (H_K + H_K.transpose());
-
-        Eigen::VectorXd w_K;
-        Eigen::MatrixXd Z_K;
-        gcta_eigh::detail::eigh_upper_asc_d(H_K, w_K, Z_K, lapack_cap);
-        Z_bot.noalias() = T0 * Z_K.leftCols(p_drop);
     }
 
     RemlVec tau(p_drop);
@@ -2608,7 +2607,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
             use_unrotated = true;
         }
     } else if (ctx.reml_woodbury_solver == RemlWoodburySolver::Auto) {
-        use_unrotated = unrotated_allowed && !ctx.reml_eigh_fp32 && (k_svd >= 1024);
+        use_unrotated = false;
     }
 
     if (use_unrotated) {
@@ -2730,6 +2729,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
     for (;;) {
         const int oversample = gcta_eigh::recommended_oversample(k_svd);
         const int k_ext = std::min(k_svd + oversample, n - 1);
+        rsvd_opts.eigh_fp32 = ctx.reml_eigh_fp32 || (ctx.reml_eigh_fp32_auto && k_ext >= 1024);
 
         if (ctx.svd_nystrom) {
             try {

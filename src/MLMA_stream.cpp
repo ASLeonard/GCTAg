@@ -3527,6 +3527,10 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                         woodbury_basis_eff = WoodburyBasisSpec{WoodburyBasisSpec::Kind::MP, 0};
                         fast_notes.push_back("woodbury-basis=MP");
                     }
+                    if (!r.reml_eigh_fp32.has_value() && !use_pcg &&
+                        r.reml_woodbury_solver != gcta_cli::RemlWoodburySolver::Cholesky) {
+                        fast_notes.push_back("eigh-fp32=auto(k>=1024)");
+                    }
                 }
                 if (fast_enabled_mlma) {
                     fast_notes.push_back("fast-mlma=adaptive");
@@ -3703,7 +3707,8 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             ctx.reml_matvec_band_rows = r.reml_matvec_band_rows;
             ctx.reml_matvec_col_chunk = r.reml_matvec_col_chunk;
             ctx.reml_qr_power_passes  = r.reml_qr_power_passes;
-            ctx.reml_eigh_fp32        = r.reml_eigh_fp32;
+            ctx.reml_eigh_fp32        = r.reml_eigh_fp32.value_or(false);
+            ctx.reml_eigh_fp32_auto   = fast_preset && !reuse_basis && !use_pcg && !r.reml_eigh_fp32.has_value();
             ctx.reml_eigh_threads     = r.reml_eigh_threads;
             ctx.reml_woodbury_solver  = static_cast<RemlWoodburySolver>(r.reml_woodbury_solver);
             ctx.reml_qr_mode          = static_cast<CholeskyQrMode>(r.reml_qr_mode);

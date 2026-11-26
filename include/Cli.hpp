@@ -144,7 +144,7 @@ struct RemlOptions {
     int reml_matvec_band_rows = 0;
     int reml_matvec_col_chunk = 0;
     int reml_qr_power_passes = 0;
-    bool reml_eigh_fp32 = false;
+    std::optional<bool> reml_eigh_fp32;
     int reml_eigh_threads = 0;
     int reml_io_slot_mb = 256;
     RemlReuseStream reml_reuse_stream = RemlReuseStream::Auto;

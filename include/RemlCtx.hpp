@@ -236,6 +236,7 @@ struct RemlCtx {
     int  reml_matvec_col_chunk = 0;   // 0 = auto (<= 1 GiB strip)
     int  reml_qr_power_passes  = 0;   // 0 = auto (1 when BF16 sketch, else 2)
     bool   reml_eigh_fp32        = false;
+    bool   reml_eigh_fp32_auto   = false;
     int    reml_eigh_threads     = 0;   // 0 = all threads
     RemlWoodburySolver reml_woodbury_solver = RemlWoodburySolver::Auto;
     CholeskyQrMode reml_qr_mode = CholeskyQrMode::Auto;

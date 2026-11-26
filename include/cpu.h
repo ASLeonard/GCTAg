@@ -673,36 +673,15 @@ inline void gcta_right_tri_sgemm_inplace(
 namespace gcta_cpu_detail {
 
 // Apply Y <- Y * L^{-T} for lower Cholesky factor G_lower (k x k, col-major, ld=k).
-// For k >= 512, uses 48-thread capped dtrtri('L') + parallel transpose into upper U_inv_f
-// + parallel gcta_right_tri_sgemm_inplace to avoid AOCL-BLIS single-threaded Right TRSM.
+// Truncates G_lower to float32 and solves directly via Level-3 cblas_strsm(Right).
 inline bool apply_lower_chol_inv_right(
     gcta_blas_int m, gcta_blas_int k,
     double* G_lower, float* G_f,
     float* Y, gcta_blas_int ldY)
 {
-    if (k < 512) {
-        copy_lower_d2f(k, G_lower, G_f);
-        cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
-                    m, k, 1.0f, G_f, k, Y, ldY);
-        return true;
-    }
-    {
-        const int lapack_cap = std::min(omp_get_max_threads(), 48);
-        ScopedBlasThreadCap cap(lapack_cap);
-        if (gcta_dtrtri(k, G_lower, k, 'L', 'N') != 0) {
-            return false;
-        }
-    }
-    // Transpose lower-triangular G_lower into upper-triangular G_f with strict lower zeroed.
-    #pragma omp parallel for schedule(static)
-    for (gcta_blas_int j = 0; j < k; ++j) {
-        float* __restrict__ dst = G_f + static_cast<size_t>(j) * static_cast<size_t>(k);
-        for (gcta_blas_int i = 0; i <= j; ++i) {
-            dst[i] = static_cast<float>(G_lower[j + static_cast<size_t>(i) * static_cast<size_t>(k)]);
-        }
-        std::memset(dst + j + 1, 0, static_cast<size_t>(k - 1 - j) * sizeof(float));
-    }
-    gcta_right_tri_sgemm_inplace(m, k, Y, ldY, G_f, k, /*T_is_upper=*/true);
+    copy_lower_d2f(k, G_lower, G_f);
+    cblas_strsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
+                m, k, 1.0f, G_f, k, Y, ldY);
     return true;
 }
 
@@ -762,11 +741,11 @@ inline void build_osnap_sketch(
 
 // Mixed-precision Shifted / Sketched CholeskyQR for float32 m x k subspace matrices:
 //   - Column L2 pre-normalization balances wildly scaled power-iteration columns.
-//   - When qr_mode resolves to Sketched (Auto when k >= 512 && m >= 3*k), Pass 0 forms
+//   - Auto defaults to Standard Shifted CholeskyQR (direct cblas_ssyrk + dpotrf + strsm).
+//     When qr_mode == Sketched (opt-in --reml-qr-mode sketched), Pass 0 forms
 //     G_0 = (S Y)^T (S Y) from an OSNAP sparse sign sketch of height s = 2k + 256,
-//     avoiding the O(m k^2) Pass-0 SSYRK; min_passes >= 2 adds 1 exact full-m polish pass.
-//   - LAPACK dpotrf/dtrtri on k >= 512 are capped at 48 threads and Right triangular
-//     updates run via parallel gcta_right_tri_sgemm_inplace.
+//     and min_passes >= 2 adds 1 exact full-m polish pass.
+//   - LAPACK dpotrf on k >= 512 is capped at 48 threads to avoid barrier contention.
 inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, gcta_blas_int ldY,
                                     Eigen::MatrixXd* workspace = nullptr,
                                     Eigen::MatrixXf* workspace_f = nullptr,
@@ -852,10 +831,8 @@ inline int gcta_cholesky_qr_thin_Q(gcta_blas_int m, gcta_blas_int k, float* Y, g
     const int base_passes = std::clamp(min_passes, 1, 2);
     const int lapack_cap = (k >= 512) ? std::min(omp_get_max_threads(), 48) : 0;
 
-    // Sketched CholeskyQR (sCholeskyQR): replace O(m k^2) Pass-0 SSYRK with OSNAP sketch.
-    const bool try_sketched =
-        (qr_mode == CholeskyQrMode::Sketched) ? (k >= 64 && m >= 3 * k)
-                                              : (qr_mode == CholeskyQrMode::Auto && k >= 512 && m >= 3 * k);
+    // Sketched CholeskyQR (sCholeskyQR): strictly opt-in via qr_mode == Sketched.
+    const bool try_sketched = (qr_mode == CholeskyQrMode::Sketched) && (k >= 64 && m >= 3 * k);
     if (try_sketched) {
         gcta_blas_int s = std::min<gcta_blas_int>(
             m, std::max<gcta_blas_int>(2 * k + 256, 4096));

@@ -373,138 +373,200 @@ struct StagedPackResult {
 };
 
 #if defined(__linux__) && defined(O_DIRECT)
-inline bool try_write_buffer_odirect(int grm_fd,
-                                     const char* data,
-                                     size_t nbytes,
-                                     uint64_t file_off,
-                                     int n_writers,
-                                     const std::string& path)
-{
-    constexpr size_t kMinDirectBytes = 64ULL << 20;
-    constexpr size_t kDioAlign       = 4096ULL;
-    constexpr size_t kStripeBytes    = 4ULL << 20;
-    if (nbytes < kMinDirectBytes || n_writers < 1) return false;
-    if ((reinterpret_cast<uintptr_t>(data) & (kDioAlign - 1ULL)) !=
-        (file_off & (kDioAlign - 1ULL))) {
-        return false;
+class DirectParallelWriter {
+public:
+    static constexpr size_t kDioAlign       = 4096ULL;
+    static constexpr size_t kMinDirectBytes = 64ULL << 20;
+    static constexpr size_t kStripeBytes    = 4ULL << 20;
+    static constexpr size_t kMaxDirectChunk = 64ULL << 20;
+
+    DirectParallelWriter() = default;
+    DirectParallelWriter(const DirectParallelWriter&) = delete;
+    DirectParallelWriter& operator=(const DirectParallelWriter&) = delete;
+
+    bool is_open() const noexcept { return static_cast<bool>(direct_fd_); }
+    bool has_written() const noexcept { return has_written_; }
+
+    void close_silent() noexcept {
+        direct_fd_.reset();
+        buffered_fd_ = -1;
+        path_.clear();
+        last_end_off_ = 0;
+        probed_ = false;
+        has_written_ = false;
     }
 
-    const uint64_t F_beg = file_off;
-    const uint64_t F_end = file_off + static_cast<uint64_t>(nbytes);
-    const size_t head = static_cast<size_t>((kDioAlign - (F_beg & (kDioAlign - 1ULL))) & (kDioAlign - 1ULL));
-    if (head >= nbytes) return false;
-    const size_t aligned_len = (nbytes - head) & ~(kDioAlign - 1ULL);
-    if (aligned_len < kMinDirectBytes) return false;
-    const uint64_t A_beg = F_beg + static_cast<uint64_t>(head);
-    const uint64_t A_end = A_beg + static_cast<uint64_t>(aligned_len);
-    const size_t tail = nbytes - head - aligned_len;
-
-    int dflags = O_WRONLY | O_DIRECT;
+    bool open_for(int buffered_fd, const std::string& path) {
+        close_silent();
+        int dflags = O_WRONLY | O_DIRECT;
 #ifdef O_CLOEXEC
-    dflags |= O_CLOEXEC;
+        dflags |= O_CLOEXEC;
 #endif
-    UniqueFd direct_fd(::open(path.c_str(), dflags));
-    if (!direct_fd) {
-        if (errno == EINVAL || errno == EOPNOTSUPP || errno == EPERM) return false;
-        throw std::runtime_error("open(O_DIRECT) failed on [" + path + "]: " + std::string(std::strerror(errno)));
-    }
-
-    ssize_t probe_w = -1;
-    do {
-        probe_w = ::pwrite(direct_fd.get(), data + head, kDioAlign, static_cast<off_t>(A_beg));
-    } while (probe_w < 0 && errno == EINTR);
-    if (probe_w < 0) {
-        if (errno == EINVAL || errno == EOPNOTSUPP) return false;
-        throw std::runtime_error("pwrite(O_DIRECT) probe failed on [" + path + "]: " + std::string(std::strerror(errno)));
-    }
-    if (static_cast<size_t>(probe_w) != kDioAlign) {
-        return false;
-    }
-
-    if (head > 0) {
-        gcta_io::pwrite_exact_throwing(grm_fd, data, head, static_cast<off_t>(F_beg), path);
-    }
-
-    const uint64_t mid_beg = A_beg + static_cast<uint64_t>(kDioAlign);
-    const uint64_t mid_bytes = (A_end > mid_beg) ? (A_end - mid_beg) : 0ULL;
-    if (mid_bytes > 0) {
-        int W = std::clamp(n_writers, 1, 8);
-        if (mid_bytes < kMinDirectBytes) W = 1;
-        const uint64_t step = (mid_bytes >= static_cast<uint64_t>(W) * kStripeBytes)
-            ? static_cast<uint64_t>(kStripeBytes)
-            : static_cast<uint64_t>(kDioAlign);
-
-        auto split_off = [&](int k) -> uint64_t {
-            if (k <= 0) return mid_beg;
-            if (k >= W) return A_end;
-            const uint64_t raw = mid_beg + (mid_bytes * static_cast<uint64_t>(k)) / static_cast<uint64_t>(W);
-            const uint64_t aligned = (raw / step) * step;
-            return std::clamp(aligned, mid_beg, A_end);
-        };
-
-        auto write_slice = [&](uint64_t s_beg, uint64_t s_end) {
-            uint64_t off = s_beg;
-            while (off < s_end) {
-                const size_t chunk = static_cast<size_t>(std::min<uint64_t>(64ULL << 20, s_end - off));
-                const char* const p = data + static_cast<size_t>(off - F_beg);
-                const ssize_t w = ::pwrite(direct_fd.get(), p, chunk, static_cast<off_t>(off));
-                if (w < 0) {
-                    if (errno == EINTR) continue;
-                    throw std::runtime_error("pwrite(O_DIRECT) failed on [" + path + "]: " + std::string(std::strerror(errno)));
-                }
-                if (w == 0) {
-                    throw std::runtime_error("pwrite(O_DIRECT) made zero progress on [" + path + "].");
-                }
-                off += static_cast<uint64_t>(w);
+        UniqueFd dfd(::open(path.c_str(), dflags));
+        if (!dfd) {
+            if (errno == EINVAL || errno == EOPNOTSUPP || errno == EPERM) {
+                return false;
             }
-        };
+            throw std::runtime_error("open(O_DIRECT) failed on [" + path + "]: " + std::string(std::strerror(errno)));
+        }
+        buffered_fd_ = buffered_fd;
+        direct_fd_ = std::move(dfd);
+        path_ = path;
+        return true;
+    }
 
-        if (W == 1) {
-            write_slice(mid_beg, A_end);
-        } else {
-            std::vector<std::exception_ptr> errs(static_cast<size_t>(W));
-            {
-                std::vector<std::jthread> workers;
-                workers.reserve(static_cast<size_t>(W - 1));
-                for (int k = 1; k < W; ++k) {
-                    const uint64_t sb = split_off(k);
-                    const uint64_t se = split_off(k + 1);
-                    workers.emplace_back([&, k, sb, se]() {
-                        try {
-                            if (sb < se) write_slice(sb, se);
-                        } catch (...) {
-                            errs[static_cast<size_t>(k)] = std::current_exception();
-                        }
-                    });
-                }
-                try {
-                    const uint64_t sb0 = split_off(0);
-                    const uint64_t se0 = split_off(1);
-                    if (sb0 < se0) write_slice(sb0, se0);
-                } catch (...) {
-                    errs[0] = std::current_exception();
-                }
+    bool write_range(const char* data, size_t nbytes, uint64_t file_off, int n_writers) {
+        if (!direct_fd_ || nbytes == 0) return false;
+        if ((reinterpret_cast<uintptr_t>(data) & (kDioAlign - 1ULL)) !=
+            (file_off & (kDioAlign - 1ULL))) {
+            return false;
+        }
+
+        const uint64_t F_beg = file_off;
+        const uint64_t F_end = file_off + static_cast<uint64_t>(nbytes);
+        const size_t head = static_cast<size_t>((kDioAlign - (F_beg & (kDioAlign - 1ULL))) & (kDioAlign - 1ULL));
+        const size_t aligned_len = (head < nbytes) ? ((nbytes - head) & ~(kDioAlign - 1ULL)) : 0ULL;
+
+        if (head >= nbytes || aligned_len == 0) {
+            if (!probed_) {
+                close_silent();
+                return false;
             }
-            for (const std::exception_ptr& e : errs) {
-                if (e) std::rethrow_exception(e);
+            gcta_io::pwrite_exact_throwing(buffered_fd_, data, nbytes, static_cast<off_t>(F_beg), path_);
+            last_end_off_ = F_end;
+            has_written_ = true;
+            return true;
+        }
+
+        const uint64_t A_beg = F_beg + static_cast<uint64_t>(head);
+        const uint64_t A_end = A_beg + static_cast<uint64_t>(aligned_len);
+        const size_t tail = nbytes - head - aligned_len;
+
+        uint64_t mid_beg = A_beg;
+        if (!probed_) {
+            ssize_t probe_w = -1;
+            do {
+                probe_w = ::pwrite(direct_fd_.get(), data + head, kDioAlign, static_cast<off_t>(A_beg));
+            } while (probe_w < 0 && errno == EINTR);
+            if (probe_w < 0) {
+                if (errno == EINVAL || errno == EOPNOTSUPP) {
+                    close_silent();
+                    return false;
+                }
+                throw std::runtime_error("pwrite(O_DIRECT) probe failed on [" + path_ + "]: " + std::string(std::strerror(errno)));
+            }
+            if (static_cast<size_t>(probe_w) != kDioAlign) {
+                close_silent();
+                return false;
+            }
+            probed_ = true;
+            mid_beg = A_beg + static_cast<uint64_t>(kDioAlign);
+        }
+
+        if (head > 0) {
+            gcta_io::pwrite_exact_throwing(buffered_fd_, data, head, static_cast<off_t>(F_beg), path_);
+        }
+
+        const uint64_t mid_bytes = (A_end > mid_beg) ? (A_end - mid_beg) : 0ULL;
+        if (mid_bytes > 0) {
+            int W = std::clamp(n_writers, 1, 8);
+            if (mid_bytes < kMinDirectBytes) W = 1;
+            const uint64_t step = (mid_bytes >= static_cast<uint64_t>(W) * kStripeBytes)
+                ? static_cast<uint64_t>(kStripeBytes)
+                : static_cast<uint64_t>(kDioAlign);
+
+            auto split_off = [&](int k) -> uint64_t {
+                if (k <= 0) return mid_beg;
+                if (k >= W) return A_end;
+                const uint64_t raw = mid_beg + (mid_bytes * static_cast<uint64_t>(k)) / static_cast<uint64_t>(W);
+                const uint64_t aligned = (raw / step) * step;
+                return std::clamp(aligned, mid_beg, A_end);
+            };
+
+            auto write_slice = [&](uint64_t s_beg, uint64_t s_end) {
+                uint64_t off = s_beg;
+                while (off < s_end) {
+                    const size_t chunk = static_cast<size_t>(std::min<uint64_t>(kMaxDirectChunk, s_end - off));
+                    const char* const p = data + static_cast<size_t>(off - F_beg);
+                    const ssize_t w = ::pwrite(direct_fd_.get(), p, chunk, static_cast<off_t>(off));
+                    if (w < 0) {
+                        if (errno == EINTR) continue;
+                        throw std::runtime_error("pwrite(O_DIRECT) failed on [" + path_ + "]: " + std::string(std::strerror(errno)));
+                    }
+                    if (w == 0) {
+                        throw std::runtime_error("pwrite(O_DIRECT) made zero progress on [" + path_ + "].");
+                    }
+                    off += static_cast<uint64_t>(w);
+                }
+            };
+
+            if (W == 1) {
+                write_slice(mid_beg, A_end);
+            } else {
+                std::vector<std::exception_ptr> errs(static_cast<size_t>(W));
+                {
+                    std::vector<std::jthread> workers;
+                    workers.reserve(static_cast<size_t>(W - 1));
+                    for (int k = 1; k < W; ++k) {
+                        const uint64_t sb = split_off(k);
+                        const uint64_t se = split_off(k + 1);
+                        workers.emplace_back([&, k, sb, se]() {
+                            try {
+                                if (sb < se) write_slice(sb, se);
+                            } catch (...) {
+                                errs[static_cast<size_t>(k)] = std::current_exception();
+                            }
+                        });
+                    }
+                    try {
+                        const uint64_t sb0 = split_off(0);
+                        const uint64_t se0 = split_off(1);
+                        if (sb0 < se0) write_slice(sb0, se0);
+                    } catch (...) {
+                        errs[0] = std::current_exception();
+                    }
+                }
+                for (const std::exception_ptr& e : errs) {
+                    if (e) std::rethrow_exception(e);
+                }
             }
         }
+
+        if (tail > 0) {
+            gcta_io::pwrite_exact_throwing(
+                buffered_fd_, data + head + aligned_len, tail, static_cast<off_t>(A_end), path_);
+        }
+
+        last_end_off_ = F_end;
+        has_written_ = true;
+        return true;
     }
 
-    if (tail > 0) {
-        gcta_io::pwrite_exact_throwing(
-            grm_fd, data + head + aligned_len, tail, static_cast<off_t>(A_end), path);
+    void finish() {
+        const int dfd = direct_fd_.release();
+        if (dfd >= 0 && ::close(dfd) != 0) {
+            throw std::runtime_error("close(O_DIRECT) failed on [" + path_ + "]: " + std::string(std::strerror(errno)));
+        }
+        if (has_written_ && buffered_fd_ >= 0) {
+            if (::lseek(buffered_fd_, static_cast<off_t>(last_end_off_), SEEK_SET) == static_cast<off_t>(-1)) {
+                throw std::runtime_error("lseek() failed on [" + path_ + "]: " + std::string(std::strerror(errno)));
+            }
+        }
+        buffered_fd_ = -1;
+        path_.clear();
+        last_end_off_ = 0;
+        probed_ = false;
+        has_written_ = false;
     }
 
-    const int dfd = direct_fd.release();
-    if (dfd >= 0 && ::close(dfd) != 0) {
-        throw std::runtime_error("close(O_DIRECT) failed on [" + path + "]: " + std::string(std::strerror(errno)));
-    }
-    if (::lseek(grm_fd, static_cast<off_t>(F_end), SEEK_SET) == static_cast<off_t>(-1)) {
-        throw std::runtime_error("lseek() failed on [" + path + "]: " + std::string(std::strerror(errno)));
-    }
-    return true;
-}
+private:
+    int buffered_fd_ = -1;
+    UniqueFd direct_fd_;
+    std::string path_;
+    uint64_t last_end_off_ = 0;
+    bool probed_ = false;
+    bool has_written_ = false;
+};
 #endif
 
 // Background sequential flusher owning a persistent packed-output slab so tile t
@@ -609,8 +671,14 @@ private:
                 const char* const payload = stage_slab_.data() + payload_offset;
                 bool wrote_direct = false;
 #if defined(__linux__) && defined(O_DIRECT)
-                wrote_direct = try_write_buffer_odirect(
-                    grm_fd, payload, grm_bytes, file_off, n_writers, grm_path);
+                if (grm_bytes >= DirectParallelWriter::kMinDirectBytes) {
+                    DirectParallelWriter direct_writer;
+                    if (direct_writer.open_for(grm_fd, grm_path) &&
+                        direct_writer.write_range(payload, grm_bytes, file_off, n_writers)) {
+                        direct_writer.finish();
+                        wrote_direct = true;
+                    }
+                }
 #else
                 (void)n_writers;
 #endif
@@ -3114,8 +3182,46 @@ private:
         const double* const diag_err_ptr = (opts_.impute_mean && grm_is_i32_ && !diag_err_total_.empty())
             ? diag_err_total_.data() : nullptr;
         const size_t out_elem_bytes = (write_fp16 && !is_sparse) ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
-        const size_t target_elems = std::max<size_t>(1, cfg_.io_slot_bytes / out_elem_bytes);
-        const int flush_nt = is_sparse ? omp_get_max_threads() : std::max(1, omp_get_max_threads() - 1);
+
+        const uint64_t part_e0 = static_cast<uint64_t>(part_rs_) * (static_cast<uint64_t>(part_rs_) + 1ULL) / 2ULL;
+        const uint64_t tile_e0 = static_cast<uint64_t>(tile_rs) * (static_cast<uint64_t>(tile_rs) + 1ULL) / 2ULL;
+        const uint64_t tile_e1 = static_cast<uint64_t>(tile_re) * (static_cast<uint64_t>(tile_re) + 1ULL) / 2ULL;
+        const size_t tile_total_elems = static_cast<size_t>(tile_e1 - tile_e0);
+        const size_t tile_total_bytes = tile_total_elems * out_elem_bytes;
+        const uint64_t body_off = write_fp16 ? gcta_grm_io::grm_f16_body_offset(num_individual_) : 0ULL;
+        const uint64_t tile_file_base = body_off + (tile_e0 - part_e0) * out_elem_bytes;
+
+        size_t chunk_cap_bytes = cfg_.io_slot_bytes;
+        bool use_direct = false;
+#if defined(__linux__) && defined(O_DIRECT)
+        constexpr size_t kDirectFlushChunkBytes = 1ULL << 30;
+        const int direct_n_writers = std::min(omp_get_max_threads(), 8);
+        DirectParallelWriter direct_writer;
+        HugeAlignedSlab<char> direct_buf;
+        if (!is_sparse && tile_total_bytes >= DirectParallelWriter::kMinDirectBytes) {
+            try {
+                grm_writer->drain();
+                if (direct_writer.open_for(grm_writer->fd(), grm_path)) {
+                    const size_t init_chunk = std::min<size_t>(kDirectFlushChunkBytes, tile_total_bytes);
+                    if (direct_buf.ensure(init_chunk + DirectParallelWriter::kDioAlign, /*parallel_first_touch=*/false)) {
+                        use_direct = true;
+                        chunk_cap_bytes = kDirectFlushChunkBytes;
+                    } else {
+                        direct_writer.close_silent();
+                    }
+                }
+            } catch (const std::exception& e) {
+                LOGGER.e(0, std::string("GrmBedInt8 flush_tile direct open failed: ") + e.what());
+            }
+        }
+#endif
+        (void)tile_total_bytes;
+        (void)tile_file_base;
+
+        const size_t target_elems = std::max<size_t>(1, chunk_cap_bytes / out_elem_bytes);
+        const int flush_nt = (is_sparse || use_direct)
+            ? omp_get_max_threads()
+            : std::max(1, omp_get_max_threads() - 1);
 
         const uint32_t* const N_base = tile_has_N_ ? std::assume_aligned<64>(N_slab_.data()) : nullptr;
         const uint32_t* const sub_miss_ptr = sub_miss_.data();
@@ -3199,7 +3305,18 @@ private:
                     row_off[static_cast<size_t>(block_rows)] = total_packed;
 
                     const size_t chunk_bytes = total_packed * out_elem_bytes;
+                    const uint64_t cur_file_off = tile_file_base + (static_cast<uint64_t>(e0) - tile_e0) * out_elem_bytes;
+                    (void)cur_file_off;
                     char* out_raw = nullptr;
+#if defined(__linux__) && defined(O_DIRECT)
+                    if (use_direct) {
+                        const size_t skew = static_cast<size_t>(cur_file_off & (DirectParallelWriter::kDioAlign - 1ULL));
+                        if (!direct_buf.ensure(chunk_bytes + DirectParallelWriter::kDioAlign, /*parallel_first_touch=*/false)) {
+                            LOGGER.e(0, "can't allocate enough memory for direct flush chunk buffer.");
+                        }
+                        out_raw = direct_buf.data() + skew;
+                    } else
+#endif
                     if (!is_sparse) {
                         AlignedRawBuffer<char, 64>& slot = grm_writer->acquire_slot();
                         if (slot.size() < chunk_bytes) slot.resize(chunk_bytes);
@@ -3322,6 +3439,19 @@ private:
                         fp16_trace_K_ += tr_K_chunk;
                         fp16_trace_K2_ += tr_K2_chunk;
                     }
+#if defined(__linux__) && defined(O_DIRECT)
+                    if (use_direct) {
+                        if (!direct_writer.write_range(out_raw, chunk_bytes, cur_file_off, direct_n_writers)) {
+                            use_direct = false;
+                            direct_writer.close_silent();
+                            if (::lseek(grm_writer->fd(), static_cast<off_t>(cur_file_off), SEEK_SET) == static_cast<off_t>(-1)) {
+                                throw std::runtime_error("lseek() failed on [" + grm_path + "]: " + errno_str());
+                            }
+                            write_buffer_with_cache_drop(grm_writer->fd(), out_raw, chunk_bytes, grm_path);
+                            direct_buf.reset();
+                        }
+                    } else
+#endif
                     if (!is_sparse) {
                         grm_writer->submit_slot(chunk_bytes);
                     } else {
@@ -3364,7 +3494,20 @@ private:
                         row_off[static_cast<size_t>(block_rows)] = total_packed;
 
                         const size_t strip_bytes = total_packed * out_elem_bytes;
+                        const uint64_t block_e0 =
+                            static_cast<uint64_t>(block_start) * (static_cast<uint64_t>(block_start) + 1ULL) / 2ULL;
+                        const uint64_t cur_file_off = tile_file_base + (block_e0 - tile_e0) * out_elem_bytes;
+                        (void)cur_file_off;
                         char* out_raw = nullptr;
+#if defined(__linux__) && defined(O_DIRECT)
+                        if (use_direct) {
+                            const size_t skew = static_cast<size_t>(cur_file_off & (DirectParallelWriter::kDioAlign - 1ULL));
+                            if (!direct_buf.ensure(strip_bytes + DirectParallelWriter::kDioAlign, /*parallel_first_touch=*/false)) {
+                                LOGGER.e(0, "can't allocate enough memory for direct flush chunk buffer.");
+                            }
+                            out_raw = direct_buf.data() + skew;
+                        } else
+#endif
                         if (!is_sparse) {
                             AlignedRawBuffer<char, 64>& slot = grm_writer->acquire_slot();
                             if (slot.size() < strip_bytes) slot.resize(strip_bytes);
@@ -3534,6 +3677,19 @@ private:
                             fp16_trace_K_ += tr_K_strip;
                             fp16_trace_K2_ += tr_K2_strip;
                         }
+#if defined(__linux__) && defined(O_DIRECT)
+                        if (use_direct) {
+                            if (!direct_writer.write_range(out_raw, strip_bytes, cur_file_off, direct_n_writers)) {
+                                use_direct = false;
+                                direct_writer.close_silent();
+                                if (::lseek(grm_writer->fd(), static_cast<off_t>(cur_file_off), SEEK_SET) == static_cast<off_t>(-1)) {
+                                    throw std::runtime_error("lseek() failed on [" + grm_path + "]: " + errno_str());
+                                }
+                                write_buffer_with_cache_drop(grm_writer->fd(), out_raw, strip_bytes, grm_path);
+                                direct_buf.reset();
+                            }
+                        } else
+#endif
                         if (!is_sparse) {
                             grm_writer->submit_slot(strip_bytes);
                         } else {
@@ -3543,26 +3699,19 @@ private:
                 }
             }
 
+#if defined(__linux__) && defined(O_DIRECT)
+            if (direct_writer.is_open() || direct_writer.has_written()) {
+                direct_writer.finish();
+            }
+            direct_buf.reset();
+#endif
+
             // Write .grm.N.bin sequentially AFTER draining grm_writer (strictly 1 active write stream)
             if (!is_sparse && N_fd >= 0) {
                 grm_writer->drain();
-                const uint64_t dre = static_cast<uint64_t>(tile_re);
-                const uint64_t drs = static_cast<uint64_t>(tile_rs);
-                const size_t tile_total_elems = static_cast<size_t>((dre * (dre + 1ULL) - drs * (drs + 1ULL)) / 2ULL);
 
                 if (zero_missing) {
-                    const float n_val = static_cast<float>(valid_m);
-                    const size_t buf_floats = std::min(tile_total_elems, kConstNFloats);
-                    if (const_N_buf.size() < buf_floats || (buf_floats > 0 && const_N_buf[0] != n_val)) {
-                        const_N_buf.assign(buf_floats, n_val);
-                    }
-                    size_t rem_bytes = tile_total_elems * sizeof(float);
-                    const size_t cap_bytes = buf_floats * sizeof(float);
-                    while (rem_bytes > 0) {
-                        const size_t c = std::min(rem_bytes, cap_bytes);
-                        gcta_io::write_exact_throwing(N_fd, const_N_buf.data(), c, N_path);
-                        rem_bytes -= c;
-                    }
+                    write_const_N_with_cache_drop(N_fd, tile_total_elems, static_cast<float>(valid_m), N_path, const_N_buf);
                 } else {
                     const size_t total_n_bytes = tile_total_elems * sizeof(float);
                     const size_t n_slot_cap = std::clamp<size_t>(

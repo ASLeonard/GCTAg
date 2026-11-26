@@ -1786,21 +1786,22 @@ inline QuantizedWoodburyUk build_quantized_woodbury_uk_from_nxk(
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < k; ++r) {
         const float* const col = uk_src + static_cast<size_t>(r) * ld_uk;
-        float m = 0.0f;
+        uint32_t mb = 0;
         if (unit_weights) {
-            #pragma omp simd reduction(max:m)
+            #pragma omp simd reduction(max:mb)
             for (int s = 0; s < n; ++s) {
-                const float av = std::fabs(col[s]);
-                if (av > m) m = av;
+                const uint32_t ab = std::bit_cast<uint32_t>(col[s]) & 0x7fffffffu;
+                if (ab > mb) mb = ab;
             }
         } else {
-            #pragma omp simd reduction(max:m)
+            #pragma omp simd reduction(max:mb)
             for (int s = 0; s < n; ++s) {
-                const float av = std::fabs(col[s] * w_ptr[s]);
-                if (av > m) m = av;
+                const float scaled = col[s] * w_ptr[s];
+                const uint32_t ab = std::bit_cast<uint32_t>(scaled) & 0x7fffffffu;
+                if (ab > mb) mb = ab;
             }
         }
-        max_abs_raw[static_cast<size_t>(r)] = m;
+        max_abs_raw[static_cast<size_t>(r)] = std::bit_cast<float>(mb);
     }
 
     std::vector<float> alpha_hi_f(static_cast<size_t>(k), 0.0f);

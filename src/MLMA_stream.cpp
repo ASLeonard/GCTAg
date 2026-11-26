@@ -54,6 +54,8 @@
 #include <vector>
 #include <functional>
 #include <algorithm>
+#include <bit>
+#include <cstdint>
 #include <numeric>
 #include <cmath>
 #include <cctype>
@@ -1705,16 +1707,16 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
             #pragma omp parallel for schedule(static)
             for (int32_t r = 0; r < k; ++r) {
                 const float* const col = uk_src + static_cast<size_t>(r) * static_cast<size_t>(n);
-                float m = 0.0f;
+                uint32_t mb = 0;
                 double dot = 0.0;
-                #pragma omp simd reduction(max:m) reduction(+:dot)
+                #pragma omp simd reduction(max:mb) reduction(+:dot)
                 for (int32_t s = 0; s < n; ++s) {
                     const float v = col[s];
-                    const float av = std::fabs(v);
-                    if (av > m) m = av;
+                    const uint32_t ab = std::bit_cast<uint32_t>(v) & 0x7fffffffu;
+                    if (ab > mb) mb = ab;
                     dot += static_cast<double>(v) * static_cast<double>(y_adj_ptr[s]);
                 }
-                max_abs[static_cast<size_t>(r)] = m;
+                max_abs[static_cast<size_t>(r)] = std::bit_cast<float>(mb);
                 uy[r] = static_cast<float>(dot);
             }
             have_max_abs = true;
@@ -1734,13 +1736,13 @@ void writeRemlStateFromCtx(const string& filename, RemlCtx& ctx, bool no_adj_cov
                 #pragma omp parallel for schedule(static)
                 for (int32_t r = 0; r < k; ++r) {
                     const float* const col = uk_src + static_cast<size_t>(r) * static_cast<size_t>(n);
-                    float m = 0.0f;
-                    #pragma omp simd reduction(max:m)
+                    uint32_t mb = 0;
+                    #pragma omp simd reduction(max:mb)
                     for (int32_t s = 0; s < n; ++s) {
-                        const float av = std::fabs(col[s]);
-                        if (av > m) m = av;
+                        const uint32_t ab = std::bit_cast<uint32_t>(col[s]) & 0x7fffffffu;
+                        if (ab > mb) mb = ab;
                     }
-                    max_abs[static_cast<size_t>(r)] = m;
+                    max_abs[static_cast<size_t>(r)] = std::bit_cast<float>(mb);
                 }
             } else {
                 const int max_t = std::max(1, omp_get_max_threads());

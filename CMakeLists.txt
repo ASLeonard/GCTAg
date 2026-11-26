@@ -657,6 +657,7 @@ target_sources(GCTAg PRIVATE
         src/GenoBackend.cpp
         src/BedBackend.cpp
         src/bed_simd.cpp
+        src/pgen_hardcall.cpp
         src/BgenBackend.cpp
         src/PgenBackend.cpp
         src/Logger.cpp
@@ -727,6 +728,7 @@ set_source_files_properties(src/Cli.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON
 # dispatch; keep it out of unity TUs so AVX-512 code paths never mix with
 # (or get attributes/macros from) other sources.
 set_source_files_properties(src/bed_simd.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+set_source_files_properties(src/pgen_hardcall.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
 target_compile_definitions(GCTAg PRIVATE
     ${GCTA_BLAS_DEFINES}
@@ -819,6 +821,20 @@ if(GCTA_BUILD_BED_TESTS)
     target_include_directories(bench_bed_simd PRIVATE include ${CMAKE_SOURCE_DIR}
         third_party/plink-ng/2.0/include third_party/plink-ng/2.0/simde)
     target_link_libraries(bench_bed_simd PRIVATE Pgenlib)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_pgen_hardcall.cpp")
+        add_executable(test_pgen_hardcall tests/test_pgen_hardcall.cpp src/pgen_hardcall.cpp src/bed_simd.cpp)
+        target_include_directories(test_pgen_hardcall PRIVATE include ${CMAKE_SOURCE_DIR}
+            third_party/plink-ng/2.0/include third_party/plink-ng/2.0/simde)
+        target_link_libraries(test_pgen_hardcall PRIVATE Pgenlib OpenMP::OpenMP_CXX Threads::Threads)
+        list(APPEND _bed_test_targets test_pgen_hardcall)
+    endif()
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/bench_pgen_vs_bed.cpp")
+        add_executable(bench_pgen_vs_bed tests/bench_pgen_vs_bed.cpp src/pgen_hardcall.cpp src/bed_simd.cpp)
+        target_include_directories(bench_pgen_vs_bed PRIVATE include ${CMAKE_SOURCE_DIR}
+            third_party/plink-ng/2.0/include third_party/plink-ng/2.0/simde)
+        target_link_libraries(bench_pgen_vs_bed PRIVATE Pgenlib OpenMP::OpenMP_CXX Threads::Threads)
+        list(APPEND _bed_test_targets bench_pgen_vs_bed)
+    endif()
     foreach(_t IN LISTS _bed_test_targets)
         foreach(_arch_flag IN LISTS _gcta_arch_flags)
             target_compile_options(${_t} PRIVATE $<$<CONFIG:Release>:${_arch_flag}>)

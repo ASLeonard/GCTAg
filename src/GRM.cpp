@@ -2060,7 +2060,7 @@ GRM::GRM(Pheno* pheno, Marker* marker, const gcta_cli::GrmMakeOptions& opts, con
     stdGenoLD = (ld_base + 63) / 64 * 64;
 
     const bool auto_use_int8 = bBLAS && isMtd && !isDominance && !opts.homogametic
-                               && (geno->getGenoFormat() == "BED")
+                               && geno->isNativeHardcall()
                                && (std::getenv("GCTA_DISABLE_INT8_GRM") == nullptr);
     if (n_markers_explicit_) {
         GRM::nMarkerBlock = *opts.n_markers;
@@ -3566,7 +3566,7 @@ vector<uint32_t> GRM::divide_parts(uint32_t from, uint32_t to, uint32_t num_part
 void GRM::processMakeGRM(bool is_homogametic){
     is_homogametic_ = is_homogametic;
     use_int8_grm = bBLAS && isMtd && !isDominance && !is_homogametic
-                   && (geno->getGenoFormat() == "BED")
+                   && geno->isNativeHardcall()
                    && (std::getenv("GCTA_DISABLE_INT8_GRM") == nullptr);
     if (!n_markers_explicit_ && !use_int8_grm && nMarkerBlock > 1024) {
         nMarkerBlock = 1024;

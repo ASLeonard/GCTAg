@@ -41,6 +41,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <span>
 #include <stdexcept>
 #include <stop_token>
@@ -48,7 +49,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -66,6 +71,102 @@ constexpr uint64_t kMaxBatchBytes     = 1ULL << 30;
 constexpr uint64_t kMaxGapBytes       = 2ULL << 20;
 constexpr uint32_t kMaxInt32Markers   = 500000000u;
 constexpr size_t   kConstNFloats      = (64ULL << 20) / sizeof(float);
+
+// Persistent 2 MiB-aligned (for buffers >= 16 MiB) slab that reuses already-faulted
+// physical pages across GRM tiles and distributes initial pages across NUMA nodes.
+template <typename T>
+class HugeAlignedSlab {
+    static_assert(std::is_trivially_default_constructible_v<T> &&
+                  std::is_trivially_destructible_v<T>,
+                  "HugeAlignedSlab requires trivial T");
+public:
+    static constexpr size_t kHugeAlignThreshold = 16ULL << 20; // 16 MiB
+    static constexpr size_t kHugeAlign          = 2ULL << 20;  // 2 MiB
+
+    HugeAlignedSlab() noexcept = default;
+    ~HugeAlignedSlab() { reset(); }
+
+    HugeAlignedSlab(const HugeAlignedSlab&) = delete;
+    HugeAlignedSlab& operator=(const HugeAlignedSlab&) = delete;
+
+    HugeAlignedSlab(HugeAlignedSlab&& other) noexcept
+        : ptr_(std::exchange(other.ptr_, nullptr)),
+          cap_(std::exchange(other.cap_, 0)),
+          align_(std::exchange(other.align_, 64)) {}
+
+    HugeAlignedSlab& operator=(HugeAlignedSlab&& other) noexcept {
+        if (this != &other) {
+            reset();
+            ptr_ = std::exchange(other.ptr_, nullptr);
+            cap_ = std::exchange(other.cap_, 0);
+            align_ = std::exchange(other.align_, 64);
+        }
+        return *this;
+    }
+
+    T* data() const noexcept { return ptr_; }
+    size_t capacity() const noexcept { return cap_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    void reset() noexcept {
+        if (ptr_) {
+#if defined(__cpp_sized_deallocation)
+            ::operator delete(ptr_, cap_ * sizeof(T), std::align_val_t{align_});
+#else
+            ::operator delete(ptr_, std::align_val_t{align_});
+#endif
+            ptr_ = nullptr;
+        }
+        cap_ = 0;
+        align_ = 64;
+    }
+
+    bool ensure(size_t need_elems, bool parallel_first_touch = true) noexcept {
+        if (need_elems == 0) return true;
+        if (need_elems <= cap_) return true;
+        if (need_elems > std::numeric_limits<size_t>::max() / sizeof(T)) return false;
+
+        reset();
+
+        const size_t bytes = need_elems * sizeof(T);
+        const size_t align = (bytes >= kHugeAlignThreshold) ? kHugeAlign : 64ULL;
+        void* const p = ::operator new(bytes, std::align_val_t{align}, std::nothrow);
+        if (!p) return false;
+
+#if defined(__cpp_lib_start_lifetime_as)
+        ptr_ = std::start_lifetime_as_array<T>(p, need_elems);
+#else
+        ptr_ = static_cast<T*>(p);
+#endif
+        cap_ = need_elems;
+        align_ = align;
+
+        if (parallel_first_touch && bytes >= kHugeAlignThreshold) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+            (void)::madvise(ptr_, bytes, MADV_HUGEPAGE);
+#endif
+            // Touch one element per 4 KiB page inside 2 MiB round-robin chunks so
+            // physical 2 MiB THP pages stripe evenly across all NUMA nodes under local membind.
+            constexpr size_t kPageElems = std::max<size_t>(1, 4096ULL / sizeof(T));
+            constexpr size_t kChunkElems = std::max<size_t>(1, kHugeAlign / sizeof(T));
+            const size_t n_chunks = (need_elems + kChunkElems - 1ULL) / kChunkElems;
+            #pragma omp parallel for schedule(static, 1)
+            for (size_t ch = 0; ch < n_chunks; ++ch) {
+                const size_t beg = ch * kChunkElems;
+                const size_t end = std::min(need_elems, beg + kChunkElems);
+                for (size_t idx = beg; idx < end; idx += kPageElems) {
+                    *static_cast<volatile T*>(&ptr_[idx]) = T{};
+                }
+            }
+        }
+        return true;
+    }
+
+private:
+    T* ptr_ = nullptr;
+    size_t cap_ = 0;
+    size_t align_ = 64;
+};
 
 class UniqueFd {
 public:
@@ -578,6 +679,7 @@ public:
             }
         }
 
+        planned_i32_slab_elems_ = 0;
         if (tiling_enabled_) {
             if (is_sparse) {
                 LOGGER.i(0, "Computing sparse GRM with a cutoff " + std::to_string(sparse_thresh) + "...");
@@ -586,6 +688,8 @@ public:
             }
             const double budget_elems = tile_budget_bytes_ / initial_bpe;
             std::vector<std::pair<int, int>> est_ranges;
+            std::vector<int> tmp_lds;
+            std::vector<size_t> tmp_offs;
             int sim_rs = part_rs_;
             while (sim_rs < part_re_) {
                 const int sim_re = solve_tile_budget_end(sim_rs, part_re_, budget_elems);
@@ -596,6 +700,11 @@ public:
                                  need_bytes / (1024.0 * 1024.0 * 1024.0),
                                  initial_bpe,
                                  tile_budget_bytes_ / (1024.0 * 1024.0 * 1024.0));
+                }
+                if (allow_i32_mode_) {
+                    planned_i32_slab_elems_ = std::max(
+                        planned_i32_slab_elems_,
+                        compute_tile_strip_layout(sim_rs, sim_re, /*as_i32=*/true, tmp_lds, tmp_offs));
                 }
                 est_ranges.emplace_back(sim_rs, sim_re);
                 sim_rs = sim_re;
@@ -656,8 +765,8 @@ public:
             tile_cols_ = re;
 
             const bool start_i32 = allow_i32_mode_ && !known_tile_missing;
-            reset_strips();
-            N_.reset();
+            clear_strip_views();
+            tile_has_N_ = false;
             N_pairs_ready_ = false;
 
             if (start_i32) {
@@ -766,10 +875,11 @@ public:
                 prof_.flush_sec += std::chrono::duration<double>(Clock::now() - t_flush0).count();
             }
 
-            reset_strips();
-            N_.reset();
+            clear_strip_views();
+            tile_has_N_ = false;
             rs = re;
         }
+        release_slabs();
 
         const auto t_fin0 = Clock::now();
         if (!is_sparse) {
@@ -1094,8 +1204,7 @@ private:
         const size_t eff_block_cap = std::min<size_t>(mb, std::max<size_t>(1, all_locs_.size()));
         const int max_ldK = pad_kmajor_ldk(static_cast<int>(eff_block_cap));
         const size_t kmajor_elems = static_cast<size_t>(max_ldK) * static_cast<size_t>(grm_n_);
-        kmajor_buf_ = make_aligned_uninitialized<int8_t, 64>(kmajor_elems);
-        if (!kmajor_buf_) {
+        if (!kmajor_buf_.ensure(kmajor_elems, /*parallel_first_touch=*/true)) {
             LOGGER.e(0, "can't allocate enough memory for the transposed int8 genotype buffer.");
         }
 
@@ -1116,55 +1225,89 @@ private:
                tile_budget_bytes_ < (48.0 * static_cast<double>(1ULL << 30));
     }
 
-    void reset_strips() noexcept {
+    void clear_strip_views() noexcept {
         strips_i32_.clear();
         strips_f64_.clear();
         strip_ld_.clear();
     }
 
-    void allocate_strips(bool as_i32) {
-        reset_strips();
+    void release_slabs() noexcept {
+        clear_strip_views();
+        i32_slab_.reset();
+        f64_slab_.reset();
+        N_slab_.reset();
+        tile_has_N_ = false;
+    }
+
+    size_t compute_tile_strip_layout(int rs,
+                                     int re,
+                                     bool as_i32,
+                                     std::vector<int>& lds_out,
+                                     std::vector<size_t>& offs_out) const {
         const int H = cfg_.strip_rows;
-        const int num_strips = (tile_rows_ + H - 1) / H;
-        strip_ld_.resize(static_cast<size_t>(num_strips));
+        const int tile_rows = re - rs;
+        const int num_strips = (tile_rows + H - 1) / H;
+        const size_t align_elems = as_i32 ? (64ULL / sizeof(int32_t)) : (64ULL / sizeof(double));
+        const bool is_rowmajor = (cfg_.layout == gcta_cli::GrmStripLayout::RowMajor);
+
+        lds_out.resize(static_cast<size_t>(num_strips));
+        offs_out.resize(static_cast<size_t>(num_strips));
+        size_t total_elems = 0;
+        for (int s = 0; s < num_strips; ++s) {
+            const int r0 = s * H;
+            const int rows_s = std::min(H, tile_rows - r0);
+            const int cols_s = rs + r0 + rows_s;
+            const int ld = as_i32
+                ? (is_rowmajor ? pad_strip_ld_i32(cols_s) : pad_strip_ld_i32(rows_s))
+                : (is_rowmajor ? pad_strip_ld_f64(cols_s) : pad_strip_ld_f64(rows_s));
+            const size_t elems = is_rowmajor
+                ? (static_cast<size_t>(rows_s) * static_cast<size_t>(ld))
+                : (static_cast<size_t>(cols_s) * static_cast<size_t>(ld));
+            const size_t aligned_elems = ((elems + align_elems - 1ULL) / align_elems) * align_elems;
+            lds_out[static_cast<size_t>(s)] = ld;
+            offs_out[static_cast<size_t>(s)] = total_elems;
+            total_elems += aligned_elems;
+        }
+        return total_elems;
+    }
+
+    void allocate_strips(bool as_i32) {
+        const auto t_alloc0 = cfg_.profile ? Clock::now() : Clock::time_point{};
+        clear_strip_views();
+        std::vector<size_t> offs;
+        const size_t need_elems = compute_tile_strip_layout(tile_rs_, tile_re_, as_i32, strip_ld_, offs);
+        const size_t num_strips = strip_ld_.size();
+
         if (as_i32) {
-            strips_i32_.resize(static_cast<size_t>(num_strips));
-            for (int s = 0; s < num_strips; ++s) {
-                const int r0 = s * H;
-                const int rows_s = std::min(H, tile_rows_ - r0);
-                const int cols_s = tile_rs_ + r0 + rows_s;
-                const int ld = (cfg_.layout == gcta_cli::GrmStripLayout::RowMajor)
-                    ? pad_strip_ld_i32(cols_s)
-                    : pad_strip_ld_i32(rows_s);
-                const size_t elems = (cfg_.layout == gcta_cli::GrmStripLayout::RowMajor)
-                    ? (static_cast<size_t>(rows_s) * static_cast<size_t>(ld))
-                    : (static_cast<size_t>(cols_s) * static_cast<size_t>(ld));
-                strip_ld_[static_cast<size_t>(s)] = ld;
-                strips_i32_[static_cast<size_t>(s)] = make_aligned_uninitialized<int32_t, 64>(elems);
-                if (!strips_i32_[static_cast<size_t>(s)]) {
-                    reset_strips();
-                    LOGGER.error(0, "can't allocate enough memory for strip-packed int32 GRM (strip {}/{}).", s + 1, num_strips);
-                }
+            f64_slab_.reset();
+            N_slab_.reset();
+            tile_has_N_ = false;
+            const size_t alloc_elems = std::max(need_elems, planned_i32_slab_elems_);
+            if (!i32_slab_.ensure(alloc_elems, /*parallel_first_touch=*/true)) {
+                release_slabs();
+                LOGGER.error(0, "can't allocate enough memory for strip-packed int32 GRM ({:.2f} GiB across {} strip(s)).",
+                             static_cast<double>(alloc_elems) * sizeof(int32_t) / static_cast<double>(1ULL << 30),
+                             num_strips);
+            }
+            strips_i32_.resize(num_strips);
+            for (size_t s = 0; s < num_strips; ++s) {
+                strips_i32_[s] = i32_slab_.data() + offs[s];
             }
         } else {
-            strips_f64_.resize(static_cast<size_t>(num_strips));
-            for (int s = 0; s < num_strips; ++s) {
-                const int r0 = s * H;
-                const int rows_s = std::min(H, tile_rows_ - r0);
-                const int cols_s = tile_rs_ + r0 + rows_s;
-                const int ld = (cfg_.layout == gcta_cli::GrmStripLayout::RowMajor)
-                    ? pad_strip_ld_f64(cols_s)
-                    : pad_strip_ld_f64(rows_s);
-                const size_t elems = (cfg_.layout == gcta_cli::GrmStripLayout::RowMajor)
-                    ? (static_cast<size_t>(rows_s) * static_cast<size_t>(ld))
-                    : (static_cast<size_t>(cols_s) * static_cast<size_t>(ld));
-                strip_ld_[static_cast<size_t>(s)] = ld;
-                strips_f64_[static_cast<size_t>(s)] = make_aligned_uninitialized<double, 64>(elems);
-                if (!strips_f64_[static_cast<size_t>(s)]) {
-                    reset_strips();
-                    LOGGER.error(0, "can't allocate enough memory for strip-packed double GRM (strip {}/{}).", s + 1, num_strips);
-                }
+            i32_slab_.reset();
+            if (!f64_slab_.ensure(need_elems, /*parallel_first_touch=*/true)) {
+                release_slabs();
+                LOGGER.error(0, "can't allocate enough memory for strip-packed double GRM ({:.2f} GiB across {} strip(s)).",
+                             static_cast<double>(need_elems) * sizeof(double) / static_cast<double>(1ULL << 30),
+                             num_strips);
             }
+            strips_f64_.resize(num_strips);
+            for (size_t s = 0; s < num_strips; ++s) {
+                strips_f64_[s] = f64_slab_.data() + offs[s];
+            }
+        }
+        if (cfg_.profile) {
+            prof_.init_sec += std::chrono::duration<double>(Clock::now() - t_alloc0).count();
         }
     }
 
@@ -1181,17 +1324,17 @@ private:
             }
             N_pairs_ready_ = true;
         }
-        if (N_) return;
+        if (tile_has_N_) return;
         const uint64_t tile_tri =
             (static_cast<uint64_t>(tile_re_) + static_cast<uint64_t>(tile_rs_) + 1ULL) *
             static_cast<uint64_t>(tile_rows_) / 2ULL;
         const uint64_t fill_N = (tile_tri + 1ULL) & ~1ULL;
-        N_ = make_aligned_uninitialized<uint32_t, 64>(fill_N);
-        if (!N_) {
+        if (!N_slab_.ensure(static_cast<size_t>(fill_N), /*parallel_first_touch=*/false)) {
             LOGGER.error(0, "can't allocate enough memory to store packed N: {:.2f}GB required.",
                          fill_N * sizeof(uint32_t) / (1024.0 * 1024.0 * 1024.0));
         }
-        uint32_t* const N_ptr = std::assume_aligned<64>(N_.get());
+        tile_has_N_ = true;
+        uint32_t* const N_ptr = std::assume_aligned<64>(N_slab_.data());
         const uint64_t rs_u = static_cast<uint64_t>(tile_rs_);
         #pragma omp parallel for schedule(static)
         for (int idx = 0; idx < static_cast<int>(N_pairs_.size()); ++idx) {
@@ -1222,9 +1365,15 @@ private:
         const int H = cfg_.strip_rows;
         const int num_strips = (tile_rows_ + H - 1) / H;
         if (first_accum_) {
-            strips_i32_.clear();
             allocate_strips(/*as_i32=*/false);
         } else {
+            std::vector<int> dst_lds;
+            std::vector<size_t> dst_offs;
+            const size_t f64_elems = compute_tile_strip_layout(tile_rs_, tile_re_, /*as_i32=*/false, dst_lds, dst_offs);
+            if (!f64_slab_.ensure(f64_elems, /*parallel_first_touch=*/true)) {
+                LOGGER.error(0, "can't allocate enough memory to promote strip-packed int32 GRM to double ({:.2f} GiB).",
+                             static_cast<double>(f64_elems) * sizeof(double) / static_cast<double>(1ULL << 30));
+            }
             strips_f64_.resize(static_cast<size_t>(num_strips));
             const double* const R_ptr = R_total_.data();
             const double S_tot = S_total_;
@@ -1234,20 +1383,12 @@ private:
                 const int r0 = s * H;
                 const int rows_s = std::min(H, tile_rows_ - r0);
                 const int global_r0 = tile_rs_ + r0;
-                const int cols_s = global_r0 + rows_s;
                 const int src_ld = strip_ld_[static_cast<size_t>(s)];
-                const int dst_ld = is_rowmajor ? pad_strip_ld_f64(cols_s) : pad_strip_ld_f64(rows_s);
-                const size_t elems = is_rowmajor
-                    ? (static_cast<size_t>(rows_s) * static_cast<size_t>(dst_ld))
-                    : (static_cast<size_t>(cols_s) * static_cast<size_t>(dst_ld));
+                const int dst_ld = dst_lds[static_cast<size_t>(s)];
+                strips_f64_[static_cast<size_t>(s)] = f64_slab_.data() + dst_offs[static_cast<size_t>(s)];
 
-                strips_f64_[static_cast<size_t>(s)] = make_aligned_uninitialized<double, 64>(elems);
-                if (!strips_f64_[static_cast<size_t>(s)]) {
-                    LOGGER.error(0, "can't allocate enough memory to promote strip {} to double.", s);
-                }
-
-                const int32_t* const src_base = std::assume_aligned<64>(strips_i32_[static_cast<size_t>(s)].get());
-                double* const dst_base = std::assume_aligned<64>(strips_f64_[static_cast<size_t>(s)].get());
+                const int32_t* const src_base = std::assume_aligned<64>(strips_i32_[static_cast<size_t>(s)]);
+                double* const dst_base = std::assume_aligned<64>(strips_f64_[static_cast<size_t>(s)]);
 
                 if (is_rowmajor) {
                     #pragma omp parallel for schedule(dynamic, 16)
@@ -1293,17 +1434,16 @@ private:
                         }
                     }
                 }
-
-                strip_ld_[static_cast<size_t>(s)] = dst_ld;
-                strips_i32_[static_cast<size_t>(s)].reset();
             }
+            strip_ld_ = std::move(dst_lds);
             strips_i32_.clear();
+            i32_slab_.reset();
         }
         grm_is_i32_ = false;
     }
 
     void N_thread(int grm_index_from, int grm_index_to, const uintptr_t* cur_cmask) {
-        uint32_t* const N_base = std::assume_aligned<64>(N_.get());
+        uint32_t* const N_base = std::assume_aligned<64>(N_slab_.data());
         const uint64_t rs_u = static_cast<uint64_t>(tile_rs_);
         const uint64_t start_pos = (static_cast<uint64_t>(grm_index_from) + 1ULL + rs_u)
                                  * static_cast<uint64_t>(grm_index_from - tile_rs_) / 2ULL;
@@ -1352,7 +1492,7 @@ private:
         int K = 0;
         double S_mu2 = 0.0;
         bool any_missing_full = false;
-        int8_t* const kmajor_base = std::assume_aligned<64>(kmajor_buf_.get());
+        int8_t* const kmajor_base = std::assume_aligned<64>(kmajor_buf_.data());
         int ldK = 64;
 
         // Stage 1 + 2 fused in ONE OpenMP parallel region per block:
@@ -1630,7 +1770,7 @@ private:
                 const int rows = std::min(H, tile_rows_ - r0);
                 const int global_r0 = tile_rs_ + r0;
                 const int8_t* const A_strip = kmajor_base + static_cast<size_t>(global_r0) * ldK;
-                int32_t* const strip_base = std::assume_aligned<64>(strips_i32_[static_cast<size_t>(s)].get());
+                int32_t* const strip_base = std::assume_aligned<64>(strips_i32_[static_cast<size_t>(s)]);
                 const int s_ld = strip_ld_[static_cast<size_t>(s)];
 
                 if (cfg_.diag_mode == gcta_cli::GrmDiagMode::Fused) {
@@ -1889,7 +2029,7 @@ private:
                 const int rows = std::min(H, tile_rows_ - r0);
                 const int global_r0 = tile_rs_ + r0;
                 const int8_t* const A_strip = kmajor_base + static_cast<size_t>(global_r0) * ldK;
-                double* const strip_base = std::assume_aligned<64>(strips_f64_[static_cast<size_t>(s)].get());
+                double* const strip_base = std::assume_aligned<64>(strips_f64_[static_cast<size_t>(s)]);
                 const int s_ld = strip_ld_[static_cast<size_t>(s)];
 
                 for (int c0 = 0; c0 < global_r0; c0 += max_c_blk) {
@@ -2058,7 +2198,7 @@ private:
                 const int rows = std::min(H, tile_rows_ - r0);
                 const int global_r0 = tile_rs_ + r0;
                 const int8_t* const A_strip = kmajor_base + static_cast<size_t>(global_r0) * ldK;
-                double* const strip_base = std::assume_aligned<64>(strips_f64_[static_cast<size_t>(s)].get());
+                double* const strip_base = std::assume_aligned<64>(strips_f64_[static_cast<size_t>(s)]);
                 const int s_ld = strip_ld_[static_cast<size_t>(s)];
 
                 prepare_row_missing(global_r0, rows);
@@ -2164,7 +2304,7 @@ private:
             return;
         }
 
-        const bool zero_missing = (N_ == nullptr);
+        const bool zero_missing = !tile_has_N_;
         const double q_scale = opts_.impute_mean
             ? (static_cast<double>(quant_q_) * static_cast<double>(quant_q_))
             : 1.0;
@@ -2175,7 +2315,7 @@ private:
         const size_t target_elems = std::max<size_t>(1, cfg_.io_slot_bytes / out_elem_bytes);
         const int flush_nt = is_sparse ? omp_get_max_threads() : std::max(1, omp_get_max_threads() - 1);
 
-        const uint32_t* const N_base = N_ ? std::assume_aligned<64>(N_.get()) : nullptr;
+        const uint32_t* const N_base = tile_has_N_ ? std::assume_aligned<64>(N_slab_.data()) : nullptr;
         const uint32_t* const sub_miss_ptr = sub_miss_.data();
         const double* const R_ptr = grm_is_i32_ ? R_total_.data() : nullptr;
         const double S_tot = S_total_;
@@ -2283,7 +2423,7 @@ private:
 
                         if (zero_missing) {
                             if (grm_is_i32_) {
-                                const int32_t* __restrict__ src = strips_i32_[static_cast<size_t>(strip_idx)].get() + static_cast<size_t>(local_r) * s_ld;
+                                const int32_t* __restrict__ src = strips_i32_[static_cast<size_t>(strip_idx)] + static_cast<size_t>(local_r) * s_ld;
                                 const double R_i = R_ptr[pair1];
                                 if (out_f16) {
                                     gcta_grm_io::GrmFp16* __restrict__ dst = out_f16 + dst_off;
@@ -2320,7 +2460,7 @@ private:
                                     dst[pair1] = static_cast<float>(d_num * inv_scale);
                                 }
                             } else {
-                                const double* __restrict__ src = strips_f64_[static_cast<size_t>(strip_idx)].get() + static_cast<size_t>(local_r) * s_ld;
+                                const double* __restrict__ src = strips_f64_[static_cast<size_t>(strip_idx)] + static_cast<size_t>(local_r) * s_ld;
                                 if (out_f16) {
                                     gcta_grm_io::GrmFp16* __restrict__ dst = out_f16 + dst_off;
                                     double off_sq = 0.0;
@@ -2346,7 +2486,7 @@ private:
                                 }
                             }
                         } else {
-                            const double* __restrict__ src = strips_f64_[static_cast<size_t>(strip_idx)].get() + static_cast<size_t>(local_r) * s_ld;
+                            const double* __restrict__ src = strips_f64_[static_cast<size_t>(strip_idx)] + static_cast<size_t>(local_r) * s_ld;
                             const uint32_t sub_miss1 = valid_m - sub_miss_ptr[pair1];
                             const uint32_t* __restrict__ N_row = get_N_row(pair1);
                             if (out_f16) {
@@ -2405,9 +2545,9 @@ private:
                         std::clamp<size_t>((raw_step / 64ULL) * 64ULL, 64ULL, static_cast<size_t>(std::max(64, strip_h))));
 
                     const double* const strip_f64 = (!grm_is_i32_ && !strips_f64_.empty())
-                        ? std::assume_aligned<64>(strips_f64_[static_cast<size_t>(s)].get()) : nullptr;
+                        ? std::assume_aligned<64>(strips_f64_[static_cast<size_t>(s)]) : nullptr;
                     const int32_t* const strip_i32 = (grm_is_i32_ && !strips_i32_.empty())
-                        ? std::assume_aligned<64>(strips_i32_[static_cast<size_t>(s)].get()) : nullptr;
+                        ? std::assume_aligned<64>(strips_i32_[static_cast<size_t>(s)]) : nullptr;
 
                     for (int block_start = strip_global_r0; block_start < strip_global_r1; block_start += sub_step_rows) {
                         const int block_end = std::min(block_start + sub_step_rows, strip_global_r1);
@@ -2706,11 +2846,15 @@ private:
     bool any_missing_seen_ = false;
     size_t processed_all_ = 0;
 
-    // Strip accumulators
-    std::vector<AlignedUniquePtr<int32_t, 64>> strips_i32_;
-    std::vector<AlignedUniquePtr<double, 64>> strips_f64_;
+    // Strip accumulators (persistent 2 MiB-aligned slabs reused across tiles)
+    HugeAlignedSlab<int32_t> i32_slab_;
+    HugeAlignedSlab<double> f64_slab_;
+    HugeAlignedSlab<uint32_t> N_slab_;
+    bool tile_has_N_ = false;
+    size_t planned_i32_slab_elems_ = 0;
+    std::vector<int32_t*> strips_i32_;
+    std::vector<double*> strips_f64_;
     std::vector<int> strip_ld_;
-    AlignedUniquePtr<uint32_t, 64> N_;
     std::vector<std::pair<int, int>> N_pairs_;
     bool N_pairs_ready_ = false;
 
@@ -2726,7 +2870,7 @@ private:
     std::vector<int8_t> valid_miss_q_;
     std::vector<double> valid_mu_q_;
     std::vector<double> valid_miss_err_q2_;
-    AlignedUniquePtr<int8_t, 64> kmajor_buf_;
+    HugeAlignedSlab<int8_t> kmajor_buf_;
 
     // Centering + missingness scratch
     std::vector<double> r_raw_;

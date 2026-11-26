@@ -28,14 +28,16 @@
 #include "Logger.h"
 #include "GenoBackend.h"     // GenoBlock, GenoBackend
 #include "bed_simd.hpp"      // native PLINK1 .bed kernels
+#include "pgen_hardcall.hpp" // native PLINK2 .pgen hardcall index & L2 cache
 #include <functional>
 
 struct SNPInfo;              // third_party/Pgenlib/PgenReader.h
 
-// Forward declarations for the three concrete backends (needed for friend).
+// Forward declarations for the concrete backends (needed for friend).
 class BedBackend;
 class BgenBackend;
 class PgenBackend;
+class NativePgenHardcallBackend;
 
 using std::function;
 using std::string;
@@ -144,13 +146,21 @@ public:
     void decodeBedI8KMajor(uintptr_t *buf, const int *markerIdx, int K, int n_rows,
                            int8_t *kmajor, int ldK, const double *mu, double *r_raw);
 
-    bool canUseInt8Mlma() const {
-        return genoFormat == "BED" &&
+    bool isNativeHardcall() const noexcept {
+        return genoFormat == "BED" || (genoFormat == "PGEN" && pgenAllNativeHardcall);
+    }
+    bool canUseInt8Mlma() const noexcept {
+        return isNativeHardcall() &&
                genoCodingModel == GenoCodingModel::ADDITIVE &&
                iDC == 1;
     }
+    double rawIoBytesPerSnpEstimate() const noexcept;
+    void ensurePgenIndicesLoaded();
+    const std::vector<pgen_hardcall::PgenFileIndex>& getPgenIndices() const noexcept {
+        return pgenIndices;
+    }
     int getMissPtrSize() const { return missPtrSize; }
-    uint32_t getRawSampleCT() { return pheno ? pheno->count_raw() : keepSampleCT; }
+    uint32_t getRawSampleCT() const { return pheno ? pheno->count_raw() : keepSampleCT; }
 
     void loopDouble(const vector<uint32_t> &extractIndex, int numMarkerBuf, bool bMakeGeno, bool bGenoCenter, bool bGenoStd, bool bMakeMiss, vector<function<void (uintptr_t *buf, std::span<const uint32_t> exIndex)>> callbacks = vector<function<void (uintptr_t *buf, std::span<const uint32_t> exIndex)>>(), bool showLog = true);
 
@@ -221,6 +231,7 @@ private:
     friend class BedBackend;
     friend class BgenBackend;
     friend class PgenBackend;
+    friend class NativePgenHardcallBackend;
 
     // getGenoDouble — resolved once at construction from genoFormat.
     typedef void (Geno::*GetGenoDoubleFunc)(uintptr_t *buf, int idx, GenoBufItem* gbuf);
@@ -311,10 +322,14 @@ private:
     vector<uint32_t> keepHeterogameticExtractIndex;
     uintptr_t *heterogameticMaskPtr = NULL;
 
-    // Native BED helpers (bed_simd).
+    // Native BED / PGEN-hardcall helpers (bed_simd + pgen_hardcall).
+    const uint8_t *decodePgenRecordToThreadL2(const uintptr_t *buf, int idx) const;
     const uint8_t *bedRecord(const uintptr_t *buf, int idx) const {
-        return reinterpret_cast<const uint8_t *>(buf) +
-               static_cast<std::size_t>(idx) * static_cast<std::size_t>(bedRecordBytes);
+        if (!pgenNativeHardcall) {
+            return reinterpret_cast<const uint8_t *>(buf) +
+                   static_cast<std::size_t>(idx) * static_cast<std::size_t>(bedRecordBytes);
+        }
+        return decodePgenRecordToThreadL2(buf, idx);
     }
     const uint64_t *bedKeepMask() const {
         return keepSampleCT == rawSampleCT ? nullptr : reinterpret_cast<const uint64_t *>(keepMaskPtr);
@@ -333,6 +348,12 @@ private:
     int pgenGenoPtrSize;
     int pgenDosagePresentPtrSize;
     int pgenDosageMainPtrSize;
+    bool pgenNativeHardcall = false;
+    bool pgenIndicesLoaded = false;
+    bool pgenAllNativeHardcall = false;
+    double pgenAvgRecBytes = 0.0;
+    std::vector<pgen_hardcall::PgenFileIndex> pgenIndices;
+    AlignedRawBuffer<uint8_t, 64> pgenKMajorUnpackBuf;
 
     std::ofstream osOut;
     FILE * bOut = NULL;

@@ -2455,6 +2455,7 @@ inline void refine_adaptive_candidates_fast_i8(
     if (cand_idx.empty()) return;
 
     const auto t_ref0 = prof ? Clock::now() : Clock::time_point{};
+    double refine_gemm_s = 0.0;
     const int m_cand = static_cast<int>(cand_idx.size());
     const int n = q_uk.n;
     const size_t need_g = static_cast<size_t>(ldG) * static_cast<size_t>(m_cand);
@@ -2532,7 +2533,11 @@ inline void refine_adaptive_candidates_fast_i8(
                 beta,
                 scratch_A_f32, scratch_B_f32, scratch_C_f32);
         }
-        if (prof) prof->xvx_gemm_s += std::chrono::duration<double>(Clock::now() - t_g0).count();
+        if (prof) {
+            const double gs = std::chrono::duration<double>(Clock::now() - t_g0).count();
+            prof->xvx_gemm_s += gs;
+            refine_gemm_s += gs;
+        }
 
         const double* const ahi   = tile.alpha_hi.data();
         const double* const alo   = tile.alpha_lo.data();
@@ -2605,7 +2610,8 @@ inline void refine_adaptive_candidates_fast_i8(
 
     if (prof) {
         prof->refined_snps += static_cast<uint64_t>(m_cand);
-        prof->xvx_reduce_s += std::chrono::duration<double>(Clock::now() - t_ref0).count();
+        const double ref_tot_s = std::chrono::duration<double>(Clock::now() - t_ref0).count();
+        prof->xvx_reduce_s += std::max(0.0, ref_tot_s - refine_gemm_s);
     }
 }
 

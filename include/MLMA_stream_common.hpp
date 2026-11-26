@@ -83,7 +83,8 @@ inline Eigen::MatrixXd compact_sample_rows(const Eigen::MatrixXd& values,
 inline int resolve_mlma_block_size(int n, double budget_gb, bool use_int8_geno = false,
                                    int raw_n = 0, int wb_k = 0,
                                    const std::string& geno_format = "BED",
-                                   int align_tile = 0)
+                                   int align_tile = 0,
+                                   double raw_io_bytes_override = -1.0)
 {
     int block = 10000; // Somewhat arbitrary, but balance of peak RSS and throughput. Increasing may help STRSM efficiency but increases memory.
     if (budget_gb > 0.0 && n > 0) {
@@ -96,7 +97,9 @@ inline int resolve_mlma_block_size(int n, double budget_gb, bool use_int8_geno =
           ? static_cast<double>(ldG_est) /* G_block_i8 */
           : static_cast<double>(sizeof(float)) * static_cast<double>(n); /* X_block */
       double raw_io_bytes = 0.5 * static_cast<double>(raw_eff);
-      if (geno_format == "PGEN") {
+      if (raw_io_bytes_override >= 0.0) {
+          raw_io_bytes = raw_io_bytes_override;
+      } else if (geno_format == "PGEN") {
           // 2 double-buffered slots of (2-bit geno + uint16 dosage_main + 1-bit dosage_present) ~ 5.0 * n bytes
           raw_io_bytes = 5.0 * static_cast<double>(n);
       } else if (geno_format == "BGEN") {
@@ -949,7 +952,7 @@ inline void run_mlma_stream_association(RemlState& state,
             LOGGER.w(0, "--fast-mlma requires a Woodbury REML basis; ignoring --fast-mlma.");
             fast_mlma = FastMlmaMode::Off;
         } else if (!use_int8_wb) {
-            LOGGER.w(0, "--fast-mlma requires the additive BED int8 streaming path; falling back to float32 Woodbury.");
+            LOGGER.w(0, "--fast-mlma requires the additive hardcall (BED/PGEN) int8 streaming path; falling back to float32 Woodbury.");
             fast_mlma = FastMlmaMode::Off;
         }
     }
@@ -961,7 +964,8 @@ inline void run_mlma_stream_association(RemlState& state,
     const int BLOCK = (tuning.block_size > 0)
         ? tuning.block_size
         : resolve_mlma_block_size(n, block_mem_budget_gb, use_int8_wb, raw_n, wb_k,
-                                  geno->getGenoFormat(), align_tile);
+                                  geno->getGenoFormat(), align_tile,
+                                  geno->rawIoBytesPerSnpEstimate());
     if (tuning.block_size > 0) {
         LOGGER << "MLMA streaming block size (override): " << BLOCK << " SNPs per tile" << std::endl;
     }

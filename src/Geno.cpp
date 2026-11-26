@@ -215,6 +215,10 @@ Geno::Geno(Pheno* pheno,
     else if (genoFormat == "PGEN") getGenoFloatFunc = &Geno::getGenoFloat_pgen;
     else if (genoFormat == "BGEN") getGenoFloatFunc = &Geno::getGenoFloat_bgen;
 
+    if (genoFormat == "PGEN") {
+        ensurePgenIndicesLoaded();
+    }
+
     string alleleFileName;
     if (!geno_opts.update_freq.empty()) {
         requireFileReadable("--update-freq", geno_opts.update_freq);
@@ -267,6 +271,65 @@ Geno::Geno(Pheno* pheno,
 }
 
 Geno::~Geno(){
+}
+
+void Geno::ensurePgenIndicesLoaded() {
+    if (pgenIndicesLoaded || genoFormat != "PGEN") {
+        return;
+    }
+    pgenIndices.clear();
+    pgenIndices.reserve(geno_files.size());
+    pgenAllNativeHardcall = !geno_files.empty();
+    pgenAvgRecBytes = 0.0;
+
+    const uint32_t expectedSamples = pheno ? pheno->count_raw() : UINT32_MAX;
+    for (std::size_t i = 0; i < geno_files.size(); ++i) {
+        const uint32_t expectedSnps =
+            marker ? marker->getMarkerParams(static_cast<int>(i)).rawCountSNP : UINT32_MAX;
+        pgen_hardcall::PgenFileIndex idx;
+        try {
+            idx = pgen_hardcall::load_pgen_index(geno_files[i], expectedSamples, expectedSnps);
+        } catch (const std::exception &e) {
+            LOGGER.e(0, std::string("PGEN error: ") + e.what());
+        }
+        if (expectedSamples != UINT32_MAX && idx.raw_sample_ct != expectedSamples) {
+            LOGGER.e(0, "Inconsistent sample count in [" + geno_files[i] + "] (expected " +
+                            to_string(expectedSamples) + ", found " +
+                            to_string(idx.raw_sample_ct) + ").");
+        }
+        if (expectedSnps != UINT32_MAX && idx.raw_variant_ct != expectedSnps) {
+            LOGGER.e(0, "Inconsistent variant count in [" + geno_files[i] + "] (expected " +
+                            to_string(expectedSnps) + ", found " +
+                            to_string(idx.raw_variant_ct) + ").");
+        }
+        if (!idx.native_hardcall_ok) {
+            pgenAllNativeHardcall = false;
+        }
+        pgenAvgRecBytes = std::max(pgenAvgRecBytes, idx.avg_rec_bytes);
+        pgenIndices.push_back(std::move(idx));
+    }
+    pgenIndicesLoaded = true;
+}
+
+double Geno::rawIoBytesPerSnpEstimate() const noexcept {
+    const uint32_t keep_n = pheno ? pheno->count_keep() : keepSampleCT;
+    const uint32_t raw_n_val = pheno ? pheno->count_raw() : rawSampleCT;
+    const double raw_eff = static_cast<double>(std::max(keep_n, raw_n_val));
+    if (genoFormat == "PGEN") {
+        if (isNativeHardcall()) {
+            return 2.0 * pgenAvgRecBytes + 64.0;
+        }
+        return 5.0 * static_cast<double>(keep_n);
+    }
+    if (genoFormat == "BGEN") {
+        return 2.0 * raw_eff;
+    }
+    return 0.5 * raw_eff;
+}
+
+const uint8_t *Geno::decodePgenRecordToThreadL2(const uintptr_t *buf, int idx) const {
+    thread_local pgen_hardcall::PgenThreadCache tls;
+    return tls.resolve(buf, static_cast<uint32_t>(idx));
 }
 
 uint32_t Geno::getTotalMarker(){
@@ -753,6 +816,27 @@ void Geno::decodeBedI8KMajor(uintptr_t *buf, const int *markerIdx, int K, int n_
         std::fill(r_raw, r_raw + n_rows, 0.0);
         return;
     }
+    const std::size_t rb = static_cast<std::size_t>(bedRecordBytes);
+    const uint8_t *unpackBuf = nullptr;
+    if (pgenNativeHardcall) {
+        const std::size_t reqBytes = static_cast<std::size_t>(K) * rb;
+        if (pgenKMajorUnpackBuf.size() < reqBytes) {
+            pgenKMajorUnpackBuf.resize(reqBytes);
+        }
+        uint8_t *const dstUnpack = pgenKMajorUnpackBuf.data();
+        #pragma omp parallel
+        {
+            thread_local pgen_hardcall::PgenThreadCache tls;
+            tls.clear();
+            #pragma omp for schedule(static)
+            for (int m = 0; m < K; ++m) {
+                tls.decode_into(buf, static_cast<uint32_t>(markerIdx[m]),
+                                dstUnpack + static_cast<std::size_t>(m) * rb);
+            }
+        }
+        unpackBuf = dstUnpack;
+    }
+
     constexpr int kBlk = 64;
     const uint64_t *keep = bedKeepMask();
     const int nTiles = (n_rows + kBlk - 1) / kBlk;
@@ -762,6 +846,7 @@ void Geno::decodeBedI8KMajor(uintptr_t *buf, const int *markerIdx, int K, int n_
                           : static_cast<uint32_t>(t * kBlk);
     }
     const uint32_t rawCT = rawSampleCT;
+    const uint8_t *const bedBase = reinterpret_cast<const uint8_t *>(buf);
     #pragma omp parallel for schedule(static)
     for (int t = 0; t < nTiles; ++t) {
         const int i0 = t * kBlk;
@@ -772,7 +857,10 @@ void Geno::decodeBedI8KMajor(uintptr_t *buf, const int *markerIdx, int K, int n_
         for (int m0 = 0; m0 < K; m0 += kBlk) {
             const int m_len = std::min(kBlk, K - m0);
             for (int dm = 0; dm < m_len; ++dm) {
-                bed_simd::decode_i8_range(bedRecord(buf, markerIdx[m0 + dm]), keep, rawCT,
+                const uint8_t *recPtr = unpackBuf
+                    ? (unpackBuf + static_cast<std::size_t>(m0 + dm) * rb)
+                    : (bedBase + static_cast<std::size_t>(markerIdx[m0 + dm]) * rb);
+                bed_simd::decode_i8_range(recPtr, keep, rawCT,
                                           tileRaw[t], static_cast<uint32_t>(s_len), col[dm]);
             }
             for (int dm = 0; dm < m_len; ++dm) {
@@ -904,12 +992,12 @@ Geno::GenoCodingSpec Geno::buildCodingSpec(double mu, double sd) const {
 }
 
 void Geno::getGenoDouble_pgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
-    SNPInfo snpinfo;
+    SNPInfo snpinfo{};
     uintptr_t *cur_buf = buf + static_cast<std::size_t>(idx) * static_cast<std::size_t>(pgenGenoBuf1PtrSize);
-    uintptr_t *dosage_present = cur_buf + pgenGenoPtrSize;
-    uint16_t *dosage_main = reinterpret_cast<uint16_t*>(cur_buf + pgenGenoPtrSize + pgenDosagePresentPtrSize);
-    uint32_t dosage_ct = static_cast<uint32_t>(cur_buf[pgenGenoBuf1PtrSize - 1]);
-    uint8_t sexChromType = markerSexChromTypes[curBufferIndex];
+    const uintptr_t *dosage_present = cur_buf + pgenGenoPtrSize;
+    const uint16_t *dosage_main = reinterpret_cast<const uint16_t*>(cur_buf + pgenGenoPtrSize + pgenDosagePresentPtrSize);
+    const uint32_t dosage_ct = static_cast<uint32_t>(cur_buf[pgenGenoBuf1PtrSize - 1]);
+    const uint8_t sexChromType = markerSexChromTypes[curBufferIndex];
 
     gbuf->valid = false;
     if (dosage_ct > keepSampleCT) {
@@ -917,59 +1005,315 @@ void Geno::getGenoDouble_pgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     + " (expected <= " + to_string(keepSampleCT) + ").");
     }
 
-    const vector<uint32_t> *curHeterogameticIndex = NULL;
-    if(sexChromType == 1){
-        curHeterogameticIndex = &keepHeterogameticExtractIndex;
-    }
+    // Pure hardcall record in fallback PGEN (e.g. GCTA_DISABLE_NATIVE_PGEN=1,
+    // multiallelic hardcalls, or hardcall variants inside a mixed .pgen file):
+    // share the exact bed_fill_snpinfo(_x) + buildCodingSpec(_f32) arithmetic
+    // so --bfile and fallback --pfile match bit-for-bit.
+    if (dosage_ct == 0) {
+        bed_simd::Counts c;
+        for (uint32_t j = 0; j < keepSampleCT; ++j) {
+            const uint32_t code = static_cast<uint32_t>((cur_buf[j >> 5] >> ((j & 31u) * 2u)) & 3u);
+            if      (code == 0u) ++c.n0;
+            else if (code == 1u) ++c.n1;
+            else if (code == 2u) ++c.n2;
+            else                 ++c.nmiss;
+        }
+        if (sexChromType == 1) {
+            bed_simd::Counts c_het;
+            for (uint32_t k = 0; k < keepHeterogameticSampleCT; ++k) {
+                const uint32_t j = keepHeterogameticExtractIndex[k];
+                const uint32_t code = static_cast<uint32_t>((cur_buf[j >> 5] >> ((j & 31u) * 2u)) & 3u);
+                if      (code == 0u) ++c_het.n0;
+                else if (code == 1u) ++c_het.n1;
+                else if (code == 2u) ++c_het.n2;
+                else                 ++c_het.nmiss;
+            }
+            bed_fill_snpinfo_x(c, c_het, keepSampleCT, iDC == 1, f_std, &snpinfo);
+        } else {
+            bed_fill_snpinfo(c, keepSampleCT, f_std, &snpinfo);
+        }
 
-    string err;
-    if(!PgenReader::CountHardDosage(cur_buf, dosage_main, dosage_present, curHeterogameticIndex, keepSampleCT, dosage_ct, &snpinfo, err)){
-        LOGGER.e(0, err);
-    }
+        double af = snpinfo.af;
+        if (bHasPreAF) {
+            af = AFA1[gbuf->extractedMarkerIndex];
+            snpinfo.mean = 2.0 * af;
+            snpinfo.std  = 2.0 * af * (1.0 - af);
+        }
+        const double maf = std::min(af, 1.0 - af);
+        if (!(maf >= min_maf && maf <= max_maf && snpinfo.nMissRate >= dFilterMiss)) {
+            gbuf->valid = false;
+            return;
+        }
 
-    double af = snpinfo.af;
-    double std = snpinfo.std;
-    if(bHasPreAF){
-        af = AFA1[gbuf->extractedMarkerIndex];
-        std = 2.0 * af * (1.0 - af);
-    }
-    double maf = std::min(af, 1.0 - af);
-    if(maf >= min_maf && maf <= max_maf && snpinfo.nMissRate >= dFilterMiss){
         gbuf->valid = true;
         gbuf->af = af;
         gbuf->additive_af = af;
         gbuf->nValidN = snpinfo.N;
         gbuf->nValidAllele = snpinfo.AlCount;
-        gbuf->mean = 2.0 * af;
+        gbuf->mean = bGRM ? (2.0 * af) : snpinfo.mean;
+        gbuf->sd = f_std ? snpinfo.std : (gbuf->mean * (1.0 - af));
+
+        uintptr_t *pmiss = bed_prepare_missing(gbuf, bMakeMiss, c.nmiss, missPtrSize, keepSampleCT);
+        if (pmiss != nullptr) {
+            const std::size_t usedWords = (static_cast<std::size_t>(keepSampleCT) + 63) / 64;
+            std::memset(pmiss, 0, usedWords * sizeof(uintptr_t));
+            for (uint32_t j = 0; j < keepSampleCT; ++j) {
+                const uint32_t code = static_cast<uint32_t>((cur_buf[j >> 5] >> ((j & 31u) * 2u)) & 3u);
+                if (code == 3u) {
+                    pmiss[j >> 6] |= (uintptr_t{1} << (j & 63u));
+                }
+            }
+        }
+
+        if (bMakeGeno) {
+            const double mu = gbuf->mean;
+            const double sd = gbuf->sd;
+            if (sd < 1.0e-50) {
+                gbuf->valid = false;
+                return;
+            }
+            if (gbuf->stats_only) {
+                return;
+            }
+            const GenoCodingSpec spec = buildCodingSpec(mu, sd);
+            if (gbuf->geno_i8_ptr) {
+                static constexpr int8_t kI8Table[4] = {0, 1, 2, 0};
+                for (uint32_t j = 0; j < keepSampleCT; ++j) {
+                    const uint32_t code = static_cast<uint32_t>((cur_buf[j >> 5] >> ((j & 31u) * 2u)) & 3u);
+                    gbuf->geno_i8_ptr[j] = kI8Table[code];
+                }
+            } else if (gbuf->geno_f32_ptr) {
+                float *out_f32 = gbuf->geno_f32_ptr;
+                const GenoCodingSpecF32 spec_f32 = buildCodingSpecF32(mu, sd);
+                const float table[4] = {spec_f32.a0, spec_f32.a1, spec_f32.a2, spec_f32.na};
+                for (uint32_t j = 0; j < keepSampleCT; ++j) {
+                    const uint32_t code = static_cast<uint32_t>((cur_buf[j >> 5] >> ((j & 31u) * 2u)) & 3u);
+                    out_f32[j] = table[code];
+                }
+                if (sexChromType == 1) {
+                    double weight;
+                    bool needWeight;
+                    setHeterogameticWeight(weight, needWeight);
+                    if (needWeight) {
+                        const float fw = static_cast<float>(weight);
+                        if (bGRM) {
+                            for (uint32_t i = 0; i < keepHeterogameticSampleCT; ++i) {
+                                out_f32[keepHeterogameticExtractIndex[i]] *= fw;
+                            }
+                        } else {
+                            const float correctWeight = static_cast<float>((weight - 1.0) * spec.rdev * spec.centerValue);
+                            for (uint32_t i = 0; i < keepHeterogameticSampleCT; ++i) {
+                                const uint32_t ci = keepHeterogameticExtractIndex[i];
+                                out_f32[ci] *= fw;
+                                out_f32[ci] += correctWeight;
+                            }
+                        }
+                    }
+                }
+            } else {
+                const double table[4] = {spec.a0, spec.a1, spec.a2, spec.na};
+                double *out_geno = gbuf->geno_ptr;
+                if (!out_geno) {
+                    gbuf->geno.resize(keepSampleCT);
+                    out_geno = gbuf->geno.data();
+                }
+                for (uint32_t j = 0; j < keepSampleCT; ++j) {
+                    const uint32_t code = static_cast<uint32_t>((cur_buf[j >> 5] >> ((j & 31u) * 2u)) & 3u);
+                    out_geno[j] = table[code];
+                }
+                if (sexChromType == 1) {
+                    double weight;
+                    bool needWeight;
+                    setHeterogameticWeight(weight, needWeight);
+                    if (needWeight) {
+                        if (bGRM) {
+                            for (uint32_t i = 0; i < keepHeterogameticSampleCT; ++i) {
+                                out_geno[keepHeterogameticExtractIndex[i]] *= weight;
+                            }
+                        } else {
+                            const double correctWeight = (weight - 1.0) * spec.rdev * spec.centerValue;
+                            for (uint32_t i = 0; i < keepHeterogameticSampleCT; ++i) {
+                                const uint32_t ci = keepHeterogameticExtractIndex[i];
+                                out_geno[ci] *= weight;
+                                out_geno[ci] += correctWeight;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Dosage path (0 < dosage_ct <= keepSampleCT):
+    // When sparse (dosage_ct < keepSampleCT), expand genovec (0->0, 1->16384,
+    // 2->32768, 3->65535/missing) and overlay dosage_main at set bits of dosage_present.
+    static constexpr uint16_t kMissingDos16 = 65535u;
+    static constexpr uint16_t kG2ToDos16[4] = {0u, 16384u, 32768u, kMissingDos16};
+    const uint16_t *d16 = dosage_main;
+    thread_local std::vector<uint16_t> tl_dosage_u16;
+    if (dosage_ct < keepSampleCT) {
+        tl_dosage_u16.resize(keepSampleCT);
+        for (uint32_t j = 0; j < keepSampleCT; ++j) {
+            const uint32_t code = static_cast<uint32_t>((cur_buf[j >> 5] >> ((j & 31u) * 2u)) & 3u);
+            tl_dosage_u16[j] = kG2ToDos16[code];
+        }
+        uint32_t d_idx = 0;
+        const uint32_t n_words = (keepSampleCT + 63u) / 64u;
+        for (uint32_t w = 0; w < n_words && d_idx < dosage_ct; ++w) {
+            uintptr_t bits = dosage_present[w];
+            if (w + 1u == n_words && (keepSampleCT & 63u) != 0u) {
+                bits &= (uintptr_t{1} << (keepSampleCT & 63u)) - 1u;
+            }
+            while (bits != 0 && d_idx < dosage_ct) {
+                const uint32_t b = static_cast<uint32_t>(std::countr_zero(bits));
+                tl_dosage_u16[w * 64u + b] = dosage_main[d_idx++];
+                bits &= (bits - 1u);
+            }
+        }
+        d16 = tl_dosage_u16.data();
+    }
+
+    uint64_t sum = 0;
+    uint64_t sumsq = 0;
+    uint32_t validN = 0;
+    uint32_t nmiss = 0;
+    for (uint32_t j = 0; j < keepSampleCT; ++j) {
+        const uint16_t curDos = d16[j];
+        if (curDos == kMissingDos16) {
+            ++nmiss;
+        } else {
+            sum += curDos;
+            sumsq += static_cast<uint64_t>(curDos) * static_cast<uint64_t>(curDos);
+            ++validN;
+        }
+    }
+    if (validN == 0) {
+        gbuf->valid = false;
+        return;
+    }
+
+    uint32_t validHet = 0;
+    double sum_half = static_cast<double>(sum);
+    double sumsq_half = static_cast<double>(sumsq);
+    if (sexChromType == 1) {
+        for (uint32_t k = 0; k < keepHeterogameticSampleCT; ++k) {
+            const uint16_t curDos = d16[keepHeterogameticExtractIndex[k]];
+            if (curDos != kMissingDos16) {
+                ++validHet;
+                sum_half -= 0.5 * static_cast<double>(curDos);
+                sumsq_half -= 0.75 * static_cast<double>(curDos) * static_cast<double>(curDos);
+            }
+        }
+    }
+
+    const uint32_t validAllele = 2u * validN - validHet;
+    if (validAllele == 0) {
+        gbuf->valid = false;
+        return;
+    }
+
+    static constexpr double kDosageScale = 1.0 / 16384.0;
+    snpinfo.N = validN;
+    snpinfo.AlCount = validAllele;
+    snpinfo.nMissRate = static_cast<double>(validN) / static_cast<double>(keepSampleCT);
+    snpinfo.af = (kDosageScale * sum_half) / static_cast<double>(validAllele);
+    if (sexChromType != 1 || (iDC == 1 && !bGRM)) {
+        const double dos_double = kDosageScale * static_cast<double>(sum);
+        snpinfo.mean = dos_double / static_cast<double>(validN);
+        snpinfo.std = (validN > 1u)
+            ? ((kDosageScale * kDosageScale * static_cast<double>(sumsq) - dos_double * snpinfo.mean)
+               / static_cast<double>(validN - 1u))
+            : 0.0;
+    } else {
+        const double dos_double = kDosageScale * sum_half;
+        snpinfo.mean = dos_double / static_cast<double>(validN);
+        snpinfo.std = (validN > 1u)
+            ? ((kDosageScale * kDosageScale * sumsq_half - dos_double * snpinfo.mean)
+               / static_cast<double>(validN - 1u))
+            : 0.0;
+    }
+
+    double af = snpinfo.af;
+    double std = snpinfo.std;
+    if (bHasPreAF) {
+        af = AFA1[gbuf->extractedMarkerIndex];
+        snpinfo.mean = 2.0 * af;
+        std = 2.0 * af * (1.0 - af);
+    }
+    const double maf = std::min(af, 1.0 - af);
+    if (maf >= min_maf && maf <= max_maf && snpinfo.nMissRate >= dFilterMiss) {
+        gbuf->valid = true;
+        gbuf->af = af;
+        gbuf->additive_af = af;
+        gbuf->nValidN = snpinfo.N;
+        gbuf->nValidAllele = snpinfo.AlCount;
+        gbuf->mean = bGRM ? (2.0 * af) : snpinfo.mean;
         gbuf->sd = std;
 
-        if(bMakeGeno){
+        uintptr_t *pmiss = bed_prepare_missing(gbuf, bMakeMiss, nmiss, missPtrSize, keepSampleCT);
+        if (pmiss != nullptr) {
+            const std::size_t usedWords = (static_cast<std::size_t>(keepSampleCT) + 63) / 64;
+            std::memset(pmiss, 0, usedWords * sizeof(uintptr_t));
+            for (uint32_t j = 0; j < keepSampleCT; ++j) {
+                if (d16[j] == kMissingDos16) {
+                    pmiss[j >> 6] |= (uintptr_t{1} << (j & 63u));
+                }
+            }
+        }
+
+        if (bMakeGeno) {
             const double mu = gbuf->mean;
-            if(std < 1.0e-50){
+            if (std < 1.0e-50) {
                 gbuf->valid = false;
+                return;
+            }
+            if (gbuf->stats_only) {
                 return;
             }
             const GenoCodingModel model = getCodingModel();
             const GenoCodingSpec spec = buildCodingSpec(mu, std);
 
-            // PGEN dosage_main uses 14-bit fractional scaling of allele
-            // dosage in [0, 2].
-            static constexpr double kDosageScale = 1.0 / 16384.0;
-            if (gbuf->geno_f32_ptr) {
-                float *out_f32 = gbuf->geno_f32_ptr;
-                for(uint32_t j = 0; j < keepSampleCT; ++j){
-                    const double dos = static_cast<double>(dosage_main[j]) * kDosageScale;
-                    const double recoded = mapDosageToModel(dos, mu, model);
-                    out_f32[j] = static_cast<float>((recoded - spec.centerValue) * spec.rdev);
+            if (gbuf->geno_i8_ptr) {
+                for (uint32_t j = 0; j < keepSampleCT; ++j) {
+                    const uint16_t curDos = d16[j];
+                    if (curDos == kMissingDos16) {
+                        gbuf->geno_i8_ptr[j] = 0;
+                    } else {
+                        const int rounded = static_cast<int>(std::lround(static_cast<double>(curDos) * kDosageScale));
+                        gbuf->geno_i8_ptr[j] = static_cast<int8_t>(std::clamp(rounded, 0, 2));
+                    }
                 }
-                if(sexChromType == 1){
+            } else if (gbuf->geno_f32_ptr) {
+                float *out_f32 = gbuf->geno_f32_ptr;
+                const float na_f32 = static_cast<float>(spec.na);
+                for (uint32_t j = 0; j < keepSampleCT; ++j) {
+                    const uint16_t curDos = d16[j];
+                    if (curDos == kMissingDos16) {
+                        out_f32[j] = na_f32;
+                    } else {
+                        const double dos = static_cast<double>(curDos) * kDosageScale;
+                        const double recoded = mapDosageToModel(dos, mu, model);
+                        out_f32[j] = static_cast<float>((recoded - spec.centerValue) * spec.rdev);
+                    }
+                }
+                if (sexChromType == 1) {
                     double weight;
                     bool needWeight;
                     setHeterogameticWeight(weight, needWeight);
-                    if(needWeight){
+                    if (needWeight) {
                         const float fw = static_cast<float>(weight);
-                        for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
-                            out_f32[keepHeterogameticExtractIndex[i]] *= fw;
+                        if (bGRM) {
+                            for (uint32_t i = 0; i < keepHeterogameticSampleCT; ++i) {
+                                out_f32[keepHeterogameticExtractIndex[i]] *= fw;
+                            }
+                        } else {
+                            const float correctWeight = static_cast<float>((weight - 1.0) * spec.rdev * spec.centerValue);
+                            for (uint32_t i = 0; i < keepHeterogameticSampleCT; ++i) {
+                                const uint32_t ci = keepHeterogameticExtractIndex[i];
+                                out_f32[ci] *= fw;
+                                out_f32[ci] += correctWeight;
+                            }
                         }
                     }
                 }
@@ -979,26 +1323,37 @@ void Geno::getGenoDouble_pgen(uintptr_t *buf, int idx, GenoBufItem* gbuf){
                     gbuf->geno.resize(keepSampleCT);
                     out_geno = gbuf->geno.data();
                 }
-                for(uint32_t j = 0; j < keepSampleCT; ++j){
-                    const double dos = static_cast<double>(dosage_main[j]) * kDosageScale;
-                    const double recoded = mapDosageToModel(dos, mu, model);
-                    out_geno[j] = (recoded - spec.centerValue) * spec.rdev;
+                for (uint32_t j = 0; j < keepSampleCT; ++j) {
+                    const uint16_t curDos = d16[j];
+                    if (curDos == kMissingDos16) {
+                        out_geno[j] = spec.na;
+                    } else {
+                        const double dos = static_cast<double>(curDos) * kDosageScale;
+                        const double recoded = mapDosageToModel(dos, mu, model);
+                        out_geno[j] = (recoded - spec.centerValue) * spec.rdev;
+                    }
                 }
 
-                if(sexChromType == 1){
+                if (sexChromType == 1) {
                     double weight;
                     bool needWeight;
                     setHeterogameticWeight(weight, needWeight);
-                    if(needWeight){
-                        for(int i = 0 ; i < keepHeterogameticSampleCT; i++){
-                            out_geno[keepHeterogameticExtractIndex[i]] *= weight;
+                    if (needWeight) {
+                        if (bGRM) {
+                            for (uint32_t i = 0; i < keepHeterogameticSampleCT; ++i) {
+                                out_geno[keepHeterogameticExtractIndex[i]] *= weight;
+                            }
+                        } else {
+                            const double correctWeight = (weight - 1.0) * spec.rdev * spec.centerValue;
+                            for (uint32_t i = 0; i < keepHeterogameticSampleCT; ++i) {
+                                const uint32_t ci = keepHeterogameticExtractIndex[i];
+                                out_geno[ci] *= weight;
+                                out_geno[ci] += correctWeight;
+                            }
                         }
                     }
                 }
             }
-        }
-        if(bMakeMiss){
-            gbuf->missing.resize(missPtrSize, 0);
         }
     }
 }

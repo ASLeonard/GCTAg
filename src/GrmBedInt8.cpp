@@ -49,8 +49,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <unistd.h>
 #ifdef __linux__
 #include <sys/mman.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 #endif
 #include <thread>
 #include <type_traits>
@@ -72,8 +76,10 @@ constexpr uint64_t kMaxGapBytes       = 2ULL << 20;
 constexpr uint32_t kMaxInt32Markers   = 500000000u;
 constexpr size_t   kConstNFloats      = (64ULL << 20) / sizeof(float);
 
-// Persistent 2 MiB-aligned (for buffers >= 16 MiB) slab that reuses already-faulted
-// physical pages across GRM tiles and distributes initial pages across NUMA nodes.
+// Persistent 2 MiB-aligned (for buffers >= 16 MiB) slab backed by direct
+// anonymous mmap + MADV_HUGEPAGE on Linux so physical 2 MiB THP pages are
+// decoupled from jemalloc thp:never, reused across tiles, and striped evenly
+// across NUMA nodes on first touch.
 template <typename T>
 class HugeAlignedSlab {
     static_assert(std::is_trivially_default_constructible_v<T> &&
@@ -92,7 +98,9 @@ public:
     HugeAlignedSlab(HugeAlignedSlab&& other) noexcept
         : ptr_(std::exchange(other.ptr_, nullptr)),
           cap_(std::exchange(other.cap_, 0)),
-          align_(std::exchange(other.align_, 64)) {}
+          align_(std::exchange(other.align_, 64)),
+          mmap_bytes_(std::exchange(other.mmap_bytes_, 0)),
+          is_mmap_(std::exchange(other.is_mmap_, false)) {}
 
     HugeAlignedSlab& operator=(HugeAlignedSlab&& other) noexcept {
         if (this != &other) {
@@ -100,6 +108,8 @@ public:
             ptr_ = std::exchange(other.ptr_, nullptr);
             cap_ = std::exchange(other.cap_, 0);
             align_ = std::exchange(other.align_, 64);
+            mmap_bytes_ = std::exchange(other.mmap_bytes_, 0);
+            is_mmap_ = std::exchange(other.is_mmap_, false);
         }
         return *this;
     }
@@ -110,15 +120,29 @@ public:
 
     void reset() noexcept {
         if (ptr_) {
+#ifdef __linux__
+            if (is_mmap_) {
+                (void)::munmap(static_cast<void*>(ptr_), mmap_bytes_);
+            } else {
+#if defined(__cpp_sized_deallocation)
+                ::operator delete(ptr_, cap_ * sizeof(T), std::align_val_t{align_});
+#else
+                ::operator delete(ptr_, std::align_val_t{align_});
+#endif
+            }
+#else
 #if defined(__cpp_sized_deallocation)
             ::operator delete(ptr_, cap_ * sizeof(T), std::align_val_t{align_});
 #else
             ::operator delete(ptr_, std::align_val_t{align_});
 #endif
+#endif
             ptr_ = nullptr;
         }
         cap_ = 0;
         align_ = 64;
+        mmap_bytes_ = 0;
+        is_mmap_ = false;
     }
 
     bool ensure(size_t need_elems, bool parallel_first_touch = true) noexcept {
@@ -130,7 +154,37 @@ public:
 
         const size_t bytes = need_elems * sizeof(T);
         const size_t align = (bytes >= kHugeAlignThreshold) ? kHugeAlign : 64ULL;
-        void* const p = ::operator new(bytes, std::align_val_t{align}, std::nothrow);
+        void* p = nullptr;
+        size_t mapped_bytes = 0;
+        bool mapped = false;
+#ifdef __linux__
+        if (bytes >= kHugeAlignThreshold) {
+            if (bytes > std::numeric_limits<size_t>::max() - 4095ULL - kHugeAlign) {
+                return false;
+            }
+            const size_t aligned_bytes = (bytes + 4095ULL) & ~4095ULL;
+            void* const raw = ::mmap(
+                nullptr, aligned_bytes + kHugeAlign, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (raw == MAP_FAILED) return false;
+            const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw);
+            const uintptr_t aligned_addr = (raw_addr + (kHugeAlign - 1ULL)) & ~(kHugeAlign - 1ULL);
+            const size_t lead = static_cast<size_t>(aligned_addr - raw_addr);
+            const size_t tail = kHugeAlign - lead;
+            if (lead > 0) (void)::munmap(raw, lead);
+            if (tail > 0) (void)::munmap(reinterpret_cast<void*>(aligned_addr + aligned_bytes), tail);
+            p = reinterpret_cast<void*>(aligned_addr);
+            mapped_bytes = aligned_bytes;
+            mapped = true;
+#ifdef MADV_HUGEPAGE
+            (void)::madvise(p, aligned_bytes, MADV_HUGEPAGE);
+#endif
+        } else {
+            p = ::operator new(bytes, std::align_val_t{align}, std::nothrow);
+        }
+#else
+        p = ::operator new(bytes, std::align_val_t{align}, std::nothrow);
+#endif
         if (!p) return false;
 
 #if defined(__cpp_lib_start_lifetime_as)
@@ -140,11 +194,10 @@ public:
 #endif
         cap_ = need_elems;
         align_ = align;
+        mmap_bytes_ = mapped_bytes;
+        is_mmap_ = mapped;
 
         if (parallel_first_touch && bytes >= kHugeAlignThreshold) {
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
-            (void)::madvise(ptr_, bytes, MADV_HUGEPAGE);
-#endif
             // Touch one element per 4 KiB page inside 2 MiB round-robin chunks so
             // physical 2 MiB THP pages stripe evenly across all NUMA nodes under local membind.
             constexpr size_t kPageElems = std::max<size_t>(1, 4096ULL / sizeof(T));
@@ -166,6 +219,252 @@ private:
     T* ptr_ = nullptr;
     size_t cap_ = 0;
     size_t align_ = 64;
+    size_t mmap_bytes_ = 0;
+    bool is_mmap_ = false;
+};
+
+inline void write_buffer_with_cache_drop(int fd,
+                                         const char* data,
+                                         size_t nbytes,
+                                         const std::string& path)
+{
+    if (nbytes == 0) return;
+#ifdef __linux__
+    constexpr size_t kMinDropBytes = 64ULL << 20;
+    constexpr size_t kChunkBytes   = 256ULL << 20;
+    if (nbytes >= kMinDropBytes) {
+        const off_t base_off = ::lseek(fd, 0, SEEK_CUR);
+        if (base_off != static_cast<off_t>(-1)) {
+            size_t done = 0;
+            off_t prev_off = 0;
+            size_t prev_len = 0;
+            while (done < nbytes) {
+                const size_t c = std::min(kChunkBytes, nbytes - done);
+                const off_t cur_off = base_off + static_cast<off_t>(done);
+                gcta_io::write_exact_throwing(fd, data + done, c, path);
+#ifdef SYNC_FILE_RANGE_WRITE
+                (void)::sync_file_range(fd, cur_off, static_cast<off_t>(c), SYNC_FILE_RANGE_WRITE);
+#endif
+                if (prev_len > 0) {
+#if defined(SYNC_FILE_RANGE_WAIT_BEFORE) && defined(SYNC_FILE_RANGE_WRITE) && defined(SYNC_FILE_RANGE_WAIT_AFTER)
+                    (void)::sync_file_range(
+                        fd, prev_off, static_cast<off_t>(prev_len),
+                        SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+#endif
+#ifdef POSIX_FADV_DONTNEED
+                    (void)::posix_fadvise(fd, prev_off, static_cast<off_t>(prev_len), POSIX_FADV_DONTNEED);
+#endif
+                }
+                prev_off = cur_off;
+                prev_len = c;
+                done += c;
+            }
+            if (prev_len > 0) {
+#if defined(SYNC_FILE_RANGE_WAIT_BEFORE) && defined(SYNC_FILE_RANGE_WRITE) && defined(SYNC_FILE_RANGE_WAIT_AFTER)
+                (void)::sync_file_range(
+                    fd, prev_off, static_cast<off_t>(prev_len),
+                    SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+#endif
+#ifdef POSIX_FADV_DONTNEED
+                (void)::posix_fadvise(fd, prev_off, static_cast<off_t>(prev_len), POSIX_FADV_DONTNEED);
+#endif
+            }
+            return;
+        }
+    }
+#endif
+    gcta_io::write_exact_throwing(fd, data, nbytes, path);
+}
+
+inline void write_const_N_with_cache_drop(int n_fd,
+                                          size_t n_elems,
+                                          float n_val,
+                                          const std::string& n_path,
+                                          std::vector<float>& const_N_buf)
+{
+    if (n_fd < 0 || n_elems == 0) return;
+    const size_t buf_floats = std::min(n_elems, kConstNFloats);
+    if (const_N_buf.size() < buf_floats || (buf_floats > 0 && const_N_buf[0] != n_val)) {
+        const_N_buf.assign(buf_floats, n_val);
+    }
+    const size_t total_bytes = n_elems * sizeof(float);
+    const size_t cap_bytes = buf_floats * sizeof(float);
+
+#ifdef __linux__
+    constexpr size_t kMinDropBytes = 64ULL << 20;
+    if (total_bytes >= kMinDropBytes) {
+        const off_t base_off = ::lseek(n_fd, 0, SEEK_CUR);
+        if (base_off != static_cast<off_t>(-1)) {
+            size_t done = 0;
+            off_t prev_off = 0;
+            size_t prev_len = 0;
+            while (done < total_bytes) {
+                const size_t c = std::min(cap_bytes, total_bytes - done);
+                const off_t cur_off = base_off + static_cast<off_t>(done);
+                gcta_io::write_exact_throwing(n_fd, const_N_buf.data(), c, n_path);
+#ifdef SYNC_FILE_RANGE_WRITE
+                (void)::sync_file_range(n_fd, cur_off, static_cast<off_t>(c), SYNC_FILE_RANGE_WRITE);
+#endif
+                if (prev_len > 0) {
+#if defined(SYNC_FILE_RANGE_WAIT_BEFORE) && defined(SYNC_FILE_RANGE_WRITE) && defined(SYNC_FILE_RANGE_WAIT_AFTER)
+                    (void)::sync_file_range(
+                        n_fd, prev_off, static_cast<off_t>(prev_len),
+                        SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+#endif
+#ifdef POSIX_FADV_DONTNEED
+                    (void)::posix_fadvise(n_fd, prev_off, static_cast<off_t>(prev_len), POSIX_FADV_DONTNEED);
+#endif
+                }
+                prev_off = cur_off;
+                prev_len = c;
+                done += c;
+            }
+            if (prev_len > 0) {
+#if defined(SYNC_FILE_RANGE_WAIT_BEFORE) && defined(SYNC_FILE_RANGE_WRITE) && defined(SYNC_FILE_RANGE_WAIT_AFTER)
+                (void)::sync_file_range(
+                    n_fd, prev_off, static_cast<off_t>(prev_len),
+                    SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+#endif
+#ifdef POSIX_FADV_DONTNEED
+                (void)::posix_fadvise(n_fd, prev_off, static_cast<off_t>(prev_len), POSIX_FADV_DONTNEED);
+#endif
+            }
+            return;
+        }
+    }
+#endif
+    size_t rem_bytes = total_bytes;
+    while (rem_bytes > 0) {
+        const size_t c = std::min(rem_bytes, cap_bytes);
+        gcta_io::write_exact_throwing(n_fd, const_N_buf.data(), c, n_path);
+        rem_bytes -= c;
+    }
+}
+
+// Background sequential flusher owning a persistent packed-output slab so tile t
+// streams to disk asynchronously while tile t+1 computes in i32_slab_.
+class StagedTileFlusher {
+public:
+    StagedTileFlusher() = default;
+    StagedTileFlusher(const StagedTileFlusher&) = delete;
+    StagedTileFlusher& operator=(const StagedTileFlusher&) = delete;
+
+    ~StagedTileFlusher() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            closing_ = true;
+        }
+        work_cv_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    HugeAlignedSlab<char>& stage_slab() noexcept { return stage_slab_; }
+
+    void wait_idle() {
+        std::unique_lock<std::mutex> lock(mu_);
+        done_cv_.wait(lock, [&]() { return !busy_; });
+        if (io_error_) {
+            std::exception_ptr err = std::exchange(io_error_, nullptr);
+            std::rethrow_exception(err);
+        }
+    }
+
+    void wait_and_release() {
+        wait_idle();
+        stage_slab_.reset();
+        std::vector<float>().swap(const_N_buf_);
+    }
+
+    void submit(int grm_fd,
+                std::string grm_path,
+                size_t grm_bytes,
+                int n_fd,
+                std::string n_path,
+                size_t n_elems,
+                float n_val)
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!worker_.joinable()) {
+            worker_ = std::jthread([this](std::stop_token st) { worker_loop(st); });
+        }
+        grm_fd_ = grm_fd;
+        grm_path_ = std::move(grm_path);
+        grm_bytes_ = grm_bytes;
+        n_fd_ = n_fd;
+        n_path_ = std::move(n_path);
+        n_elems_ = n_elems;
+        n_val_ = n_val;
+        busy_ = true;
+        work_cv_.notify_one();
+    }
+
+private:
+    void worker_loop(std::stop_token st) {
+        while (true) {
+            int grm_fd = -1;
+            std::string grm_path;
+            size_t grm_bytes = 0;
+            int n_fd = -1;
+            std::string n_path;
+            size_t n_elems = 0;
+            float n_val = 0.0f;
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                work_cv_.wait(lock, st, [&]() { return busy_ || closing_; });
+                if (!busy_) {
+                    if (closing_ || st.stop_requested()) return;
+                    continue;
+                }
+                grm_fd = grm_fd_;
+                grm_path = std::move(grm_path_);
+                grm_bytes = grm_bytes_;
+                n_fd = n_fd_;
+                n_path = std::move(n_path_);
+                n_elems = n_elems_;
+                n_val = n_val_;
+            }
+
+            std::exception_ptr err;
+            try {
+                write_buffer_with_cache_drop(grm_fd, stage_slab_.data(), grm_bytes, grm_path);
+                if (n_fd >= 0 && n_elems > 0) {
+                    write_const_N_with_cache_drop(n_fd, n_elems, n_val, n_path, const_N_buf_);
+                }
+            } catch (...) {
+                err = std::current_exception();
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                if (err && !io_error_) {
+                    io_error_ = std::move(err);
+                }
+                busy_ = false;
+            }
+            done_cv_.notify_all();
+        }
+    }
+
+    HugeAlignedSlab<char> stage_slab_;
+    std::vector<float> const_N_buf_;
+    std::mutex mu_;
+    std::condition_variable_any work_cv_;
+    std::condition_variable_any done_cv_;
+    bool busy_ = false;
+    bool closing_ = false;
+    std::exception_ptr io_error_;
+
+    int grm_fd_ = -1;
+    std::string grm_path_;
+    size_t grm_bytes_ = 0;
+    int n_fd_ = -1;
+    std::string n_path_;
+    size_t n_elems_ = 0;
+    float n_val_ = 0.0f;
+
+    std::jthread worker_;
 };
 
 class UniqueFd {
@@ -311,6 +610,8 @@ public:
 
     BedBlockReader(const BedBlockReader&) = delete;
     BedBlockReader& operator=(const BedBlockReader&) = delete;
+
+    void set_drop_read_cache(bool v) noexcept { drop_read_cache_ = v; }
 
     template <typename Fn>
     void stream(std::span<const BedMarkerLoc> locs,
@@ -460,6 +761,19 @@ private:
             } else {
                 preadv_full_throwing(fd, iov_.data(), static_cast<int>(iov_.size()), file_off, fname);
             }
+#if defined(__linux__) && defined(POSIX_FADV_DONTNEED)
+            if (drop_read_cache_ && batch_bytes >= 8192ULL) {
+                const uint64_t drop_beg = (file_off + 4095ULL) & ~4095ULL;
+                const uint64_t drop_end = (file_off + batch_bytes) & ~4095ULL;
+                if (drop_end > drop_beg) {
+                    (void)::posix_fadvise(
+                        fd,
+                        static_cast<off_t>(drop_beg),
+                        static_cast<off_t>(drop_end - drop_beg),
+                        POSIX_FADV_DONTNEED);
+                }
+            }
+#endif
             iov_.clear();
             batch_bytes = 0;
         };
@@ -526,6 +840,7 @@ private:
     std::array<BedBlock, 2> slots_;
     AlignedRawBuffer<uint8_t, 64> discard_;
     std::vector<struct iovec> iov_;
+    bool drop_read_cache_ = false;
 };
 
 inline std::vector<uint32_t> divide_parts_mem(uint32_t n_sample, uint32_t num_parts) {
@@ -668,7 +983,11 @@ public:
         const uint64_t n_out = num_individual_;
         const uint64_t body_off = write_fp16 ? gcta_grm_io::grm_f16_body_offset(n_out) : 0ULL;
 
+        const size_t out_elem_bytes = (!is_sparse && write_fp16)
+            ? sizeof(gcta_grm_io::GrmFp16)
+            : sizeof(float);
         const double initial_bpe = allow_i32_mode_ ? 4.0 : 8.0;
+        const double staged_bpe = 4.0 + static_cast<double>(out_elem_bytes);
         tiling_enabled_ = tile_budget_bytes_ > 0.0;
         if (tiling_enabled_) {
             const double budget_elems = tile_budget_bytes_ / initial_bpe;
@@ -678,15 +997,23 @@ public:
                 tiling_enabled_ = false;
             }
         }
+        if (tiling_enabled_ && total_bed_bytes_ >= (32ULL << 30)) {
+            reader_->set_drop_read_cache(true);
+        }
 
         planned_i32_slab_elems_ = 0;
+        planned_stage_bytes_ = 0;
+        staged_flush_enabled_ = false;
         if (tiling_enabled_) {
             if (is_sparse) {
                 LOGGER.i(0, "Computing sparse GRM with a cutoff " + std::to_string(sparse_thresh) + "...");
             } else {
                 LOGGER.i(0, write_fp16 ? "Computing tiled native FP16 GRM..." : "Computing tiled GRM...");
             }
-            const double budget_elems = tile_budget_bytes_ / initial_bpe;
+            staged_flush_enabled_ = !is_sparse && allow_i32_mode_ &&
+                                    (static_cast<double>(part_re_) * staged_bpe <= tile_budget_bytes_);
+            const double tile_plan_bpe = staged_flush_enabled_ ? staged_bpe : initial_bpe;
+            const double budget_elems = tile_budget_bytes_ / tile_plan_bpe;
             std::vector<std::pair<int, int>> est_ranges;
             std::vector<int> tmp_lds;
             std::vector<size_t> tmp_offs;
@@ -694,11 +1021,11 @@ public:
             while (sim_rs < part_re_) {
                 const int sim_re = solve_tile_budget_end(sim_rs, part_re_, budget_elems);
                 if (sim_re <= sim_rs) {
-                    const uint64_t need_bytes = static_cast<uint64_t>(sim_rs + 1) * static_cast<uint64_t>(initial_bpe);
+                    const uint64_t need_bytes = static_cast<uint64_t>(sim_rs + 1) * static_cast<uint64_t>(tile_plan_bpe);
                     LOGGER.error(0, "--GRM-tile-budget is too small: the next row (sample offset {}) alone needs {:.3f} GB ({:.0f} B/elem), but the budget is only {:.3f} GB. Increase --GRM-tile-budget.",
                                  sim_rs,
                                  need_bytes / (1024.0 * 1024.0 * 1024.0),
-                                 initial_bpe,
+                                 tile_plan_bpe,
                                  tile_budget_bytes_ / (1024.0 * 1024.0 * 1024.0));
                 }
                 if (allow_i32_mode_) {
@@ -706,15 +1033,33 @@ public:
                         planned_i32_slab_elems_,
                         compute_tile_strip_layout(sim_rs, sim_re, /*as_i32=*/true, tmp_lds, tmp_offs));
                 }
+                if (staged_flush_enabled_) {
+                    const uint64_t sim_tri =
+                        (static_cast<uint64_t>(sim_re) * (static_cast<uint64_t>(sim_re) + 1ULL) -
+                         static_cast<uint64_t>(sim_rs) * (static_cast<uint64_t>(sim_rs) + 1ULL)) / 2ULL;
+                    planned_stage_bytes_ = std::max(
+                        planned_stage_bytes_,
+                        static_cast<size_t>(sim_tri) * out_elem_bytes);
+                }
                 est_ranges.emplace_back(sim_rs, sim_re);
                 sim_rs = sim_re;
             }
-            LOGGER.info(0, "Block-tiled GRM (strip-packed, budget {:.3f} GB, initial {:.0f} B/elem): {} tile(s), rows/tile ranging {}-{}.",
-                        tile_budget_bytes_ / (1024.0 * 1024.0 * 1024.0),
-                        initial_bpe,
-                        est_ranges.size(),
-                        est_ranges.front().second - est_ranges.front().first,
-                        est_ranges.back().second - est_ranges.back().first);
+            if (staged_flush_enabled_) {
+                LOGGER.info(0, "Block-tiled GRM (strip-packed + overlapped {} staging, budget {:.3f} GB, {:.0f} B/elem): {} tile(s), rows/tile ranging {}-{}.",
+                            write_fp16 ? "fp16" : "f32",
+                            tile_budget_bytes_ / (1024.0 * 1024.0 * 1024.0),
+                            tile_plan_bpe,
+                            est_ranges.size(),
+                            est_ranges.front().second - est_ranges.front().first,
+                            est_ranges.back().second - est_ranges.back().first);
+            } else {
+                LOGGER.info(0, "Block-tiled GRM (strip-packed, budget {:.3f} GB, initial {:.0f} B/elem): {} tile(s), rows/tile ranging {}-{}.",
+                            tile_budget_bytes_ / (1024.0 * 1024.0 * 1024.0),
+                            tile_plan_bpe,
+                            est_ranges.size(),
+                            est_ranges.front().second - est_ranges.front().first,
+                            est_ranges.back().second - est_ranges.back().first);
+            }
         } else {
             LOGGER << "Computing dense GRM..." << std::endl;
         }
@@ -722,6 +1067,7 @@ public:
         UniqueFile sparse_out;
         std::unique_ptr<gcta_io::AsyncSeqWriter> grm_writer;
         UniqueFd N_fd;
+        StagedTileFlusher staged_flusher;
         std::vector<float> flush_const_N;
         std::string flush_sparse_buf;
 
@@ -735,7 +1081,13 @@ public:
             bool known_tile_missing = false;
             if (tiling_enabled_) {
                 const bool effective_missing = any_missing_seen_ && !opts_.impute_mean;
-                const double cur_bpe = effective_missing ? 12.0 : initial_bpe;
+                if (effective_missing && staged_flush_enabled_) {
+                    staged_flusher.wait_and_release();
+                    staged_flush_enabled_ = false;
+                }
+                const double cur_bpe = effective_missing
+                    ? 12.0
+                    : (staged_flush_enabled_ ? staged_bpe : initial_bpe);
                 if (effective_missing && !logged_missing_rebudget && rs > part_rs_) {
                     logged_missing_rebudget = true;
                     LOGGER.info(0, "  Missing genotypes detected; adapting remaining tile budget to 12 B/elem (double GRM + N).");
@@ -791,9 +1143,15 @@ public:
                 const double tile_elems = (dre * (dre + 1.0) - drs * (drs + 1.0)) * 0.5;
                 const double est_bpe = start_i32 ? 4.0 : (known_tile_missing ? 12.0 : 8.0);
                 const double tile_gb = tile_elems * est_bpe / (1024.0 * 1024.0 * 1024.0);
-                LOGGER.info(0, "  Tile rows {}-{} ({:.2f} GB strip-packed {})",
-                            rs, re - 1, tile_gb,
-                            start_i32 ? "int32 GRM" : (known_tile_missing ? "double GRM+N" : "double GRM"));
+                if (staged_flush_enabled_ && start_i32) {
+                    const double stage_gb = tile_elems * static_cast<double>(out_elem_bytes) / (1024.0 * 1024.0 * 1024.0);
+                    LOGGER.info(0, "  Tile rows {}-{} ({:.2f} GB strip-packed int32 GRM + {:.2f} GB {} stage)",
+                                rs, re - 1, tile_gb, stage_gb, write_fp16 ? "fp16" : "f32");
+                } else {
+                    LOGGER.info(0, "  Tile rows {}-{} ({:.2f} GB strip-packed {})",
+                                rs, re - 1, tile_gb,
+                                start_i32 ? "int32 GRM" : (known_tile_missing ? "double GRM+N" : "double GRM"));
+                }
             }
 
             first_accum_ = true;
@@ -868,9 +1226,38 @@ public:
             }
 
             const auto t_flush0 = Clock::now();
-            flush_tile(grm_writer.get(), N_fd.get(), sparse_out.get(), grm_path, N_path,
-                       sparse_thresh, is_sparse, write_fp16, mtd_weight,
-                       flush_const_N, flush_sparse_buf);
+            const bool can_stage = staged_flush_enabled_ && !is_sparse && !tile_has_N_ &&
+                                   !(first_accum_ || num_valid_markers_ == 0);
+            if (can_stage) {
+                try {
+                    staged_flusher.wait_idle();
+                    const size_t tile_bytes = pack_tile_to_stage(
+                        staged_flusher.stage_slab(), planned_stage_bytes_, write_fp16, mtd_weight);
+                    grm_writer->drain();
+                    const uint64_t dre = static_cast<uint64_t>(tile_re_);
+                    const uint64_t drs = static_cast<uint64_t>(tile_rs_);
+                    const size_t tile_elems = static_cast<size_t>((dre * (dre + 1ULL) - drs * (drs + 1ULL)) / 2ULL);
+                    staged_flusher.submit(
+                        grm_writer->fd(),
+                        grm_path,
+                        tile_bytes,
+                        N_fd.get(),
+                        N_path,
+                        N_fd ? tile_elems : 0ULL,
+                        static_cast<float>(num_valid_markers_));
+                } catch (const std::exception& e) {
+                    LOGGER.e(0, std::string("GrmBedInt8 staged flush failed: ") + e.what());
+                }
+            } else {
+                try {
+                    staged_flusher.wait_and_release();
+                } catch (const std::exception& e) {
+                    LOGGER.e(0, std::string("GrmBedInt8 staged flush failed: ") + e.what());
+                }
+                flush_tile(grm_writer.get(), N_fd.get(), sparse_out.get(), grm_path, N_path,
+                           sparse_thresh, is_sparse, write_fp16, mtd_weight,
+                           flush_const_N, flush_sparse_buf);
+            }
             if (cfg_.profile) {
                 prof_.flush_sec += std::chrono::duration<double>(Clock::now() - t_flush0).count();
             }
@@ -882,6 +1269,11 @@ public:
         release_slabs();
 
         const auto t_fin0 = Clock::now();
+        try {
+            staged_flusher.wait_and_release();
+        } catch (const std::exception& e) {
+            LOGGER.e(0, std::string("GrmBedInt8 staged flush failed: ") + e.what());
+        }
         if (!is_sparse) {
             try {
                 if (write_fp16) {
@@ -1019,6 +1411,7 @@ private:
                                 " samples x " + std::to_string(mp.rawCountSNP) + " variants, found " +
                                 std::to_string(static_cast<long long>(st.st_size)) + ").");
             }
+            total_bed_bytes_ += static_cast<uint64_t>(st.st_size);
         }
 
         // MAF / missingness thresholds matching Geno
@@ -2241,6 +2634,232 @@ private:
         (void)decode_rows;
     }
 
+    size_t pack_tile_to_stage(HugeAlignedSlab<char>& stage_slab,
+                              size_t planned_stage_bytes,
+                              bool write_fp16,
+                              double mtd_weight)
+    {
+        const uint64_t tile_e0 = static_cast<uint64_t>(tile_rs_) * (static_cast<uint64_t>(tile_rs_) + 1ULL) / 2ULL;
+        const uint64_t tile_e1 = static_cast<uint64_t>(tile_re_) * (static_cast<uint64_t>(tile_re_) + 1ULL) / 2ULL;
+        const size_t tile_elems = static_cast<size_t>(tile_e1 - tile_e0);
+        const size_t out_elem_bytes = write_fp16 ? sizeof(gcta_grm_io::GrmFp16) : sizeof(float);
+        const size_t tile_bytes = tile_elems * out_elem_bytes;
+
+        const size_t ensure_bytes = std::max(tile_bytes, planned_stage_bytes);
+        if (!stage_slab.ensure(ensure_bytes, /*parallel_first_touch=*/false)) {
+            LOGGER.error(0, "can't allocate enough memory for staged GRM output buffer ({:.2f} GiB).",
+                         static_cast<double>(ensure_bytes) / static_cast<double>(1ULL << 30));
+        }
+
+        const double q_scale = opts_.impute_mean
+            ? (static_cast<double>(quant_q_) * static_cast<double>(quant_q_))
+            : 1.0;
+        const double inv_scale = (mtd_weight / static_cast<double>(num_valid_markers_)) / q_scale;
+        const double* const diag_err_ptr = (opts_.impute_mean && grm_is_i32_ && !diag_err_total_.empty())
+            ? diag_err_total_.data() : nullptr;
+        const double* const R_ptr = grm_is_i32_ ? R_total_.data() : nullptr;
+        const double S_tot = S_total_;
+        const int H = cfg_.strip_rows;
+        const bool is_rowmajor = (cfg_.layout == gcta_cli::GrmStripLayout::RowMajor);
+
+        gcta_grm_io::GrmFp16* const out_f16 = write_fp16
+            ? reinterpret_cast<gcta_grm_io::GrmFp16*>(stage_slab.data()) : nullptr;
+        float* const out_f32 = !write_fp16
+            ? reinterpret_cast<float*>(stage_slab.data()) : nullptr;
+
+        double tr_K_tile = 0.0;
+        double tr_K2_tile = 0.0;
+
+        if (is_rowmajor) {
+            #pragma omp parallel for schedule(dynamic, 32) reduction(+:tr_K_tile, tr_K2_tile)
+            for (int pair1 = tile_rs_; pair1 < tile_re_; ++pair1) {
+                const int strip_idx = (pair1 - tile_rs_) / H;
+                const int local_r = (pair1 - tile_rs_) % H;
+                const int s_ld = strip_ld_[static_cast<size_t>(strip_idx)];
+                const size_t dst_off = static_cast<size_t>(
+                    static_cast<uint64_t>(pair1) * (static_cast<uint64_t>(pair1) + 1ULL) / 2ULL - tile_e0);
+
+                if (grm_is_i32_) {
+                    const int32_t* __restrict__ src =
+                        strips_i32_[static_cast<size_t>(strip_idx)] + static_cast<size_t>(local_r) * s_ld;
+                    const double R_i = R_ptr[pair1];
+                    if (out_f16) {
+                        gcta_grm_io::GrmFp16* __restrict__ dst = out_f16 + dst_off;
+                        double off_sq = 0.0;
+                        #pragma omp simd reduction(+:off_sq)
+                        for (int c = 0; c < pair1; ++c) {
+                            const float v = static_cast<float>(((static_cast<double>(src[c]) - R_i) + (S_tot - R_ptr[c])) * inv_scale);
+                            dst[c] = gcta_grm_io::f32_to_fp16(v);
+                            const double vd = static_cast<double>(v);
+                            off_sq += vd * vd;
+                        }
+                        double d_num = (static_cast<double>(src[pair1]) - R_i) + (S_tot - R_ptr[pair1]);
+                        if (diag_err_ptr) {
+                            d_num -= diag_err_ptr[pair1];
+                            if (d_num < 0.0) d_num = 0.0;
+                        }
+                        const float dv = static_cast<float>(d_num * inv_scale);
+                        dst[pair1] = gcta_grm_io::f32_to_fp16(dv);
+                        fp16_diag_[static_cast<size_t>(pair1 - part_rs_)] = dv;
+                        const double dd = static_cast<double>(dv);
+                        tr_K_tile += dd;
+                        tr_K2_tile += dd * dd + 2.0 * off_sq;
+                    } else {
+                        float* __restrict__ dst = out_f32 + dst_off;
+                        #pragma omp simd
+                        for (int c = 0; c < pair1; ++c) {
+                            dst[c] = static_cast<float>(((static_cast<double>(src[c]) - R_i) + (S_tot - R_ptr[c])) * inv_scale);
+                        }
+                        double d_num = (static_cast<double>(src[pair1]) - R_i) + (S_tot - R_ptr[pair1]);
+                        if (diag_err_ptr) {
+                            d_num -= diag_err_ptr[pair1];
+                            if (d_num < 0.0) d_num = 0.0;
+                        }
+                        dst[pair1] = static_cast<float>(d_num * inv_scale);
+                    }
+                } else {
+                    const double* __restrict__ src =
+                        strips_f64_[static_cast<size_t>(strip_idx)] + static_cast<size_t>(local_r) * s_ld;
+                    if (out_f16) {
+                        gcta_grm_io::GrmFp16* __restrict__ dst = out_f16 + dst_off;
+                        double off_sq = 0.0;
+                        #pragma omp simd reduction(+:off_sq)
+                        for (int c = 0; c < pair1; ++c) {
+                            const float v = static_cast<float>(src[c] * inv_scale);
+                            dst[c] = gcta_grm_io::f32_to_fp16(v);
+                            const double vd = static_cast<double>(v);
+                            off_sq += vd * vd;
+                        }
+                        const float dv = static_cast<float>(src[pair1] * inv_scale);
+                        dst[pair1] = gcta_grm_io::f32_to_fp16(dv);
+                        fp16_diag_[static_cast<size_t>(pair1 - part_rs_)] = dv;
+                        const double dd = static_cast<double>(dv);
+                        tr_K_tile += dd;
+                        tr_K2_tile += dd * dd + 2.0 * off_sq;
+                    } else {
+                        float* __restrict__ dst = out_f32 + dst_off;
+                        #pragma omp simd
+                        for (int c = 0; c <= pair1; ++c) {
+                            dst[c] = static_cast<float>(src[c] * inv_scale);
+                        }
+                    }
+                }
+            }
+        } else {
+            const int num_strips = (tile_rows_ + H - 1) / H;
+            std::vector<std::pair<int, int>> active_tiles;
+            constexpr int kBlk = 64;
+            const bool i32_mode = grm_is_i32_;
+
+            for (int s = 0; s < num_strips; ++s) {
+                const int strip_local_r0 = s * H;
+                const int strip_h = std::min(H, tile_rows_ - strip_local_r0);
+                const int strip_global_r0 = tile_rs_ + strip_local_r0;
+                const int strip_global_r1 = strip_global_r0 + strip_h;
+                const int s_ld = strip_ld_[static_cast<size_t>(s)];
+
+                const double* const strip_f64 = (!grm_is_i32_ && !strips_f64_.empty())
+                    ? std::assume_aligned<64>(strips_f64_[static_cast<size_t>(s)]) : nullptr;
+                const int32_t* const strip_i32 = (grm_is_i32_ && !strips_i32_.empty())
+                    ? std::assume_aligned<64>(strips_i32_[static_cast<size_t>(s)]) : nullptr;
+
+                active_tiles.clear();
+                for (int r0 = 0; r0 < strip_h; r0 += kBlk) {
+                    const int r_len = std::min(kBlk, strip_h - r0);
+                    const int max_c = std::min(strip_global_r1, strip_global_r0 + r0 + r_len);
+                    for (int c0 = 0; c0 < max_c; c0 += kBlk) {
+                        active_tiles.emplace_back(r0, c0);
+                    }
+                }
+                const int n_active = static_cast<int>(active_tiles.size());
+
+                #pragma omp parallel for reduction(+:tr_K_tile, tr_K2_tile) schedule(static)
+                for (int ti = 0; ti < n_active; ++ti) {
+                    const auto [r0, c0] = active_tiles[static_cast<size_t>(ti)];
+                    const int r_len = std::min(kBlk, strip_h - r0);
+                    const int c_len = std::min(kBlk, strip_global_r1 - c0);
+                    const int global_r0 = strip_global_r0 + r0;
+                    alignas(64) float tmp[kBlk][kBlk];
+                    if (i32_mode) {
+                        const double* __restrict__ R_row = R_ptr + global_r0;
+                        for (int dc = 0; dc < c_len; ++dc) {
+                            const int c = c0 + dc;
+                            const int dr_start = std::max(0, c - global_r0);
+                            if (dr_start >= r_len) break;
+                            const int32_t* __restrict__ col_src = strip_i32 + static_cast<size_t>(c) * s_ld + r0;
+                            const double r_j_plus_S = S_tot - R_ptr[c];
+                            for (int dr = dr_start; dr < r_len; ++dr) {
+                                tmp[dr][dc] = static_cast<float>(
+                                    (static_cast<double>(col_src[dr]) - R_row[dr] + r_j_plus_S) * inv_scale);
+                            }
+                            if (diag_err_ptr && c >= global_r0 && c < global_r0 + r_len) {
+                                const int dr_diag = c - global_r0;
+                                double d_num = static_cast<double>(col_src[dr_diag]) - R_row[dr_diag] + r_j_plus_S - diag_err_ptr[c];
+                                if (d_num < 0.0) d_num = 0.0;
+                                tmp[dr_diag][dc] = static_cast<float>(d_num * inv_scale);
+                            }
+                        }
+                    } else {
+                        for (int dc = 0; dc < c_len; ++dc) {
+                            const int c = c0 + dc;
+                            const int dr_start = std::max(0, c - global_r0);
+                            if (dr_start >= r_len) break;
+                            const double* __restrict__ col_src = strip_f64 + static_cast<size_t>(c) * s_ld + r0;
+                            for (int dr = dr_start; dr < r_len; ++dr) {
+                                tmp[dr][dc] = static_cast<float>(col_src[dr] * inv_scale);
+                            }
+                        }
+                    }
+                    if (out_f16) {
+                        for (int dr = 0; dr < r_len; ++dr) {
+                            const int pair1 = global_r0 + dr;
+                            const int valid_c = std::min(c_len, pair1 + 1 - c0);
+                            if (valid_c <= 0) continue;
+                            const size_t row_off = static_cast<size_t>(
+                                static_cast<uint64_t>(pair1) * (static_cast<uint64_t>(pair1) + 1ULL) / 2ULL - tile_e0);
+                            gcta_grm_io::GrmFp16* __restrict__ dst = out_f16 + row_off + c0;
+                            const float* __restrict__ src = tmp[dr];
+                            const bool has_diag = (c0 + valid_c - 1 == pair1);
+                            const int off_end = has_diag ? (valid_c - 1) : valid_c;
+                            double off_sq = 0.0;
+                            #pragma omp simd reduction(+:off_sq)
+                            for (int dc = 0; dc < off_end; ++dc) {
+                                const float v = src[dc];
+                                dst[dc] = gcta_grm_io::f32_to_fp16(v);
+                                const double vd = static_cast<double>(v);
+                                off_sq += vd * vd;
+                            }
+                            tr_K2_tile += 2.0 * off_sq;
+                            if (has_diag) {
+                                const float dv = src[off_end];
+                                dst[off_end] = gcta_grm_io::f32_to_fp16(dv);
+                                fp16_diag_[static_cast<size_t>(pair1 - part_rs_)] = dv;
+                                const double dd = static_cast<double>(dv);
+                                tr_K_tile += dd;
+                                tr_K2_tile += dd * dd;
+                            }
+                        }
+                    } else {
+                        for (int dr = 0; dr < r_len; ++dr) {
+                            const int pair1 = global_r0 + dr;
+                            const int valid_c = std::min(c_len, pair1 + 1 - c0);
+                            if (valid_c <= 0) continue;
+                            const size_t row_off = static_cast<size_t>(
+                                static_cast<uint64_t>(pair1) * (static_cast<uint64_t>(pair1) + 1ULL) / 2ULL - tile_e0);
+                            std::memcpy(out_f32 + row_off + c0, tmp[dr], static_cast<size_t>(valid_c) * sizeof(float));
+                        }
+                    }
+                }
+            }
+        }
+
+        if (out_f16) {
+            fp16_trace_K_ += tr_K_tile;
+            fp16_trace_K2_ += tr_K2_tile;
+        }
+        return tile_bytes;
+    }
+
     void flush_tile(gcta_io::AsyncSeqWriter* grm_writer,
                     int N_fd,
                     FILE* sparse_out,
@@ -2817,6 +3436,7 @@ private:
     const uint64_t* keep_mask_ptr_ = nullptr;
 
     std::vector<std::string> bed_files_;
+    uint64_t total_bed_bytes_ = 0;
     std::vector<BedMarkerLoc> all_locs_;
     std::unique_ptr<BedBlockReader> reader_;
 
@@ -2852,6 +3472,8 @@ private:
     HugeAlignedSlab<uint32_t> N_slab_;
     bool tile_has_N_ = false;
     size_t planned_i32_slab_elems_ = 0;
+    size_t planned_stage_bytes_ = 0;
+    bool staged_flush_enabled_ = false;
     std::vector<int32_t*> strips_i32_;
     std::vector<double*> strips_f64_;
     std::vector<int> strip_ld_;

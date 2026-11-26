@@ -476,9 +476,10 @@ def main():
             run_pair(
                 f"{ds}_fast_tiled",
                 ["--bfile", D(ds), "--fast", "--n-markers", "64", "--tile-budget", "0.0005"],
-                ["--grm-strip-rows", "64"],
+                ["--grm-strip-rows", "64"] + (["--grm-profile"] if ds == "zero_miss" else []),
                 runs_dir,
                 is_fast=True,
+                check_profile=(ds == "zero_miss"),
             )
 
         # 6. Subsetting (--keep), partitioning (--part), sparse (--sparse-cutoff), MAF/geno filters

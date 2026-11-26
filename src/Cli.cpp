@@ -810,8 +810,10 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
             if (grm_make_opts.legacy_engine) {
                 throw CLI::ValidationError("--impute-mean", "cannot be combined with --grm-legacy-engine.");
             }
-            if (grm_make_opts.geno.bfile.empty() && grm_make_opts.geno.mbfile.empty()) {
-                throw CLI::ValidationError("--impute-mean", "requires PLINK1 BED input (--bfile or --mbfile).");
+            if (grm_make_opts.geno.bfile.empty() && grm_make_opts.geno.mbfile.empty() &&
+                grm_make_opts.geno.pfile.empty() && grm_make_opts.geno.bpfile.empty() &&
+                grm_make_opts.geno.mpfile.empty() && grm_make_opts.geno.mbpfile.empty()) {
+                throw CLI::ValidationError("--impute-mean", "requires PLINK1 BED or hardcall PLINK2 PGEN input.");
             }
             if (!grm_make_opts.geno.update_freq.empty()) {
                 throw CLI::ValidationError("--impute-mean", "cannot be combined with --update-freq.");

@@ -3957,20 +3957,82 @@ void GRM::runMake(const gcta_cli::GrmMakeOptions& opts, const std::string& out_p
                   /*default_autosome=*/!opts.homogametic && !has_explicit_chr,
                   /*force_chr_homogametic=*/opts.homogametic && !has_explicit_chr);
 
-    const bool use_clean_bed_int8 =
+    const bool is_bed_input = !opts.geno.bfile.empty() || !opts.geno.mbfile.empty();
+    const bool is_pgen_input = !opts.geno.pfile.empty() || !opts.geno.bpfile.empty() ||
+                               !opts.geno.mpfile.empty() || !opts.geno.mbpfile.empty();
+    const bool eligible_clean_int8 =
         !opts.legacy_engine &&
         opts.alg == gcta_cli::GrmAlg::VanRaden &&
         !opts.dominance &&
         !opts.homogametic &&
-        (!opts.geno.bfile.empty() || !opts.geno.mbfile.empty()) &&
+        (is_bed_input || is_pgen_input) &&
         opts.geno.update_freq.empty() &&
         (std::getenv("GCTA_DISABLE_INT8_GRM") == nullptr);
-    if (use_clean_bed_int8) {
-        gcta_grm::run_bed_int8_grm(pheno, marker, opts, out_prefix);
-        return;
+
+    if (eligible_clean_int8) {
+        if (is_bed_input) {
+            gcta_grm::run_bed_int8_grm(pheno, marker, opts, out_prefix);
+            return;
+        }
+
+        std::vector<std::string> pgen_files;
+        if (!opts.geno.pfile.empty()) {
+            const std::string f = opts.geno.pfile + ".pgen";
+            requireFileReadable("--pfile", f);
+            pgen_files.push_back(f);
+        } else if (!opts.geno.bpfile.empty()) {
+            const std::string f = opts.geno.bpfile + ".pgen";
+            requireFileReadable("--bpfile", f);
+            pgen_files.push_back(f);
+        } else if (!opts.geno.mpfile.empty()) {
+            pgen_files = expandFileList(opts.geno.mpfile, ".pgen");
+        } else if (!opts.geno.mbpfile.empty()) {
+            pgen_files = expandFileList(opts.geno.mbpfile, ".pgen");
+        }
+
+        const uint32_t expected_samples = pheno.count_raw();
+        std::vector<pgen_hardcall::PgenFileIndex> pgen_indices;
+        pgen_indices.reserve(pgen_files.size());
+        bool all_native_hardcall = !pgen_files.empty();
+        std::string fallback_file;
+        std::string fallback_reason;
+
+        for (size_t i = 0; i < pgen_files.size(); ++i) {
+            const MarkerParam mp = marker.getMarkerParams(static_cast<int>(i));
+            pgen_hardcall::PgenFileIndex idx;
+            try {
+                idx = pgen_hardcall::load_pgen_index(pgen_files[i], expected_samples, mp.rawCountSNP);
+            } catch (const std::exception& e) {
+                LOGGER.e(0, std::string("Failed to read PGEN header [") + pgen_files[i] + "]: " + e.what());
+            }
+            if (idx.native_hardcall_ok &&
+                (idx.raw_sample_ct != expected_samples || idx.raw_variant_ct != mp.rawCountSNP)) {
+                LOGGER.e(0, "PGEN header dimension mismatch for [" + pgen_files[i] + "] (expected " +
+                                std::to_string(expected_samples) + " samples x " +
+                                std::to_string(mp.rawCountSNP) + " variants, found " +
+                                std::to_string(idx.raw_sample_ct) + " samples x " +
+                                std::to_string(idx.raw_variant_ct) + " variants).");
+            }
+            if (!idx.native_hardcall_ok && all_native_hardcall) {
+                all_native_hardcall = false;
+                fallback_file = pgen_files[i];
+                fallback_reason = idx.fallback_reason;
+            }
+            pgen_indices.push_back(std::move(idx));
+        }
+
+        if (all_native_hardcall) {
+            gcta_grm::run_bed_int8_grm(pheno, marker, opts, out_prefix, std::move(pgen_indices));
+            return;
+        }
+        if (opts.impute_mean) {
+            LOGGER.e(0, "--impute-mean requires native hardcall BED/PGEN input; [" + fallback_file +
+                            "] cannot use the clean-room INT8 GRM engine (" +
+                            (fallback_reason.empty() ? "dosages or multiallelic variants present" : fallback_reason) + ").");
+        }
     }
     if (opts.impute_mean) {
-        LOGGER.e(0, "--impute-mean requires the clean-room BED INT8 GRM engine (unset GCTA_DISABLE_INT8_GRM).");
+        LOGGER.e(0, "--impute-mean requires the clean-room BED/PGEN INT8 GRM engine (unset GCTA_DISABLE_INT8_GRM).");
     }
 
     GRM grm(&pheno, &marker, opts, out_prefix);

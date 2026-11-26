@@ -1,8 +1,8 @@
 /*
    GCTA: a tool for Genome-wide Complex Trait Analysis
 
-   Clean-room BED autosomal additive VanRaden INT8 GRM engine.
-   Completely decoupled from legacy GRM / Geno / GenoBufItem / loopDouble / BedBackend.
+   Clean-room BED / native hardcall PGEN autosomal additive VanRaden INT8 GRM engine.
+   Completely decoupled from legacy GRM / Geno / GenoBufItem / loopDouble / BedBackend / PgenBackend.
 */
 
 #include "GrmBedInt8.hpp"
@@ -16,6 +16,8 @@
 #include "grm_binary_io.hpp"
 #include "grm_format.hpp"
 #include "mem.hpp"
+#include "pgen_hardcall.hpp"
+#include "posix_span_io.hpp"
 #include "utils.hpp"
 #include "third_party/plink-ng/2.0/include/plink2_bits.h"
 
@@ -23,8 +25,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
-#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -46,9 +48,7 @@
 #include <stdexcept>
 #include <stop_token>
 #include <string>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/uio.h>
+#include <unistd.h>
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
@@ -61,16 +61,13 @@ namespace gcta_grm_bed_detail {
 
 using Clock = std::chrono::steady_clock;
 
-#if defined(IOV_MAX)
-constexpr int kMaxIov = (IOV_MAX < 1024) ? IOV_MAX : 1024;
-#else
-constexpr int kMaxIov = 1024;
-#endif
-
-constexpr uint64_t kMaxBatchBytes     = 1ULL << 30;
-constexpr uint64_t kMaxGapBytes       = 2ULL << 20;
 constexpr uint32_t kMaxInt32Markers   = 500000000u;
 constexpr size_t   kConstNFloats      = (64ULL << 20) / sizeof(float);
+
+inline uint64_t next_pgen_block_seq_id() noexcept {
+    static std::atomic<uint64_t> seq{1ULL};
+    return seq.fetch_add(1ULL, std::memory_order_relaxed);
+}
 
 // Persistent 2 MiB-aligned (for buffers >= 16 MiB) slab that reuses already-faulted
 // physical pages across GRM tiles and distributes initial pages across NUMA nodes.
@@ -168,137 +165,36 @@ private:
     size_t align_ = 64;
 };
 
-class UniqueFd {
-public:
-    UniqueFd() = default;
-    explicit UniqueFd(int fd) noexcept : fd_(fd) {}
-    ~UniqueFd() { reset(); }
-    UniqueFd(const UniqueFd&) = delete;
-    UniqueFd& operator=(const UniqueFd&) = delete;
-    UniqueFd(UniqueFd&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
-    UniqueFd& operator=(UniqueFd&& o) noexcept {
-        if (this != &o) {
-            reset(o.fd_);
-            o.fd_ = -1;
-        }
-        return *this;
-    }
-    int get() const noexcept { return fd_; }
-    explicit operator bool() const noexcept { return fd_ >= 0; }
-    void reset(int new_fd = -1) noexcept {
-        if (fd_ >= 0) ::close(fd_);
-        fd_ = new_fd;
-    }
-private:
-    int fd_ = -1;
-};
-
-inline std::string errno_str() {
-    return std::string(std::strerror(errno));
-}
-
-inline UniqueFd open_bed_read(const std::string& path) {
-    int flags = O_RDONLY;
-#ifdef O_CLOEXEC
-    flags |= O_CLOEXEC;
-#endif
-    const int fd = ::open(path.c_str(), flags);
-    if (fd < 0) {
-        LOGGER.e(0, "GrmBedInt8: can't open [" + path + "]: " + errno_str());
-    }
-    return UniqueFd(fd);
-}
-
-inline UniqueFd open_posix_write_trunc(const std::string& path) noexcept {
+inline gcta_io::PosixUniqueFd open_posix_write_trunc(const std::string& path) noexcept {
     int flags = O_WRONLY | O_CREAT | O_TRUNC;
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
 #endif
-    return UniqueFd(::open(path.c_str(), flags, 0644));
+    return gcta_io::PosixUniqueFd(::open(path.c_str(), flags, 0644));
 }
 
-inline void pread_full_throwing(int fd, void* dst, size_t len, uint64_t off, const std::string& fname) {
-    auto* p = static_cast<unsigned char*>(dst);
-    while (len > 0) {
-        const ssize_t r = ::pread(fd, p, len, static_cast<off_t>(off));
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error("read error on [" + fname + "]: " + errno_str());
-        }
-        if (r == 0) {
-            throw std::runtime_error("unexpected end of file in [" + fname + "].");
-        }
-        p += r;
-        len -= static_cast<size_t>(r);
-        off += static_cast<uint64_t>(r);
-    }
-}
-
-inline void preadv_full_throwing(int fd, struct iovec* iov, int cnt, uint64_t off, const std::string& fname) {
-    if (cnt <= 0) return;
-    if (cnt == 1) {
-        pread_full_throwing(fd, iov[0].iov_base, iov[0].iov_len, off, fname);
-        return;
-    }
-#if defined(__linux__) || defined(__APPLE__)
-    int idx = 0;
-    uint64_t pos = off;
-    while (idx < cnt) {
-        const int rem_cnt = cnt - idx;
-        if (rem_cnt == 1) {
-            pread_full_throwing(fd, iov[idx].iov_base, iov[idx].iov_len, pos, fname);
-            return;
-        }
-        ssize_t r;
-        do {
-            r = ::preadv(fd, iov + idx, rem_cnt, static_cast<off_t>(pos));
-        } while (r < 0 && errno == EINTR);
-        if (r < 0) {
-            throw std::runtime_error("read error on [" + fname + "]: " + errno_str());
-        }
-        if (r == 0) {
-            throw std::runtime_error("unexpected end of file in [" + fname + "].");
-        }
-        size_t done = static_cast<size_t>(r);
-        pos += static_cast<uint64_t>(done);
-        while (idx < cnt && done >= iov[idx].iov_len) {
-            done -= iov[idx].iov_len;
-            ++idx;
-        }
-        if (idx < cnt && done > 0) {
-            iov[idx].iov_base = static_cast<unsigned char*>(iov[idx].iov_base) + done;
-            iov[idx].iov_len -= done;
-        }
-    }
-#else
-    uint64_t pos = off;
-    for (int i = 0; i < cnt; ++i) {
-        pread_full_throwing(fd, iov[i].iov_base, iov[i].iov_len, pos, fname);
-        pos += static_cast<uint64_t>(iov[i].iov_len);
-    }
-#endif
-}
-
-struct BedMarkerLoc {
+struct HardcallMarkerLoc {
     uint32_t file_idx = 0;
     uint32_t local_rec = 0;
 };
 
-struct BedBlock {
+struct HardcallBlock {
     AlignedRawBuffer<uint8_t, 64> buf;
     uint32_t num_markers = 0;
+    uint64_t io_bytes = 0;
 };
 
-// Persistent 2-slot double-buffered async sequential BED reader.
+// Persistent 2-slot double-buffered async sequential BED / PGEN hardcall reader.
 // Buffers are allocated ONCE and reused across all GRM row tiles (<=1 reader thread).
-class BedBlockReader {
+class HardcallBlockReader {
 public:
-    BedBlockReader(std::vector<std::string> files,
-                   std::vector<uint64_t> file_snp_counts,
-                   uint32_t rec_bytes,
-                   size_t block_marker_cap,
-                   size_t total_marker_hint)
-        : files_(std::move(files)),
+    HardcallBlockReader(std::vector<std::string> files,
+                        std::vector<uint64_t> file_snp_counts,
+                        uint32_t rec_bytes,
+                        size_t block_marker_cap,
+                        size_t total_marker_hint)
+        : is_pgen_(false),
+          files_(std::move(files)),
           file_snp_counts_(std::move(file_snp_counts)),
           rec_bytes_(rec_bytes)
     {
@@ -306,14 +202,42 @@ public:
         const size_t slot_bytes = std::max<size_t>(64, eff_markers * static_cast<size_t>(rec_bytes_));
         slots_[0].buf.resize(slot_bytes);
         slots_[1].buf.resize(slot_bytes);
-        iov_.reserve(64);
+        bed_spans_.reserve(eff_markers);
     }
 
-    BedBlockReader(const BedBlockReader&) = delete;
-    BedBlockReader& operator=(const BedBlockReader&) = delete;
+    HardcallBlockReader(std::vector<pgen_hardcall::PgenFileIndex> pgen_indices,
+                        uint32_t rec_bytes,
+                        double max_avg_rec_bytes,
+                        size_t block_marker_cap,
+                        size_t total_marker_hint)
+        : is_pgen_(true),
+          pgen_indices_(std::move(pgen_indices)),
+          rec_bytes_(rec_bytes)
+    {
+        files_.reserve(pgen_indices_.size());
+        file_snp_counts_.reserve(pgen_indices_.size());
+        for (const auto& idx : pgen_indices_) {
+            files_.push_back(idx.path);
+            file_snp_counts_.push_back(idx.raw_variant_ct);
+        }
+        const size_t eff_markers = std::min(block_marker_cap, std::max<size_t>(1, total_marker_hint));
+        const size_t payload_est = static_cast<size_t>(
+            std::ceil(static_cast<double>(eff_markers) * std::max(0.0, max_avg_rec_bytes) * 1.25));
+        const size_t slot_bytes = std::max<size_t>(
+            64,
+            sizeof(pgen_hardcall::PgenBlockHeader) +
+            eff_markers * sizeof(pgen_hardcall::PgenBlockEntry) +
+            payload_est);
+        slots_[0].buf.resize(slot_bytes);
+        slots_[1].buf.resize(slot_bytes);
+        pgen_vindices_.reserve(eff_markers);
+    }
+
+    HardcallBlockReader(const HardcallBlockReader&) = delete;
+    HardcallBlockReader& operator=(const HardcallBlockReader&) = delete;
 
     template <typename Fn>
-    void stream(std::span<const BedMarkerLoc> locs,
+    void stream(std::span<const HardcallMarkerLoc> locs,
                 uint32_t block_markers,
                 bool track_wait,
                 double& io_wait_sec_out,
@@ -330,7 +254,7 @@ public:
         std::exception_ptr io_err;
 
         std::jthread io_thread([&](std::stop_token st) {
-            UniqueFd cur_fd;
+            gcta_io::PosixUniqueFd cur_fd;
             int cur_file = -1;
             try {
                 size_t cursor = 0;
@@ -353,30 +277,40 @@ public:
                         in_use[static_cast<size_t>(slot)] = true;
                     }
 
-                    BedBlock& blk = slots_[static_cast<size_t>(slot)];
+                    HardcallBlock& blk = slots_[static_cast<size_t>(slot)];
                     blk.num_markers = static_cast<uint32_t>(take);
-                    const size_t need_bytes = take * static_cast<size_t>(rec_bytes_);
-                    if (blk.buf.size() < need_bytes) {
-                        blk.buf.resize(need_bytes);
-                    }
 
                     const std::string& fname = files_[file_idx];
                     if (cur_file != static_cast<int>(file_idx)) {
                         cur_fd.reset();
-                        int flags = O_RDONLY;
-#ifdef O_CLOEXEC
-                        flags |= O_CLOEXEC;
-#endif
-                        const int raw_fd = ::open(fname.c_str(), flags);
-                        if (raw_fd < 0) {
-                            throw std::runtime_error("BedBlockReader: can't open [" + fname + "]: " + errno_str());
-                        }
-                        cur_fd = UniqueFd(raw_fd);
+                        cur_fd = gcta_io::open_posix_readonly_throwing(fname);
                         cur_file = static_cast<int>(file_idx);
                     }
 
-                    read_batch(cur_fd.get(), fname, file_snp_counts_[file_idx],
-                               locs.subspan(cursor, take), blk.buf.data());
+                    const auto sub = locs.subspan(cursor, take);
+                    if (is_pgen_) {
+                        const uint64_t n_snp_file = file_snp_counts_[file_idx];
+                        pgen_vindices_.resize(take);
+                        for (size_t i = 0; i < take; ++i) {
+                            const uint32_t vidx = sub[i].local_rec;
+                            if (vidx >= n_snp_file) {
+                                throw std::runtime_error("HardcallBlockReader: variant index out of range for [" + fname + "].");
+                            }
+                            pgen_vindices_[i] = vidx;
+                        }
+                        const uint64_t seq_id = next_pgen_block_seq_id();
+                        pgen_reader_.read_batch(
+                            cur_fd.get(), pgen_indices_[file_idx], pgen_vindices_, seq_id, blk.buf);
+                        const auto* hdr = pgen_hardcall::block_header(blk.buf.data());
+                        blk.io_bytes = hdr ? hdr->payload_bytes : 0ULL;
+                    } else {
+                        const size_t need_bytes = take * static_cast<size_t>(rec_bytes_);
+                        if (blk.buf.size() < need_bytes) {
+                            blk.buf.resize(need_bytes);
+                        }
+                        read_bed_batch(cur_fd.get(), fname, file_snp_counts_[file_idx], sub, blk.buf.data());
+                        blk.io_bytes = static_cast<uint64_t>(need_bytes);
+                    }
                     cursor += take;
 
                     {
@@ -440,92 +374,38 @@ public:
     }
 
 private:
-    void read_batch(int fd,
-                    const std::string& fname,
-                    uint64_t n_snp_file,
-                    std::span<const BedMarkerLoc> span_locs,
-                    uint8_t* base)
+    void read_bed_batch(int fd,
+                        const std::string& fname,
+                        uint64_t n_snp_file,
+                        std::span<const HardcallMarkerLoc> span_locs,
+                        uint8_t* base)
     {
-        iov_.clear();
-        uint64_t batch_start = 0;
-        uint64_t next_rec = 0;
-        uint64_t batch_bytes = 0;
+        bed_spans_.clear();
         const uint64_t rec_b = rec_bytes_;
-
-        auto flush = [&]() {
-            if (iov_.empty()) return;
-            const uint64_t file_off = 3ULL + batch_start * rec_b;
-            if (iov_.size() == 1) {
-                pread_full_throwing(fd, iov_[0].iov_base, iov_[0].iov_len, file_off, fname);
-            } else {
-                preadv_full_throwing(fd, iov_.data(), static_cast<int>(iov_.size()), file_off, fname);
-            }
-            iov_.clear();
-            batch_bytes = 0;
-        };
-
         for (size_t i = 0; i < span_locs.size(); ++i) {
             const uint64_t rec = span_locs[i].local_rec;
             if (rec >= n_snp_file) {
-                throw std::runtime_error("BedBlockReader: variant index out of range for [" + fname + "].");
+                throw std::runtime_error("HardcallBlockReader: variant index out of range for [" + fname + "].");
             }
-            uint8_t* const dst = base + i * rec_b;
-            bool start_new = iov_.empty();
-            bool bridged_gap = false;
-            if (!start_new) {
-                if (rec < next_rec) {
-                    start_new = true;
-                } else if (rec > next_rec) {
-                    const uint64_t gap_bytes = (rec - next_rec) * rec_b;
-                    if (gap_bytes <= kMaxGapBytes &&
-                        iov_.size() + 2 <= static_cast<size_t>(kMaxIov) &&
-                        batch_bytes + gap_bytes + rec_b <= kMaxBatchBytes) {
-                        if (discard_.size() < kMaxGapBytes) {
-                            discard_.resize(static_cast<size_t>(kMaxGapBytes));
-                        }
-                        iov_.push_back({discard_.data(), static_cast<size_t>(gap_bytes)});
-                        batch_bytes += gap_bytes;
-                        next_rec = rec;
-                        bridged_gap = true;
-                    } else {
-                        start_new = true;
-                    }
-                }
-            }
-            if (!start_new && !bridged_gap) {
-                const bool can_coalesce =
-                    !iov_.empty() &&
-                    iov_.back().iov_base != discard_.data() &&
-                    static_cast<uint8_t*>(iov_.back().iov_base) + iov_.back().iov_len == dst;
-                if (batch_bytes + rec_b > kMaxBatchBytes ||
-                    (!can_coalesce && iov_.size() + 1 > static_cast<size_t>(kMaxIov))) {
-                    start_new = true;
-                }
-            }
-            if (start_new) {
-                flush();
-                batch_start = rec;
-                next_rec = rec;
-            }
-            if (!iov_.empty() &&
-                iov_.back().iov_base != discard_.data() &&
-                static_cast<uint8_t*>(iov_.back().iov_base) + iov_.back().iov_len == dst) {
-                iov_.back().iov_len += static_cast<size_t>(rec_b);
-            } else {
-                iov_.push_back({dst, static_cast<size_t>(rec_b)});
-            }
-            batch_bytes += rec_b;
-            next_rec = rec + 1;
+            bed_spans_.push_back(gcta_io::FileByteSpan{
+                3ULL + rec * rec_b,
+                static_cast<std::size_t>(rec_b),
+                base + i * rec_b
+            });
         }
-        flush();
+        span_coalescer_.read_spans(fd, fname, bed_spans_);
     }
 
+    bool is_pgen_ = false;
     std::vector<std::string> files_;
     std::vector<uint64_t> file_snp_counts_;
+    std::vector<pgen_hardcall::PgenFileIndex> pgen_indices_;
     uint32_t rec_bytes_ = 0;
-    std::array<BedBlock, 2> slots_;
-    AlignedRawBuffer<uint8_t, 64> discard_;
-    std::vector<struct iovec> iov_;
+    std::array<HardcallBlock, 2> slots_;
+    std::vector<gcta_io::FileByteSpan> bed_spans_;
+    std::vector<uint32_t> pgen_vindices_;
+    gcta_io::SpanBatchCoalescer span_coalescer_;
+    pgen_hardcall::CompressedBatchReader pgen_reader_;
 };
 
 inline std::vector<uint32_t> divide_parts_mem(uint32_t n_sample, uint32_t num_parts) {
@@ -634,10 +514,13 @@ struct EngineConfig {
 struct ProfileStats {
     double init_sec = 0.0;
     double io_wait_sec = 0.0;
+    double pgen_unpack_sec = 0.0;
     double count_decode_sec = 0.0;
     double miss_sec = 0.0;
     double gemm_sec = 0.0;
     double flush_sec = 0.0;
+    uint64_t io_bytes = 0;
+    uint64_t bed_equiv_bytes = 0;
 };
 
 class BedInt8GrmRunner {
@@ -645,11 +528,13 @@ public:
     BedInt8GrmRunner(Pheno& pheno,
                      Marker& marker,
                      const gcta_cli::GrmMakeOptions& opts,
-                     const std::string& out_prefix)
+                     const std::string& out_prefix,
+                     std::vector<pgen_hardcall::PgenFileIndex> preloaded_pgen_indices)
         : pheno_(pheno),
           marker_(marker),
           opts_(opts),
-          out_prefix_(out_prefix) {}
+          out_prefix_(out_prefix),
+          pgen_indices_(std::move(preloaded_pgen_indices)) {}
 
     void run() {
         const auto t_init0 = Clock::now();
@@ -721,7 +606,7 @@ public:
 
         UniqueFile sparse_out;
         std::unique_ptr<gcta_io::AsyncSeqWriter> grm_writer;
-        UniqueFd N_fd;
+        gcta_io::PosixUniqueFd N_fd;
         std::vector<float> flush_const_N;
         std::string flush_sparse_buf;
 
@@ -808,13 +693,13 @@ public:
                 }
                 reader_->stream(all_locs_, static_cast<uint32_t>(cfg_.n_marker_block),
                                 cfg_.profile, prof_.io_wait_sec,
-                                [&](const BedBlock& blk) { process_block(blk); });
+                                [&](const HardcallBlock& blk) { process_block(blk); });
             } else if (num_valid_markers_ > 0 && !tile1_valid_locs_.empty()) {
                 tile1_cursor_ = 0;
                 use_tile1_cache_ = true;
                 reader_->stream(tile1_valid_locs_, static_cast<uint32_t>(cfg_.n_marker_block),
                                 cfg_.profile, prof_.io_wait_sec,
-                                [&](const BedBlock& blk) { process_block(blk); });
+                                [&](const HardcallBlock& blk) { process_block(blk); });
                 use_tile1_cache_ = false;
             }
 
@@ -951,10 +836,25 @@ public:
         }
 
         if (cfg_.profile) {
-            LOGGER.info(0,
-                "GRM profile (s): init={:.3f} io_wait={:.3f} count+decode={:.3f} miss={:.3f} gemm={:.3f} flush={:.3f}",
-                prof_.init_sec, prof_.io_wait_sec, prof_.count_decode_sec,
-                prof_.miss_sec, prof_.gemm_sec, prof_.flush_sec);
+            if (is_pgen_) {
+                const double comp_mib = static_cast<double>(prof_.io_bytes) / (1024.0 * 1024.0);
+                const double raw_mib = static_cast<double>(prof_.bed_equiv_bytes) / (1024.0 * 1024.0);
+                const double ratio = (prof_.io_bytes > 0)
+                    ? (static_cast<double>(prof_.bed_equiv_bytes) / static_cast<double>(prof_.io_bytes))
+                    : 1.0;
+                LOGGER.info(0,
+                    "GRM profile (s): init={:.3f} io_wait={:.3f} count+decode={:.3f} miss={:.3f} gemm={:.3f} flush={:.3f} unpack={:.3f}",
+                    prof_.init_sec, prof_.io_wait_sec, prof_.count_decode_sec,
+                    prof_.miss_sec, prof_.gemm_sec, prof_.flush_sec, prof_.pgen_unpack_sec);
+                LOGGER.info(0,
+                    "GRM PGEN I/O: compressed={:.2f} MiB vs raw_bed_equiv={:.2f} MiB ({:.2f}x)",
+                    comp_mib, raw_mib, ratio);
+            } else {
+                LOGGER.info(0,
+                    "GRM profile (s): init={:.3f} io_wait={:.3f} count+decode={:.3f} miss={:.3f} gemm={:.3f} flush={:.3f}",
+                    prof_.init_sec, prof_.io_wait_sec, prof_.count_decode_sec,
+                    prof_.miss_sec, prof_.gemm_sec, prof_.flush_sec);
+            }
         }
     }
 
@@ -980,44 +880,112 @@ private:
         if (!opts_.geno.bfile.empty()) {
             const std::string f = opts_.geno.bfile + ".bed";
             requireFileReadable("--bfile", f);
-            bed_files_.push_back(f);
+            geno_files_.push_back(f);
+            is_pgen_ = false;
         } else if (!opts_.geno.mbfile.empty()) {
-            bed_files_ = expandFileList(opts_.geno.mbfile, ".bed");
+            geno_files_ = expandFileList(opts_.geno.mbfile, ".bed");
+            is_pgen_ = false;
+        } else if (!opts_.geno.pfile.empty()) {
+            const std::string f = opts_.geno.pfile + ".pgen";
+            requireFileReadable("--pfile", f);
+            geno_files_.push_back(f);
+            is_pgen_ = true;
+        } else if (!opts_.geno.bpfile.empty()) {
+            const std::string f = opts_.geno.bpfile + ".pgen";
+            requireFileReadable("--bpfile", f);
+            geno_files_.push_back(f);
+            is_pgen_ = true;
+        } else if (!opts_.geno.mpfile.empty()) {
+            geno_files_ = expandFileList(opts_.geno.mpfile, ".pgen");
+            is_pgen_ = true;
+        } else if (!opts_.geno.mbpfile.empty()) {
+            geno_files_ = expandFileList(opts_.geno.mbpfile, ".pgen");
+            is_pgen_ = true;
         } else {
-            LOGGER.e(0, "GrmBedInt8: no --bfile/--mbfile specified.");
+            LOGGER.e(0, "GrmBedInt8: no --bfile/--mbfile/--pfile/--bpfile/--mpfile/--mbpfile specified.");
         }
 
         std::vector<uint64_t> file_snp_counts;
         std::vector<uint64_t> file_raw_starts;
-        file_snp_counts.reserve(bed_files_.size());
-        file_raw_starts.reserve(bed_files_.size());
+        file_snp_counts.reserve(geno_files_.size());
+        file_raw_starts.reserve(geno_files_.size());
         uint64_t raw_cursor = 0;
-        for (size_t i = 0; i < bed_files_.size(); ++i) {
-            const MarkerParam mp = marker_.getMarkerParams(static_cast<int>(i));
-            file_raw_starts.push_back(raw_cursor);
-            raw_cursor += mp.rawCountSNP;
-            file_snp_counts.push_back(mp.rawCountSNP);
 
-            const std::string& fname = bed_files_[i];
-            UniqueFd fd = open_bed_read(fname);
-            unsigned char magic[3] = {0, 0, 0};
-            pread_full_throwing(fd.get(), magic, 3, 0, fname);
-            if (magic[0] != 0x6c || magic[1] != 0x1b) {
-                LOGGER.e(0, "[" + fname + "] is not a PLINK 1 binary genotype (.bed) file (bad magic number).");
+        if (is_pgen_) {
+            if (!pgen_indices_.empty() && pgen_indices_.size() != geno_files_.size()) {
+                pgen_indices_.clear();
             }
-            if (magic[2] != 0x01) {
-                LOGGER.e(0, "[" + fname + "] is in individual-major mode; only variant-major (SNP-major) .bed files are supported.");
+            const bool need_load = pgen_indices_.empty();
+            if (need_load) {
+                pgen_indices_.reserve(geno_files_.size());
             }
-            struct stat st{};
-            if (::fstat(fd.get(), &st) != 0) {
-                LOGGER.e(0, "GrmBedInt8: can't stat [" + fname + "]: " + errno_str());
+            pgen_max_avg_rec_bytes_ = 0.0;
+            for (size_t i = 0; i < geno_files_.size(); ++i) {
+                const MarkerParam mp = marker_.getMarkerParams(static_cast<int>(i));
+                file_raw_starts.push_back(raw_cursor);
+                raw_cursor += mp.rawCountSNP;
+                file_snp_counts.push_back(mp.rawCountSNP);
+
+                const std::string& fname = geno_files_[i];
+                if (need_load) {
+                    try {
+                        pgen_indices_.push_back(
+                            pgen_hardcall::load_pgen_index(fname, raw_ct_, mp.rawCountSNP));
+                    } catch (const std::exception& e) {
+                        LOGGER.e(0, std::string("GrmBedInt8: failed to load PGEN index [") + fname + "]: " + e.what());
+                    }
+                }
+                const auto& idx = pgen_indices_[i];
+                if (!idx.native_hardcall_ok) {
+                    LOGGER.e(0, "GrmBedInt8: [" + fname + "] is not eligible for native hardcall PGEN (" +
+                                    idx.fallback_reason + ").");
+                }
+                if (idx.raw_sample_ct != raw_ct_ || idx.raw_variant_ct != mp.rawCountSNP ||
+                    idx.bed_rec_bytes != rec_bytes_) {
+                    LOGGER.e(0, "Unexpected PLINK 2 .pgen dimensions for [" + fname + "] (expected " +
+                                    std::to_string(raw_ct_) + " samples x " + std::to_string(mp.rawCountSNP) +
+                                    " variants, found " + std::to_string(idx.raw_sample_ct) + " samples x " +
+                                    std::to_string(idx.raw_variant_ct) + " variants).");
+                }
+                double avg = idx.avg_rec_bytes;
+                if (avg <= 0.0 && idx.raw_variant_ct > 0 && idx.total_payload_bytes > 0) {
+                    avg = static_cast<double>(idx.total_payload_bytes) / static_cast<double>(idx.raw_variant_ct);
+                }
+                if (avg <= 0.0) {
+                    avg = static_cast<double>(rec_bytes_);
+                }
+                pgen_max_avg_rec_bytes_ = std::max(pgen_max_avg_rec_bytes_, avg);
             }
-            const uint64_t expected = 3ULL + static_cast<uint64_t>(rec_bytes_) * static_cast<uint64_t>(mp.rawCountSNP);
-            if (st.st_size < 0 || static_cast<uint64_t>(st.st_size) != expected) {
-                LOGGER.e(0, "Unexpected PLINK 1 .bed file size for [" + fname + "] (expected " +
-                                std::to_string(expected) + " bytes for " + std::to_string(raw_ct_) +
-                                " samples x " + std::to_string(mp.rawCountSNP) + " variants, found " +
-                                std::to_string(static_cast<long long>(st.st_size)) + ").");
+        } else {
+            for (size_t i = 0; i < geno_files_.size(); ++i) {
+                const MarkerParam mp = marker_.getMarkerParams(static_cast<int>(i));
+                file_raw_starts.push_back(raw_cursor);
+                raw_cursor += mp.rawCountSNP;
+                file_snp_counts.push_back(mp.rawCountSNP);
+
+                const std::string& fname = geno_files_[i];
+                unsigned char magic[3] = {0, 0, 0};
+                uint64_t fsize = 0;
+                try {
+                    gcta_io::PosixUniqueFd fd = gcta_io::open_posix_readonly_throwing(fname);
+                    fsize = gcta_io::stat_file_size_throwing(fd.get(), fname);
+                    gcta_io::pread_full_throwing(fd.get(), magic, 3, 0, fname);
+                } catch (const std::exception& e) {
+                    LOGGER.e(0, std::string("GrmBedInt8: ") + e.what());
+                }
+                if (magic[0] != 0x6c || magic[1] != 0x1b) {
+                    LOGGER.e(0, "[" + fname + "] is not a PLINK 1 binary genotype (.bed) file (bad magic number).");
+                }
+                if (magic[2] != 0x01) {
+                    LOGGER.e(0, "[" + fname + "] is in individual-major mode; only variant-major (SNP-major) .bed files are supported.");
+                }
+                const uint64_t expected = 3ULL + static_cast<uint64_t>(rec_bytes_) * static_cast<uint64_t>(mp.rawCountSNP);
+                if (fsize != expected) {
+                    LOGGER.e(0, "Unexpected PLINK 1 .bed file size for [" + fname + "] (expected " +
+                                    std::to_string(expected) + " bytes for " + std::to_string(raw_ct_) +
+                                    " samples x " + std::to_string(mp.rawCountSNP) + " variants, found " +
+                                    std::to_string(fsize) + ").");
+                }
             }
         }
 
@@ -1089,7 +1057,7 @@ private:
         for (const uint32_t ext_i : auto_ext) {
             const uint32_t raw_i = raw_extract[ext_i];
             const uint32_t f_idx = static_cast<uint32_t>(marker_.getMIndex(raw_i));
-            all_locs_.push_back(BedMarkerLoc{f_idx, static_cast<uint32_t>(raw_i - file_raw_starts[f_idx])});
+            all_locs_.push_back(HardcallMarkerLoc{f_idx, static_cast<uint32_t>(raw_i - file_raw_starts[f_idx])});
         }
         allow_i32_mode_ = (all_locs_.size() <= kMaxInt32Markers);
         if (opts_.impute_mean) {
@@ -1141,9 +1109,21 @@ private:
                 kmajor_floor,
                 12ULL << 30);
             const uint64_t bed_slot_target = kmajor_target / 4ULL;
-            const uint64_t k_by_kmajor = kmajor_target / std::max<uint64_t>(1ULL, static_cast<uint64_t>(grm_n_));
-            const uint64_t k_by_bed = bed_slot_target / std::max<uint64_t>(1ULL, static_cast<uint64_t>(rec_bytes_));
-            const uint64_t raw_k = std::min(k_by_kmajor, k_by_bed);
+            uint64_t raw_k = 0;
+            if (is_pgen_) {
+                const uint64_t io_rec_est = std::max<uint64_t>(
+                    1ULL, static_cast<uint64_t>(std::ceil(pgen_max_avg_rec_bytes_)));
+                const uint64_t k_by_bed = bed_slot_target / io_rec_est;
+                const uint64_t work_slab_target = kmajor_target + bed_slot_target;
+                const uint64_t work_bytes_per_k = std::max<uint64_t>(
+                    1ULL, static_cast<uint64_t>(grm_n_) + static_cast<uint64_t>(rec_bytes_));
+                const uint64_t k_by_work = work_slab_target / work_bytes_per_k;
+                raw_k = std::min(k_by_work, k_by_bed);
+            } else {
+                const uint64_t k_by_kmajor = kmajor_target / std::max<uint64_t>(1ULL, static_cast<uint64_t>(grm_n_));
+                const uint64_t k_by_bed = bed_slot_target / std::max<uint64_t>(1ULL, static_cast<uint64_t>(rec_bytes_));
+                raw_k = std::min(k_by_kmajor, k_by_bed);
+            }
             cfg_.n_marker_block = static_cast<int>(std::clamp<uint64_t>((raw_k / 64ULL) * 64ULL, 1024ULL, 12288ULL));
         }
 
@@ -1202,6 +1182,12 @@ private:
         marker_miss_offset_.resize(mb + 1);
 
         const size_t eff_block_cap = std::min<size_t>(mb, std::max<size_t>(1, all_locs_.size()));
+        if (is_pgen_) {
+            const size_t unpack_bytes = eff_block_cap * static_cast<size_t>(rec_bytes_);
+            if (!pgen_unpack_slab_.ensure(unpack_bytes, /*parallel_first_touch=*/true)) {
+                LOGGER.e(0, "can't allocate enough memory for the persistent PGEN unpack buffer.");
+            }
+        }
         const int max_ldK = pad_kmajor_ldk(static_cast<int>(eff_block_cap));
         const size_t kmajor_elems = static_cast<size_t>(max_ldK) * static_cast<size_t>(grm_n_);
         if (!kmajor_buf_.ensure(kmajor_elems, /*parallel_first_touch=*/true)) {
@@ -1215,9 +1201,15 @@ private:
         r_tilde_.resize(static_cast<size_t>(grm_n_));
         sample_miss_offset_.resize(static_cast<size_t>(grm_n_) + 1);
 
-        reader_ = std::make_unique<BedBlockReader>(
-            std::move(bed_files_), std::move(file_snp_counts),
-            rec_bytes_, mb, all_locs_.size());
+        if (is_pgen_) {
+            reader_ = std::make_unique<HardcallBlockReader>(
+                std::move(pgen_indices_), rec_bytes_, pgen_max_avg_rec_bytes_,
+                mb, all_locs_.size());
+        } else {
+            reader_ = std::make_unique<HardcallBlockReader>(
+                std::move(geno_files_), std::move(file_snp_counts),
+                rec_bytes_, mb, all_locs_.size());
+        }
     }
 
     bool is_tight_mem_budget() const noexcept {
@@ -1236,6 +1228,7 @@ private:
         i32_slab_.reset();
         f64_slab_.reset();
         N_slab_.reset();
+        pgen_unpack_slab_.reset();
         tile_has_N_ = false;
     }
 
@@ -1479,10 +1472,12 @@ private:
         }
     }
 
-    void process_block(const BedBlock& blk) {
+    void process_block(const HardcallBlock& blk) {
         const auto t_cd0 = Clock::now();
         const int num_marker = static_cast<int>(blk.num_markers);
-        const uint8_t* const raw_base = blk.buf.data();
+        uint8_t* const unpack_base = is_pgen_ ? pgen_unpack_slab_.data() : nullptr;
+        const void* const pgen_block_buf = is_pgen_ ? static_cast<const void*>(blk.buf.data()) : nullptr;
+        const uint8_t* const raw_base = is_pgen_ ? unpack_base : blk.buf.data();
         const uint32_t rb = rec_bytes_;
         const uint32_t raw_ct = raw_ct_;
         const uint32_t keep_ct = keep_ct_;
@@ -1492,37 +1487,78 @@ private:
         int K = 0;
         double S_mu2 = 0.0;
         bool any_missing_full = false;
+        double blk_unpack_sec = 0.0;
         int8_t* const kmajor_base = std::assume_aligned<64>(kmajor_buf_.data());
         int ldK = 64;
 
+        auto filter_marker = [&](int i, const uint8_t* rec_ptr) {
+            const bed_simd::Counts c = bed_simd::count(rec_ptr, keep_mask, raw_ct, keep_ct);
+            const uint32_t n_obs = keep_ct - c.nmiss;
+            if (n_obs == 0) {
+                raw_valid_[static_cast<size_t>(i)] = 0;
+                return;
+            }
+            const uint32_t dosage = c.n1 + 2u * c.n2;
+            const double af = static_cast<double>(dosage) / static_cast<double>(2u * n_obs);
+            const double maf = std::min(af, 1.0 - af);
+            const double obs_rate = static_cast<double>(n_obs) / static_cast<double>(keep_ct);
+            const double mu = 2.0 * af;
+            const double sd = mu * (1.0 - af);
+            if (maf >= min_maf_ && maf <= max_maf_ && obs_rate >= min_obs_rate_ && sd >= 1.0e-50) {
+                raw_valid_[static_cast<size_t>(i)] = 1;
+                raw_mu_[static_cast<size_t>(i)] = mu;
+                raw_sd_[static_cast<size_t>(i)] = sd;
+                raw_nmiss_[static_cast<size_t>(i)] = c.nmiss;
+            } else {
+                raw_valid_[static_cast<size_t>(i)] = 0;
+            }
+        };
+
         // Stage 1 + 2 fused in ONE OpenMP parallel region per block:
-        // count/filter -> compact SoA -> K-major decode
+        // [PGEN unpack ->] count/filter -> compact SoA -> K-major decode
         #pragma omp parallel
         {
             if (!use_tile1_cache_) {
+                if (is_pgen_) {
+                    thread_local pgen_hardcall::PgenThreadCache tls_pgen;
+                    if (cfg_.profile) {
+                        double thr_unpack = 0.0;
+                        #pragma omp for schedule(static)
+                        for (int i = 0; i < num_marker; ++i) {
+                            uint8_t* const dst_rec = unpack_base + static_cast<size_t>(i) * rb;
+                            const auto tu0 = Clock::now();
+                            tls_pgen.decode_into(pgen_block_buf, static_cast<uint32_t>(i), dst_rec);
+                            thr_unpack += std::chrono::duration<double>(Clock::now() - tu0).count();
+                            filter_marker(i, dst_rec);
+                        }
+                        #pragma omp critical
+                        {
+                            if (thr_unpack > blk_unpack_sec) blk_unpack_sec = thr_unpack;
+                        }
+                    } else {
+                        #pragma omp for schedule(static)
+                        for (int i = 0; i < num_marker; ++i) {
+                            uint8_t* const dst_rec = unpack_base + static_cast<size_t>(i) * rb;
+                            tls_pgen.decode_into(pgen_block_buf, static_cast<uint32_t>(i), dst_rec);
+                            filter_marker(i, dst_rec);
+                        }
+                    }
+                } else {
+                    #pragma omp for schedule(static)
+                    for (int i = 0; i < num_marker; ++i) {
+                        filter_marker(i, raw_base + static_cast<size_t>(i) * rb);
+                    }
+                }
+            } else if (is_pgen_) {
+                thread_local pgen_hardcall::PgenThreadCache tls_pgen;
+                const auto tu0 = (cfg_.profile && omp_get_thread_num() == 0) ? Clock::now() : Clock::time_point{};
                 #pragma omp for schedule(static)
                 for (int i = 0; i < num_marker; ++i) {
-                    const bed_simd::Counts c = bed_simd::count(raw_base + static_cast<size_t>(i) * rb,
-                                                               keep_mask, raw_ct, keep_ct);
-                    const uint32_t n_obs = keep_ct - c.nmiss;
-                    if (n_obs == 0) {
-                        raw_valid_[static_cast<size_t>(i)] = 0;
-                        continue;
-                    }
-                    const uint32_t dosage = c.n1 + 2u * c.n2;
-                    const double af = static_cast<double>(dosage) / static_cast<double>(2u * n_obs);
-                    const double maf = std::min(af, 1.0 - af);
-                    const double obs_rate = static_cast<double>(n_obs) / static_cast<double>(keep_ct);
-                    const double mu = 2.0 * af;
-                    const double sd = mu * (1.0 - af);
-                    if (maf >= min_maf_ && maf <= max_maf_ && obs_rate >= min_obs_rate_ && sd >= 1.0e-50) {
-                        raw_valid_[static_cast<size_t>(i)] = 1;
-                        raw_mu_[static_cast<size_t>(i)] = mu;
-                        raw_sd_[static_cast<size_t>(i)] = sd;
-                        raw_nmiss_[static_cast<size_t>(i)] = c.nmiss;
-                    } else {
-                        raw_valid_[static_cast<size_t>(i)] = 0;
-                    }
+                    tls_pgen.decode_into(pgen_block_buf, static_cast<uint32_t>(i),
+                                         unpack_base + static_cast<size_t>(i) * rb);
+                }
+                if (cfg_.profile && omp_get_thread_num() == 0) {
+                    blk_unpack_sec = std::chrono::duration<double>(Clock::now() - tu0).count();
                 }
             }
 
@@ -1630,7 +1666,11 @@ private:
 
         const auto t_cd1 = Clock::now();
         if (cfg_.profile) {
-            prof_.count_decode_sec += std::chrono::duration<double>(t_cd1 - t_cd0).count();
+            const double cd_wall = std::chrono::duration<double>(t_cd1 - t_cd0).count();
+            prof_.pgen_unpack_sec += blk_unpack_sec;
+            prof_.count_decode_sec += std::max(0.0, cd_wall - blk_unpack_sec);
+            prof_.io_bytes += blk.io_bytes;
+            prof_.bed_equiv_bytes += static_cast<uint64_t>(num_marker) * static_cast<uint64_t>(rb);
         }
         if (K == 0) return;
 
@@ -2816,9 +2856,12 @@ private:
     AlignedUniquePtr<uint64_t, 64> keep_mask_;
     const uint64_t* keep_mask_ptr_ = nullptr;
 
-    std::vector<std::string> bed_files_;
-    std::vector<BedMarkerLoc> all_locs_;
-    std::unique_ptr<BedBlockReader> reader_;
+    bool is_pgen_ = false;
+    double pgen_max_avg_rec_bytes_ = 0.0;
+    std::vector<std::string> geno_files_;
+    std::vector<pgen_hardcall::PgenFileIndex> pgen_indices_;
+    std::vector<HardcallMarkerLoc> all_locs_;
+    std::unique_ptr<HardcallBlockReader> reader_;
 
     double min_maf_ = 0.0;
     double max_maf_ = 0.5;
@@ -2870,6 +2913,7 @@ private:
     std::vector<int8_t> valid_miss_q_;
     std::vector<double> valid_mu_q_;
     std::vector<double> valid_miss_err_q2_;
+    HugeAlignedSlab<uint8_t> pgen_unpack_slab_;
     HugeAlignedSlab<int8_t> kmajor_buf_;
 
     // Centering + missingness scratch
@@ -2900,7 +2944,7 @@ private:
     std::vector<float> scratch_C_f32_;
 
     // Tile-1 valid marker cache for Tiles 2..T
-    std::vector<BedMarkerLoc> tile1_valid_locs_;
+    std::vector<HardcallMarkerLoc> tile1_valid_locs_;
     std::vector<double> tile1_valid_mu_;
     std::vector<uint8_t> tile1_valid_has_miss_;
     size_t tile1_cursor_ = 0;
@@ -2920,8 +2964,10 @@ namespace gcta_grm {
 void run_bed_int8_grm(Pheno& pheno,
                       Marker& marker,
                       const gcta_cli::GrmMakeOptions& opts,
-                      const std::string& out_prefix) {
-    gcta_grm_bed_detail::BedInt8GrmRunner runner(pheno, marker, opts, out_prefix);
+                      const std::string& out_prefix,
+                      std::vector<pgen_hardcall::PgenFileIndex> preloaded_pgen_indices) {
+    gcta_grm_bed_detail::BedInt8GrmRunner runner(
+        pheno, marker, opts, out_prefix, std::move(preloaded_pgen_indices));
     runner.run();
 }
 

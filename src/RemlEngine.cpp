@@ -2625,7 +2625,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                    << " warm-start vector(s) (--reml-woodbury-basis-warm-start)." << std::endl;
         }
         const bool can_bf16_inplace =
-            ctx.grm_fp16 &&
+            (ctx.grm_fp16 || ctx.grm_chunked_budget > 0.0) &&
             static_cast<bool>(ctx.grm_tile_reader_f32.large_k_symm_fn) &&
             gcta_chunked::default_bf16_sketch();
 
@@ -2788,7 +2788,7 @@ void compute_woodbury_basis(RemlCtx& ctx) {
                     ? std::function<void()>(release_grm_storage)
                     : std::function<void()>{};
                 const bool can_bf16_inplace =
-                    ctx.grm_fp16 &&
+                    (ctx.grm_fp16 || ctx.grm_chunked_budget > 0.0) &&
                     static_cast<bool>(ctx.grm_tile_reader_f32.large_k_symm_fn) &&
                     gcta_chunked::default_bf16_sketch();
                 try {
@@ -3437,7 +3437,7 @@ void run_pcg_reml(RemlCtx& ctx,
     const int oversample = gcta_eigh::recommended_oversample(k_pc);
     const int k_ext = std::min(k_pc + oversample, n - 1);
     const bool can_bf16_inplace =
-        ctx.grm_fp16 &&
+        (ctx.grm_fp16 || ctx.grm_chunked_budget > 0.0) &&
         static_cast<bool>(ctx.grm_tile_reader_f32.large_k_symm_fn) &&
         gcta_chunked::default_bf16_sketch();
 

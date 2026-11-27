@@ -51,9 +51,14 @@ inline constexpr size_t kMaxAsyncGrmSlotBytes  = 256ULL << 20;
 enum class ChunkedReadMode : uint8_t { Auto = 0, Buffered = 1, Direct = 2 };
 
 struct ChunkedGrmReadConfig {
-    int read_threads = 1;
+    int read_threads = 0; // 0 = auto (clamp(compute_threads / 12, 1, 8))
     ChunkedReadMode read_mode = ChunkedReadMode::Auto;
 };
+
+inline int resolve_chunked_read_threads(int requested, int compute_threads) noexcept {
+    if (requested > 0) return std::clamp(requested, 1, 16);
+    return std::clamp(std::max(1, compute_threads) / 12, 1, 8);
+}
 
 namespace detail {
 
@@ -894,7 +899,8 @@ public:
           band_byte_budget_(band_byte_budget),
           read_cfg_(read_cfg)
     {
-        read_cfg_.read_threads = std::clamp(read_cfg_.read_threads, 1, 16);
+        [[maybe_unused]] const bool explicit_multi_read = (read_cfg_.read_threads > 1);
+        read_cfg_.read_threads = resolve_chunked_read_threads(read_cfg_.read_threads, omp_get_max_threads());
         fd_ = open_readonly_checked(path_);
         {
             struct stat st{};
@@ -987,7 +993,7 @@ public:
         const bool want_direct =
             (read_cfg_.read_mode == ChunkedReadMode::Direct) ||
             (read_cfg_.read_mode == ChunkedReadMode::Auto &&
-             (read_cfg_.read_threads > 1 || byte_len_ >= (32ULL << 30)));
+             (explicit_multi_read || byte_len_ >= (32ULL << 30)));
         if (want_direct && byte_len_ > 0) {
             int dflags = O_RDONLY | O_DIRECT;
 #ifdef O_CLOEXEC
@@ -3478,7 +3484,8 @@ inline void ChunkedGrmReader::symm_f32_fused_stream(
     const std::vector<int> bands = compute_row_bands(std::min(n, 65536));
     auto sweep = begin_sweep(bands);
     const int max_t = std::max(1, omp_get_max_threads());
-    const int use_nt = std::clamp(sweep ? std::max(1, max_t - read_cfg_.read_threads) : max_t, 1, n);
+    const int bg_readers = (direct_fd_ >= 0) ? read_cfg_.read_threads : 1;
+    const int use_nt = std::clamp(sweep ? std::max(1, max_t - bg_readers) : max_t, 1, n);
 
     auto acquire_band = [&](int /*b*/, int rs, int re) -> std::pair<const GrmFp16*, size_t> {
         if (!sweep) {
@@ -3554,8 +3561,9 @@ inline void ChunkedGrmReader::symm_large_k_stream(
     const std::vector<int> bands = compute_row_bands(H);
     const int num_bands = static_cast<int>(bands.size()) - 1;
     auto sweep = begin_sweep(bands);
+    const int bg_readers = (direct_fd_ >= 0) ? read_cfg_.read_threads : 1;
     const int unpack_nt = sweep
-        ? std::max(1, omp_get_max_threads() - read_cfg_.read_threads)
+        ? std::max(1, omp_get_max_threads() - bg_readers)
         : std::max(1, omp_get_max_threads());
 
     auto pad_ld = [&](int dim) noexcept -> int {

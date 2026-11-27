@@ -370,6 +370,8 @@ struct QuantizedWoodburyTile {
     size_t q_lo_bytes = 0;
     AlignedUniquePtr<int8_t, 64> Q_reordered;             // AOCL pre-reordered B buffer (null if unused)
     size_t q_reordered_bytes = 0;
+    AlignedUniquePtr<int8_t, 64> Q_lo_reordered;          // AOCL pre-reordered Q_lo_refine buffer (null if unused)
+    size_t q_lo_reordered_bytes = 0;
     std::vector<double> alpha_hi;                         // r_count
     std::vector<double> alpha_lo;                         // (is_2slice || has_lo_refine) ? r_count : 0
     std::vector<double> u_sum_q;                          // r_count (Stage-1 centering sum)
@@ -392,36 +394,57 @@ struct QuantizedWoodburyUk {
 
     size_t total_q_reordered_bytes() const {
         size_t total = 0;
-        for (const auto& t : tiles) total += t.q_reordered_bytes;
+        for (const auto& t : tiles) total += t.q_reordered_bytes + t.q_lo_reordered_bytes;
         return total;
     }
 };
 
-// Pre-reorder each tile.Q once via AOCL-DLP u8s8s32 reorder API (called after
-// Uk_f has been freed so Q_reordered does not coexist with Uk_f in RAM).
+// Pre-reorder each tile.Q (and optionally tile.Q_lo_refine) once via AOCL-DLP
+// u8s8s32 reorder API (called after Uk_f has been freed).
 // No-op when !GCTA_HAS_AOCL_S8_GEMM or when n exceeds the int32 K-tile cap.
-inline void reorder_quantized_woodbury_uk(QuantizedWoodburyUk& q_uk)
+inline void reorder_quantized_woodbury_uk(QuantizedWoodburyUk& q_uk, bool include_lo_refine = false)
 {
     constexpr int kAoclMaxSampleTile = 8388608;
     if (q_uk.n <= 0 || q_uk.n > kAoclMaxSampleTile) return;
     for (auto& tile : q_uk.tiles) {
-        if (tile.q_rows <= 0 || !tile.Q) continue;
-        const size_t sz = gcta_u8s8s32_reorder_b_size(
-            static_cast<gcta_blas_int>(tile.q_rows),
-            static_cast<gcta_blas_int>(q_uk.n));
-        if (sz == 0) continue;
-        tile.Q_reordered = make_aligned_uninitialized<int8_t, 64>(sz);
-        if (!tile.Q_reordered) {
-            LOGGER.w(0, "Failed to allocate pre-reordered Q tile; falling back to unpacked Q.");
-            continue;
+        if (tile.q_rows > 0 && tile.Q) {
+            const size_t sz = gcta_u8s8s32_reorder_b_size(
+                static_cast<gcta_blas_int>(tile.q_rows),
+                static_cast<gcta_blas_int>(q_uk.n));
+            if (sz > 0) {
+                tile.Q_reordered = make_aligned_uninitialized<int8_t, 64>(sz);
+                if (!tile.Q_reordered) {
+                    LOGGER.w(0, "Failed to allocate pre-reordered Q tile; falling back to unpacked Q.");
+                } else {
+                    tile.q_reordered_bytes = sz;
+                    gcta_u8s8s32_reorder_b(
+                        static_cast<gcta_blas_int>(tile.q_rows),
+                        static_cast<gcta_blas_int>(q_uk.n),
+                        tile.Q.get(),
+                        static_cast<gcta_blas_int>(tile.q_ld > 0 ? tile.q_ld : tile.q_rows),
+                        tile.Q_reordered.get());
+                }
+            }
         }
-        tile.q_reordered_bytes = sz;
-        gcta_u8s8s32_reorder_b(
-            static_cast<gcta_blas_int>(tile.q_rows),
-            static_cast<gcta_blas_int>(q_uk.n),
-            tile.Q.get(),
-            static_cast<gcta_blas_int>(tile.q_ld > 0 ? tile.q_ld : tile.q_rows),
-            tile.Q_reordered.get());
+        if (include_lo_refine && tile.has_lo_refine && tile.r_count > 0 && tile.Q_lo_refine) {
+            const size_t sz_lo = gcta_u8s8s32_reorder_b_size(
+                static_cast<gcta_blas_int>(tile.r_count),
+                static_cast<gcta_blas_int>(q_uk.n));
+            if (sz_lo > 0) {
+                tile.Q_lo_reordered = make_aligned_uninitialized<int8_t, 64>(sz_lo);
+                if (!tile.Q_lo_reordered) {
+                    LOGGER.w(0, "Failed to allocate pre-reordered Q_lo_refine tile; falling back to unpacked Q_lo_refine.");
+                } else {
+                    tile.q_lo_reordered_bytes = sz_lo;
+                    gcta_u8s8s32_reorder_b(
+                        static_cast<gcta_blas_int>(tile.r_count),
+                        static_cast<gcta_blas_int>(q_uk.n),
+                        tile.Q_lo_refine.get(),
+                        static_cast<gcta_blas_int>(tile.q_lo_ld > 0 ? tile.q_lo_ld : tile.r_count),
+                        tile.Q_lo_reordered.get());
+                }
+            }
+        }
     }
 }
 
@@ -497,6 +520,22 @@ inline size_t estimate_quantized_woodbury_reorder_bytes(const QuantizedWoodburyU
         if (tile.q_rows <= 0 || !tile.Q) continue;
         const size_t sz = gcta_u8s8s32_reorder_b_size(
             static_cast<gcta_blas_int>(tile.q_rows),
+            static_cast<gcta_blas_int>(q_uk.n));
+        if (sz == 0) return 0;
+        total += sz;
+    }
+    return total;
+}
+
+inline size_t estimate_quantized_woodbury_lo_reorder_bytes(const QuantizedWoodburyUk& q_uk)
+{
+    constexpr int kAoclMaxSampleTile = 8388608;
+    if (q_uk.n <= 0 || q_uk.n > kAoclMaxSampleTile) return 0;
+    size_t total = 0;
+    for (const auto& tile : q_uk.tiles) {
+        if (!tile.has_lo_refine || tile.r_count <= 0 || !tile.Q_lo_refine) continue;
+        const size_t sz = gcta_u8s8s32_reorder_b_size(
+            static_cast<gcta_blas_int>(tile.r_count),
             static_cast<gcta_blas_int>(q_uk.n));
         if (sz == 0) return 0;
         total += sz;
@@ -2407,6 +2446,202 @@ inline void woodbury_xvx_diag_block_fast_i8(
 // corresponding to p_tent < ~0.034). Recomputes tail tiles [k_hi, k) using
 // both Q (hi) and Q_lo_refine (lo) on the small gathered M_cand columns.
 // ---------------------------------------------------------------------------
+inline void refine_adaptive_batch_fast_i8(
+    const WoodburyMLMACache& wb,
+    const QuantizedWoodburyUk& q_uk,
+    const int8_t* cand_G_ptr,
+    int ldG,
+    int m_cand,
+    const std::vector<float>& cand_mu,
+    const std::vector<float>& cand_x_norm,
+    const std::vector<double>& cand_ukx_hi,
+    const std::vector<std::vector<int>>& cand_miss,
+    bool batch_has_miss,
+    std::vector<float>& cand_xvx_out,
+    AlignedRawBuffer<int32_t, 64>& P_hi_cand,
+    AlignedRawBuffer<int32_t, 64>& P_lo_cand,
+    AlignedRawBuffer<int32_t, 64>& miss_acc_buf,
+    std::vector<float>& scratch_A_f32,
+    std::vector<float>& scratch_B_f32,
+    std::vector<float>& scratch_C_f32,
+    MlmaProfileStats* prof = nullptr)
+{
+    using Clock = std::chrono::steady_clock;
+    if (m_cand <= 0) {
+        cand_xvx_out.clear();
+        return;
+    }
+
+    cand_xvx_out.resize(static_cast<size_t>(m_cand));
+
+    bool has_refine_tile = false;
+    for (const auto& t : q_uk.tiles) {
+        if (t.has_lo_refine) {
+            has_refine_tile = true;
+            break;
+        }
+    }
+    if (!has_refine_tile) return;
+
+    const auto t_ref0 = prof ? Clock::now() : Clock::time_point{};
+    double refine_gemm_s = 0.0;
+    const int n = q_uk.n;
+
+#if GCTA_HAS_AOCL_S8_GEMM
+    const int kSampleTile = std::min(n, 8388608);
+    constexpr int kMaxBatchCols = 4096;
+#else
+    constexpr int kSampleTile = 8192;
+    constexpr int kMaxBatchCols = 1024;
+#endif
+    const int max_threads =
+    #ifdef _OPENMP
+        std::max(1, omp_get_max_threads());
+    #else
+        1;
+    #endif
+
+    const double debias_2s = 1.0 + q_uk.delta_quant_2s;
+    const double sig2e     = static_cast<double>(wb.sigma2_eff_f);
+    std::vector<double> tail_norm_sq;
+
+    for (int c0 = 0; c0 < m_cand; c0 += kMaxBatchCols) {
+        const int c_len = std::min(kMaxBatchCols, m_cand - c0);
+        tail_norm_sq.assign(static_cast<size_t>(c_len), 0.0);
+        const int8_t* const sub_G_ptr = cand_G_ptr + static_cast<size_t>(c0) * static_cast<size_t>(ldG);
+
+        for (size_t ti = 0; ti < q_uk.tiles.size(); ++ti) {
+            const auto& tile = q_uk.tiles[ti];
+            if (!tile.has_lo_refine) continue;
+            const int rc = tile.r_count;
+            int ldP = ((rc + 15) / 16) * 16;
+            if ((static_cast<size_t>(ldP) * sizeof(int32_t)) % 4096 == 0) ldP += 16;
+            ldP = std::max(rc, ldP);
+
+            const size_t need_p = static_cast<size_t>(ldP) * static_cast<size_t>(c_len);
+            if (P_hi_cand.size() < need_p) P_hi_cand.resize(need_p);
+            if (P_lo_cand.size() < need_p) P_lo_cand.resize(need_p);
+
+            const size_t miss_stride = ((static_cast<size_t>(2 * rc) + 15) / 16) * 16;
+            if (batch_has_miss) {
+                const size_t need_miss = static_cast<size_t>(max_threads) * miss_stride;
+                if (miss_acc_buf.size() < need_miss) miss_acc_buf.resize(need_miss);
+            }
+
+            const auto t_g0 = prof ? Clock::now() : Clock::time_point{};
+            for (int s0 = 0; s0 < n; s0 += kSampleTile) {
+                const int rows = std::min(kSampleTile, n - s0);
+                const int32_t beta = (s0 == 0) ? 0 : 1;
+                const int8_t* const q_reord    = (s0 == 0 && rows == n) ? tile.Q_reordered.get() : nullptr;
+                const int8_t* const q_lo_reord = (s0 == 0 && rows == n) ? tile.Q_lo_reordered.get() : nullptr;
+                gcta_gemm_u8s8s32_colmajor_nn_reordered(
+                    static_cast<gcta_blas_int>(rc),
+                    static_cast<gcta_blas_int>(c_len),
+                    static_cast<gcta_blas_int>(rows),
+                    q_reord,
+                    tile.Q.get() + static_cast<size_t>(s0) * static_cast<size_t>(tile.q_ld),
+                    static_cast<gcta_blas_int>(tile.q_ld),
+                    sub_G_ptr + s0,
+                    static_cast<gcta_blas_int>(ldG),
+                    P_hi_cand.data(),
+                    static_cast<gcta_blas_int>(ldP),
+                    beta,
+                    scratch_A_f32, scratch_B_f32, scratch_C_f32);
+                gcta_gemm_u8s8s32_colmajor_nn_reordered(
+                    static_cast<gcta_blas_int>(rc),
+                    static_cast<gcta_blas_int>(c_len),
+                    static_cast<gcta_blas_int>(rows),
+                    q_lo_reord,
+                    tile.Q_lo_refine.get() + static_cast<size_t>(s0) * static_cast<size_t>(tile.q_lo_ld),
+                    static_cast<gcta_blas_int>(tile.q_lo_ld),
+                    sub_G_ptr + s0,
+                    static_cast<gcta_blas_int>(ldG),
+                    P_lo_cand.data(),
+                    static_cast<gcta_blas_int>(ldP),
+                    beta,
+                    scratch_A_f32, scratch_B_f32, scratch_C_f32);
+            }
+            if (prof) {
+                const double gs = std::chrono::duration<double>(Clock::now() - t_g0).count();
+                prof->xvx_gemm_s += gs;
+                refine_gemm_s += gs;
+            }
+
+            const double* const ahi   = tile.alpha_hi.data();
+            const double* const alo   = tile.alpha_lo.data();
+            const double* const usq2s = tile.u_sum_q_2s.data();
+            const int8_t* const q_hi_base = tile.Q.get();
+            const int8_t* const q_lo_base = tile.Q_lo_refine.get();
+            const int q_hi_ld = tile.q_ld;
+            const int q_lo_ld = tile.q_lo_ld;
+
+            #pragma omp parallel
+            {
+                const int tid =
+                #ifdef _OPENMP
+                    omp_get_thread_num();
+                #else
+                    0;
+                #endif
+                int32_t* const ma_hi = miss_acc_buf.data() + static_cast<size_t>(tid) * miss_stride;
+                int32_t* const ma_lo = ma_hi + rc;
+
+                #pragma omp for schedule(static)
+                for (int c = 0; c < c_len; ++c) {
+                    const int g_idx = c0 + c;
+                    const int32_t* const p_hi = P_hi_cand.data() + static_cast<size_t>(c) * static_cast<size_t>(ldP);
+                    const int32_t* const p_lo = P_lo_cand.data() + static_cast<size_t>(c) * static_cast<size_t>(ldP);
+                    const double mu_j = static_cast<double>(cand_mu[static_cast<size_t>(g_idx)]);
+                    double tile_sq = 0.0;
+
+                    if (!batch_has_miss || cand_miss[static_cast<size_t>(g_idx)].empty()) {
+                        #pragma omp simd reduction(+:tile_sq)
+                        for (int rl = 0; rl < rc; ++rl) {
+                            const double val = ahi[rl] * static_cast<double>(p_hi[rl])
+                                             + alo[rl] * static_cast<double>(p_lo[rl])
+                                             - mu_j * usq2s[rl];
+                            tile_sq += val * val;
+                        }
+                    } else {
+                        std::memset(ma_hi, 0, static_cast<size_t>(2 * rc) * sizeof(int32_t));
+                        for (int s : cand_miss[static_cast<size_t>(g_idx)]) {
+                            const int8_t* const qh_s = q_hi_base + static_cast<size_t>(s) * static_cast<size_t>(q_hi_ld);
+                            const int8_t* const ql_s = q_lo_base + static_cast<size_t>(s) * static_cast<size_t>(q_lo_ld);
+                            #pragma omp simd
+                            for (int rl = 0; rl < rc; ++rl) {
+                                ma_hi[rl] += static_cast<int32_t>(qh_s[rl]);
+                                ma_lo[rl] += static_cast<int32_t>(ql_s[rl]);
+                            }
+                        }
+                        #pragma omp simd reduction(+:tile_sq)
+                        for (int rl = 0; rl < rc; ++rl) {
+                            const double val = ahi[rl] * (static_cast<double>(p_hi[rl]) + mu_j * static_cast<double>(ma_hi[rl]))
+                                             + alo[rl] * (static_cast<double>(p_lo[rl]) + mu_j * static_cast<double>(ma_lo[rl]))
+                                             - mu_j * usq2s[rl];
+                            tile_sq += val * val;
+                        }
+                    }
+                    tail_norm_sq[static_cast<size_t>(c)] += tile_sq;
+                }
+            }
+        }
+
+        #pragma omp parallel for schedule(static) if (c_len >= 64)
+        for (int c = 0; c < c_len; ++c) {
+            const int g_idx = c0 + c;
+            const double tot_sq = cand_ukx_hi[static_cast<size_t>(g_idx)] + tail_norm_sq[static_cast<size_t>(c)];
+            const double val = (debias_2s * static_cast<double>(cand_x_norm[static_cast<size_t>(g_idx)]) - tot_sq) / sig2e;
+            cand_xvx_out[static_cast<size_t>(g_idx)] = std::max(0.0f, static_cast<float>(val));
+        }
+    }
+
+    if (prof) {
+        prof->refined_snps += static_cast<uint64_t>(m_cand);
+        const double ref_tot_s = std::chrono::duration<double>(Clock::now() - t_ref0).count();
+        prof->xvx_reduce_s += std::max(0.0, ref_tot_s - refine_gemm_s);
+    }
+}
+
 inline void refine_adaptive_candidates_fast_i8(
     const WoodburyMLMACache& wb,
     const QuantizedWoodburyUk& q_uk,
@@ -2430,7 +2665,6 @@ inline void refine_adaptive_candidates_fast_i8(
     std::vector<float>& scratch_C_f32,
     MlmaProfileStats* prof = nullptr)
 {
-    using Clock = std::chrono::steady_clock;
     if (bs <= 0) return;
 
     bool has_refine_tile = false;
@@ -2454,12 +2688,15 @@ inline void refine_adaptive_candidates_fast_i8(
     }
     if (cand_idx.empty()) return;
 
-    const auto t_ref0 = prof ? Clock::now() : Clock::time_point{};
-    double refine_gemm_s = 0.0;
     const int m_cand = static_cast<int>(cand_idx.size());
     const int n = q_uk.n;
     const size_t need_g = static_cast<size_t>(ldG) * static_cast<size_t>(m_cand);
     if (cand_G_buf.size() < need_g) cand_G_buf.resize(need_g);
+
+    std::vector<float> cand_mu(static_cast<size_t>(m_cand));
+    std::vector<float> cand_x_norm(static_cast<size_t>(m_cand));
+    std::vector<double> cand_ukx_hi(static_cast<size_t>(m_cand));
+    std::vector<std::vector<int>> cand_miss(static_cast<size_t>(m_cand));
 
     #pragma omp parallel for schedule(static) if (m_cand >= 4)
     for (int c = 0; c < m_cand; ++c) {
@@ -2467,151 +2704,23 @@ inline void refine_adaptive_candidates_fast_i8(
         std::memcpy(cand_G_buf.data() + static_cast<size_t>(c) * static_cast<size_t>(ldG),
                     G_block_i8 + static_cast<size_t>(j) * static_cast<size_t>(ldG),
                     static_cast<size_t>(n));
-    }
-
-#if GCTA_HAS_AOCL_S8_GEMM
-    const int kSampleTile = std::min(n, 8388608);
-#else
-    constexpr int kSampleTile = 8192;
-#endif
-    const int max_threads =
-    #ifdef _OPENMP
-        std::max(1, omp_get_max_threads());
-    #else
-        1;
-    #endif
-
-    std::vector<double> tail_norm_sq(static_cast<size_t>(m_cand), 0.0);
-
-    for (size_t ti = 0; ti < q_uk.tiles.size(); ++ti) {
-        const auto& tile = q_uk.tiles[ti];
-        if (!tile.has_lo_refine) continue;
-        const int rc = tile.r_count;
-        int ldP = ((rc + 15) / 16) * 16;
-        if ((static_cast<size_t>(ldP) * sizeof(int32_t)) % 4096 == 0) ldP += 16;
-        ldP = std::max(rc, ldP);
-
-        const size_t need_p = static_cast<size_t>(ldP) * static_cast<size_t>(m_cand);
-        if (P_hi_cand.size() < need_p) P_hi_cand.resize(need_p);
-        if (P_lo_cand.size() < need_p) P_lo_cand.resize(need_p);
-
-        const size_t miss_stride = ((static_cast<size_t>(2 * rc) + 15) / 16) * 16;
-        if (block_has_miss) {
-            const size_t need_miss = static_cast<size_t>(max_threads) * miss_stride;
-            if (miss_acc_buf.size() < need_miss) miss_acc_buf.resize(need_miss);
-        }
-
-        const auto t_g0 = prof ? Clock::now() : Clock::time_point{};
-        for (int s0 = 0; s0 < n; s0 += kSampleTile) {
-            const int rows = std::min(kSampleTile, n - s0);
-            const int32_t beta = (s0 == 0) ? 0 : 1;
-            const int8_t* const q_reord = (s0 == 0 && rows == n) ? tile.Q_reordered.get() : nullptr;
-            gcta_gemm_u8s8s32_colmajor_nn_reordered(
-                static_cast<gcta_blas_int>(rc),
-                static_cast<gcta_blas_int>(m_cand),
-                static_cast<gcta_blas_int>(rows),
-                q_reord,
-                tile.Q.get() + static_cast<size_t>(s0) * static_cast<size_t>(tile.q_ld),
-                static_cast<gcta_blas_int>(tile.q_ld),
-                cand_G_buf.data() + s0,
-                static_cast<gcta_blas_int>(ldG),
-                P_hi_cand.data(),
-                static_cast<gcta_blas_int>(ldP),
-                beta,
-                scratch_A_f32, scratch_B_f32, scratch_C_f32);
-            gcta_gemm_u8s8s32_colmajor_nn_reordered(
-                static_cast<gcta_blas_int>(rc),
-                static_cast<gcta_blas_int>(m_cand),
-                static_cast<gcta_blas_int>(rows),
-                nullptr,
-                tile.Q_lo_refine.get() + static_cast<size_t>(s0) * static_cast<size_t>(tile.q_lo_ld),
-                static_cast<gcta_blas_int>(tile.q_lo_ld),
-                cand_G_buf.data() + s0,
-                static_cast<gcta_blas_int>(ldG),
-                P_lo_cand.data(),
-                static_cast<gcta_blas_int>(ldP),
-                beta,
-                scratch_A_f32, scratch_B_f32, scratch_C_f32);
-        }
-        if (prof) {
-            const double gs = std::chrono::duration<double>(Clock::now() - t_g0).count();
-            prof->xvx_gemm_s += gs;
-            refine_gemm_s += gs;
-        }
-
-        const double* const ahi   = tile.alpha_hi.data();
-        const double* const alo   = tile.alpha_lo.data();
-        const double* const usq2s = tile.u_sum_q_2s.data();
-        const int8_t* const q_hi_base = tile.Q.get();
-        const int8_t* const q_lo_base = tile.Q_lo_refine.get();
-        const int q_hi_ld = tile.q_ld;
-        const int q_lo_ld = tile.q_lo_ld;
-
-        #pragma omp parallel
-        {
-            const int tid =
-            #ifdef _OPENMP
-                omp_get_thread_num();
-            #else
-                0;
-            #endif
-            int32_t* const ma_hi = miss_acc_buf.data() + static_cast<size_t>(tid) * miss_stride;
-            int32_t* const ma_lo = ma_hi + rc;
-
-            #pragma omp for schedule(static)
-            for (int c = 0; c < m_cand; ++c) {
-                const int j = cand_idx[static_cast<size_t>(c)];
-                const int32_t* const p_hi = P_hi_cand.data() + static_cast<size_t>(c) * static_cast<size_t>(ldP);
-                const int32_t* const p_lo = P_lo_cand.data() + static_cast<size_t>(c) * static_cast<size_t>(ldP);
-                const double mu_j = static_cast<double>(mu_v[j]);
-                double tile_sq = 0.0;
-
-                if (!block_has_miss || snp_miss_samples[j].empty()) {
-                    #pragma omp simd reduction(+:tile_sq)
-                    for (int rl = 0; rl < rc; ++rl) {
-                        const double val = ahi[rl] * static_cast<double>(p_hi[rl])
-                                         + alo[rl] * static_cast<double>(p_lo[rl])
-                                         - mu_j * usq2s[rl];
-                        tile_sq += val * val;
-                    }
-                } else {
-                    std::memset(ma_hi, 0, static_cast<size_t>(2 * rc) * sizeof(int32_t));
-                    for (int s : snp_miss_samples[j]) {
-                        const int8_t* const qh_s = q_hi_base + static_cast<size_t>(s) * static_cast<size_t>(q_hi_ld);
-                        const int8_t* const ql_s = q_lo_base + static_cast<size_t>(s) * static_cast<size_t>(q_lo_ld);
-                        #pragma omp simd
-                        for (int rl = 0; rl < rc; ++rl) {
-                            ma_hi[rl] += static_cast<int32_t>(qh_s[rl]);
-                            ma_lo[rl] += static_cast<int32_t>(ql_s[rl]);
-                        }
-                    }
-                    #pragma omp simd reduction(+:tile_sq)
-                    for (int rl = 0; rl < rc; ++rl) {
-                        const double val = ahi[rl] * (static_cast<double>(p_hi[rl]) + mu_j * static_cast<double>(ma_hi[rl]))
-                                         + alo[rl] * (static_cast<double>(p_lo[rl]) + mu_j * static_cast<double>(ma_lo[rl]))
-                                         - mu_j * usq2s[rl];
-                        tile_sq += val * val;
-                    }
-                }
-                tail_norm_sq[static_cast<size_t>(c)] += tile_sq;
-            }
+        cand_mu[static_cast<size_t>(c)]     = mu_v[static_cast<size_t>(j)];
+        cand_x_norm[static_cast<size_t>(c)] = x_norm_v[static_cast<size_t>(j)];
+        cand_ukx_hi[static_cast<size_t>(c)] = ukx_norm_sq_hi[static_cast<size_t>(j)];
+        if (block_has_miss && !snp_miss_samples[static_cast<size_t>(j)].empty()) {
+            cand_miss[static_cast<size_t>(c)] = snp_miss_samples[static_cast<size_t>(j)];
         }
     }
 
-    const double debias_2s = 1.0 + q_uk.delta_quant_2s;
-    const double sig2e     = static_cast<double>(wb.sigma2_eff_f);
-    #pragma omp parallel for schedule(static) if (m_cand >= 64)
+    std::vector<float> cand_xvx_out;
+    refine_adaptive_batch_fast_i8(
+        wb, q_uk, cand_G_buf.data(), ldG, m_cand,
+        cand_mu, cand_x_norm, cand_ukx_hi, cand_miss, block_has_miss,
+        cand_xvx_out, P_hi_cand, P_lo_cand, miss_acc_buf,
+        scratch_A_f32, scratch_B_f32, scratch_C_f32, prof);
+
     for (int c = 0; c < m_cand; ++c) {
-        const int j = cand_idx[static_cast<size_t>(c)];
-        const double tot_sq = ukx_norm_sq_hi[j] + tail_norm_sq[static_cast<size_t>(c)];
-        const double val = (debias_2s * static_cast<double>(x_norm_v[j]) - tot_sq) / sig2e;
-        xvx_diag[j] = std::max(0.0f, static_cast<float>(val));
-    }
-
-    if (prof) {
-        prof->refined_snps += static_cast<uint64_t>(m_cand);
-        const double ref_tot_s = std::chrono::duration<double>(Clock::now() - t_ref0).count();
-        prof->xvx_reduce_s += std::max(0.0, ref_tot_s - refine_gemm_s);
+        xvx_diag[cand_idx[static_cast<size_t>(c)]] = cand_xvx_out[static_cast<size_t>(c)];
     }
 }
 

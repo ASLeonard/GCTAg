@@ -529,8 +529,18 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
             (tuning.reorder_q == MlmaReorderPolicy::Auto &&
              should_auto_reorder_woodbury_uk(q_uk, total_m, block_size));
         if (do_reorder_q) {
+            bool include_lo_refine = (tuning.reorder_q == MlmaReorderPolicy::On);
+            const uint64_t lo_bytes = static_cast<uint64_t>(estimate_quantized_woodbury_lo_reorder_bytes(q_uk));
+            if (tuning.reorder_q == MlmaReorderPolicy::Auto && lo_bytes > 0) {
+                const uint64_t hi_bytes = static_cast<uint64_t>(estimate_quantized_woodbury_reorder_bytes(q_uk));
+                const uint64_t avail = detect_available_memory_bytes();
+                constexpr uint64_t kLoHeadroomReserve = 4ULL << 30;
+                if (avail > kLoHeadroomReserve + hi_bytes + 2ULL * lo_bytes) {
+                    include_lo_refine = true;
+                }
+            }
             const auto t_qr0 = prof ? Clock::now() : Clock::time_point{};
-            reorder_quantized_woodbury_uk(q_uk);
+            reorder_quantized_woodbury_uk(q_uk, include_lo_refine);
             if (prof) {
                 prof->q_reorder_s += std::chrono::duration<double>(Clock::now() - t_qr0).count();
             }
@@ -679,6 +689,84 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
     AlignedRawBuffer<uintptr_t, 64> thr_miss_buf(
         static_cast<size_t>(max_threads) * miss_words_stride);
 
+    bool has_refine_tile = false;
+    if (use_fast_i8 && q_uk.mode == FastMlmaMode::Adaptive) {
+        for (const auto& t : q_uk.tiles) {
+            if (t.has_lo_refine) {
+                has_refine_tile = true;
+                break;
+            }
+        }
+    }
+    const bool use_batch_adaptive = has_refine_tile;
+
+    struct PendingMlmaBlock {
+        std::vector<uint32_t> exIdx;
+        std::vector<uint8_t>  valid_v;
+        std::vector<float>    additive_af_v;
+        Eigen::VectorXf       Xt_Vi_y;
+        Eigen::VectorXf       xvx_diag;
+    };
+    constexpr size_t kRefineGCapBytes = 2ULL << 30; // 2 GiB cap on gathered candidate genotypes
+    const int max_cands_by_mem = static_cast<int>(
+        std::max<size_t>(256, kRefineGCapBytes / std::max<size_t>(1, static_cast<size_t>(ldG))));
+    const int refine_batch_target = std::clamp(std::max(1024, 16 * max_threads), 256, std::min(4096, max_cands_by_mem));
+
+    std::vector<PendingMlmaBlock> pending_blocks;
+    int cand_count = 0;
+    int cand_cap = 0;
+    bool batch_has_miss = false;
+    std::vector<int> cand_blk_idx;
+    std::vector<int> cand_local_j;
+    std::vector<float> cand_mu;
+    std::vector<float> cand_x_norm;
+    std::vector<double> cand_ukx_hi;
+    std::vector<std::vector<int>> cand_miss_samples;
+    std::vector<float> cand_xvx_out;
+
+    auto flush_pending_adaptive = [&]() {
+        if (pending_blocks.empty()) return;
+        if (cand_count > 0) {
+            refine_adaptive_batch_fast_i8(
+                wb, q_uk, cand_G_buf.data(), ldG, cand_count,
+                cand_mu, cand_x_norm, cand_ukx_hi, cand_miss_samples, batch_has_miss,
+                cand_xvx_out, P_hi_cand, P_lo_cand, thr_miss_acc,
+                scratch_A_f32, scratch_B_f32, scratch_C_f32, prof);
+            for (int c = 0; c < cand_count; ++c) {
+                pending_blocks[static_cast<size_t>(cand_blk_idx[static_cast<size_t>(c)])]
+                    .xvx_diag[cand_local_j[static_cast<size_t>(c)]] = cand_xvx_out[static_cast<size_t>(c)];
+            }
+        }
+        const auto t_fmt0 = prof ? Clock::now() : Clock::time_point{};
+        for (const auto& blk : pending_blocks) {
+            const int blk_bs = static_cast<int>(blk.exIdx.size());
+            format_and_buffer_mlma_block(blk_bs, blk.exIdx, marker, blk.valid_v, blk.additive_af_v,
+                                         blk.Xt_Vi_y, blk.xvx_diag, log_pval,
+                                         thr_buf, out_state, writer);
+        }
+        if (prof) {
+            prof->format_write_s += std::chrono::duration<double>(Clock::now() - t_fmt0).count();
+        }
+        pending_blocks.clear();
+        cand_count = 0;
+        batch_has_miss = false;
+        cand_blk_idx.clear();
+        cand_local_j.clear();
+        cand_mu.clear();
+        cand_x_norm.clear();
+        cand_ukx_hi.clear();
+        cand_miss_samples.clear();
+    };
+
+    struct BlockCandMeta {
+        int col_in_g = 0;
+        int orig_j = 0;
+        float mu = 0.0f;
+        float x_norm = 0.0f;
+        double ukx_hi = 0.0;
+    };
+    std::vector<BlockCandMeta> block_cands;
+
     auto callback = [&](uintptr_t* buf, std::span<const uint32_t> exIdx) {
         const int bs = static_cast<int>(exIdx.size());
         int block_has_miss = 0;
@@ -772,7 +860,7 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                                                 block_has_miss != 0, &ukx_norm_sq, &thr_miss_acc,
                                                 tuning.p_budget_mb, tuning.snp_tile, prof,
                                                 use_adaptive ? &ukx_norm_sq_hi : nullptr);
-                if (use_adaptive) {
+                if (use_adaptive && !use_batch_adaptive) {
                     refine_adaptive_candidates_fast_i8(
                         wb, q_uk, G_block_i8.get(), ldG, bs,
                         valid_v, mu_v, x_norm_v, Xt_Vi_y, snp_miss_samples,
@@ -836,7 +924,7 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                                                 block_has_miss != 0, &ukx_norm_sq, &thr_miss_acc,
                                                 tuning.p_budget_mb, tuning.snp_tile, prof,
                                                 use_adaptive ? &ukx_norm_sq_hi : nullptr);
-                if (use_adaptive) {
+                if (use_adaptive && !use_batch_adaptive) {
                     refine_adaptive_candidates_fast_i8(
                         wb, q_uk, G_block_i8.get(), ldG, n_valid,
                         compact_valid, compact_mu, compact_x_norm, compact_xt_vi_y, snp_miss_samples,
@@ -858,15 +946,115 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
             }
         }
 
-        const auto t_fmt0 = prof ? Clock::now() : Clock::time_point{};
-        format_and_buffer_mlma_block(bs, exIdx, marker, valid_v, additive_af_v,
-                                     Xt_Vi_y, xvx_diag, log_pval,
-                                     thr_buf, out_state, writer);
-        if (prof) {
-            prof->format_write_s += std::chrono::duration<double>(Clock::now() - t_fmt0).count();
-            ++prof->blocks;
-            prof->valid_snps += static_cast<uint64_t>(n_valid);
-            prof->total_snps += static_cast<uint64_t>(bs);
+        if (use_batch_adaptive) {
+            block_cands.clear();
+            if (n_valid == bs) {
+                for (int j = 0; j < bs; ++j) {
+                    if (!valid_v[j]) continue;
+                    const double num = static_cast<double>(Xt_Vi_y[j]);
+                    const double den = static_cast<double>(xvx_diag[j]);
+                    if ((den <= 0.0 && num != 0.0) || (den > 0.0 && (num * num / den) >= 4.5)) {
+                        block_cands.push_back({j, j, mu_v[j], x_norm_v[j], ukx_norm_sq_hi[j]});
+                    }
+                }
+            } else if (n_valid > 0) {
+                for (int c = 0; c < n_valid; ++c) {
+                    const double num = static_cast<double>(compact_xt_vi_y[c]);
+                    const double den = static_cast<double>(compact_xvx[c]);
+                    if ((den <= 0.0 && num != 0.0) || (den > 0.0 && (num * num / den) >= 4.5)) {
+                        block_cands.push_back({c, compact_idx[static_cast<size_t>(c)],
+                                               compact_mu[static_cast<size_t>(c)],
+                                               compact_x_norm[static_cast<size_t>(c)],
+                                               ukx_norm_sq_hi[static_cast<size_t>(c)]});
+                    }
+                }
+            }
+
+            if (pending_blocks.empty() && block_cands.empty()) {
+                const auto t_fmt0 = prof ? Clock::now() : Clock::time_point{};
+                format_and_buffer_mlma_block(bs, exIdx, marker, valid_v, additive_af_v,
+                                             Xt_Vi_y, xvx_diag, log_pval,
+                                             thr_buf, out_state, writer);
+                if (prof) {
+                    prof->format_write_s += std::chrono::duration<double>(Clock::now() - t_fmt0).count();
+                }
+            } else {
+                const int m_new = static_cast<int>(block_cands.size());
+                if (cand_count > 0 && cand_count + m_new > cand_cap) {
+                    flush_pending_adaptive();
+                }
+                const int blk_id = static_cast<int>(pending_blocks.size());
+                PendingMlmaBlock blk;
+                blk.exIdx.assign(exIdx.begin(), exIdx.end());
+                blk.valid_v.assign(valid_v.begin(), valid_v.begin() + bs);
+                blk.additive_af_v.assign(additive_af_v.begin(), additive_af_v.begin() + bs);
+                blk.Xt_Vi_y = Xt_Vi_y.head(bs);
+                blk.xvx_diag = xvx_diag.head(bs);
+                pending_blocks.push_back(std::move(blk));
+
+                if (m_new > 0) {
+                    const int need_cap = std::max(refine_batch_target, cand_count + m_new);
+                    if (need_cap > cand_cap) {
+                        cand_cap = need_cap;
+                        cand_G_buf.resize(static_cast<size_t>(ldG) * static_cast<size_t>(cand_cap));
+                    }
+                    const int base_c = cand_count;
+                    cand_blk_idx.resize(static_cast<size_t>(base_c + m_new));
+                    cand_local_j.resize(static_cast<size_t>(base_c + m_new));
+                    cand_mu.resize(static_cast<size_t>(base_c + m_new));
+                    cand_x_norm.resize(static_cast<size_t>(base_c + m_new));
+                    cand_ukx_hi.resize(static_cast<size_t>(base_c + m_new));
+                    cand_miss_samples.resize(static_cast<size_t>(base_c + m_new));
+
+                    #pragma omp parallel for schedule(static) if (m_new >= 4)
+                    for (int t = 0; t < m_new; ++t) {
+                        const BlockCandMeta& m = block_cands[static_cast<size_t>(t)];
+                        const size_t dst_c = static_cast<size_t>(base_c + t);
+                        std::memcpy(cand_G_buf.data() + dst_c * static_cast<size_t>(ldG),
+                                    G_block_i8.get() + static_cast<size_t>(m.col_in_g) * static_cast<size_t>(ldG),
+                                    static_cast<size_t>(n));
+                        cand_blk_idx[dst_c] = blk_id;
+                        cand_local_j[dst_c] = m.orig_j;
+                        cand_mu[dst_c]      = m.mu;
+                        cand_x_norm[dst_c]  = m.x_norm;
+                        cand_ukx_hi[dst_c]  = m.ukx_hi;
+                        if (block_has_miss != 0 && !snp_miss_samples[static_cast<size_t>(m.col_in_g)].empty()) {
+                            cand_miss_samples[dst_c] = snp_miss_samples[static_cast<size_t>(m.col_in_g)];
+                        } else {
+                            cand_miss_samples[dst_c].clear();
+                        }
+                    }
+                    if (block_has_miss != 0) {
+                        for (int t = 0; t < m_new; ++t) {
+                            if (!cand_miss_samples[static_cast<size_t>(base_c + t)].empty()) {
+                                batch_has_miss = true;
+                                break;
+                            }
+                        }
+                    }
+                    cand_count += m_new;
+                }
+
+                if (cand_count >= refine_batch_target || pending_blocks.size() >= 64) {
+                    flush_pending_adaptive();
+                }
+            }
+            if (prof) {
+                ++prof->blocks;
+                prof->valid_snps += static_cast<uint64_t>(n_valid);
+                prof->total_snps += static_cast<uint64_t>(bs);
+            }
+        } else {
+            const auto t_fmt0 = prof ? Clock::now() : Clock::time_point{};
+            format_and_buffer_mlma_block(bs, exIdx, marker, valid_v, additive_af_v,
+                                         Xt_Vi_y, xvx_diag, log_pval,
+                                         thr_buf, out_state, writer);
+            if (prof) {
+                prof->format_write_s += std::chrono::duration<double>(Clock::now() - t_fmt0).count();
+                ++prof->blocks;
+                prof->valid_snps += static_cast<uint64_t>(n_valid);
+                prof->total_snps += static_cast<uint64_t>(bs);
+            }
         }
 
         snp_done += bs;
@@ -888,6 +1076,7 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
                      /*bMakeMiss*/   false,
                      {callback});
 
+    flush_pending_adaptive();
     out_state.flush(writer);
 }
 

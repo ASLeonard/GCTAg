@@ -152,7 +152,7 @@ struct RemlOptions {
     RemlWoodburySolver reml_woodbury_solver = RemlWoodburySolver::Auto;
     RemlQrMode reml_qr_mode = RemlQrMode::Auto;
     RemlSvdFilter reml_svd_filter = RemlSvdFilter::Power;
-    int grm_read_threads = 1;
+    int grm_read_threads = 0; // 0 = auto (clamp(threads / 12, 1, 8))
     GrmReadMode grm_read_mode = GrmReadMode::Auto;
 };
 
@@ -243,7 +243,7 @@ struct PcaOptions {
     PcaLoadMode pca_load_mode = PcaLoadMode::Auto;
     int pca_io_slot_mb = 0;   // 0 = default (256 MiB)
     int pca_tile_size = 0;    // 0 = default (8192 small-k / 4096 large-k)
-    int grm_read_threads = 1;
+    int grm_read_threads = 0; // 0 = auto (clamp(threads / 12, 1, 8))
     GrmReadMode grm_read_mode = GrmReadMode::Auto;
 };
 

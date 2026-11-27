@@ -520,6 +520,19 @@ RemlGroups add_reml_options(CLI::App* sub, RemlOptions& r, bool add_subcmd_level
                      "Dev: Async I/O slot size in MiB for GRM load and TUN3 save/reuse")
         ->check(CLI::PositiveNumber)
         ->group("");
+    reml->add_option("--grm-read-threads", r.grm_read_threads,
+                     "Dev: Number of O_DIRECT reader threads for chunked GRM streaming (default: 1)")
+        ->check(CLI::Range(1, 16))
+        ->group("");
+    reml->add_option("--grm-read-mode", r.grm_read_mode,
+                     "Dev: Chunked GRM I/O mode {auto,buffered,direct}")
+        ->transform(make_enum_transformer<GrmReadMode>(
+            {{"auto", GrmReadMode::Auto},
+             {"buffered", GrmReadMode::Buffered},
+             {"direct", GrmReadMode::Direct}},
+            "{auto,buffered,direct}",
+            /*allow_numeric=*/false))
+        ->group("");
     reml->add_option("--reml-reuse-stream", r.reml_reuse_stream,
                      "Dev: Zero-Uk streaming TREF reuse policy {auto,off,on}")
         ->transform(make_enum_transformer<RemlReuseStream>(
@@ -1031,6 +1044,19 @@ int parse_cli(int argc, char** argv, ParsedCli& out) {
     pca_cmd->add_option("--pca-tile-size", pca_opts.pca_tile_size,
                         "Dev: Override tiled symmetric matvec block size (0 = default)")
         ->check(CLI::NonNegativeNumber)->group("");
+    pca_cmd->add_option("--grm-read-threads", pca_opts.grm_read_threads,
+                        "Dev: Number of O_DIRECT reader threads for chunked GRM streaming (default: 1)")
+        ->check(CLI::Range(1, 16))
+        ->group("");
+    pca_cmd->add_option("--grm-read-mode", pca_opts.grm_read_mode,
+                        "Dev: Chunked GRM I/O mode {auto,buffered,direct}")
+        ->transform(make_enum_transformer<GrmReadMode>(
+            {{"auto", GrmReadMode::Auto},
+             {"buffered", GrmReadMode::Buffered},
+             {"direct", GrmReadMode::Direct}},
+            "{auto,buffered,direct}",
+            /*allow_numeric=*/false))
+        ->group("");
     pca_cmd->callback([&out, &pca_opts]() { out.command = std::move(pca_opts); });
 
     // ------------------------------------------------------------------

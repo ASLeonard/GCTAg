@@ -3613,9 +3613,16 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                     grm_chunk_rows = fp16_grm.chunk_rows;
                     m_all = fp16_grm.m_snps;
                 } else if (grm_chunked) {
+                    gcta_grm_io::ChunkedReadMode read_mode = gcta_grm_io::ChunkedReadMode::Auto;
+                    if (r.grm_read_mode == gcta_cli::GrmReadMode::Buffered) {
+                        read_mode = gcta_grm_io::ChunkedReadMode::Buffered;
+                    } else if (r.grm_read_mode == gcta_cli::GrmReadMode::Direct) {
+                        read_mode = gcta_grm_io::ChunkedReadMode::Direct;
+                    }
+                    const gcta_grm_io::ChunkedGrmReadConfig read_cfg{r.grm_read_threads, read_mode};
                     chunked_grm = gcta_grm_io::make_chunked_grm_reader(
                         grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget",
-                        /*need_m_snps=*/need_m_snps);
+                        /*need_m_snps=*/need_m_snps, nullptr, false, read_cfg);
                     grm_chunk_rows = chunked_grm.chunk_rows;
                     m_all = chunked_grm.m_snps;
                     if (grm_chunk_rows >= n) {

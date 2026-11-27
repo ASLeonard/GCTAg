@@ -4,6 +4,12 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/mman.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+#endif
 
 #include <algorithm>
 #include <array>
@@ -15,8 +21,10 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -39,6 +47,129 @@ namespace gcta_grm_io {
 // GRMs keep plenty of rows per chunk across high core counts while keeping RAM bounded.
 inline constexpr size_t kDefaultGrmIoSlotBytes = 256ULL << 20;
 inline constexpr size_t kMaxAsyncGrmSlotBytes  = 256ULL << 20;
+
+enum class ChunkedReadMode : uint8_t { Auto = 0, Buffered = 1, Direct = 2 };
+
+struct ChunkedGrmReadConfig {
+    int read_threads = 1;
+    ChunkedReadMode read_mode = ChunkedReadMode::Auto;
+};
+
+namespace detail {
+
+// 4 KiB-aligned (or 2 MiB-aligned direct anonymous mmap + MADV_HUGEPAGE on
+// Linux for buffers >= 16 MiB) reusable band buffer for ChunkedGrmReader.
+class BandSlab {
+public:
+    static constexpr size_t kMinAlign           = 4096ULL;
+    static constexpr size_t kHugeAlignThreshold = 16ULL << 20;
+    static constexpr size_t kHugeAlign          = 2ULL << 20;
+
+    BandSlab() noexcept = default;
+    ~BandSlab() { reset(); }
+
+    BandSlab(const BandSlab&) = delete;
+    BandSlab& operator=(const BandSlab&) = delete;
+
+    BandSlab(BandSlab&& o) noexcept
+        : ptr_(std::exchange(o.ptr_, nullptr)),
+          cap_(std::exchange(o.cap_, 0)),
+          mmap_bytes_(std::exchange(o.mmap_bytes_, 0)),
+          is_mmap_(std::exchange(o.is_mmap_, false)) {}
+
+    BandSlab& operator=(BandSlab&& o) noexcept {
+        if (this != &o) {
+            reset();
+            ptr_ = std::exchange(o.ptr_, nullptr);
+            cap_ = std::exchange(o.cap_, 0);
+            mmap_bytes_ = std::exchange(o.mmap_bytes_, 0);
+            is_mmap_ = std::exchange(o.is_mmap_, false);
+        }
+        return *this;
+    }
+
+    char* data() const noexcept { return ptr_; }
+    size_t capacity() const noexcept { return cap_; }
+
+    void reset() noexcept {
+        if (ptr_) {
+#ifdef __linux__
+            if (is_mmap_) {
+                (void)::munmap(static_cast<void*>(ptr_), mmap_bytes_);
+            } else {
+#if defined(__cpp_sized_deallocation)
+                ::operator delete(ptr_, cap_, std::align_val_t{kMinAlign});
+#else
+                ::operator delete(ptr_, std::align_val_t{kMinAlign});
+#endif
+            }
+#else
+#if defined(__cpp_sized_deallocation)
+            ::operator delete(ptr_, cap_, std::align_val_t{kMinAlign});
+#else
+            ::operator delete(ptr_, std::align_val_t{kMinAlign});
+#endif
+#endif
+            ptr_ = nullptr;
+        }
+        cap_ = 0;
+        mmap_bytes_ = 0;
+        is_mmap_ = false;
+    }
+
+    bool ensure(size_t need_bytes) noexcept {
+        if (need_bytes == 0) return true;
+        if (need_bytes <= cap_) return true;
+
+        reset();
+
+        void* p = nullptr;
+        size_t mapped_bytes = 0;
+        bool mapped = false;
+#ifdef __linux__
+        if (need_bytes >= kHugeAlignThreshold) {
+            if (need_bytes > std::numeric_limits<size_t>::max() - 4095ULL - kHugeAlign) {
+                return false;
+            }
+            const size_t aligned_bytes = (need_bytes + 4095ULL) & ~4095ULL;
+            void* const raw = ::mmap(
+                nullptr, aligned_bytes + kHugeAlign, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (raw == MAP_FAILED) return false;
+            const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw);
+            const uintptr_t aligned_addr = (raw_addr + (kHugeAlign - 1ULL)) & ~(kHugeAlign - 1ULL);
+            const size_t lead = static_cast<size_t>(aligned_addr - raw_addr);
+            const size_t tail = kHugeAlign - lead;
+            if (lead > 0) (void)::munmap(raw, lead);
+            if (tail > 0) (void)::munmap(reinterpret_cast<void*>(aligned_addr + aligned_bytes), tail);
+            p = reinterpret_cast<void*>(aligned_addr);
+            mapped_bytes = aligned_bytes;
+            mapped = true;
+#ifdef MADV_HUGEPAGE
+            (void)::madvise(p, aligned_bytes, MADV_HUGEPAGE);
+#endif
+        } else {
+            p = ::operator new(need_bytes, std::align_val_t{kMinAlign}, std::nothrow);
+        }
+#else
+        p = ::operator new(need_bytes, std::align_val_t{kMinAlign}, std::nothrow);
+#endif
+        if (!p) return false;
+        ptr_ = static_cast<char*>(p);
+        cap_ = need_bytes;
+        mmap_bytes_ = mapped_bytes;
+        is_mmap_ = mapped;
+        return true;
+    }
+
+private:
+    char* ptr_ = nullptr;
+    size_t cap_ = 0;
+    size_t mmap_bytes_ = 0;
+    bool is_mmap_ = false;
+};
+
+} // namespace detail
 
 // ---------------------------------------------------------------------------
 // IEEE 754 binary16 (FP16) storage & conversion helpers
@@ -755,10 +886,22 @@ class ChunkedGrmReader {
 public:
     ChunkedGrmReader(const std::string& path, std::vector<int> kp, int n_grm,
                      size_t band_byte_budget = (1ull << 30) /* 1GiB */,
-                     const std::vector<std::string>* grm_ids_for_hash = nullptr)
-        : kp_(std::move(kp)), path_(path), n_grm_(n_grm), band_byte_budget_(band_byte_budget)
+                     const std::vector<std::string>* grm_ids_for_hash = nullptr,
+                     ChunkedGrmReadConfig read_cfg = {})
+        : kp_(std::move(kp)),
+          path_(path),
+          n_grm_(n_grm),
+          band_byte_budget_(band_byte_budget),
+          read_cfg_(read_cfg)
     {
+        read_cfg_.read_threads = std::clamp(read_cfg_.read_threads, 1, 16);
         fd_ = open_readonly_checked(path_);
+        {
+            struct stat st{};
+            if (::fstat(fd_, &st) == 0 && st.st_size >= 0) {
+                file_size_ = static_cast<uint64_t>(st.st_size);
+            }
+        }
 
         is_fp16_ = (path_.size() >= 8 && path_.compare(path_.size() - 8, 8, ".grm.f16") == 0);
         if (is_fp16_) {
@@ -839,9 +982,33 @@ public:
                 kp_runs_ = std::move(runs);
             }
         }
+
+#if defined(__linux__) && defined(O_DIRECT)
+        const bool want_direct =
+            (read_cfg_.read_mode == ChunkedReadMode::Direct) ||
+            (read_cfg_.read_mode == ChunkedReadMode::Auto &&
+             (read_cfg_.read_threads > 1 || byte_len_ >= (32ULL << 30)));
+        if (want_direct && byte_len_ > 0) {
+            int dflags = O_RDONLY | O_DIRECT;
+#ifdef O_CLOEXEC
+            dflags |= O_CLOEXEC;
+#endif
+            const int dfd = ::open(path_.c_str(), dflags);
+            if (dfd >= 0) {
+                direct_fd_ = dfd;
+            } else if (errno != EINVAL && errno != EOPNOTSUPP && errno != EPERM) {
+                ::close(fd_);
+                fd_ = -1;
+                LOGGER.e(0, "ChunkedGrmReader: open(O_DIRECT) failed on [" + path_ + "]: " + std::string(std::strerror(errno)));
+            }
+        }
+#endif
     }
 
     ~ChunkedGrmReader() {
+        if (direct_fd_ != -1) {
+            ::close(direct_fd_);
+        }
         if (fd_ != -1) {
             ::close(fd_);
         }
@@ -852,11 +1019,31 @@ public:
     bool is_fp16() const noexcept { return is_fp16_; }
     bool kp_is_identity() const noexcept { return kp_is_identity_; }
     const GrmFp16Header& f16_header() const noexcept { return f16_hdr_; }
+    void set_fused_j_block(int jb) const noexcept { if (jb > 0) fused_j_block_ = jb; }
+
+    inline void symm_f32_fused_stream(
+        const Eigen::Ref<const Eigen::MatrixXf>& X,
+        Eigen::MatrixXf& Y,
+        double* trace_K_out,
+        double* trace_K2_out) const;
+
+    inline void symm_large_k_stream(
+        const float* X_ptr, gcta_blas_int ldX,
+        const uint16_t* X_bf16_pre,
+        int cols,
+        float* Y_ptr, gcta_blas_int ldY,
+        bool use_bf16,
+        int band_rows,
+        int col_chunk,
+        double* trace_K_out,
+        double* trace_K2_out,
+        gcta_chunked::MatvecStats* stats) const;
 
     // Release cached row-band and tile-scratch buffers immediately (safe to reuse later).
     void release_buffers() const noexcept {
         band_buf_[0].reset();
         band_buf_[1].reset();
+        band_data_off_ = {0, 0};
         band_lo_ = {0, 0};
         band_hi_ = {0, 0};
         active_buf_ = 0;
@@ -864,6 +1051,8 @@ public:
         tile_scratch_f32_.resize(0, 0);
         tile_scratch_T_.resize(0, 0);
         tile_scratch_f32_T_.resize(0, 0);
+        strip_scratch_bf16_.clear();
+        strip_scratch_f32_.clear();
     }
 
     // Partition analysis rows [0, n) into variable-height row bands [rs, re) so
@@ -1052,7 +1241,7 @@ public:
                                     (band_lo_[static_cast<size_t>(slot)] + 1) / 2;
 
         if (is_fp16_) {
-            const auto* buf = reinterpret_cast<const GrmFp16*>(band_buf_[static_cast<size_t>(slot)].data());
+            const auto* buf = reinterpret_cast<const GrmFp16*>(band_data(slot));
             if (kp_is_identity_) {
                 #pragma omp parallel for schedule(guided)
                 for (int lp = 0; lp < tile_rows; ++lp) {
@@ -1122,7 +1311,7 @@ public:
             return tile_T;
         }
 
-        const auto* buf = reinterpret_cast<const float*>(band_buf_[static_cast<size_t>(slot)].data());
+        const auto* buf = reinterpret_cast<const float*>(band_data(slot));
         if (kp_is_identity_) {
             #pragma omp parallel for schedule(guided)
             for (int lp = 0; lp < tile_rows; ++lp) {
@@ -1195,7 +1384,7 @@ public:
                                     (band_lo_[static_cast<size_t>(slot)] + 1) / 2;
 
         if (is_fp16_) {
-            const auto* buf = reinterpret_cast<const GrmFp16*>(band_buf_[static_cast<size_t>(slot)].data());
+            const auto* buf = reinterpret_cast<const GrmFp16*>(band_data(slot));
             if (kp_is_identity_) {
                 #pragma omp parallel for schedule(guided)
                 for (int lp = 0; lp < tile_rows; ++lp) {
@@ -1265,7 +1454,7 @@ public:
             return tile_T;
         }
 
-        const auto* buf = reinterpret_cast<const float*>(band_buf_[static_cast<size_t>(slot)].data());
+        const auto* buf = reinterpret_cast<const float*>(band_data(slot));
         if (kp_is_identity_) {
             #pragma omp parallel for schedule(guided)
             for (int lp = 0; lp < tile_rows; ++lp) {
@@ -1392,10 +1581,179 @@ private:
     mutable Eigen::MatrixXd tile_scratch_T_;
     mutable Eigen::MatrixXf tile_scratch_f32_T_;
 
-    mutable std::array<AlignedRawBuffer<char, 64>, 2> band_buf_;
+    mutable std::array<detail::BandSlab, 2> band_buf_;
+    mutable std::array<size_t, 2> band_data_off_{0, 0};
     mutable std::array<int, 2> band_lo_{0, 0};
     mutable std::array<int, 2> band_hi_{0, 0};
     mutable int active_buf_ = 0;
+    mutable int fused_j_block_ = 1024;
+    mutable AlignedRawBuffer<uint16_t, 64> strip_scratch_bf16_;
+    mutable AlignedRawBuffer<float, 64> strip_scratch_f32_;
+
+    const char* band_data(int slot) const noexcept {
+        const size_t sl = static_cast<size_t>(slot);
+        return band_buf_[sl].data() + band_data_off_[sl];
+    }
+
+    void read_band_into_slot_impl(int slot, uint64_t file_off, size_t byte_cnt) const {
+        const size_t sl = static_cast<size_t>(slot);
+        if (byte_cnt == 0) {
+            band_data_off_[sl] = 0;
+            return;
+        }
+        const size_t hint_cap = std::min<size_t>(
+            band_byte_budget_ / 2ULL + 8192ULL,
+            byte_len_ + 8192ULL);
+
+#if defined(__linux__) && defined(O_DIRECT)
+        if (direct_fd_ >= 0) {
+            constexpr size_t kDioAlign       = 4096ULL;
+            constexpr size_t kMinDirectBytes = 64ULL << 20;
+            constexpr size_t kStripeBytes    = 4ULL << 20;
+            constexpr size_t kMaxDirectChunk = 64ULL << 20;
+
+            const uint64_t R_beg = file_off & ~static_cast<uint64_t>(kDioAlign - 1ULL);
+            const size_t lead_skip = static_cast<size_t>(file_off - R_beg);
+            const uint64_t F_end = file_off + static_cast<uint64_t>(byte_cnt);
+            const uint64_t R_end_aligned =
+                (F_end + static_cast<uint64_t>(kDioAlign - 1ULL)) & ~static_cast<uint64_t>(kDioAlign - 1ULL);
+            const size_t read_len = static_cast<size_t>(R_end_aligned - R_beg);
+
+            const size_t want_cap = std::max(read_len, hint_cap);
+            if (!band_buf_[sl].ensure(want_cap)) {
+                throw std::bad_alloc();
+            }
+            char* const buf = band_buf_[sl].data();
+
+            uint64_t mid_beg = R_beg;
+            bool ok_direct = true;
+            if (!direct_probed_) {
+                ssize_t probe_r = -1;
+                do {
+                    probe_r = ::pread(direct_fd_, buf, kDioAlign, static_cast<off_t>(R_beg));
+                } while (probe_r < 0 && errno == EINTR);
+                if (probe_r < 0) {
+                    if (errno == EINVAL || errno == EOPNOTSUPP) {
+                        ::close(direct_fd_);
+                        direct_fd_ = -1;
+                        ok_direct = false;
+                    } else {
+                        throw std::runtime_error("pread(O_DIRECT) probe failed on [" + path_ + "]: " + std::string(std::strerror(errno)));
+                    }
+                } else if (probe_r == 0) {
+                    throw std::runtime_error("unexpected EOF reading [" + path_ + "].");
+                } else {
+                    direct_probed_ = true;
+                    mid_beg = R_beg + static_cast<uint64_t>(probe_r);
+                    if (mid_beg >= F_end) {
+                        band_data_off_[sl] = lead_skip;
+                        return;
+                    }
+                    if (static_cast<size_t>(probe_r) != kDioAlign) {
+                        ::close(direct_fd_);
+                        direct_fd_ = -1;
+                        direct_probed_ = false;
+                        ok_direct = false;
+                    }
+                }
+            }
+
+            if (ok_direct) {
+                const uint64_t mid_bytes = (R_end_aligned > mid_beg) ? (R_end_aligned - mid_beg) : 0ULL;
+                if (mid_bytes > 0 && mid_beg < F_end) {
+                    int W = std::clamp(read_cfg_.read_threads, 1, 16);
+                    if (mid_bytes < kMinDirectBytes) W = 1;
+                    const uint64_t step = (mid_bytes >= static_cast<uint64_t>(W) * kStripeBytes)
+                        ? static_cast<uint64_t>(kStripeBytes)
+                        : static_cast<uint64_t>(kDioAlign);
+
+                    auto split_off = [&](int k) -> uint64_t {
+                        if (k <= 0) return mid_beg;
+                        if (k >= W) return R_end_aligned;
+                        const uint64_t raw = mid_beg + (mid_bytes * static_cast<uint64_t>(k)) / static_cast<uint64_t>(W);
+                        const uint64_t aligned = (raw / step) * step;
+                        return std::clamp(aligned, mid_beg, R_end_aligned);
+                    };
+
+                    auto read_slice = [&](uint64_t s_beg, uint64_t s_end) {
+                        const uint64_t need_end = std::min(s_end, F_end);
+                        uint64_t off = s_beg;
+                        while (off < need_end) {
+                            const size_t chunk = static_cast<size_t>(std::min<uint64_t>(kMaxDirectChunk, s_end - off));
+                            char* const dst = buf + static_cast<size_t>(off - R_beg);
+                            const ssize_t r = ::pread(direct_fd_, dst, chunk, static_cast<off_t>(off));
+                            if (r < 0) {
+                                if (errno == EINTR) continue;
+                                throw std::runtime_error("pread(O_DIRECT) failed on [" + path_ + "]: " + std::string(std::strerror(errno)));
+                            }
+                            if (r == 0) {
+                                throw std::runtime_error("unexpected EOF in pread(O_DIRECT) on [" + path_ + "].");
+                            }
+                            if ((static_cast<uint64_t>(r) & static_cast<uint64_t>(kDioAlign - 1ULL)) != 0 &&
+                                off + static_cast<uint64_t>(r) < need_end) {
+                                throw std::runtime_error("unaligned short pread(O_DIRECT) on [" + path_ + "].");
+                            }
+                            off += static_cast<uint64_t>(r);
+                        }
+                    };
+
+                    if (W == 1) {
+                        read_slice(mid_beg, R_end_aligned);
+                    } else {
+                        std::vector<std::exception_ptr> errs(static_cast<size_t>(W));
+                        {
+                            std::vector<std::jthread> workers;
+                            workers.reserve(static_cast<size_t>(W - 1));
+                            for (int k = 1; k < W; ++k) {
+                                const uint64_t sb = split_off(k);
+                                const uint64_t se = split_off(k + 1);
+                                workers.emplace_back([&, k, sb, se]() {
+                                    try {
+                                        if (sb < se) read_slice(sb, se);
+                                    } catch (...) {
+                                        errs[static_cast<size_t>(k)] = std::current_exception();
+                                    }
+                                });
+                            }
+                            try {
+                                const uint64_t sb0 = split_off(0);
+                                const uint64_t se0 = split_off(1);
+                                if (sb0 < se0) read_slice(sb0, se0);
+                            } catch (...) {
+                                errs[0] = std::current_exception();
+                            }
+                        }
+                        for (const std::exception_ptr& e : errs) {
+                            if (e) std::rethrow_exception(e);
+                        }
+                    }
+                }
+                band_data_off_[sl] = lead_skip;
+                return;
+            }
+        }
+#endif
+
+        const size_t want_cap = std::max(byte_cnt, hint_cap);
+        if (!band_buf_[sl].ensure(want_cap)) {
+            throw std::bad_alloc();
+        }
+        band_data_off_[sl] = 0;
+        gcta_io::read_exact_at_throwing(fd_, band_buf_[sl].data(), byte_cnt, static_cast<off_t>(file_off), path_);
+#if defined(__linux__) && defined(POSIX_FADV_DONTNEED)
+        if (byte_len_ >= (32ULL << 30) && byte_cnt >= 8192ULL) {
+            const uint64_t drop_beg = (file_off + 4095ULL) & ~4095ULL;
+            const uint64_t drop_end = (file_off + static_cast<uint64_t>(byte_cnt)) & ~4095ULL;
+            if (drop_end > drop_beg) {
+                (void)::posix_fadvise(
+                    fd_,
+                    static_cast<off_t>(drop_beg),
+                    static_cast<off_t>(drop_end - drop_beg),
+                    POSIX_FADV_DONTNEED);
+            }
+        }
+#endif
+    }
 
     void load_band_exact_into_slot(int slot, int file_lo, int file_hi) const {
         const size_t sl = static_cast<size_t>(slot);
@@ -1405,10 +1763,8 @@ private:
         const size_t elem_lo = static_cast<size_t>(file_lo) * (file_lo + 1) / 2;
         const size_t elem_hi = static_cast<size_t>(file_hi) * (file_hi + 1) / 2;
         const size_t byte_cnt = (elem_hi - elem_lo) * elem_bytes_;
-        band_buf_[sl].resize(byte_cnt);
-        gcta_io::read_exact_at_throwing(
-            fd_, band_buf_[sl].data(), byte_cnt,
-            body_offset_ + static_cast<off_t>(elem_lo * elem_bytes_), path_);
+        const uint64_t file_off = static_cast<uint64_t>(body_offset_) + static_cast<uint64_t>(elem_lo) * elem_bytes_;
+        read_band_into_slot_impl(slot, file_off, byte_cnt);
         band_lo_[sl] = file_lo;
         band_hi_[sl] = file_hi;
     }
@@ -1427,9 +1783,12 @@ private:
 
         const size_t elem_hi = static_cast<size_t>(actual_hi) * (actual_hi + 1) / 2;
         const size_t byte_cnt = (elem_hi - elem_lo) * elem_bytes_;
-        band_buf_[sl].resize(byte_cnt);
-        read_exact_at(fd_, band_buf_[sl].data(), byte_cnt,
-                      body_offset_ + static_cast<off_t>(elem_lo * elem_bytes_), path_);
+        const uint64_t file_off = static_cast<uint64_t>(body_offset_) + static_cast<uint64_t>(elem_lo) * elem_bytes_;
+        try {
+            read_band_into_slot_impl(slot, file_off, byte_cnt);
+        } catch (const std::exception& e) {
+            LOGGER.e(0, std::string("ChunkedGrmReader band read failed on [") + path_ + "]: " + e.what());
+        }
         band_lo_[sl] = file_lo;
         band_hi_[sl] = actual_hi;
     }
@@ -1438,9 +1797,13 @@ private:
     std::vector<KpRun> kp_runs_;
     std::string path_;
     int fd_ = -1;
+    mutable int direct_fd_ = -1;
+    mutable bool direct_probed_ = false;
+    uint64_t file_size_ = 0;
     size_t byte_len_ = 0;
     int n_grm_ = 0;
     size_t band_byte_budget_ = 0;
+    ChunkedGrmReadConfig read_cfg_{};
     bool kp_is_identity_ = false;
     bool is_fp16_ = false;
     size_t elem_bytes_ = sizeof(float);
@@ -1552,11 +1915,11 @@ inline double read_grm_N_mean(const std::string& prefix, int n_grm, bool prefer_
 }
 
 // Splits a --grm-chunked-budget total (GB) into the slice reserved for
-// ChunkedGrmReader's double-buffered row-band cache. Because column tiles are
-// capped at 4096 (<= 64-128 MB tile scratch), up to 2.0 GB (1.0 GB per buffer)
-// can go to row bands while keeping total memory strictly <= total_budget_gb.
+// ChunkedGrmReader's double-buffered row-band cache. Allowing up to 32.0 GB
+// (16.0 GB per buffer) keeps bands 4,500-9,000+ rows tall even at the bottom
+// of an N=885k+ GRM while respecting small budgets via min(32.0, budget * 0.5).
 inline double chunked_reader_reserved_gb(double total_budget_gb) {
-    return std::min(2.0, total_budget_gb * 0.50);
+    return std::min(32.0, total_budget_gb * 0.50);
 }
 
 struct ChunkedGrmHandle {
@@ -1579,7 +1942,8 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
     const std::string& feature_flag = "--grm-chunked-budget",
     bool need_m_snps = true,
     const std::vector<std::string>* preloaded_grm_ids = nullptr,
-    bool prefer_fp16 = false)
+    bool prefer_fp16 = false,
+    ChunkedGrmReadConfig read_cfg = {})
 {
     const ResolvedGrmInput resolved = resolve_grm_input(prefix, prefer_fp16);
     std::vector<std::string> grm_ids_storage;
@@ -1619,7 +1983,7 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
     auto file = std::make_shared<ChunkedGrmReader>(
         resolved.data_path, std::move(kp), n_grm,
         static_cast<size_t>(reader_reserved_gb * 1e9),
-        &grm_ids);
+        &grm_ids, read_cfg);
     handle.file = file;
 
     if (file->is_fp16()) {
@@ -1678,6 +2042,27 @@ inline ChunkedGrmHandle make_chunked_grm_reader(
     handle.reader_f32.release_fn = [file]() {
         file->release_buffers();
     };
+    if (file->is_fp16() && file->kp_is_identity() &&
+        (file->f16_header().flags & kGrmF16FlagHasTraces) != 0) {
+        handle.reader_f32.fused_symm_fn = [file](const Eigen::Ref<const Eigen::MatrixXf>& X,
+                                                 Eigen::MatrixXf& Y,
+                                                 double* tr_K,
+                                                 double* tr_K2) {
+            file->symm_f32_fused_stream(X, Y, tr_K, tr_K2);
+        };
+        handle.reader_f32.fused_max_k = 128;
+        handle.reader_f32.large_k_symm_fn = [file](const float* X_ptr, gcta_blas_int ldX,
+                                                   const uint16_t* X_bf16_pre,
+                                                   int cols,
+                                                   float* Y_ptr, gcta_blas_int ldY,
+                                                   bool use_bf16,
+                                                   int band_rows, int col_chunk,
+                                                   double* tr_K, double* tr_K2,
+                                                   gcta_chunked::MatvecStats* stats) {
+            file->symm_large_k_stream(X_ptr, ldX, X_bf16_pre, cols, Y_ptr, ldY,
+                                      use_bf16, band_rows, col_chunk, tr_K, tr_K2, stats);
+        };
+    }
 
     return handle;
 }
@@ -2617,7 +3002,8 @@ inline void unpack_diag_tile_symmetric(
     int rs,
     int rows_i,
     Elem* T,
-    gcta_blas_int ldD) noexcept
+    gcta_blas_int ldD,
+    size_t base_elem_offset = 0) noexcept
 {
     constexpr int kB = 64;
     const int nblk = (rows_i + kB - 1) / kB;
@@ -2642,7 +3028,7 @@ inline void unpack_diag_tile_symmetric(
                 const int c = c0 + dc;
                 const int gi = rs + c;
                 const GrmFp16* __restrict__ src =
-                    packed_base + static_cast<size_t>(gi) * (gi + 1) / 2 + (rs + r0);
+                    packed_base + (static_cast<size_t>(gi) * (gi + 1) / 2 - base_elem_offset) + (rs + r0);
                 Elem* __restrict__ dst_col = T + r0 + static_cast<size_t>(c) * static_cast<size_t>(ldD);
                 unpack_fp16_row_strip(src, dst_col, static_cast<size_t>(rlen));
                 for (int dr = 0; dr < rlen; ++dr) {
@@ -2658,7 +3044,7 @@ inline void unpack_diag_tile_symmetric(
                 const int c = c0 + dc;
                 const int gi = rs + c;
                 const GrmFp16* __restrict__ src =
-                    packed_base + static_cast<size_t>(gi) * (gi + 1) / 2 + (rs + c0);
+                    packed_base + (static_cast<size_t>(gi) * (gi + 1) / 2 - base_elem_offset) + (rs + c0);
                 Elem* __restrict__ dst_col = T + c0 + static_cast<size_t>(c) * static_cast<size_t>(ldD);
                 if (dc > 0) {
                     unpack_fp16_row_strip(src, dst_col, static_cast<size_t>(dc));
@@ -2867,6 +3253,462 @@ struct PackedGrmFp16Handle {
     uint64_t id_hash = 0;
     int chunk_rows = 0;
 };
+
+namespace detail {
+
+inline std::vector<int> band_row_partition(int rs, int re, int num_parts) {
+    std::vector<int> bounds(1, rs);
+    if (re <= rs) return bounds;
+    const size_t e0 = static_cast<size_t>(rs) * (rs + 1) / 2ULL;
+    const size_t e1 = static_cast<size_t>(re) * (re + 1) / 2ULL;
+    const size_t total = e1 - e0;
+    int cur = rs;
+    for (int p = 1; p < num_parts && cur < re; ++p) {
+        const size_t target_elems = e0 + (total * static_cast<size_t>(p)) / static_cast<size_t>(num_parts);
+        const int nxt = row_bound_for_cumulative(target_elems, cur, re);
+        bounds.push_back(nxt);
+        cur = nxt;
+        if (cur >= re) break;
+    }
+    if (bounds.back() < re) bounds.push_back(re);
+    return bounds;
+}
+
+template <int P, typename ReaderFn>
+inline void packed_f16_symm_panel_loop_stream(
+    int n,
+    int cols,
+    int j_block,
+    const std::vector<int>& bands,
+    int use_nt,
+    gcta_chunked::TileSweep* sweep,
+    ReaderFn&& acquire_band_fn,
+    const float* diag_ptr,
+    const float* X_ptr,
+    Eigen::Index ldX,
+    float* Y_ptr,
+    Eigen::Index ldY)
+{
+    gcta_chunked::detail::parallel_zero_colmajor(Y_ptr, ldY, n, cols);
+    const int num_bands = static_cast<int>(bands.size()) - 1;
+    if (num_bands <= 0 || n <= 0 || cols <= 0) return;
+
+    int max_band_rows = 1;
+    for (int b = 0; b < num_bands; ++b) {
+        max_band_rows = std::max(max_band_rows, bands[static_cast<size_t>(b + 1)] - bands[static_cast<size_t>(b)]);
+    }
+
+    const int n_panels = (cols + P - 1) / P;
+    const size_t panel_elems = static_cast<size_t>(n) * P;
+    AlignedRawBuffer<float, 64> X_panels(static_cast<size_t>(n_panels) * panel_elems);
+    AlignedRawBuffer<float, 64> Y_row(static_cast<size_t>(max_band_rows) * P);
+    AlignedRawBuffer<float, 64> Y_col(panel_elems);
+
+    #pragma omp parallel num_threads(use_nt)
+    {
+        const int tid = omp_get_thread_num();
+        const int nt  = omp_get_num_threads();
+        const int row_lo = static_cast<int>((static_cast<int64_t>(n) * tid) / nt);
+        const int row_hi = static_cast<int>((static_cast<int64_t>(n) * (tid + 1)) / nt);
+        for (int p = 0; p < n_panels; ++p) {
+            const int p0 = p * P;
+            const int p_len = std::min(P, cols - p0);
+            float* const xp = X_panels.data() + static_cast<size_t>(p) * panel_elems;
+            for (int i = row_lo; i < row_hi; ++i) {
+                float* __restrict__ xrow = xp + static_cast<size_t>(i) * P;
+                for (int d = 0; d < p_len; ++d) {
+                    xrow[d] = X_ptr[i + static_cast<Eigen::Index>(p0 + d) * ldX];
+                }
+                for (int d = p_len; d < P; ++d) {
+                    xrow[d] = 0.0f;
+                }
+            }
+        }
+    }
+
+    const int JB = j_block;
+    const bool use_avx512 = packed_f16_has_avx512();
+
+    for (int b = 0; b < num_bands; ++b) {
+        const int rs = bands[static_cast<size_t>(b)];
+        const int re = bands[static_cast<size_t>(b + 1)];
+        const int rows_i = re - rs;
+        if (sweep) sweep->acquire(b);
+        const auto band_info = acquire_band_fn(b, rs, re);
+        const GrmFp16* const band_base = band_info.first;
+        const size_t band_elem_lo = band_info.second;
+
+        const int n_slabs_b = (re > 1) ? ((re - 2) / JB + 1) : 0;
+        std::vector<std::mutex> slab_locks(static_cast<size_t>(std::max(1, n_slabs_b)));
+        std::vector<int> bounds = band_row_partition(rs, re, use_nt);
+
+        for (int p = 0; p < n_panels; ++p) {
+            const int p0 = p * P;
+            const int p_len = std::min(P, cols - p0);
+            const float* const x_rm_ptr = X_panels.data() + static_cast<size_t>(p) * panel_elems;
+            float* const y_col_ptr = Y_col.data();
+            float* const y_row_ptr = Y_row.data();
+
+            #pragma omp parallel num_threads(use_nt)
+            {
+                const int tid = omp_get_thread_num();
+                const int nt  = omp_get_num_threads();
+
+                const int c_lo = static_cast<int>((static_cast<int64_t>(re) * tid) / nt);
+                const int c_hi = static_cast<int>((static_cast<int64_t>(re) * (tid + 1)) / nt);
+                if (c_hi > c_lo) {
+                    std::memset(y_col_ptr + static_cast<size_t>(c_lo) * P, 0,
+                                static_cast<size_t>(c_hi - c_lo) * P * sizeof(float));
+                }
+
+                #pragma omp barrier
+
+                const int num_parts = static_cast<int>(bounds.size()) - 1;
+                const int r_lo = (tid < num_parts) ? bounds[static_cast<size_t>(tid)] : re;
+                const int r_hi = (tid < num_parts) ? bounds[static_cast<size_t>(tid + 1)] : re;
+
+                for (int i = r_lo; i < r_hi; ++i) {
+                    const float dv = diag_ptr[i];
+                    const float* __restrict__ xi = x_rm_ptr + static_cast<size_t>(i) * P;
+                    float* __restrict__ yr = y_row_ptr + static_cast<size_t>(i - rs) * P;
+                    #pragma omp simd
+                    for (int d = 0; d < P; ++d) {
+                        yr[d] = dv * xi[d];
+                    }
+                }
+
+                const int n_slabs_t = (r_hi > 1) ? ((r_hi - 2) / JB + 1) : 0;
+                if (n_slabs_t > 0 && r_lo < r_hi) {
+                    AlignedRawBuffer<float, 64> y_col_loc(static_cast<size_t>(JB) * P);
+                    const int offset = (tid * 7) % n_slabs_t;
+                    for (int step = 0; step < n_slabs_t; ++step) {
+                        const int s = (step + offset) % n_slabs_t;
+                        const int j0 = s * JB;
+                        const int j1 = std::min(re, j0 + JB);
+                        const int i_start = std::max(r_lo, j0 + 1);
+                        if (i_start >= r_hi) continue;
+                        const int j_len = j1 - j0;
+                        std::memset(y_col_loc.data(), 0, static_cast<size_t>(j_len) * P * sizeof(float));
+
+                        const float* const x_j_ptr = x_rm_ptr + static_cast<size_t>(j0) * P;
+
+                        const int i_diag_end = std::min(r_hi, j1);
+                        for (int i = i_start; i < i_diag_end; ++i) {
+                            const GrmFp16* src_i = band_base + (static_cast<size_t>(i) * (i + 1) / 2 - band_elem_lo) + j0;
+                            const int len = i - j0;
+                            packed_f16_kernel_1row<P>(
+                                src_i, len, x_j_ptr,
+                                x_rm_ptr + static_cast<size_t>(i) * P,
+                                y_row_ptr + static_cast<size_t>(i - rs) * P,
+                                y_col_loc.data(), use_avx512);
+                        }
+
+                        int i = std::max(i_start, j1);
+                        for (; i + 3 < r_hi; i += 4) {
+                            const GrmFp16* s0 = band_base + (static_cast<size_t>(i) * (i + 1) / 2 - band_elem_lo) + j0;
+                            const GrmFp16* s1 = band_base + (static_cast<size_t>(i + 1) * (i + 2) / 2 - band_elem_lo) + j0;
+                            const GrmFp16* s2 = band_base + (static_cast<size_t>(i + 2) * (i + 3) / 2 - band_elem_lo) + j0;
+                            const GrmFp16* s3 = band_base + (static_cast<size_t>(i + 3) * (i + 4) / 2 - band_elem_lo) + j0;
+                            packed_f16_kernel_4row<P>(
+                                s0, s1, s2, s3, j_len, x_j_ptr,
+                                x_rm_ptr + static_cast<size_t>(i) * P,
+                                y_row_ptr + static_cast<size_t>(i - rs) * P,
+                                y_col_loc.data(), use_avx512);
+                        }
+                        for (; i < r_hi; ++i) {
+                            const GrmFp16* src_i = band_base + (static_cast<size_t>(i) * (i + 1) / 2 - band_elem_lo) + j0;
+                            packed_f16_kernel_1row<P>(
+                                src_i, j_len, x_j_ptr,
+                                x_rm_ptr + static_cast<size_t>(i) * P,
+                                y_row_ptr + static_cast<size_t>(i - rs) * P,
+                                y_col_loc.data(), use_avx512);
+                        }
+
+                        {
+                            std::lock_guard<std::mutex> lk(slab_locks[static_cast<size_t>(s)]);
+                            float* __restrict__ dst = y_col_ptr + static_cast<size_t>(j0) * P;
+                            const float* __restrict__ src = y_col_loc.data();
+                            const size_t cnt = static_cast<size_t>(j_len) * P;
+                            #pragma omp simd
+                            for (size_t idx = 0; idx < cnt; ++idx) {
+                                dst[idx] += src[idx];
+                            }
+                        }
+                    }
+                }
+
+                #pragma omp barrier
+
+                for (int idx = c_lo; idx < c_hi; ++idx) {
+                    const float* __restrict__ yc = y_col_ptr + static_cast<size_t>(idx) * P;
+                    if (idx >= rs && idx < rs + rows_i) {
+                        const float* __restrict__ yr = y_row_ptr + static_cast<size_t>(idx - rs) * P;
+                        for (int d = 0; d < p_len; ++d) {
+                            Y_ptr[idx + static_cast<Eigen::Index>(p0 + d) * ldY] += yc[d] + yr[d];
+                        }
+                    } else {
+                        for (int d = 0; d < p_len; ++d) {
+                            Y_ptr[idx + static_cast<Eigen::Index>(p0 + d) * ldY] += yc[d];
+                        }
+                    }
+                }
+            }
+        }
+        if (sweep) sweep->release(b);
+    }
+}
+
+} // namespace detail
+
+inline void ChunkedGrmReader::symm_f32_fused_stream(
+    const Eigen::Ref<const Eigen::MatrixXf>& X,
+    Eigen::MatrixXf& Y,
+    double* trace_K_out,
+    double* trace_K2_out) const
+{
+    if (!is_fp16_ || !kp_is_identity_) {
+        throw std::runtime_error("symm_f32_fused_stream requires identity-order .grm.f16.");
+    }
+    if (trace_K_out)  *trace_K_out  = f16_hdr_.trace_K;
+    if (trace_K2_out) *trace_K2_out = f16_hdr_.trace_K2;
+    const int n = static_cast<int>(kp_.size());
+    const int cols = static_cast<int>(X.cols());
+    if (n == 0 || cols == 0) return;
+
+    const std::vector<int> bands = compute_row_bands(std::min(n, 65536));
+    auto sweep = begin_sweep(bands);
+    const int max_t = std::max(1, omp_get_max_threads());
+    const int use_nt = std::clamp(sweep ? std::max(1, max_t - read_cfg_.read_threads) : max_t, 1, n);
+
+    auto acquire_band = [&](int /*b*/, int rs, int re) -> std::pair<const GrmFp16*, size_t> {
+        if (!sweep) {
+            load_band_exact_into_slot(0, rs, re);
+            active_buf_ = 0;
+        }
+        const int slot = active_buf_;
+        const auto* base = reinterpret_cast<const GrmFp16*>(band_data(slot));
+        const size_t lo = static_cast<size_t>(band_lo_[static_cast<size_t>(slot)]) *
+                          (band_lo_[static_cast<size_t>(slot)] + 1) / 2ULL;
+        return {base, lo};
+    };
+
+    if (cols <= 16) {
+        detail::packed_f16_symm_panel_loop_stream<16>(
+            n, cols, fused_j_block_, bands, use_nt, sweep.get(), acquire_band,
+            diag_f32_.data(), X.data(), X.outerStride(), Y.data(), Y.outerStride());
+    } else {
+        detail::packed_f16_symm_panel_loop_stream<32>(
+            n, cols, fused_j_block_, bands, use_nt, sweep.get(), acquire_band,
+            diag_f32_.data(), X.data(), X.outerStride(), Y.data(), Y.outerStride());
+    }
+}
+
+inline void ChunkedGrmReader::symm_large_k_stream(
+    const float* X_ptr, gcta_blas_int ldX,
+    const uint16_t* X_bf16_pre,
+    int cols,
+    float* Y_ptr, gcta_blas_int ldY,
+    bool use_bf16,
+    int band_rows,
+    int col_chunk,
+    double* trace_K_out,
+    double* trace_K2_out,
+    gcta_chunked::MatvecStats* stats) const
+{
+    if (!is_fp16_ || !kp_is_identity_) {
+        throw std::runtime_error("symm_large_k_stream requires identity-order .grm.f16.");
+    }
+    using Clock = std::chrono::steady_clock;
+    if (trace_K_out)  *trace_K_out  = f16_hdr_.trace_K;
+    if (trace_K2_out) *trace_K2_out = f16_hdr_.trace_K2;
+    const int n = static_cast<int>(kp_.size());
+    if (n <= 0 || cols <= 0) return;
+
+    gcta_chunked::detail::parallel_zero_colmajor(Y_ptr, ldY, n, cols);
+
+    AlignedRawBuffer<uint16_t, 64> X_bf16_local;
+    const uint16_t* X_bf16_ptr = X_bf16_pre;
+    if (use_bf16) {
+        strip_scratch_f32_.clear();
+        if (X_bf16_ptr == nullptr) {
+            X_bf16_local.resize(static_cast<size_t>(n) * static_cast<size_t>(cols));
+            gcta_chunked::detail::convert_colmajor_f32_to_bf16(
+                X_ptr, ldX, X_bf16_local.data(),
+                static_cast<gcta_blas_int>(n), static_cast<gcta_blas_int>(cols));
+            X_bf16_ptr = X_bf16_local.data();
+        }
+    } else {
+        strip_scratch_bf16_.clear();
+    }
+
+    const int auto_H = (n >= 32768 && cols >= 2048) ? 16384 : 8192;
+    const int H = std::clamp(band_rows > 0 ? band_rows : auto_H, 64, n);
+    const size_t elem_b = use_bf16 ? sizeof(uint16_t) : sizeof(float);
+    const size_t max_elems = ((use_bf16 ? 1ULL : 2ULL) << 30) / elem_b;
+    int C = (col_chunk > 0)
+        ? col_chunk
+        : static_cast<int>(std::clamp<size_t>(
+              (max_elems / static_cast<size_t>(H)) & ~size_t(63), 4096, 65536));
+    C = std::max(64, std::min(n, C));
+
+    const std::vector<int> bands = compute_row_bands(H);
+    const int num_bands = static_cast<int>(bands.size()) - 1;
+    auto sweep = begin_sweep(bands);
+    const int unpack_nt = sweep
+        ? std::max(1, omp_get_max_threads() - read_cfg_.read_threads)
+        : std::max(1, omp_get_max_threads());
+
+    auto pad_ld = [&](int dim) noexcept -> int {
+        if (use_bf16) {
+            return ((dim & 2047) == 0) ? (dim + 32) : dim;
+        }
+        return ((dim & 1023) == 0) ? (dim + 16) : dim;
+    };
+
+    int max_band_rows = 1;
+    for (int b = 0; b < num_bands; ++b) {
+        max_band_rows = std::max(max_band_rows, bands[static_cast<size_t>(b + 1)] - bands[static_cast<size_t>(b)]);
+    }
+    const int max_cols_j = std::min(n, C);
+    const size_t need_elems = std::max(
+        static_cast<size_t>(pad_ld(max_cols_j)) * static_cast<size_t>(max_band_rows),
+        static_cast<size_t>(pad_ld(max_band_rows)) * static_cast<size_t>(max_band_rows));
+
+    if (use_bf16) {
+        if (strip_scratch_bf16_.size() < need_elems) strip_scratch_bf16_.resize(need_elems);
+    } else {
+        if (strip_scratch_f32_.size() < need_elems) strip_scratch_f32_.resize(need_elems);
+    }
+
+    const float* const diag_ptr = diag_f32_.data();
+    const gcta_blas_int ldX_bf16 = static_cast<gcta_blas_int>(n);
+
+    for (int b = 0; b < num_bands; ++b) {
+        const int rs = bands[static_cast<size_t>(b)];
+        const int re = bands[static_cast<size_t>(b + 1)];
+        const int rows_i = re - rs;
+
+        if (sweep) {
+            sweep->acquire(b);
+        } else {
+            load_band_exact_into_slot(0, rs, re);
+            active_buf_ = 0;
+        }
+        const int slot = active_buf_;
+        const GrmFp16* const band_base = reinterpret_cast<const GrmFp16*>(band_data(slot));
+        const size_t band_elem_lo = static_cast<size_t>(band_lo_[static_cast<size_t>(slot)]) *
+                                    (band_lo_[static_cast<size_t>(slot)] + 1) / 2ULL;
+
+        for (int cs = 0; cs < rs; cs += C) {
+            const int ce = std::min(rs, cs + C);
+            const int cols_j = ce - cs;
+            const gcta_blas_int ldT = static_cast<gcta_blas_int>(pad_ld(cols_j));
+
+            const auto t_u0 = stats ? Clock::now() : Clock::time_point{};
+            if (use_bf16) {
+                uint16_t* const T_bf16 = strip_scratch_bf16_.data();
+                #pragma omp parallel for num_threads(unpack_nt) schedule(static) if (static_cast<size_t>(rows_i) * static_cast<size_t>(cols_j) >= 16384)
+                for (int lp = 0; lp < rows_i; ++lp) {
+                    const int gi = rs + lp;
+                    const GrmFp16* __restrict__ src =
+                        band_base + (static_cast<size_t>(gi) * (gi + 1) / 2ULL - band_elem_lo) + cs;
+                    uint16_t* __restrict__ dst = T_bf16 + static_cast<size_t>(lp) * static_cast<size_t>(ldT);
+                    detail::fp16_to_bf16_rne_vec(src, dst, static_cast<size_t>(cols_j));
+                }
+            } else {
+                float* const T_f32 = strip_scratch_f32_.data();
+                #pragma omp parallel for num_threads(unpack_nt) schedule(static) if (static_cast<size_t>(rows_i) * static_cast<size_t>(cols_j) >= 16384)
+                for (int lp = 0; lp < rows_i; ++lp) {
+                    const int gi = rs + lp;
+                    const GrmFp16* __restrict__ src =
+                        band_base + (static_cast<size_t>(gi) * (gi + 1) / 2ULL - band_elem_lo) + cs;
+                    float* __restrict__ dst = T_f32 + static_cast<size_t>(lp) * static_cast<size_t>(ldT);
+                    #pragma omp simd
+                    for (int lq = 0; lq < cols_j; ++lq) {
+                        dst[lq] = fp16_to_f32(src[lq]);
+                    }
+                }
+            }
+            const auto t_g0 = stats ? Clock::now() : Clock::time_point{};
+            if (stats) {
+                stats->unpack_s += std::chrono::duration<double>(t_g0 - t_u0).count();
+            }
+
+            if (use_bf16) {
+                const uint16_t* const T_bf16 = strip_scratch_bf16_.data();
+                gcta_gemm_bf16bf16f32_colmajor(
+                    'T', 'N',
+                    static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols),
+                    static_cast<gcta_blas_int>(cols_j),
+                    1.0f, T_bf16, ldT,
+                    X_bf16_ptr + cs, ldX_bf16,
+                    1.0f, Y_ptr + rs, ldY);
+                gcta_gemm_bf16bf16f32_colmajor(
+                    'N', 'N',
+                    static_cast<gcta_blas_int>(cols_j), static_cast<gcta_blas_int>(cols),
+                    static_cast<gcta_blas_int>(rows_i),
+                    1.0f, T_bf16, ldT,
+                    X_bf16_ptr + rs, ldX_bf16,
+                    1.0f, Y_ptr + cs, ldY);
+            } else {
+                const float* const T_f32 = strip_scratch_f32_.data();
+                cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans,
+                            static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols),
+                            static_cast<gcta_blas_int>(cols_j),
+                            1.0f, T_f32, ldT,
+                            X_ptr + cs, ldX,
+                            1.0f, Y_ptr + rs, ldY);
+                cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                            static_cast<gcta_blas_int>(cols_j), static_cast<gcta_blas_int>(cols),
+                            static_cast<gcta_blas_int>(rows_i),
+                            1.0f, T_f32, ldT,
+                            X_ptr + rs, ldX,
+                            1.0f, Y_ptr + cs, ldY);
+            }
+            if (stats) {
+                stats->gemm_s += std::chrono::duration<double>(Clock::now() - t_g0).count();
+                stats->tiles += 1;
+                stats->gemm_calls += 2;
+            }
+        }
+
+        const gcta_blas_int ldD = static_cast<gcta_blas_int>(pad_ld(rows_i));
+        const auto t_u0 = stats ? Clock::now() : Clock::time_point{};
+        if (use_bf16) {
+            detail::unpack_diag_tile_symmetric(
+                band_base, diag_ptr, rs, rows_i, strip_scratch_bf16_.data(), ldD, band_elem_lo);
+        } else {
+            detail::unpack_diag_tile_symmetric(
+                band_base, diag_ptr, rs, rows_i, strip_scratch_f32_.data(), ldD, band_elem_lo);
+        }
+        const auto t_g0 = stats ? Clock::now() : Clock::time_point{};
+        if (stats) {
+            stats->unpack_s += std::chrono::duration<double>(t_g0 - t_u0).count();
+        }
+        if (use_bf16) {
+            gcta_gemm_bf16bf16f32_colmajor(
+                'N', 'N',
+                static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols),
+                static_cast<gcta_blas_int>(rows_i),
+                1.0f, strip_scratch_bf16_.data(), ldD,
+                X_bf16_ptr + rs, ldX_bf16,
+                1.0f, Y_ptr + rs, ldY);
+        } else {
+            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<gcta_blas_int>(rows_i), static_cast<gcta_blas_int>(cols),
+                        static_cast<gcta_blas_int>(rows_i),
+                        1.0f, strip_scratch_f32_.data(), ldD,
+                        X_ptr + rs, ldX,
+                        1.0f, Y_ptr + rs, ldY);
+        }
+        if (stats) {
+            stats->gemm_s += std::chrono::duration<double>(Clock::now() - t_g0).count();
+            stats->tiles += 1;
+            stats->gemm_calls += 1;
+        }
+        if (sweep) sweep->release(b);
+    }
+}
 
 inline PackedGrmFp16Handle load_packed_grm_fp16(
     const std::string& grm_prefix,

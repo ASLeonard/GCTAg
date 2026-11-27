@@ -199,6 +199,13 @@ void PCAStream::run(const gcta_cli::PcaOptions& opts, const std::string& out_pre
         ? (static_cast<size_t>(opts.pca_io_slot_mb) << 20)
         : gcta_grm_io::kDefaultGrmIoSlotBytes;
     const bool direct_load = (opts.pca_load_mode != gcta_cli::PcaLoadMode::Async);
+    gcta_grm_io::ChunkedReadMode read_mode = gcta_grm_io::ChunkedReadMode::Auto;
+    if (opts.grm_read_mode == gcta_cli::GrmReadMode::Buffered) {
+        read_mode = gcta_grm_io::ChunkedReadMode::Buffered;
+    } else if (opts.grm_read_mode == gcta_cli::GrmReadMode::Direct) {
+        read_mode = gcta_grm_io::ChunkedReadMode::Direct;
+    }
+    const gcta_grm_io::ChunkedGrmReadConfig read_cfg{opts.grm_read_threads, read_mode};
 
     if (opts.fast) {
         vector<string> fast_notes;
@@ -253,7 +260,7 @@ void PCAStream::run(const gcta_cli::PcaOptions& opts, const std::string& out_pre
     if (grm_chunked) {
         chunked_handle = gcta_grm_io::make_chunked_grm_reader(
             grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--pca",
-            /*need_m_snps=*/false, &grm_ids);
+            /*need_m_snps=*/false, &grm_ids, /*prefer_fp16=*/false, read_cfg);
         chunk_size = chunked_handle.chunk_rows;
         if (chunk_size >= n) {
             LOGGER.w(0, "--grm-chunked-budget=" + to_string(grm_chunked_budget) +
@@ -303,6 +310,21 @@ void PCAStream::run(const gcta_cli::PcaOptions& opts, const std::string& out_pre
     } else if (grm_chunked) {
         chunked_reader = std::move(chunked_handle.reader);
         chunked_reader_f32 = std::move(chunked_handle.reader_f32);
+        if (chunked_handle.has_traces) {
+            trace_total = chunked_handle.trace_K;
+            have_trace_total = true;
+        }
+        if (chunked_handle.file) {
+            chunked_handle.file->set_fused_j_block(opts.pca_j_block);
+        }
+        if (opts.pca_matvec_mode == gcta_cli::PcaMatvecMode::Tiled) {
+            chunked_reader_f32.fused_symm_fn = nullptr;
+            chunked_reader_f32.fused_max_k = 0;
+        } else if (opts.pca_matvec_mode == gcta_cli::PcaMatvecMode::Fused) {
+            chunked_reader_f32.fused_max_k = std::max(opts.pca_fused_max_k, n);
+        } else {
+            chunked_reader_f32.fused_max_k = opts.pca_fused_max_k;
+        }
         chunked_handle.file.reset();  // reader closures own the shared_ptr
     } else if (pca_approx.has_value()) {
         double m_snps_unused = -1.0;

@@ -97,6 +97,7 @@ enum class RemlReuseStream { Auto = 0, Off = 1, On = 2 };
 enum class RemlWoodburySolver { Auto = 0, Cholesky = 1, Eigh = 2 };
 enum class RemlQrMode : uint8_t { Auto = 0, Sketched = 1, Standard = 2 };
 enum class RemlSvdFilter : uint8_t { Power = 0, Chebyshev = 1 };
+enum class GrmReadMode : uint8_t { Auto = 0, Buffered = 1, Direct = 2 };
 
 struct RemlOptions {
     std::string grm;
@@ -151,6 +152,8 @@ struct RemlOptions {
     RemlWoodburySolver reml_woodbury_solver = RemlWoodburySolver::Auto;
     RemlQrMode reml_qr_mode = RemlQrMode::Auto;
     RemlSvdFilter reml_svd_filter = RemlSvdFilter::Power;
+    int grm_read_threads = 1;
+    GrmReadMode grm_read_mode = GrmReadMode::Auto;
 };
 
 struct GrmMakeOptions {
@@ -240,6 +243,8 @@ struct PcaOptions {
     PcaLoadMode pca_load_mode = PcaLoadMode::Auto;
     int pca_io_slot_mb = 0;   // 0 = default (256 MiB)
     int pca_tile_size = 0;    // 0 = default (8192 small-k / 4096 large-k)
+    int grm_read_threads = 1;
+    GrmReadMode grm_read_mode = GrmReadMode::Auto;
 };
 
 enum class MlmaReorderQ { Auto = 0, Off = 1, On = 2 };

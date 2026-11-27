@@ -2604,6 +2604,10 @@ void compute_woodbury_basis(RemlCtx& ctx) {
             LOGGER.w(0, "--reml-woodbury-solver cholesky requires fixed-k power-iteration rSVD; "
                         "falling back to eigh.");
         } else {
+            if (k_svd >= 4096) {
+                LOGGER.w(0, "--reml-woodbury-solver cholesky is slower than eigh at large k and incompatible "
+                            "with --woodbury-reuse; prefer default eigh.");
+            }
             use_unrotated = true;
         }
     } else if (ctx.reml_woodbury_solver == RemlWoodburySolver::Auto) {
@@ -3226,6 +3230,61 @@ void finalize_unrotated_woodbury_factor(RemlCtx& ctx) {
                 r_eff += p_pos;
             }
         }
+    } else if (m_rem > 4096) {
+        LOGGER.w(0, "Woodbury Cholesky: C = I - sig2e * V_Q^{-1} is strongly indefinite (m_rem=" +
+                    std::to_string(m_rem) + "/" + std::to_string(k) +
+                    " > 4096); falling back to exact spectral projection of C "
+                    "(use --reml-woodbury-solver eigh for better performance).");
+        build_C_upper(C);
+        ctx.wb_VQ_Uinv.resize(0, 0);
+
+        Eigen::MatrixXf C_f(k, k);
+        #pragma omp parallel for schedule(guided) if (k >= 128)
+        for (int j = 0; j < k; ++j) {
+            const double* __restrict__ src = C.col(j).data();
+            float* __restrict__ dst = C_f.col(j).data();
+            #pragma omp simd
+            for (int i = 0; i <= j; ++i) {
+                dst[i] = static_cast<float>(src[i]);
+            }
+        }
+        C.resize(0, 0);
+
+        Eigen::VectorXd w_c;
+        Eigen::MatrixXf Z_c;
+        gcta_eigh::detail::eigh_upper_asc_f(C_f, w_c, Z_c, lapack_cap);
+        C_f.resize(0, 0);
+
+        int pos_rank = 0;
+        #pragma omp parallel for schedule(static) reduction(+:pos_rank) if (k >= 128)
+        for (int j = 0; j < k; ++j) {
+            float* __restrict__ zcol = Z_c.col(j).data();
+            if (w_c[j] > 1.0e-12) {
+                const float s = static_cast<float>(std::sqrt(w_c[j]));
+                #pragma omp simd
+                for (int i = 0; i < k; ++i) {
+                    zcol[i] *= s;
+                }
+                ++pos_rank;
+            } else {
+                std::memset(zcol, 0, static_cast<size_t>(k) * sizeof(float));
+            }
+        }
+
+        if (ctx.Uk.cols() > k) {
+            ctx.Uk.conservativeResize(Eigen::NoChange, k);
+        }
+        gcta_eigh::detail::rotate_basis_inplace<float>(
+            ctx.Uk, Z_c, k, /*reverse_Z_cols=*/true, /*keep_trailing_cols=*/true);
+
+        LOGGER.i(0, "Woodbury Cholesky spectral fallback: positive rank=" +
+                    std::to_string(pos_rank) + "/" + std::to_string(k) + ".");
+        ctx.dk = RemlVec::Zero(k);
+        ctx.ck = RemlVec::Ones(k);
+        ctx.wb_uk_is_prebaked_wk = true;
+        ctx.wb_unrotated = false;
+        ctx.reml_wb_solver_used = "cholesky_fallback";
+        return;
     } else {
         ctx.wb_VQ_Uinv.resize(0, 0);
     }

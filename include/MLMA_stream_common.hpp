@@ -73,50 +73,84 @@ inline Eigen::MatrixXd compact_sample_rows(const Eigen::MatrixXd& values,
     return compacted;
 }
 
-// Resolve the streaming block width (SNPs per tile) from a memory budget.
+// Resolve the streaming block width (SNPs per tile) from a memory budget or
+// automatically from thread count and remaining available memory headroom.
 // Accounts for all O(BLOCK) streaming buffers held simultaneously per tile:
 //   - G_block_i8 (~n bytes, 64B-aligned column stride) vs X_block (4*n bytes)
 //   - Backend double-buffered raw slots: ~0.5*raw_n (BED), ~5.0*n (PGEN dosage), ~2.0*raw_n (BGEN)
 //   - Woodbury projection scratch UkX_scratch (4 * wb_k bytes when Woodbury active)
 // Per-SNP scalars (Xt_Vi_y, xvx_diag, af_v, valid_v) are O(1) per column.
-// budget_gb <= 0 preserves the previous fixed BLOCK=10000 behavior exactly.
 inline int resolve_mlma_block_size(int n, double budget_gb, bool use_int8_geno = false,
                                    int raw_n = 0, int wb_k = 0,
                                    const std::string& geno_format = "BED",
                                    int align_tile = 0)
 {
-    int block = 10000; // Somewhat arbitrary, but balance of peak RSS and throughput. Increasing may help STRSM efficiency but increases memory.
-    if (budget_gb > 0.0 && n > 0) {
+    int block = 10000;
+    const char* mode_tag = "default";
 
-      LOGGER << "MLMA streaming memory budget: " << budget_gb << " GB" << std::endl;
-      const int raw_eff = std::max(n, raw_n);
-      size_t ldG_est = (static_cast<size_t>(n) + 63) / 64 * 64;
-      if (ldG_est % 4096 == 0) ldG_est += 64;
-      const double geno_bytes = use_int8_geno
-          ? static_cast<double>(ldG_est) /* G_block_i8 */
-          : static_cast<double>(sizeof(float)) * static_cast<double>(n); /* X_block */
-      double raw_io_bytes = 0.5 * static_cast<double>(raw_eff);
-      if (geno_format == "PGEN") {
-          // 2 double-buffered slots of (2-bit geno + uint16 dosage_main + 1-bit dosage_present) ~ 5.0 * n bytes
-          raw_io_bytes = 5.0 * static_cast<double>(n);
-      } else if (geno_format == "BGEN") {
-          raw_io_bytes = 2.0 * static_cast<double>(raw_eff);
-      }
-      const double scratch_bytes = (wb_k > 0)
-          ? static_cast<double>(sizeof(float)) * static_cast<double>(wb_k)
-          : 0.0;
-      constexpr int    min_block = 256;    // floor: keep BLAS3 tiles meaningful
-      constexpr int    max_block = 65536;  // ceiling: cap per-column scalar creep
+    if (n > 0) {
+        const int raw_eff = std::max(n, raw_n);
+        size_t ldG_est = (static_cast<size_t>(n) + 63) / 64 * 64;
+        if (ldG_est % 4096 == 0) ldG_est += 64;
+        const double geno_bytes = use_int8_geno
+            ? static_cast<double>(ldG_est) /* G_block_i8 */
+            : static_cast<double>(sizeof(float)) * static_cast<double>(n); /* X_block */
+        double raw_io_bytes = 0.5 * static_cast<double>(raw_eff);
+        if (geno_format == "PGEN") {
+            // 2 double-buffered slots of (2-bit geno + uint16 dosage_main + 1-bit dosage_present) ~ 5.0 * n bytes
+            raw_io_bytes = 5.0 * static_cast<double>(n);
+        } else if (geno_format == "BGEN") {
+            raw_io_bytes = 2.0 * static_cast<double>(raw_eff);
+        }
+        const double scratch_bytes = (wb_k > 0)
+            ? static_cast<double>(sizeof(float)) * static_cast<double>(wb_k)
+            : 0.0;
+        const double per_snp_bytes = geno_bytes + raw_io_bytes + scratch_bytes;
 
-      const double budget_bytes  = budget_gb * 1e9;
-      const double per_snp_bytes = geno_bytes + raw_io_bytes + scratch_bytes;
-      block = std::clamp(static_cast<int>(budget_bytes / per_snp_bytes), min_block, max_block);
-      if (align_tile > 0) {
-          const int step = (block >= align_tile) ? align_tile : min_block;
-          block = std::clamp((block / step) * step, min_block, max_block);
-      }
+        constexpr int min_block = 256;    // floor: keep BLAS3 tiles meaningful
+        constexpr int max_block = 65536;  // ceiling: cap per-column scalar creep
+        auto align_block = [&](int raw_b) -> int {
+            int b = std::clamp(raw_b, min_block, max_block);
+            if (align_tile > 0) {
+                const int step = (b >= align_tile) ? align_tile : min_block;
+                b = std::clamp((b / step) * step, min_block, max_block);
+            }
+            return b;
+        };
+
+        if (budget_gb > 0.0) {
+            mode_tag = "budget";
+            LOGGER << "MLMA streaming memory budget: " << budget_gb << " GB" << std::endl;
+            const double budget_bytes = budget_gb * 1e9;
+            block = align_block(static_cast<int>(budget_bytes / per_snp_bytes));
+        } else if (use_int8_geno) {
+            mode_tag = "auto";
+            const int max_t =
+            #ifdef _OPENMP
+                std::max(1, omp_get_max_threads());
+            #else
+                1;
+            #endif
+            const int raw_target = std::clamp(((max_t * 128 + 2047) / 2048) * 2048, 8192, 32768);
+            const uint64_t avail = detect_available_memory_bytes();
+            int target_cols = std::min(raw_target, 10240);
+            if (avail > 0) {
+                const uint64_t auto_budget = (avail > (8ULL << 30))
+                    ? ((avail - (8ULL << 30)) / 4ULL)
+                    : (avail / 3ULL);
+                const double cap_d = static_cast<double>(auto_budget) / std::max(1.0, per_snp_bytes);
+                const int mem_cap = static_cast<int>(std::min(cap_d, static_cast<double>(max_block)));
+                target_cols = std::min(raw_target, mem_cap);
+            }
+            block = align_block(target_cols);
+        }
     }
-    LOGGER << "MLMA streaming block size: " << block << " SNPs per tile" << std::endl;
+
+    if (std::string_view(mode_tag) == "auto") {
+        LOGGER << "MLMA streaming block size (auto): " << block << " SNPs per tile" << std::endl;
+    } else {
+        LOGGER << "MLMA streaming block size: " << block << " SNPs per tile" << std::endl;
+    }
     return block;
 }
 
@@ -707,10 +741,15 @@ inline void run_mlma_stream_association_woodbury_i8(const WoodburyMLMACache& wb,
         Eigen::VectorXf       Xt_Vi_y;
         Eigen::VectorXf       xvx_diag;
     };
-    constexpr size_t kRefineGCapBytes = 2ULL << 30; // 2 GiB cap on gathered candidate genotypes
+    uint64_t refine_g_cap_bytes = 2ULL << 30;
+    const uint64_t avail_ref = detect_available_memory_bytes();
+    if (avail_ref > (16ULL << 30)) {
+        refine_g_cap_bytes = std::clamp<uint64_t>(
+            (avail_ref - (8ULL << 30)) / 16ULL, 2ULL << 30, 8ULL << 30);
+    }
     const int max_cands_by_mem = static_cast<int>(
-        std::max<size_t>(256, kRefineGCapBytes / std::max<size_t>(1, static_cast<size_t>(ldG))));
-    const int refine_batch_target = std::clamp(std::max(1024, 16 * max_threads), 256, std::min(4096, max_cands_by_mem));
+        std::max<size_t>(256, static_cast<size_t>(refine_g_cap_bytes) / std::max<size_t>(1, static_cast<size_t>(ldG))));
+    const int refine_batch_target = std::clamp(std::max(2048, 32 * max_threads), 256, std::min(8192, max_cands_by_mem));
 
     std::vector<PendingMlmaBlock> pending_blocks;
     int cand_count = 0;

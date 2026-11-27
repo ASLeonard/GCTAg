@@ -2489,7 +2489,7 @@ inline void refine_adaptive_batch_fast_i8(
 
 #if GCTA_HAS_AOCL_S8_GEMM
     const int kSampleTile = std::min(n, 8388608);
-    constexpr int kMaxBatchCols = 4096;
+    constexpr int kMaxBatchCols = 8192;
 #else
     constexpr int kSampleTile = 8192;
     constexpr int kMaxBatchCols = 1024;

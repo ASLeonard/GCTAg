@@ -1207,6 +1207,226 @@ def main():
         assert bad_fisher.returncode != 0, "Expected --reml-pcg + --reml-alg 1 rejection"
         print("  PASS reml_pcg_exact_woodbury_preconditioned")
 
+        # 8. Automatic sample-order alignment for permuted GRMs (--grm-fp16 & --grm-chunked-budget)
+        def write_permuted_bfile(src_pfx, dst_pfx, seed=42):
+            import random
+            with open(src_pfx + ".fam") as f:
+                fam_lines = [ln for ln in f if ln.strip()]
+            with open(src_pfx + ".bim") as f:
+                bim_lines = [ln for ln in f if ln.strip()]
+            n_ind = len(fam_lines)
+            n_snp = len(bim_lines)
+            perm = list(range(n_ind))
+            random.Random(seed).shuffle(perm)
+
+            with open(dst_pfx + ".fam", "w") as f:
+                for p in perm:
+                    f.write(fam_lines[p])
+            shutil.copyfile(src_pfx + ".bim", dst_pfx + ".bim")
+
+            in_stride = (n_ind + 3) // 4
+            out_stride = (n_ind + 3) // 4
+            with open(src_pfx + ".bed", "rb") as fb_in, open(dst_pfx + ".bed", "wb") as fb_out:
+                magic = fb_in.read(3)
+                assert magic == b"\x6c\x1b\x01", f"Unexpected PLINK magic: {magic!r}"
+                fb_out.write(magic)
+                for _ in range(n_snp):
+                    snp_bytes = fb_in.read(in_stride)
+                    assert len(snp_bytes) == in_stride
+                    out_buf = bytearray(out_stride)
+                    for out_i, src_i in enumerate(perm):
+                        geno = (snp_bytes[src_i >> 2] >> ((src_i & 3) * 2)) & 0x3
+                        out_buf[out_i >> 2] |= geno << ((out_i & 3) * 2)
+                    fb_out.write(out_buf)
+
+        syn_perm_bfile = os.path.join(work, "syn_perm")
+        write_permuted_bfile(syn_bfile, syn_perm_bfile, seed=20261128)
+
+        syn_perm_grm = os.path.join(work, "syn_perm_grm")
+        syn_perm_grm_f32 = os.path.join(work, "syn_perm_grm_f32")
+        must_run(
+            [NEW_BIN, "grm", "make", "--bfile", syn_perm_bfile, "--fast", "--threads", "4", "--out", syn_perm_grm],
+            "grm make permuted syn fp16",
+        )
+        must_run(
+            [NEW_BIN, "grm", "make", "--bfile", syn_perm_bfile, "--threads", "4", "--out", syn_perm_grm_f32],
+            "grm make permuted syn f32",
+        )
+
+        perm_wb = os.path.join(work, "perm_wb_k80")
+        perm_mlma_wb = os.path.join(work, "perm_mlma_wb_k80")
+        must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_perm_grm,
+                "--fast",
+                "--woodbury-basis", "80",
+                "--seed", "7",
+                "--threads", "4",
+                "--out", perm_wb,
+            ],
+            "reml permuted syn fast wb k80",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", syn_bfile + ".phen",
+                "--load-reml", perm_wb + ".reml",
+                "--fast-mlma", "adaptive",
+                "--threads", "4",
+                "--out", perm_mlma_wb,
+            ],
+            "mlma permuted syn load TUN3",
+        )
+        # k=80 out of n=2003 truncates most of the bulk spectrum (~5-10% p-value jitter even unpermuted)
+        compare_mlma("perm_wb_mlma_vs_exact", perm_mlma_wb + ".mlma", mlma_ex + ".mlma", rel_tol=1.5e-1, abs_tol=5e-3)
+
+        perm_pcg = os.path.join(work, "perm_pcg_k80")
+        perm_mlma_pcg_load = os.path.join(work, "perm_mlma_pcg_load")
+        perm_mlma_pcg_inl = os.path.join(work, "perm_mlma_pcg_inl")
+        must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_perm_grm,
+                "--fast",
+                "--reml-pcg", "80",
+                "--seed", "7",
+                "--threads", "4",
+                "--out", perm_pcg,
+            ],
+            "reml permuted syn fast pcg k80",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", syn_bfile + ".phen",
+                "--load-reml", perm_pcg + ".reml",
+                "--fast-mlma", "adaptive",
+                "--threads", "4",
+                "--out", perm_mlma_pcg_load,
+            ],
+            "mlma permuted syn load TANG pcg",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_perm_grm,
+                "--fast",
+                "--reml-pcg", "80",
+                "--seed", "7",
+                "--threads", "4",
+                "--out", perm_mlma_pcg_inl,
+            ],
+            "mlma permuted syn inline fast pcg k80",
+        )
+        compare_mlma("perm_pcg_mlma_load_vs_exact", perm_mlma_pcg_load + ".mlma", mlma_ex + ".mlma", rel_tol=5e-2, abs_tol=2e-3)
+        compare_mlma("perm_pcg_mlma_inl_vs_load", perm_mlma_pcg_inl + ".mlma", perm_mlma_pcg_load + ".mlma", rel_tol=1e-4, abs_tol=1e-6)
+
+        perm_dense = os.path.join(work, "perm_dense_fp16")
+        perm_mlma_dense = os.path.join(work, "perm_mlma_dense_fp16")
+        must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_perm_grm,
+                "--grm-fp16",
+                "--threads", "4",
+                "--out", perm_dense,
+            ],
+            "reml permuted syn dense grm-fp16",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", syn_bfile + ".phen",
+                "--load-reml", perm_dense + ".reml",
+                "--threads", "4",
+                "--out", perm_mlma_dense,
+            ],
+            "mlma permuted syn load GOBY dense fp16",
+        )
+        compare_mlma("perm_dense_fp16_mlma_vs_exact", perm_mlma_dense + ".mlma", mlma_ex + ".mlma", rel_tol=2e-3, abs_tol=5e-4)
+
+        perm_chunked = os.path.join(work, "perm_chunked_f32")
+        perm_mlma_chunked = os.path.join(work, "perm_mlma_chunked_f32")
+        must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_perm_grm_f32,
+                "--grm-chunked-budget", "0.0005",
+                "--woodbury-basis", "80",
+                "--seed", "7",
+                "--threads", "4",
+                "--out", perm_chunked,
+            ],
+            "reml permuted syn chunked f32",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--pheno", syn_bfile + ".phen",
+                "--load-reml", perm_chunked + ".reml",
+                "--fast-mlma", "adaptive",
+                "--threads", "4",
+                "--out", perm_mlma_chunked,
+            ],
+            "mlma permuted syn load chunked f32",
+        )
+        compare_mlma("perm_chunked_mlma_vs_exact", perm_mlma_chunked + ".mlma", mlma_ex + ".mlma", rel_tol=1.5e-1, abs_tol=5e-3)
+
+        keep_500 = os.path.join(work, "keep_500.txt")
+        with open(syn_bfile + ".fam") as f_in, open(keep_500, "w") as f_out:
+            for idx, ln in enumerate(f_in):
+                if idx >= 500:
+                    break
+                ps = ln.strip().split()
+                if len(ps) >= 2:
+                    f_out.write(f"{ps[0]} {ps[1]}\n")
+        perm_keep = os.path.join(work, "perm_keep500")
+        perm_mlma_keep = os.path.join(work, "perm_mlma_keep500")
+        must_run(
+            [
+                NEW_BIN, "reml",
+                "--fam", syn_bfile + ".fam",
+                "--keep", keep_500,
+                "--pheno", syn_bfile + ".phen",
+                "--grm", syn_perm_grm,
+                "--fast",
+                "--woodbury-basis", "80",
+                "--seed", "7",
+                "--threads", "4",
+                "--out", perm_keep,
+            ],
+            "reml permuted + keep 500",
+        )
+        must_run(
+            [
+                NEW_BIN, "mlma",
+                "--bfile", syn_bfile,
+                "--keep", keep_500,
+                "--pheno", syn_bfile + ".phen",
+                "--load-reml", perm_keep + ".reml",
+                "--fast-mlma", "adaptive",
+                "--threads", "4",
+                "--out", perm_mlma_keep,
+            ],
+            "mlma permuted + keep 500 load",
+        )
+        print("  PASS reml_permuted_grm_sample_order")
+
         print("ALL REML TUNING & TRACK C TESTS PASSED")
     finally:
         if tmp_ctx is not None:

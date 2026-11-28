@@ -1622,6 +1622,105 @@ Eigen::VectorXf compute_vi_y_streaming_tun3(const StreamingReuseHandle& h,
     return (y_adj_f - proj_y) / sig2e_f;
 }
 
+// Restores sample-indexed REML outputs back from GRM row order to original analysis_ids
+// order after inline REML completes so downstream .reml / inline MLMA matches --fam/--bfile.
+void unpermute_reml_ctx_to_orig_order(RemlCtx& ctx,
+                                      const std::vector<int>& orig_to_grm_order,
+                                      const std::vector<double>& orig_phenos,
+                                      const Eigen::MatrixXd& orig_X)
+{
+    const int n = ctx.n;
+    if (n <= 0 || static_cast<int>(orig_to_grm_order.size()) != n) return;
+
+    for (int i = 0; i < n; ++i) {
+        ctx.y[i] = orig_phenos[static_cast<size_t>(i)];
+    }
+    ctx.X = orig_X;
+
+    if (ctx.has_pcg_cached_Vi_y && ctx.pcg_cached_Vi_y_f.size() == n) {
+        Eigen::VectorXf tmp(n);
+        for (int orig = 0; orig < n; ++orig) {
+            tmp[orig] = ctx.pcg_cached_Vi_y_f[orig_to_grm_order[static_cast<size_t>(orig)]];
+        }
+        ctx.pcg_cached_Vi_y_f = std::move(tmp);
+    }
+
+    if (ctx.Vi_use_woodbury_basis) {
+        if (!ctx.Uk_is_transposed && ctx.Uk.rows() == n) {
+            const int k_cols = static_cast<int>(ctx.Uk.cols());
+            #pragma omp parallel if (k_cols > 1 && n >= 1024)
+            {
+                std::vector<float> tmp(static_cast<size_t>(n));
+                #pragma omp for schedule(static)
+                for (int j = 0; j < k_cols; ++j) {
+                    float* const col = ctx.Uk.col(j).data();
+                    for (int orig = 0; orig < n; ++orig) {
+                        tmp[static_cast<size_t>(orig)] = col[orig_to_grm_order[static_cast<size_t>(orig)]];
+                    }
+                    std::memcpy(col, tmp.data(), static_cast<size_t>(n) * sizeof(float));
+                }
+            }
+        } else if (ctx.Uk_is_transposed && ctx.Uk.cols() == n) {
+            const int k_rows = static_cast<int>(ctx.Uk.rows());
+            const size_t col_bytes = static_cast<size_t>(k_rows) * sizeof(float);
+            std::vector<uint8_t> done(static_cast<size_t>(n), 0);
+            std::vector<float> saved(static_cast<size_t>(k_rows));
+            float* const uk_ptr = ctx.Uk.data();
+            const size_t k_stride = static_cast<size_t>(k_rows);
+            for (int start = 0; start < n; ++start) {
+                if (done[static_cast<size_t>(start)] || orig_to_grm_order[static_cast<size_t>(start)] == start) {
+                    done[static_cast<size_t>(start)] = 1;
+                    continue;
+                }
+                std::memcpy(saved.data(), uk_ptr + static_cast<size_t>(start) * k_stride, col_bytes);
+                int cur = start;
+                while (true) {
+                    const int nxt = orig_to_grm_order[static_cast<size_t>(cur)];
+                    done[static_cast<size_t>(cur)] = 1;
+                    if (nxt == start) {
+                        std::memcpy(uk_ptr + static_cast<size_t>(cur) * k_stride, saved.data(), col_bytes);
+                        break;
+                    }
+                    std::memcpy(uk_ptr + static_cast<size_t>(cur) * k_stride,
+                                uk_ptr + static_cast<size_t>(nxt) * k_stride, col_bytes);
+                    cur = nxt;
+                }
+            }
+        }
+    } else if (ctx.Vi_use_llt && ctx.Vi_L.rows() == n && ctx.Vi_L.cols() == n) {
+        #pragma omp parallel for schedule(guided) if (n >= 512)
+        for (int j = 0; j < n - 1; ++j) {
+            ctx.Vi_L.col(j).tail(n - 1 - j).setZero();
+        }
+        Eigen::MatrixXd V_grm = Eigen::MatrixXd::Zero(n, n);
+        V_grm.selfadjointView<Eigen::Upper>().rankUpdate(ctx.Vi_L.transpose());
+        #pragma omp parallel for schedule(guided) if (n >= 512)
+        for (int j = 0; j < n; ++j) {
+            const int gj = orig_to_grm_order[static_cast<size_t>(j)];
+            for (int i = 0; i <= j; ++i) {
+                const int gi = orig_to_grm_order[static_cast<size_t>(i)];
+                ctx.Vi_L(i, j) = (gi <= gj) ? V_grm(gi, gj) : V_grm(gj, gi);
+            }
+        }
+        V_grm.resize(0, 0);
+        const gcta_blas_int blas_n = static_cast<gcta_blas_int>(n);
+        if (gcta_dpotrf(blas_n, ctx.Vi_L.data(), blas_n, 'U') != 0) {
+            LOGGER.e(0, "REML: failed to re-factorize V after restoring original sample order.");
+        }
+    } else if (ctx.Vi.rows() == n && ctx.Vi.cols() == n) {
+        Eigen::MatrixXd Vi_orig(n, n);
+        #pragma omp parallel for schedule(guided) if (n >= 512)
+        for (int j = 0; j < n; ++j) {
+            const int gj = orig_to_grm_order[static_cast<size_t>(j)];
+            for (int i = 0; i <= j; ++i) {
+                const int gi = orig_to_grm_order[static_cast<size_t>(i)];
+                Vi_orig(i, j) = (gi <= gj) ? ctx.Vi(gi, gj) : ctx.Vi(gj, gi);
+            }
+        }
+        ctx.Vi.swap(Vi_orig);
+    }
+}
+
 // Writes TUN3 (compact 16-bit Woodbury), TREF (thin reference on --woodbury-reuse
 // unless reml_standalone=true), or GOBY (exact dense float32 Cholesky).
 // Note: invoked only on --save-reml (which exits immediately), so it may release ctx.Uk
@@ -3604,12 +3703,70 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             gcta_grm_io::ChunkedGrmHandle chunked_grm;       // only populated when grm_chunked
             gcta_grm_io::PackedGrmFp16Handle fp16_grm;       // only populated when grm_fp16
 
+            bool reml_permuted = false;
+            std::vector<int> grm_order_to_orig;
+            std::vector<int> orig_to_grm_order;
+            std::vector<string> reml_ids;
+            std::vector<string> preloaded_grm_ids;
+
+            if (!reuse_basis && (grm_fp16 || grm_chunked)) {
+                const auto resolved_grm = gcta_grm_io::resolve_grm_input(grm_pfx, grm_fp16);
+                preloaded_grm_ids = Pheno::read_sublist(resolved_grm.id_path);
+                if (preloaded_grm_ids.empty()) {
+                    LOGGER.e(0, "GRM id file [" + resolved_grm.id_path + "] is empty.");
+                }
+                const std::vector<int> kp = gcta_grm_io::match_ids_to_grm(analysis_ids, preloaded_grm_ids);
+                const char* const mode_flag = grm_fp16 ? "--grm-fp16" : "--grm-chunked-budget";
+                for (int i = 0; i < n; ++i) {
+                    if (kp[static_cast<size_t>(i)] < 0) {
+                        LOGGER.e(0, std::string(mode_flag) + ": individual [" + analysis_ids[static_cast<size_t>(i)] +
+                                    "] not found in GRM [" + grm_pfx + "].");
+                    }
+                }
+                bool is_monotonic = true;
+                for (int i = 1; i < n; ++i) {
+                    if (kp[static_cast<size_t>(i)] <= kp[static_cast<size_t>(i - 1)]) {
+                        is_monotonic = false;
+                        break;
+                    }
+                }
+                if (!is_monotonic) {
+                    grm_order_to_orig.resize(static_cast<size_t>(n));
+                    std::iota(grm_order_to_orig.begin(), grm_order_to_orig.end(), 0);
+                    std::stable_sort(grm_order_to_orig.begin(), grm_order_to_orig.end(),
+                                     [&kp](int a, int b) {
+                                         return kp[static_cast<size_t>(a)] < kp[static_cast<size_t>(b)];
+                                     });
+                    for (int g = 1; g < n; ++g) {
+                        const int cur = grm_order_to_orig[static_cast<size_t>(g)];
+                        const int prv = grm_order_to_orig[static_cast<size_t>(g - 1)];
+                        if (kp[static_cast<size_t>(cur)] == kp[static_cast<size_t>(prv)]) {
+                            LOGGER.e(0, "Duplicate sample ID [" + analysis_ids[static_cast<size_t>(cur)] +
+                                        "] matched in GRM [" + grm_pfx + "].");
+                        }
+                    }
+                    orig_to_grm_order.resize(static_cast<size_t>(n));
+                    reml_ids.resize(static_cast<size_t>(n));
+                    for (int g = 0; g < n; ++g) {
+                        const int orig = grm_order_to_orig[static_cast<size_t>(g)];
+                        orig_to_grm_order[static_cast<size_t>(orig)] = g;
+                        reml_ids[static_cast<size_t>(g)] = analysis_ids[static_cast<size_t>(orig)];
+                    }
+                    reml_permuted = true;
+                    LOGGER.i(0, "Sample order differs from [" + resolved_grm.id_path +
+                                "]; permuting REML inputs into GRM row order for fast sequential load "
+                                "(outputs will be restored to input FAM order).");
+                }
+            }
+
             {
                 const auto t_load0 = r.reml_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const vector<string>& grm_query_ids = reml_permuted ? reml_ids : analysis_ids;
+                const vector<string>* const grm_ids_ptr = preloaded_grm_ids.empty() ? nullptr : &preloaded_grm_ids;
                 if (grm_fp16) {
                     fp16_grm = gcta_grm_io::load_packed_grm_fp16(
-                        grm_pfx, analysis_ids, /*need_m_snps=*/need_m_snps, "--grm-fp16",
-                        reml_io_slot_bytes);
+                        grm_pfx, grm_query_ids, /*need_m_snps=*/need_m_snps, "--grm-fp16",
+                        reml_io_slot_bytes, grm_ids_ptr);
                     grm_chunk_rows = fp16_grm.chunk_rows;
                     m_all = fp16_grm.m_snps;
                 } else if (grm_chunked) {
@@ -3621,8 +3778,8 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                     }
                     const gcta_grm_io::ChunkedGrmReadConfig read_cfg{r.grm_read_threads, read_mode};
                     chunked_grm = gcta_grm_io::make_chunked_grm_reader(
-                        grm_pfx, analysis_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget",
-                        /*need_m_snps=*/need_m_snps, nullptr, false, read_cfg);
+                        grm_pfx, grm_query_ids, grm_chunked_budget, /*k_ext=*/0, "--grm-chunked-budget",
+                        /*need_m_snps=*/need_m_snps, grm_ids_ptr, false, read_cfg);
                     grm_chunk_rows = chunked_grm.chunk_rows;
                     m_all = chunked_grm.m_snps;
                     if (grm_chunk_rows >= n) {
@@ -3632,13 +3789,24 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                                     "for no benefit.");
                         chunked_grm = {};
                         grm_chunked = false;
+                        if (reml_permuted) {
+                            reml_permuted = false;
+                            grm_order_to_orig.clear();
+                            orig_to_grm_order.clear();
+                            reml_ids.clear();
+                        }
                     }
                 }
                 if (!grm_chunked && !grm_fp16 && !reuse_basis) {
                     double m_all_load = (m_all > 0.0) ? -1.0 : m_all;
-                    load_and_subset_grm_upper(grm_pfx, analysis_ids, G_n, m_all_load, "--mlma");
+                    load_and_subset_grm_upper(grm_pfx, analysis_ids, G_n, m_all_load, "--mlma",
+                                              /*grm_read_chunk_bytes=*/gcta_grm_io::kDefaultGrmIoSlotBytes,
+                                              /*trace_K_out=*/nullptr, /*trace_K2_out=*/nullptr,
+                                              /*preloaded_grm_ids=*/grm_ids_ptr);
                     if (m_all <= 0.0) m_all = m_all_load;
                 }
+                preloaded_grm_ids.clear();
+                preloaded_grm_ids.shrink_to_fit();
                 if (r.reml_profile) {
                     reml_grm_load_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
                 }
@@ -3649,11 +3817,24 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             RemlCtx ctx;
             ctx.n   = n;
             ctx.X_c = x_c;
-            ctx.X   = X_design;
-            {
+            if (reml_permuted) {
+                ctx.X.resize(n, x_c);
+                for (int c = 0; c < x_c; ++c) {
+                    for (int g = 0; g < n; ++g) {
+                        ctx.X(g, c) = X_design(grm_order_to_orig[static_cast<size_t>(g)], c);
+                    }
+                }
                 Eigen::VectorXd y_d(n);
-                for (int i = 0; i < n; ++i) y_d[i] = phenos_vec[i];
-                ctx.y     = y_d;
+                for (int g = 0; g < n; ++g) {
+                    y_d[g] = phenos_vec[static_cast<size_t>(grm_order_to_orig[static_cast<size_t>(g)])];
+                }
+                ctx.y     = std::move(y_d);
+                ctx.y_Ssq = ctx.y.squaredNorm();
+            } else {
+                ctx.X = X_design;
+                Eigen::VectorXd y_d(n);
+                for (int i = 0; i < n; ++i) y_d[i] = phenos_vec[static_cast<size_t>(i)];
+                ctx.y     = std::move(y_d);
                 ctx.y_Ssq = ctx.y.squaredNorm();
             }
             ctx.A.resize(2);
@@ -3730,7 +3911,9 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
                     LOGGER.w(0, "--reml-woodbury-basis-warm-start has no effect with --svd-method nystrom "
                                 "(the Nystrom path doesn't use power iteration); ignoring.");
                 else {
-                    ctx.Uk = load_pca_warm_start(r.woodbury_warm_start, analysis_ids, basis_file_override);
+                    ctx.Uk = load_pca_warm_start(r.woodbury_warm_start,
+                                                 reml_permuted ? reml_ids : analysis_ids,
+                                                 basis_file_override);
                     ctx.Uk_is_transposed = false;
                 }
             }
@@ -3759,6 +3942,9 @@ void MLMA::run(const gcta_cli::MlmaOptions& opts, const std::string& out_prefix)
             reml::compute(ctx, r.priors, r.priors_var, no_constrain);
             ctx.grm_tile_reader = nullptr;
             ctx.grm_tile_reader_f32 = nullptr;
+            if (reml_permuted) {
+                unpermute_reml_ctx_to_orig_order(ctx, orig_to_grm_order, phenos_vec, X_design);
+            }
 
             LOGGER.i(0, "Inline REML complete. Variance components:");
             for (size_t ci = 0; ci < ctx.varcmp.size(); ++ci)
